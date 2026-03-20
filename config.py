@@ -51,7 +51,7 @@ def ensure_env() -> None:
             "# PORT=6969",
             "",
         ]
-        ENV_PATH.write_text("\n".join(lines))
+        ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
     load_dotenv(str(ENV_PATH), override=True)
 
 
