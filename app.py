@@ -8,6 +8,7 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -1987,6 +1988,93 @@ def shutdown():
         os._exit(0)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+# ── Update / self-update ──────────────────────────────────────────────────────
+
+@app.route("/api/update/check")
+def update_check():
+    """Fetch from origin and report whether the remote main branch is ahead."""
+    root = Path(__file__).parent
+    try:
+        fetch = subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=str(root), capture_output=True, text=True, timeout=20,
+        )
+        if fetch.returncode != 0:
+            return jsonify({"error": fetch.stderr.strip() or "git fetch failed"}), 500
+
+        count_r = subprocess.run(
+            ["git", "rev-list", "HEAD..origin/main", "--count"],
+            cwd=str(root), capture_output=True, text=True, timeout=5,
+        )
+        if count_r.returncode != 0:
+            return jsonify({"error": "Could not compare branches"}), 500
+
+        count = int(count_r.stdout.strip() or "0")
+        return jsonify({"up_to_date": count == 0, "commits_behind": count})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out — check your connection"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/update/apply", methods=["POST"])
+def update_apply():
+    """Pull latest changes then restart via the Start Menu shortcut."""
+    root = Path(__file__).parent
+    pull = subprocess.run(
+        ["git", "pull", "origin", "main"],
+        cwd=str(root), capture_output=True, text=True, timeout=120,
+    )
+    if pull.returncode != 0:
+        return jsonify({"error": pull.stderr.strip() or "git pull failed"}), 500
+
+    def _restart() -> None:
+        global _tray
+        # Stop any active recording / test first (mirrors _do_shutdown)
+        with _state_lock:
+            sid      = _state["session_id"]
+            capture  = _state["audio_capture"]
+            test_cap = _state["test_capture"]
+            _state["is_recording"] = False
+            _state["is_testing"]   = False
+            _state["audio_capture"] = None
+            _state["test_capture"]  = None
+        if test_cap:
+            test_cap.stop()
+        if capture:
+            capture.stop()
+        _transcriber.stop()
+        if sid:
+            storage.end_session(sid)
+        time.sleep(0.5)  # let the HTTP response reach the browser
+
+        # Launch via Start Menu shortcut so the experience matches a normal start
+        lnk_path = (
+            Path(os.environ.get("APPDATA", ""))
+            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            / "Meeting Assistant.lnk"
+        )
+        if lnk_path.exists():
+            os.startfile(str(lnk_path))
+        else:
+            # Fallback: run launch.bat directly
+            bat = root / "launch.bat"
+            if bat.exists():
+                subprocess.Popen(
+                    ["cmd.exe", "/c", str(bat)],
+                    cwd=str(root),
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
+                )
+
+        if _tray is not None:
+            _tray.stop()
+            _tray = None
+        os._exit(0)
+
+    threading.Thread(target=_restart, daemon=True).start()
     return jsonify({"ok": True})
 
 

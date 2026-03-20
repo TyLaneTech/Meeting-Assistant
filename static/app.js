@@ -3587,6 +3587,82 @@ function closeSettings() {
   ['key-anthropic', 'key-openai', 'key-huggingface'].forEach(id => {
     document.getElementById(id).value = '';
   });
+  // Reset update button
+  const btn = document.getElementById('check-update-btn');
+  btn.disabled = false;
+  btn.textContent = 'Check for Updates';
+  btn.onclick = checkForUpdates;
+  document.getElementById('settings-update-status').textContent = '';
+  document.getElementById('settings-update-status').className = 'settings-info-val';
+}
+
+async function checkForUpdates() {
+  const btn = document.getElementById('check-update-btn');
+  const statusEl = document.getElementById('settings-update-status');
+  btn.disabled = true;
+  btn.textContent = 'Checking...';
+  statusEl.textContent = '';
+  statusEl.className = 'settings-info-val';
+
+  try {
+    const res = await fetch('/api/update/check');
+    const data = await res.json();
+
+    if (data.error) {
+      statusEl.textContent = data.error;
+      statusEl.className = 'settings-info-val val-warn';
+      btn.disabled = false;
+      btn.textContent = 'Check for Updates';
+      return;
+    }
+
+    if (data.up_to_date) {
+      statusEl.textContent = 'Up to date';
+      statusEl.className = 'settings-info-val val-ok';
+      btn.disabled = false;
+      btn.textContent = 'Check for Updates';
+    } else {
+      statusEl.textContent = `${data.commits_behind} update${data.commits_behind !== 1 ? 's' : ''} available`;
+      statusEl.className = 'settings-info-val val-warn';
+      btn.disabled = false;
+      btn.textContent = 'Update & Restart';
+      btn.onclick = applyUpdate;
+    }
+  } catch (_) {
+    statusEl.textContent = 'Check failed';
+    statusEl.className = 'settings-info-val val-warn';
+    btn.disabled = false;
+    btn.textContent = 'Check for Updates';
+  }
+}
+
+async function applyUpdate() {
+  const btn = document.getElementById('check-update-btn');
+  const statusEl = document.getElementById('settings-update-status');
+  btn.disabled = true;
+  btn.textContent = 'Updating...';
+  statusEl.textContent = 'Pulling latest changes...';
+  statusEl.className = 'settings-info-val';
+
+  try {
+    const res = await fetch('/api/update/apply', { method: 'POST' });
+    const data = await res.json();
+
+    if (data.error) {
+      statusEl.textContent = data.error;
+      statusEl.className = 'settings-info-val val-warn';
+      btn.disabled = false;
+      btn.textContent = 'Retry Update';
+    } else {
+      statusEl.textContent = 'Restarting...';
+      btn.textContent = 'Restarting...';
+    }
+  } catch (_) {
+    statusEl.textContent = 'Update failed';
+    statusEl.className = 'settings-info-val val-warn';
+    btn.disabled = false;
+    btn.textContent = 'Retry Update';
+  }
 }
 
 function closeSettingsOnOverlay(e) {
