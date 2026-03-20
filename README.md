@@ -1,20 +1,6 @@
-<div align="center">
-  <img src="static/images/logo.png" width="88" alt="Meeting Assistant"><br><br>
-
   # Meeting Assistant
 
-  **Local, private, GPU-accelerated transcription + AI for every meeting.**
-
-  ![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?logo=python&logoColor=white)
-  ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows&logoColor=white)
-  ![CUDA](https://img.shields.io/badge/CUDA-optional-76b900?logo=nvidia&logoColor=white)
-  ![Claude](https://img.shields.io/badge/Powered%20by-Claude-d97706?logoColor=white)
-
-</div>
-
----
-
-> Captures your meetings. Transcribes in real time. Summarizes without sending your audio anywhere. Ask it anything — during the call or after. Runs on your machine, on your GPU, with your data staying put.
+> Captures meetings. Transcribes in real time. Summarizes without sending audio anywhere. Ask it anything — during the call or after. Runs on your machine, on your GPU, with your data staying put.
 
 ---
 
