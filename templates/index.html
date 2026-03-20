@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meeting Assistant</title>
+  <link rel="icon" id="favicon" href="/static/images/logo.png" type="image/png">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+
+<div class="app-layout">
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div style="display:flex;align-items:center;gap:4px">
+        <span class="sidebar-title">Sessions</span>
+        <button class="icon-btn emoji folder-btn" onclick="createFolder()" title="New folder">📁</button>
+        <button class="icon-btn emoji multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions">✅</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px">
+        <button class="icon-btn emoji new-session-btn" onclick="newSession()" title="New session">➕</button>
+        <button class="icon-btn sidebar-toggle-btn" id="sidebar-close-btn" onclick="toggleSidebar()" title="Collapse sidebar">☰</button>
+      </div>
+    </div>
+    <div class="sidebar-bulk-bar hidden" id="sidebar-bulk-bar">
+      <span class="sidebar-bulk-count" id="sidebar-bulk-count">0 selected</span>
+      <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI">⟳ Titles</button>
+      <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()">✕ Delete</button>
+      <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()">✕</button>
+    </div>
+    <div class="sidebar-body" id="session-list">
+      <p class="sidebar-empty">No past sessions yet.</p>
+    </div>
+    <div class="model-config" id="model-config">
+      <button class="model-config-toggle" onclick="toggleModelConfig()">
+        <span class="model-config-label">Models</span>
+        <span class="model-config-arrow" id="model-config-arrow">▸</span>
+      </button>
+      <div class="model-config-body hidden" id="model-config-body">
+        <div class="model-config-row">
+          <label class="model-config-lbl">Whisper</label>
+          <select id="whisper-preset-sel" class="model-config-sel" onchange="changeWhisperPreset(this.value)">
+          </select>
+        </div>
+        <div class="model-config-row">
+          <label class="model-config-lbl">Diarizer</label>
+          <select id="diarizer-device-sel" class="model-config-sel" onchange="changeDiarizerDevice(this.value)">
+          </select>
+        </div>
+        <div class="model-config-row hidden" id="diarization-enabled-row">
+          <label class="model-config-lbl">Speaker ID</label>
+          <button class="icon-btn active" id="diarization-toggle-btn"
+                  onclick="toggleDiarizationEnabled()" title="Enable/disable speaker diarization">On</button>
+        </div>
+      </div>
+    </div>
+    <div class="audio-viz">
+      <!-- Desktop device + gain -->
+      <div class="viz-device-row">
+        <label class="viz-device-lbl viz-lbl-desktop">Desktop</label>
+        <select id="viz-loopback-sel" class="viz-select" onchange="saveDeviceSelection()">
+          <option value="">— loading —</option>
+        </select>
+        <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list">↻</button>
+      </div>
+      <div class="viz-gain-row">
+        <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
+        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1"
+               oninput="onGainInput('lb', this.value)">
+        <span id="viz-lb-gain-val" class="viz-gain-val viz-lbl-desktop">1.0×</span>
+      </div>
+
+      <!-- Waveform canvas + level meter -->
+      <div class="viz-canvas-row">
+        <canvas id="viz-canvas"></canvas>
+        <div class="viz-level-meter" id="viz-level-meter">
+          <div class="viz-meter-track">
+            <div class="viz-meter-fill viz-meter-lb" id="viz-meter-lb"></div>
+          </div>
+          <div class="viz-meter-track">
+            <div class="viz-meter-fill viz-meter-mic" id="viz-meter-mic"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mic gain + device -->
+      <div class="viz-gain-row">
+        <label class="viz-gain-lbl viz-lbl-mic">Gain</label>
+        <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1"
+               oninput="onGainInput('mic', this.value)">
+        <span id="viz-mic-gain-val" class="viz-gain-val viz-lbl-mic">1.0×</span>
+      </div>
+      <div class="viz-device-row">
+        <label class="viz-device-lbl viz-lbl-mic">Mic</label>
+        <select id="viz-mic-sel" class="viz-select" onchange="saveDeviceSelection()">
+          <option value="-2">Browser Mic (this tab)</option>
+          <option value="-1">None</option>
+        </select>
+      </div>
+
+      <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
+        ▶ Test Audio
+      </button>
+    </div>
+  </aside>
+  <div class="sidebar-resize-handle" id="sidebar-resize-handle"></div>
+
+  <!-- ── Main area ────────────────────────────────────────────────────── -->
+  <div class="main-area">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <button class="icon-btn sidebar-toggle-btn" id="sidebar-open-btn"
+                onclick="toggleSidebar()" title="Open sessions sidebar"
+                style="display:none">☰</button>
+        <img id="brand-icon" class="brand-icon" src="/static/images/logo.png" alt="">
+        <span class="brand-name">Meeting Assistant</span>
+      </div>
+      <div class="topbar-right">
+        <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
+          <span class="btn-icon">▶</span> Start Recording
+        </button>
+        <div class="status-pill" id="status-pill">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Loading model…</span>
+          <span id="recording-duration" class="recording-duration hidden"></span>
+        </div>
+        <div class="topbar-sep"></div>
+        <button class="btn btn-settings" onclick="openSettings()" title="Settings">
+          ⚙ Settings
+        </button>
+        <button class="btn btn-danger" onclick="confirmShutdown()" title="Stop the server and close">
+          ⏻ Shut Down
+        </button>
+      </div>
+    </header>
+
+    <div class="workspace">
+
+      <!-- ── Transcript ──────────────────────────────────────────────── -->
+      <div class="col col-transcript">
+        <div class="col-header">
+          <div class="col-actions left">
+            <span class="col-title">Transcript</span>
+            <button class="icon-btn" id="speakers-btn" title="Manage speakers" onclick="openSpeakerManager()">Speakers</button>
+            <button class="icon-btn active" id="auto-scroll-btn" title="Auto-scroll to latest" onclick="toggleAutoScroll()">Auto</button>
+          </div>
+          <div class="col-actions right">
+            <button class="icon-btn emoji" title="Copy transcript" onclick="copyTranscript()">📋</button>
+            <button class="icon-btn emoji" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)">🔎</button>
+            <button class="icon-btn emoji" title="Clear transcript" onclick="clearTranscript()">❌</button>
+          </div>
+        </div>
+        <div id="playback-bar" class="playback-bar hidden">
+          <button class="icon-btn playback-play-btn" id="playback-play" onclick="togglePlayback()" title="Play/Pause">▶</button>
+          <span class="playback-time" id="playback-time">0:00</span>
+          <input type="range" class="playback-seek" id="playback-seek" min="0" max="100" step="0.1" value="0"
+                 oninput="seekPlayback(this.value)" />
+          <span class="playback-time" id="playback-duration">0:00</span>
+          <select class="playback-speed" id="playback-speed" onchange="setPlaybackSpeed(this.value)" title="Playback speed">
+            <option value="0.5">0.5×</option>
+            <option value="0.75">0.75×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+          </select>
+        </div>
+        <div id="transcript-selection-bar" class="transcript-selection-bar hidden">
+          <span class="tsb-count" id="tsb-count">0 segments selected</span>
+          <input id="tsb-input" class="tsb-input" type="text" list="tsb-datalist" placeholder="Reassign to…" />
+          <datalist id="tsb-datalist"></datalist>
+          <button class="tsb-btn tsb-apply" onclick="applyTranscriptBulkReassign()">Apply</button>
+          <button class="tsb-btn tsb-clear" onclick="clearTranscriptSelection()">&#x2715;</button>
+        </div>
+        <div id="transcript" class="col-body transcript-body">
+          <p class="empty-hint">Transcript will appear here once recording starts.</p>
+        </div>
+      </div>
+
+      <div class="col-resize-handle" data-left="0" data-right="1"></div>
+
+      <!-- ── Summary ────────────────────────────────────────────────── -->
+      <div class="col col-summary">
+        <div class="col-header">
+          <span class="col-title">Summary</span>
+          <div class="col-actions">
+            <span class="badge hidden" id="summary-badge">updating…</span>
+            <button class="icon-btn active" id="auto-summary-btn"
+                    title="Toggle auto-summary" onclick="toggleAutoSummary()">Auto</button>
+            <button class="icon-btn" id="summary-prompt-toggle"
+                    title="Custom summary instructions" onclick="toggleSummaryPrompt()">⚙</button>
+            <button class="icon-btn" title="Refresh summary" onclick="triggerSummary()">↻</button>
+          </div>
+        </div>
+        <div id="summary-prompt-area" class="summary-prompt-area hidden">
+          <textarea
+            id="summary-custom-prompt"
+            class="summary-prompt-input"
+            placeholder="Optional: describe the context to shape the summary — e.g. &quot;This is a podcast interview. Summarize the guest's key insights and talking points instead of action items.&quot;"
+            rows="3"
+            oninput="saveSummaryPrompt()"
+          ></textarea>
+        </div>
+        <div id="summary" class="col-body markdown-body">
+          <p class="empty-hint">An auto-updating summary will appear here as the meeting progresses.</p>
+        </div>
+      </div>
+
+      <div class="col-resize-handle" data-left="1" data-right="2"></div>
+
+      <!-- ── Chat ───────────────────────────────────────────────────── -->
+      <div class="col col-chat">
+        <div class="col-header">
+          <div class="col-title-wrap">
+            <span class="col-title">Chat</span>
+            <span class="col-subtitle" id="chat-model-label"></span>
+          </div>
+          <div class="col-actions">
+            <button class="icon-btn" title="Clear chat" onclick="clearChat()">✕</button>
+          </div>
+        </div>
+        <div id="chat-messages" class="col-body chat-body">
+          <p class="empty-hint">Ask questions about the meeting here.</p>
+        </div>
+        <div class="chat-input-area">
+          <textarea
+            id="chat-input"
+            placeholder="Ask about the meeting… (Enter to send, Shift+Enter for newline)"
+            rows="3"
+            onkeydown="handleChatKey(event)"
+          ></textarea>
+          <button id="send-btn" class="btn btn-send" onclick="sendMessage()">Send</button>
+        </div>
+      </div>
+
+    </div><!-- .workspace -->
+  </div><!-- .main-area -->
+</div><!-- .app-layout -->
+
+<audio id="playback-audio" preload="auto"></audio>
+
+<div class="overlay hidden" id="speaker-manager-overlay" onclick="closeSpeakerManagerOnOverlay(event)">
+  <div class="dialog speaker-manager-dialog">
+    <div class="speaker-manager-header">
+      <h3 class="speaker-manager-title">Speakers</h3>
+      <p class="speaker-manager-subtitle" id="speaker-manager-subtitle">Manage speaker names, colors, and bulk assignments.</p>
+      <button class="icon-btn speaker-manager-close" onclick="closeSpeakerManager()">&#x2715;</button>
+    </div>
+
+    <span class="speaker-editor-hint" id="speaker-editor-hint">Click · Ctrl multi · Shift range</span>
+    <div class="speaker-manager-body">
+      <div class="speaker-manager-list" id="speaker-manager-list"></div>
+      <div class="speaker-editor">
+        <div class="speaker-editor-row">
+          <input id="speaker-editor-name" class="speaker-editor-input" list="speaker-name-options"
+                 placeholder="Speaker name" />
+          <datalist id="speaker-name-options"></datalist>
+          <div class="speaker-color-grid" id="speaker-color-grid"></div>
+        </div>
+        <div class="speaker-editor-actions">
+          <div class="left-actions">
+            <button class="speaker-manager-btn speaker-manager-btn-primary" id="speaker-save-btn" onclick="applySpeakerEditor()">Save</button>
+            <button class="speaker-manager-btn speaker-manager-btn-secondary" id="speaker-add-btn" onclick="createSpeakerProfile()">+ Add</button>
+            <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="clearSpeakerSelection()">Clear</button>
+          </div>
+          <button class="speaker-manager-btn speaker-manager-btn-ghost fp-lib-btn" onclick="openFingerprintPanel()" title="Manage cross-session voice profiles">Voice Library</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Fingerprint match toast ─────────────────────────────────────────── -->
+<div class="fp-match-toast hidden" id="fp-match-toast">
+  <div class="fp-toast-body">
+    <span class="fp-toast-label" id="fp-toast-label">Speaker 1 sounds like <strong id="fp-toast-name"></strong></span>
+    <span class="fp-toast-sim" id="fp-toast-sim"></span>
+  </div>
+  <div class="fp-toast-actions">
+    <button class="fp-toast-btn fp-toast-apply" id="fp-toast-apply" onclick="fpToastApply()">Apply</button>
+    <div class="fp-toast-more-wrap">
+      <button class="fp-toast-btn fp-toast-other" id="fp-toast-other" onclick="fpToastToggleOther()">Not this</button>
+      <div class="fp-toast-other-list hidden" id="fp-toast-other-list"></div>
+    </div>
+    <button class="fp-toast-btn fp-toast-skip" onclick="fpToastSkip()">Skip</button>
+  </div>
+</div>
+
+<!-- ── Voice Library panel ─────────────────────────────────────────────── -->
+<div class="overlay hidden" id="fingerprint-panel-overlay" onclick="closeFingerprintPanelOnOverlay(event)">
+  <div class="dialog fingerprint-panel-dialog">
+    <div class="fingerprint-panel-header">
+      <h3>Voice Library</h3>
+      <p class="fingerprint-panel-subtitle">Cross-session speaker identity profiles</p>
+      <button class="icon-btn fingerprint-panel-close" onclick="closeFingerprintPanel()">&#x2715;</button>
+    </div>
+    <div class="fingerprint-panel-body">
+      <div class="fingerprint-panel-list" id="fingerprint-profile-list">
+        <div class="fp-panel-empty">No voice profiles yet.</div>
+      </div>
+      <div class="fingerprint-panel-detail hidden" id="fingerprint-profile-detail">
+        <div class="fp-detail-name-row">
+          <input class="fp-detail-name-input" id="fp-detail-name" placeholder="Name" />
+          <div class="speaker-color-grid fp-detail-color-grid" id="fp-detail-color-grid"></div>
+        </div>
+        <div class="fp-detail-meta" id="fp-detail-meta"></div>
+        <div class="fp-detail-sessions" id="fp-detail-sessions"></div>
+        <div class="fp-detail-actions">
+            <div class="actions-left">
+                <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpDetailSave()">Save</button>
+                <button class="speaker-manager-btn speaker-manager-btn-secondary" onclick="fpDetailOptimize()">Optimize</button>
+            </div>
+          <div class="fp-detail-merge-wrap">
+            <select id="fp-detail-merge-sel" class="fp-detail-merge-sel">
+              <option value="">Merge into…</option>
+            </select>
+            <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpDetailMerge()">Merge</button>
+          </div>
+          <button class="speaker-manager-btn fp-detail-delete-btn" onclick="fpDetailDelete()">Delete</button>
+        </div>
+      </div>
+      <div class="fingerprint-panel-new" id="fingerprint-panel-new" style="display:none">
+        <input class="fp-detail-name-input" id="fp-new-name" placeholder="New profile name" />
+        <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpCreateProfile()">Create</button>
+        <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpCancelNew()">Cancel</button>
+      </div>
+    </div>
+    <div class="fingerprint-panel-footer">
+      <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpShowNew()">+ New Profile</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Settings modal ──────────────────────────────────────────────────── -->
+<div class="overlay hidden" id="settings-overlay" onclick="closeSettingsOnOverlay(event)">
+  <div class="dialog settings-dialog">
+    <div class="settings-header">
+      <h3>Settings</h3>
+      <button class="icon-btn" onclick="closeSettings()">&#x2715;</button>
+    </div>
+    <div class="settings-body">
+
+      <!-- ── AI Assistant ─────────────────────────────────────────── -->
+      <div class="settings-section">
+        <h4>AI Assistant</h4>
+        <div class="settings-field">
+          <label>Provider</label>
+          <div class="provider-toggle" id="provider-toggle">
+            <button id="provider-btn-anthropic" onclick="setAiProvider('anthropic')">Anthropic</button>
+            <button id="provider-btn-openai"    onclick="setAiProvider('openai')">OpenAI</button>
+          </div>
+        </div>
+        <div class="settings-field">
+          <label for="ai-model-sel">Model</label>
+          <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
+        </div>
+      </div>
+
+      <!-- ── API Keys ─────────────────────────────────────────────── -->
+      <div class="settings-section">
+        <h4>API Keys</h4>
+        <p class="settings-desc" id="settings-setup-hint" style="display:none">
+          Enter your API key to get started. HuggingFace is optional but enables speaker diarization.
+        </p>
+        <div class="settings-field" id="key-anthropic-field">
+          <label for="key-anthropic">
+            Anthropic API Key <span class="settings-req" id="key-anthropic-req">required</span>
+          </label>
+          <p class="settings-hint">
+            Powers AI summaries and chat when using Anthropic.
+            <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Get a key</a>
+          </p>
+          <div class="key-input-row">
+            <input type="password" id="key-anthropic" placeholder="sk-ant-..." autocomplete="off" />
+            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-anthropic')" title="Show/hide">&#x25C9;</button>
+          </div>
+          <div class="key-status" id="key-anthropic-status"></div>
+        </div>
+        <div class="settings-field" id="key-openai-field">
+          <label for="key-openai">
+            OpenAI API Key <span class="settings-req" id="key-openai-req">required</span>
+          </label>
+          <p class="settings-hint">
+            Powers AI summaries and chat when using OpenAI.
+            <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Get a key</a>
+          </p>
+          <div class="key-input-row">
+            <input type="password" id="key-openai" placeholder="sk-..." autocomplete="off" />
+            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-openai')" title="Show/hide">&#x25C9;</button>
+          </div>
+          <div class="key-status" id="key-openai-status"></div>
+        </div>
+        <div class="settings-field">
+          <label for="key-huggingface">
+            HuggingFace Token <span class="settings-opt">optional</span>
+          </label>
+          <p class="settings-hint">
+            Enables speaker diarization (who said what).
+            <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Get a token</a>
+          </p>
+          <div class="key-input-row">
+            <input type="password" id="key-huggingface" placeholder="hf_..." autocomplete="off" />
+            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-huggingface')" title="Show/hide">&#x25C9;</button>
+          </div>
+          <div class="key-status" id="key-huggingface-status"></div>
+        </div>
+        <button class="btn btn-save-keys" onclick="saveApiKeys()">Save Keys</button>
+      </div>
+
+      <!-- ── System ───────────────────────────────────────────────── -->
+      <div class="settings-section">
+        <h4>System</h4>
+        <div class="settings-info-row">
+          <span class="settings-info-label">CUDA (GPU)</span>
+          <span class="settings-info-val" id="settings-cuda-status">checking...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

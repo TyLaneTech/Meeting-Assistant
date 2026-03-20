@@ -1,0 +1,11 @@
+.env
+/.claude
+/__pycache__
+AGENT.md
+data/
+*.db
+*.wav
+.env
+__pycache__/
+*.pyc
+.venv/

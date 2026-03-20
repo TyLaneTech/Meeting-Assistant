@@ -1,0 +1,40 @@
+# ── AI providers ──────────────────────────────────────────────────────────────
+anthropic>=0.40.0
+openai>=1.0.0
+
+# ── Transcription ─────────────────────────────────────────────────────────────
+faster-whisper>=1.0.0
+
+# ── NVIDIA CUDA DLLs (Windows) ────────────────────────────────────────────────
+# ctranslate2 (used by faster-whisper) needs cublas and cudnn DLLs to run on
+# GPU. These packages install the DLLs under site-packages/nvidia/*/bin/;
+# transcriber.py registers those paths via os.add_dll_directory() at startup
+# so no system CUDA Toolkit installation is required.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# ── Speaker diarization ───────────────────────────────────────────────────────
+# diart depends on torch/torchaudio/pyannote. A plain `pip install diart` pulls
+# in CPU-only torch from PyPI. For GPU diarization, launch.bat installs the
+# CUDA-enabled torch variant first (via the PyTorch index URL) so this resolves
+# to the already-installed GPU build instead.
+torch>=2.0.0
+torchaudio>=2.0.0
+diart
+
+# ── Audio capture ─────────────────────────────────────────────────────────────
+# pyaudiowpatch is a fork of PyAudio with Windows WASAPI loopback support.
+# Its wheel bundles PortAudio, so no system library install is needed.
+pyaudiowpatch>=0.2.12.7
+
+# ── Signal processing / numerics ──────────────────────────────────────────────
+scipy>=1.11.0
+numpy>=1.26.0
+
+# ── Web server & utilities ────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+flask>=3.0.0
+
+# ── System tray ───────────────────────────────────────────────────────────────
+pystray>=0.19.0
+Pillow>=10.0.0

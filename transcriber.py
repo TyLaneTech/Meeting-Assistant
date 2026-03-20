@@ -1,0 +1,473 @@
+"""
+Real-time transcription using faster-whisper.
+Auto-detects CUDA (RTX 4080) and uses large-v3 + float16 if available,
+falling back to small + int8 on CPU.
+
+When a DiartDiarizer is attached (via load_diarizer), each audio chunk
+is first split into per-speaker segments by diart, then each segment is
+transcribed individually and emitted as ("Speaker N", text).
+Without a diarizer the audio is transcribed as a single chunk using
+Whisper's built-in VAD.
+"""
+import glob as _glob
+import os
+import queue
+import site
+import sys
+import threading
+import traceback
+from typing import Callable
+
+import wave
+
+# ── Windows: register nvidia pip-package DLL directories ──────────────────
+# nvidia-cublas-cu12 / nvidia-cudnn-cu12 etc. install their DLLs under
+# site-packages/nvidia/*/bin/ but don't add that to PATH or the Windows DLL
+# search path. os.add_dll_directory() fixes this before ctranslate2 or torch
+# try to load cublas / cudnn.
+if sys.platform == "win32":
+    try:
+        for _sp in site.getsitepackages():
+            for _d in _glob.glob(os.path.join(_sp, "nvidia", "*", "bin")):
+                if os.path.isdir(_d):
+                    os.add_dll_directory(_d)
+    except Exception:
+        pass
+
+import log
+import numpy as np
+from scipy import signal as scipy_signal
+from faster_whisper import WhisperModel
+
+
+def detect_cuda_available() -> bool:
+    """Check whether CUDA is actually usable for ctranslate2 (Whisper)."""
+    try:
+        import ctranslate2
+        types = ctranslate2.get_supported_compute_types("cuda")
+        if types and ctranslate2.get_cuda_device_count() > 0:
+            import ctypes, sys
+            for ver in ("12", "13", "11"):
+                try:
+                    lib = f"cublas64_{ver}.dll" if sys.platform == "win32" else f"libcublas.so.{ver}"
+                    ctypes.CDLL(lib)
+                    return True
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def detect_device() -> tuple[str, str, str]:
+    """Returns (device, compute_type, model_size). Prefers CUDA if available."""
+    if detect_cuda_available():
+        log.info("whisper", "CUDA OK — using large-v3 (float16).")
+        return "cuda", "float16", "large-v3"
+    log.info("whisper", "CUDA unavailable — using CPU.")
+    return "cpu", "int8", "small"
+
+
+# All available whisper presets: (label, device, compute_type, model_size, requires_cuda)
+WHISPER_PRESETS = [
+    {"id": "cuda-large-v3",  "label": "GPU — large-v3 (float16)",  "device": "cuda", "compute_type": "float16", "model_size": "large-v3",  "requires_cuda": True},
+    {"id": "cuda-medium",    "label": "GPU — medium (float16)",    "device": "cuda", "compute_type": "float16", "model_size": "medium",    "requires_cuda": True},
+    {"id": "cuda-small",     "label": "GPU — small (float16)",     "device": "cuda", "compute_type": "float16", "model_size": "small",     "requires_cuda": True},
+    {"id": "cpu-medium",     "label": "CPU — medium (int8)",       "device": "cpu",  "compute_type": "int8",    "model_size": "medium",    "requires_cuda": False},
+    {"id": "cpu-small",      "label": "CPU — small (int8)",        "device": "cpu",  "compute_type": "int8",    "model_size": "small",     "requires_cuda": False},
+    {"id": "cpu-tiny",       "label": "CPU — tiny (int8)",         "device": "cpu",  "compute_type": "int8",    "model_size": "tiny",      "requires_cuda": False},
+]
+
+DIARIZER_OPTIONS = [
+    {"id": "cuda", "label": "GPU", "requires_cuda": True},
+    {"id": "cpu",  "label": "CPU", "requires_cuda": False},
+]
+
+CUDA_AVAILABLE = detect_cuda_available()
+DEVICE, COMPUTE_TYPE, MODEL_SIZE = detect_device()
+
+# Minimum samples to pass to Whisper — very short clips produce garbage output.
+_MIN_WHISPER_SAMPLES = 3_200   # 0.2 s at 16 kHz
+
+# Repetition / hallucination-loop detection.
+# Whisper can get stuck repeating a short phrase when conditioned on a
+# contaminated context (common with noisy mic input).  We measure the ratio of
+# unique N-grams to total N-grams; a low ratio means the text is a loop.
+_HALLUCINATION_NGRAM      = 4     # n-gram size for repetition check
+_HALLUCINATION_THRESHOLD  = 0.35  # unique-ratio below this → treat as loop
+
+
+def _repetition_ratio(text: str, n: int = _HALLUCINATION_NGRAM) -> float:
+    """Return the fraction of unique n-grams in *text* (1.0 = no repetition)."""
+    words = text.lower().split()
+    if len(words) < n * 2:
+        return 1.0  # too short to judge reliably
+    grams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
+    return len(set(grams)) / len(grams)
+
+
+class Transcriber:
+    TARGET_RATE = 16_000
+    CHUNK_SIZE = 512           # Must match AudioCapture.CHUNK_SIZE
+    PROMPT_CHARS = 800         # Rolling context window fed as initial_prompt
+
+    # Pause-detection flush parameters
+    SILENCE_THRESHOLD   = 0.025  # RMS below this is considered silence (0–1 float)
+    SILENCE_DURATION_S  = 0.3   # Seconds of continuous silence before flushing
+    MIN_BUFFER_SECONDS  = 1   # Don't flush until at least this much audio is buffered
+    MAX_BUFFER_SECONDS  = 10.0   # Hard cap — flush regardless of silence
+
+    def __init__(
+        self,
+        audio_queue: queue.Queue,
+        on_text_callback: Callable[[str, str, float, float], None],
+    ):
+        self.audio_queue = audio_queue
+        self.on_text_callback = on_text_callback
+        self.model: WhisperModel | None = None
+        self.diarizer = None   # StreamingDiarizer | None, set via load_diarizer()
+        self.is_running = False
+        self._thread: threading.Thread | None = None
+        self.sample_rate: int | None = None
+        self.channels: int | None = None
+        self._context = ""
+        self.device = DEVICE
+        self.compute_type = COMPUTE_TYPE
+        self.model_size = MODEL_SIZE
+        self.diarization_enabled = True  # Can be toggled via the UI
+        self.fingerprint_callback: Callable | None = None
+        # (speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None
+
+    @property
+    def device_info(self) -> str:
+        return f"{self.model_size} on {self.device} ({self.compute_type})"
+
+    @property
+    def whisper_preset_id(self) -> str:
+        for p in WHISPER_PRESETS:
+            if p["device"] == self.device and p["model_size"] == self.model_size:
+                return p["id"]
+        return f"{self.device}-{self.model_size}"
+
+    @property
+    def diarizer_device(self) -> str | None:
+        if self.diarizer is None:
+            return None
+        return getattr(self.diarizer, "_device_name", None)
+
+    def load_model(self) -> None:
+        """Download (first run) and load Whisper. Blocking — run in a thread."""
+        log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
+        self.model = WhisperModel(
+            self.model_size,
+            device=self.device,
+            compute_type=self.compute_type,
+        )
+        log.info("whisper", "Model ready.")
+
+    def reload_model(self, device: str, compute_type: str, model_size: str) -> None:
+        """Reload Whisper with a different configuration. Blocking."""
+        self.device = device
+        self.compute_type = compute_type
+        self.model_size = model_size
+        self.model = None
+        self.load_model()
+
+    def load_diarizer(self, hf_token: str, device: str | None = None) -> None:
+        """Load diart diarization pipeline. Blocking — run in a thread."""
+        from diarizer import DiartDiarizer
+        self.diarizer = DiartDiarizer(hf_token, device=device)
+
+    def reload_diarizer(self, hf_token: str, device: str) -> None:
+        """Reload the diarizer on a different device. Blocking."""
+        self.diarizer = None
+        self.load_diarizer(hf_token, device=device)
+
+    def start(self, sample_rate: int, channels: int) -> None:
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self._context = ""
+        if self.diarizer is not None:
+            self.diarizer.reset()
+        self.is_running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        diar = "with diarization" if self.diarizer else "no diarization"
+        log.info("transcriber", f"Started ({diar}, {sample_rate} Hz)")
+
+    def stop(self) -> None:
+        self.is_running = False
+        if self._thread:
+            self._thread.join(timeout=12)
+            self._thread = None
+        log.info("transcriber", "Stopped.")
+
+    def process_wav_file(self, wav_path: str) -> None:
+        """Transcribe a saved WAV file synchronously (blocking).
+
+        Reads the file in MAX_BUFFER_SECONDS windows and runs the full
+        diarization + Whisper pipeline for each window, firing on_text_callback
+        exactly as the live loop does.  Intended to be called from a background
+        worker thread (e.g. _run_reanalysis in app.py).
+        """
+        import math
+
+        with wave.open(wav_path, "rb") as wf:
+            n_channels   = wf.getnchannels()
+            sample_width = wf.getsampwidth()   # bytes per sample per channel
+            file_rate    = wf.getframerate()
+            total_frames = wf.getnframes()
+
+            # Configure transcriber state to match the file's audio format
+            self.sample_rate = file_rate
+            self.channels    = n_channels
+            self._context    = ""
+            if self.diarizer is not None:
+                self.diarizer.reset()
+
+            frames_per_window = int(self.MAX_BUFFER_SECONDS * file_rate)
+            offset = 0
+
+            log.info(
+                "reanalysis",
+                f"Processing {wav_path} "
+                f"({total_frames / file_rate:.1f}s, {n_channels}ch, {file_rate}Hz)"
+            )
+
+            while offset < total_frames:
+                n_read = min(frames_per_window, total_frames - offset)
+                raw_window = wf.readframes(n_read)
+
+                # Split the window into CHUNK_SIZE-frame byte chunks so that
+                # _convert() receives the same format as the live audio path.
+                bytes_per_frame = n_channels * sample_width
+                chunk_bytes = self.CHUNK_SIZE * bytes_per_frame
+                chunks: list[bytes] = []
+                for i in range(0, len(raw_window), chunk_bytes):
+                    chunk = raw_window[i : i + chunk_bytes]
+                    if len(chunk) == chunk_bytes:
+                        chunks.append(chunk)
+                    # Drop the last partial chunk — too short for Whisper anyway.
+
+                start_t = offset / file_rate
+                end_t   = (offset + n_read) / file_rate
+
+                if chunks:
+                    self._transcribe(chunks, "reanalysis",
+                                     start_time=start_t, end_time=end_t)
+
+                offset += n_read
+
+        log.info("reanalysis", "Complete.")
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _convert(self, raw_chunks: list[bytes]) -> np.ndarray:
+        raw = b"".join(raw_chunks)
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32_768.0
+        if self.channels > 1:
+            audio = audio.reshape(-1, self.channels).mean(axis=1)
+        if self.sample_rate != self.TARGET_RATE:
+            audio = scipy_signal.resample_poly(audio, self.TARGET_RATE, self.sample_rate)
+        return audio
+
+    def _transcribe(
+        self,
+        buffer: list[bytes],
+        source: str,
+        start_time: float = 0.0,
+        end_time: float = 0.0,
+    ) -> None:
+        """Orchestrate diarization (if available) then Whisper transcription."""
+        if not buffer or self.model is None:
+            return
+
+        skip_diarizer = not self.diarization_enabled
+
+        try:
+            audio = self._convert(buffer)
+        except Exception:
+            log.error("transcriber", "Error converting audio buffer:")
+            traceback.print_exc()
+            return
+
+        # ── Diarized path ────────────────────────────────────────────────────
+        if self.diarizer is not None and not skip_diarizer:
+            # diart processes the new audio incrementally — no rolling buffer needed.
+            try:
+                segments = self.diarizer.process(audio)
+            except Exception:
+                # Diarizer failure must not kill transcription — fall through.
+                log.error("diarizer", "Error in process() — falling back to plain Whisper:")
+                traceback.print_exc()
+                segments = []
+
+            if segments:
+                # Timestamps from diart are relative to the start of `audio`.
+                # Reconstruct absolute recording-clock times from end_time.
+                chunk_start = end_time - len(audio) / self.TARGET_RATE
+                for label, start, end in segments:
+                    start_i   = int(start * self.TARGET_RATE)
+                    end_i     = int(end   * self.TARGET_RATE)
+                    seg_audio = audio[start_i:end_i]
+                    if len(seg_audio) < _MIN_WHISPER_SAMPLES:
+                        continue
+                    if self.fingerprint_callback is not None:
+                        try:
+                            self.fingerprint_callback(label, seg_audio,
+                                                      chunk_start + start,
+                                                      chunk_start + end)
+                        except Exception:
+                            pass
+                    self._run_whisper(seg_audio, label, use_vad=False,
+                                     start_time=chunk_start + start,
+                                     end_time=chunk_start + end)
+            # Diarizer was active — don't also run plain Whisper on the same audio.
+            return
+
+        # ── Plain Whisper path (no diarizer) ────────────────────────────────
+        self._run_whisper(audio, source, use_vad=True,
+                          start_time=start_time, end_time=end_time)
+
+    def _run_whisper(
+        self,
+        audio: np.ndarray,
+        label: str,
+        use_vad: bool,
+        start_time: float = 0.0,
+        end_time: float = 0.0,
+    ) -> None:
+        """Run Whisper on a pre-converted float32 array and fire the callback."""
+        if len(audio) < _MIN_WHISPER_SAMPLES:
+            return
+
+        # Proactively clear context if it has itself become repetitive — this
+        # prevents a contaminated prompt from seeding the next call.
+        prompt = self._context[-self.PROMPT_CHARS:]
+        if prompt and _repetition_ratio(prompt) < _HALLUCINATION_THRESHOLD:
+            log.warn("transcriber", "Context contaminated by repetition — clearing")
+            self._context = ""
+            prompt = ""
+
+        try:
+            segments, _ = self.model.transcribe(
+                audio,
+                beam_size=2,
+                language="en",
+                vad_filter=use_vad,
+                vad_parameters=(
+                    {"min_silence_duration_ms": 300, "speech_pad_ms": 150}
+                    if use_vad else None
+                ),
+                condition_on_previous_text=True,
+                initial_prompt=prompt or None,
+                # Lower than the default 2.4 — when exceeded faster-whisper
+                # automatically retries without initial_prompt, breaking loops.
+                compression_ratio_threshold=2.0,
+                word_timestamps=False,
+            )
+            parts = [seg.text.strip() for seg in segments if seg.text.strip()]
+            if parts:
+                text = " ".join(parts)
+                # Discard and clear context if output is a hallucination loop.
+                if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:
+                    log.warn("transcriber", f"[{label}] Hallucination loop detected — discarding")
+                    self._context = ""
+                    return
+                self._context = (self._context + " " + text)[-self.PROMPT_CHARS * 2:]
+                preview = text[:60] + ("…" if len(text) > 60 else "")
+                log.info("transcriber", f"[{label}] {preview!r}")
+                self.on_text_callback(text, label, start_time, end_time)
+        except RuntimeError as e:
+            if "cublas" in str(e) or "cuda" in str(e).lower():
+                log.warn("whisper", f"CUDA runtime error — switching to CPU: {e}")
+                self._switch_to_cpu()
+                self._run_whisper(audio, label, use_vad,
+                                 start_time=start_time, end_time=end_time)
+            else:
+                log.error("transcriber", f"Error in Whisper ({label}):")
+                traceback.print_exc()
+        except Exception:
+            log.error("transcriber", f"Error in Whisper ({label}):")
+            traceback.print_exc()
+
+    def _switch_to_cpu(self) -> None:
+        """Reload the Whisper model in CPU/int8 mode after a CUDA failure."""
+        self.device = "cpu"
+        self.compute_type = "int8"
+        self.model_size = "small"
+        log.warn("whisper", "Reloading as 'small' on CPU (int8)…")
+        self.model = WhisperModel("small", device="cpu", compute_type="int8")
+        log.info("whisper", "CPU fallback ready.")
+
+    def _loop(self) -> None:
+        buffer: list[bytes] = []
+        source_counts: dict[str, int] = {}
+        silence_chunks = 0
+        first_offset = -1     # sample offset of the first chunk in this buffer
+        last_offset  = -1     # sample offset of the most recent chunk
+
+        chunks_per_second      = self.sample_rate / self.CHUNK_SIZE
+        silence_chunk_thresh   = int(self.SILENCE_DURATION_S * chunks_per_second)
+        min_buffer_chunks      = int(self.MIN_BUFFER_SECONDS  * chunks_per_second)
+        max_buffer_chunks      = int(self.MAX_BUFFER_SECONDS  * chunks_per_second)
+
+        def _flush() -> None:
+            nonlocal silence_chunks, first_offset, last_offset
+            if not buffer:
+                return
+            dominant = max(source_counts, key=source_counts.get) if source_counts else "loopback"
+            # Compute wall-clock times from sample offsets
+            if first_offset >= 0 and self.sample_rate:
+                start_t = first_offset / self.sample_rate
+                end_t   = (last_offset + self.CHUNK_SIZE) / self.sample_rate
+            else:
+                start_t, end_t = 0.0, 0.0
+            self._transcribe(buffer, dominant, start_time=start_t, end_time=end_t)
+            buffer.clear()
+            source_counts.clear()
+            silence_chunks = 0
+            first_offset = -1
+            last_offset  = -1
+
+        while self.is_running:
+            try:
+                item = self.audio_queue.get(timeout=0.5)
+                if isinstance(item, tuple) and len(item) == 3:
+                    src, chunk, sample_off = item
+                elif isinstance(item, tuple):
+                    src, chunk = item
+                    sample_off = -1
+                else:
+                    src, chunk, sample_off = "loopback", item, -1
+
+                buffer.append(chunk)
+                source_counts[src] = source_counts.get(src, 0) + 1
+
+                if sample_off >= 0:
+                    if first_offset < 0:
+                        first_offset = sample_off
+                    last_offset = sample_off
+
+                # Measure energy of this chunk to track pauses
+                samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32_768.0
+                rms = float(np.sqrt(np.mean(samples ** 2)))
+
+                if rms < self.SILENCE_THRESHOLD:
+                    silence_chunks += 1
+                else:
+                    silence_chunks = 0
+
+                enough_audio  = len(buffer) >= min_buffer_chunks
+                long_pause    = silence_chunks >= silence_chunk_thresh
+                hit_max       = len(buffer) >= max_buffer_chunks
+
+                if (enough_audio and long_pause) or hit_max:
+                    _flush()
+
+            except queue.Empty:
+                # Queue dried up (genuine audio gap) — flush whatever we have
+                _flush()
+
+        # Final flush
+        _flush()

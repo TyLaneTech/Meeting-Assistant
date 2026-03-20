@@ -1,0 +1,376 @@
+"""
+Meeting Assistant launcher.
+Handles dependency installation then starts the app.
+Run via launch.bat (double-click) or directly: python launch.py
+"""
+import ctypes
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# ── ANSI colour setup ─────────────────────────────────────────────────────────
+
+def _enable_ansi():
+    if sys.platform == "win32":
+        try:
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            k = ctypes.windll.kernel32
+            k.SetConsoleMode(k.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+
+_enable_ansi()
+
+R   = "\033[0m"
+B   = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[91m"
+GRN = "\033[92m"
+YLW = "\033[93m"
+CYN = "\033[96m"
+GRY = "\033[90m"
+
+SEP_HEAVY = f"{CYN}{B}  {'=' * 54}{R}"
+SEP_LIGHT = f"{GRY}  {'-' * 52}{R}"
+
+
+def _ok(msg):   print(f"{GRN}  [OK] {msg}{R}")
+def _info(msg): print(f"{GRY}       {msg}{R}")
+def _warn(msg): print(f"{YLW}  [!!] {msg}{R}")
+def _err(msg):  print(f"{RED}  [XX] {msg}{R}")
+
+def _section(title):
+    print()
+    print(f"{B}  {title}{R}")
+    print(SEP_LIGHT)
+
+def _fatal(msg):
+    print()
+    _err(msg)
+    print()
+    input("Press Enter to exit...")
+    sys.exit(1)
+
+# ── Venv helpers ──────────────────────────────────────────────────────────────
+
+VENV_DIR = Path(__file__).parent / ".venv"
+
+
+def _venv_python() -> Path:
+    """Return the expected Python executable path inside the venv."""
+    if sys.platform == "win32":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def _running_in_venv() -> bool:
+    """True when this process IS the venv Python."""
+    try:
+        return Path(sys.executable).resolve() == _venv_python().resolve()
+    except Exception:
+        return False
+
+
+def _venv_python_version() -> tuple[int, int] | None:
+    """Return (major, minor) of the Python that created the venv, or None."""
+    cfg = VENV_DIR / "pyvenv.cfg"
+    if not cfg.exists():
+        return None
+    try:
+        text = cfg.read_text()
+        m = re.search(r"version\s*=\s*(\d+)\.(\d+)", text)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_venv():
+    """
+    If not already running inside the venv, create (or rebuild) it, then
+    re-exec this script using the venv Python.  Does not return on success.
+    """
+    if _running_in_venv():
+        return  # already inside the venv — nothing to do
+
+    need_create = not _venv_python().exists()
+
+    # Staleness check: venv built with a different Python minor version
+    if not need_create:
+        venv_ver = _venv_python_version()
+        cur_ver  = (sys.version_info.major, sys.version_info.minor)
+        if venv_ver and venv_ver != cur_ver:
+            print()
+            _warn(
+                f"Environment was built with Python {venv_ver[0]}.{venv_ver[1]} "
+                f"but you're running {cur_ver[0]}.{cur_ver[1]}."
+            )
+            answer = input("      Rebuild environment? [Y/n]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                _info("Removing old environment...")
+                shutil.rmtree(VENV_DIR, ignore_errors=True)
+                need_create = True
+            else:
+                _warn("Skipping rebuild — things may not work correctly.")
+
+    if need_create:
+        _info("Creating Python environment (one-time setup)...")
+        r = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)])
+        if r.returncode != 0:
+            _fatal("Failed to create virtual environment.")
+
+    # Re-exec using venv Python
+    os.execv(str(_venv_python()), [str(_venv_python())] + sys.argv)
+
+
+# ── Start Menu shortcut ───────────────────────────────────────────────────────
+
+_SHORTCUT_NAME = "Meeting Assistant.lnk"
+
+
+def _create_start_menu_shortcut():
+    """
+    Ensures a Start Menu shortcut exists and points to the current launch.bat.
+    Reads the existing shortcut's Arguments via PowerShell before writing so it
+    only touches the filesystem when the shortcut is missing or stale.
+    No-ops silently on non-Windows.
+    """
+    if sys.platform != "win32":
+        return
+
+    root       = Path(__file__).parent
+    bat_path   = root / "launch.bat"
+    icon_path  = root / "static" / "images" / "logo.ico"
+    start_menu = (
+        Path(os.environ.get("APPDATA", ""))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    )
+    lnk_path = start_menu / _SHORTCUT_NAME
+
+    if not bat_path.exists():
+        return
+
+    # ── Check whether the existing shortcut already points here ──────────────
+    already_correct = False
+    if lnk_path.exists():
+        try:
+            check = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"$ws = New-Object -ComObject WScript.Shell; "
+                 f"$s = $ws.CreateShortcut('{lnk_path}'); $s.Arguments"],
+                capture_output=True, text=True,
+            )
+            if check.returncode == 0 and str(bat_path) in check.stdout:
+                already_correct = True
+        except Exception:
+            pass
+
+    if already_correct:
+        return
+
+    # ── Create or update the shortcut ────────────────────────────────────────
+    was_existing = lnk_path.exists()
+    ps_script = (
+        f"$ws = New-Object -ComObject WScript.Shell; "
+        f"$s  = $ws.CreateShortcut('{lnk_path}'); "
+        f"$s.TargetPath       = 'cmd.exe'; "
+        f"$s.Arguments        = '/c \"\"{bat_path}\"\"'; "
+        f"$s.WorkingDirectory = '{root}'; "
+        f"$s.WindowStyle      = 7; "          # 7 = minimised
+        + (f"$s.IconLocation = '{icon_path}, 0'; " if icon_path.exists() else "")
+        + "$s.Save()"
+    )
+
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            verb = "updated" if was_existing else "created"
+            _ok(f"Start Menu shortcut {verb}")
+        else:
+            _warn("Could not update Start Menu shortcut (non-fatal)")
+    except Exception:
+        _warn("Could not update Start Menu shortcut (non-fatal)")
+
+
+# ── GPU detection ─────────────────────────────────────────────────────────────
+
+TORCH_INDEX = "https://download.pytorch.org/whl/"
+
+def _detect_gpu():
+    """Return (wheel_tag, gpu_name, cuda_ver_str) or ('cpu', '', '')."""
+    try:
+        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
+        if r.returncode != 0:
+            return "cpu", "", ""
+
+        m = re.search(r"CUDA Version: (\d+)\.(\d+)", r.stdout)
+        if not m:
+            return "cpu", "", ""
+
+        major, minor = int(m.group(1)), int(m.group(2))
+
+        nr = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True,
+        )
+        gpu_name = (
+            nr.stdout.strip().splitlines()[0].strip()
+            if nr.returncode == 0 else "NVIDIA GPU"
+        )
+
+        if   major >= 13:                  whl = "cu130"
+        elif major == 12 and minor >= 8:   whl = "cu128"
+        elif major == 12 and minor >= 6:   whl = "cu126"
+        elif major == 12 and minor >= 4:   whl = "cu124"
+        elif major == 12 and minor >= 1:   whl = "cu121"
+        elif major == 11 and minor >= 8:   whl = "cu118"
+        else:                              whl = "cpu"
+
+        return whl, gpu_name, f"{major}.{minor}"
+
+    except FileNotFoundError:
+        return "cpu", "", ""
+
+# ── pip helpers ───────────────────────────────────────────────────────────────
+
+def _pip(*args, show_output=False):
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if not show_output:
+        cmd.append("--quiet")
+    cmd.extend(args)
+    return subprocess.run(cmd).returncode == 0
+
+
+def _torch_build() -> str:
+    """
+    Return the installed torch build variant, e.g. 'cu126', 'cpu', or ''
+    if torch is not installed.  Reads torch.__version__ directly so it works
+    regardless of the index URL used to install it.
+    """
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", "import torch; print(torch.__version__)"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return ""
+        ver = r.stdout.strip()          # e.g. "2.10.0+cu126" or "2.10.0+cpu"
+        if "+" in ver:
+            return ver.split("+", 1)[1] # "cu126" or "cpu"
+        return ""                       # plain version string — treat as unknown
+    except Exception:
+        return ""
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    os.chdir(Path(__file__).parent)
+    _ensure_venv()   # re-execs into .venv if not already running inside it
+    os.system("cls" if sys.platform == "win32" else "clear")
+
+    # Banner
+    print()
+    print(SEP_HEAVY)
+    print(f"{CYN}{B}   MEETING ASSISTANT{R}")
+    print(f"{GRY}   Real-time transcription + AI  |  local  |  private{R}")
+    print(SEP_HEAVY)
+
+    # ── System ────────────────────────────────────────────────────────────────
+    _section("SYSTEM")
+
+    # Python version gate
+    vi = sys.version_info
+    if vi < (3, 10):
+        _err(f"Python {vi.major}.{vi.minor}.{vi.micro} -- 3.10+ required")
+        print()
+        print("      Upgrade from: https://www.python.org/downloads/")
+        _fatal("Python version too old")
+    _ok(f"Python {vi.major}.{vi.minor}.{vi.micro}")
+
+    # Start Menu shortcut (first run only)
+    _create_start_menu_shortcut()
+
+    # GPU
+    whl, gpu_name, cuda_ver = _detect_gpu()
+    if whl == "cpu":
+        print(f"{GRY}  [--] No NVIDIA GPU detected -- CPU mode{R}")
+    else:
+        print(f"{GRN}  [OK] {gpu_name}  {GRY}|  CUDA {cuda_ver}{R}")
+
+    # ── Packages ──────────────────────────────────────────────────────────────
+    _section("PACKAGES")
+
+    # pip
+    _info("pip...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
+        capture_output=True,
+    )
+    _ok("pip")
+
+    # PyTorch — only install/replace when the installed variant doesn't match
+    installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
+
+    if whl == "cpu":
+        if installed_build == "cpu":
+            _ok(f"PyTorch  {GRY}[CPU]{R}")
+        else:
+            _info("PyTorch [CPU]...")
+            if not _pip("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
+                _fatal("PyTorch install failed -- check your connection and retry")
+            _ok(f"PyTorch  {GRY}[CPU]{R}")
+    else:
+        if installed_build == whl:
+            _ok(f"PyTorch  {GRY}[{whl} | GPU-accelerated]{R}")
+        else:
+            if installed_build:
+                _info(f"PyTorch: replacing {installed_build} build with {whl}...")
+            else:
+                _info(f"PyTorch [{whl}]...  first run may take several minutes")
+            # --force-reinstall is required to replace a same-version CPU build
+            # with a CUDA one (pip considers them equal by version number alone)
+            if _pip("torch", "torchaudio",
+                    "--force-reinstall",
+                    "--index-url", TORCH_INDEX + whl):
+                _ok(f"PyTorch  {GRY}[{whl} | GPU-accelerated]{R}")
+            else:
+                _warn(f"GPU build failed -- falling back to CPU...")
+                if not _pip("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
+                    _fatal("PyTorch install failed -- check your connection and retry")
+                _ok(f"PyTorch  {GRY}[CPU | fallback]{R}")
+
+    # All other deps
+    _info("Dependencies...")
+    if not _pip("-r", "requirements.txt"):
+        _warn("Some packages failed -- retrying with full output...")
+        print()
+        if not _pip("-r", "requirements.txt", show_output=True):
+            _fatal("Dependency install failed -- see errors above")
+    _ok("All packages ready")
+
+    # ── Launch ────────────────────────────────────────────────────────────────
+    print()
+    print(SEP_HEAVY)
+    print(f"{B}   Launching...{R}")
+    print(f"{GRY}   Your browser will open automatically.{R}")
+    print(f"{GRY}   Close this window or use the tray icon to exit.{R}")
+    print(SEP_HEAVY)
+    print()
+
+    result = subprocess.run([sys.executable, "app.py"])
+    if result.returncode != 0:
+        print()
+        _err("Meeting Assistant exited with an error.")
+        print()
+        input("Press Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
