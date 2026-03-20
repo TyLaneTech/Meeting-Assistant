@@ -6,6 +6,10 @@ This module has NO imports from other project files to avoid circular dependenci
 import os
 from pathlib import Path
 
+# Suppress HuggingFace symlinks warning on Windows (symlinks require Developer Mode
+# or admin rights; caching still works fine without them).
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 from dotenv import load_dotenv, set_key
 
 ENV_PATH = Path(__file__).parent / ".env"
@@ -44,8 +48,11 @@ def ensure_env() -> None:
             "OPENAI_API_KEY=",
             "",
             "# Get your HuggingFace token at: https://huggingface.co/settings/tokens",
-            "# (Optional — needed for speaker diarization)",
+            "# (Optional - needed for speaker diarization)",
             "HUGGING_FACE_KEY=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", # This token has minimal access, just enough to download public models.
+            "",
+            "# Suppress HuggingFace symlinks warning on Windows (caching still works without them)",
+            "HF_HUB_DISABLE_SYMLINKS_WARNING=1",
             "",
             "# Server port (default: 6969)",
             "# PORT=6969",
