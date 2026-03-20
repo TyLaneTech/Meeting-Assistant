@@ -44,14 +44,14 @@ def ensure_env() -> None:
             "OPENAI_API_KEY=",
             "",
             "# Get your HuggingFace token at: https://huggingface.co/settings/tokens",
-            "# (Optional — needed for speaker diarization)",
+            "# (Optional - needed for speaker diarization)",
             "HUGGING_FACE_KEY=",
             "",
             "# Server port (default: 6969)",
             "# PORT=6969",
             "",
         ]
-        ENV_PATH.write_text("\n".join(lines))
+        ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
     load_dotenv(str(ENV_PATH), override=True)
 
 
