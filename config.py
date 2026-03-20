@@ -45,7 +45,7 @@ def ensure_env() -> None:
             "",
             "# Get your HuggingFace token at: https://huggingface.co/settings/tokens",
             "# (Optional — needed for speaker diarization)",
-            "HUGGING_FACE_KEY=",
+            "HUGGING_FACE_KEY=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", # This token has minimal access, just enough to download public models.
             "",
             "# Server port (default: 6969)",
             "# PORT=6969",
