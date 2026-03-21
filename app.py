@@ -273,14 +273,43 @@ def _on_segment(
     start_time: float = 0.0,
     end_time: float = 0.0,
 ) -> None:
+    merged = False
+    merge_seg_id = None
+
     with _state_lock:
         sid = _state["session_id"]
         if not sid:
             return
-        _state["segments"].append({
-            "text": text, "source": source,
-            "start_time": start_time, "end_time": end_time,
-        })
+
+        segments = _state["segments"]
+
+        # Merge with previous segment if same speaker, short gap, and
+        # previous text didn't end with sentence-ending punctuation.
+        if segments:
+            prev = segments[-1]
+            same_speaker = prev["source"] == source
+            gap = (start_time - prev["end_time"]
+                   if start_time > 0 and prev.get("end_time", 0) > 0
+                   else float("inf"))
+            prev_text = prev["text"].rstrip()
+            prev_incomplete = prev_text and prev_text[-1] not in ".?!"
+
+            if same_speaker and gap < 2.0 and prev_incomplete:
+                prev["text"] = prev["text"] + " " + text
+                prev["end_time"] = end_time
+                merge_seg_id = prev.get("_seg_id")
+                merged = True
+                # Use full merged text for DB / SSE
+                text = prev["text"]
+                start_time = prev["start_time"]
+
+        if not merged:
+            segments.append({
+                "text": text, "source": source,
+                "start_time": start_time, "end_time": end_time,
+                "_seg_id": None,  # filled after DB insert
+            })
+
         _state["pending_segments"] += 1
         should_summarize = (
             settings.get("auto_summary", True)
@@ -305,12 +334,23 @@ def _on_segment(
                 current_summary=existing_summary,
             )
 
-    seg_id = storage.save_segment(sid, text, source, start_time, end_time)
-    _push("transcript", {
-        "text": text, "source": source, "session_id": sid,
-        "start_time": start_time, "end_time": end_time,
-        "seg_id": seg_id,
-    })
+    if merged and merge_seg_id is not None:
+        storage.update_segment(merge_seg_id, text, end_time)
+        _push("transcript_update", {
+            "seg_id": merge_seg_id, "text": text, "end_time": end_time,
+        })
+    else:
+        seg_id = storage.save_segment(sid, text, source, start_time, end_time)
+        if not merged:
+            # Store DB id for future merges
+            with _state_lock:
+                if segments:
+                    segments[-1]["_seg_id"] = seg_id
+        _push("transcript", {
+            "text": text, "source": source, "session_id": sid,
+            "start_time": start_time, "end_time": end_time,
+            "seg_id": seg_id,
+        })
 
     if should_summarize:
         threading.Thread(

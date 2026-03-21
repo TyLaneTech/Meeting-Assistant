@@ -323,7 +323,8 @@ class AIAssistant:
             "- Do not arbitrarily append bullets; update existing ones when appropriate\n"
             "- Use markdown hierarchy and nesting to keep things organised\n"
             "- Timestamps: [M:SS] format (e.g. [4:32]) inline for key moments only\n"
-            "- Attribute decisions and points to speakers by name when identified"
+            "- Attribute decisions and points to speakers by name when identified\n"
+            "- Always write in English regardless of any foreign words or phrases in the transcript"
         )
         user_prompt = (
             f"Update the summary to reflect any significant new content in the transcript."

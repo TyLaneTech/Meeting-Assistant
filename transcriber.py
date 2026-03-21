@@ -114,7 +114,7 @@ class Transcriber:
     # Pause-detection flush parameters
     SILENCE_THRESHOLD   = 0.025  # RMS below this is considered silence (0–1 float)
     SILENCE_DURATION_S  = 0.3   # Seconds of continuous silence before flushing
-    MIN_BUFFER_SECONDS  = 1   # Don't flush until at least this much audio is buffered
+    MIN_BUFFER_SECONDS  = 0.5   # Don't flush until at least this much audio is buffered
     MAX_BUFFER_SECONDS  = 10.0   # Hard cap — flush regardless of silence
 
     def __init__(
@@ -163,6 +163,13 @@ class Transcriber:
             device=self.device,
             compute_type=self.compute_type,
         )
+        # Warm up CUDA kernels — first inference is significantly slower
+        # due to kernel compilation and memory allocation.
+        try:
+            _warmup = np.zeros(self.TARGET_RATE, dtype=np.float32)
+            list(self.model.transcribe(_warmup, beam_size=1)[0])
+        except Exception:
+            pass
         log.info("whisper", "Model ready.")
 
     def reload_model(self, device: str, compute_type: str, model_size: str) -> None:

@@ -461,13 +461,19 @@ class AudioCapture:
                         mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
-                        mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
+
+                        # Source-gated mixing: only use the dominant source's
+                        # audio to prevent speaker-to-mic bleed (echo) from
+                        # duplicating remote speech in the transcription.
                         if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
                             src = "loopback"
+                            mixed = lb_chunk
                         elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
                             src = "mic"
+                            mixed = mic_chunk
                         else:
                             src = "both"
+                            mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
                     else:
                         self.mic_level = 0.0
                         mixed = lb_chunk

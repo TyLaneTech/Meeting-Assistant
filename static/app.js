@@ -907,6 +907,31 @@ function connectSSE(afterSegId = 0) {
     if (!state.isViewingPast) appendTranscript(d.text, d.source || 'loopback', d.start_time, d.end_time, d.seg_id);
   });
 
+  src.addEventListener('transcript_update', e => {
+    const d = JSON.parse(e.data);
+    if (!state.isViewingPast && d.seg_id) {
+      const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
+      if (seg) {
+        // Update text node — preserve the badge, replace everything after it
+        const badge = seg.querySelector('.src-badge');
+        if (badge) {
+          // Remove all text nodes after the badge, then append updated text
+          while (badge.nextSibling) badge.nextSibling.remove();
+          seg.appendChild(document.createTextNode(d.text));
+        } else {
+          // Source-label segments (loopback/mic/both) use innerHTML with badge
+          const badgeHtml = seg.querySelector('.src-badge')?.outerHTML || '';
+          seg.innerHTML = badgeHtml + escapeHtml(d.text);
+        }
+        if (d.end_time) seg.dataset.end = d.end_time;
+        if (_autoScroll && !_pickerOpen) {
+          const el = document.getElementById('transcript');
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+    }
+  });
+
   src.addEventListener('replay', e => {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;

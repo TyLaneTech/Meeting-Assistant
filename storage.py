@@ -318,6 +318,15 @@ def save_summary(session_id: str, content: str) -> None:
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
+def update_segment(segment_id: int, text: str, end_time: float) -> None:
+    """Update an existing segment's text and end_time (used for merging)."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE transcript_segments SET text = ?, end_time = ? WHERE id = ?",
+            (text, end_time, segment_id),
+        )
+
+
 def save_segment_label_override(segment_id: int, label: str | None) -> None:
     """Set or clear a per-segment label override."""
     with _conn() as conn:
