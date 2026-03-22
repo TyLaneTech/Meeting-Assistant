@@ -337,7 +337,7 @@ def main():
     _section("PACKAGES")
 
     # pip
-    _info("pip...")
+    #_info("pip...")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
         capture_output=True,
@@ -378,6 +378,16 @@ def main():
     # Pre-install matplotlib from a binary wheel so diart's transitive pull
     # never triggers a source build (which requires MSVC on Windows).
     _pip("matplotlib>=3.8.0", "--only-binary", ":all:", "--quiet")
+
+    # Force CPU onnxruntime. pyannote.audio pulls in onnxruntime-gpu which was
+    # built against cuDNN 8 and crashes on machines with cuDNN 9 (the version
+    # bundled with torch cu12x) because cudnnGetLibConfig was removed in cuDNN 9.
+    # CPU onnxruntime avoids the conflict; torch still handles GPU compute.
+    subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"],
+        capture_output=True,
+    )
+    _pip("onnxruntime>=1.17.0", "--quiet")
 
     # All other deps
     _info("Dependencies...")
