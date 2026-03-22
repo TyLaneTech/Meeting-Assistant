@@ -379,16 +379,6 @@ def main():
     # never triggers a source build (which requires MSVC on Windows).
     _pip("matplotlib>=3.8.0", "--only-binary", ":all:", "--quiet")
 
-    # Force CPU onnxruntime. pyannote.audio pulls in onnxruntime-gpu which was
-    # built against cuDNN 8 and crashes on machines with cuDNN 9 (the version
-    # bundled with torch cu12x) because cudnnGetLibConfig was removed in cuDNN 9.
-    # CPU onnxruntime avoids the conflict; torch still handles GPU compute.
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"],
-        capture_output=True,
-    )
-    _pip("onnxruntime>=1.17.0", "--quiet")
-
     # All other deps
     _info("Dependencies...")
     if not _pip_streaming("-r", "requirements.txt"):
@@ -397,6 +387,18 @@ def main():
         if not _pip("-r", "requirements.txt", show_output=True):
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
+
+    # diart → pyannote.audio pulls in onnxruntime-gpu and nvidia-cudnn-cu12
+    # as transitive deps. onnxruntime-gpu was built against cuDNN 8, but
+    # torch cu12x bundles cuDNN 9 — the cudnnGetLibConfig symbol was removed
+    # in cuDNN 9, causing a fatal C-level crash. We must do this cleanup
+    # *after* requirements install so diart can't pull them back in.
+    subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y",
+         "onnxruntime-gpu", "nvidia-cudnn-cu12", "nvidia-cublas-cu12"],
+        capture_output=True,
+    )
+    _pip("onnxruntime>=1.17.0", "--quiet")
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print()
