@@ -4853,6 +4853,18 @@ async function openSettings() {
     _applyAiConfig(aiCfg.provider, aiCfg.model, currentAiModels);
     updateChatModelLabel(aiCfg.provider, aiCfg.model, currentAiModels);
   } catch (_) {}
+
+  // Startup toggle (Windows only — hidden on unsupported platforms)
+  try {
+    const startup = await fetch('/api/settings/startup').then(r => r.json());
+    const row = document.getElementById('startup-row');
+    if (startup.supported) {
+      row.style.display = '';
+      document.getElementById('startup-toggle').checked = startup.enabled;
+    } else {
+      row.style.display = 'none';
+    }
+  } catch (_) {}
 }
 
 /** Sync provider toggle buttons and model dropdown to the given values. */
@@ -5033,6 +5045,25 @@ function _pollUntilBack(btn, statusEl) {
       } catch (_) { /* server still down, keep polling */ }
     }
   }, 2000);
+}
+
+function switchSettingsSection(btn) {
+  document.querySelectorAll('.settings-nav-item').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.settings-panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(btn.dataset.target).classList.add('active');
+}
+
+async function setStartupLaunch(enabled) {
+  try {
+    await fetch('/api/settings/startup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+  } catch (_) {
+    document.getElementById('startup-toggle').checked = !enabled;
+  }
 }
 
 function closeSettingsOnOverlay(e) {

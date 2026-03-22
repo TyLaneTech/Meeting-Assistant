@@ -155,7 +155,7 @@
             <button class="icon-btn active" id="auto-scroll-btn" title="Auto-scroll to latest" onclick="toggleAutoScroll()">Auto</button>
           </div>
           <div class="col-actions right">
-            <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-magnifying-glass"></i></button>
+            <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-filter"></i></button>
             <button class="icon-btn" id="analytics-btn" title="Session analytics" onclick="toggleAnalyticsPanel()"><i class="fa-solid fa-chart-pie"></i></button>
             <button class="icon-btn" title="Copy transcript" onclick="copyTranscript()"><i class="fa-solid fa-clipboard"></i></button>
             <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-solid fa-eraser"></i></button>
@@ -433,90 +433,132 @@
 <div class="overlay hidden" id="settings-overlay" onclick="closeSettingsOnOverlay(event)">
   <div class="dialog settings-dialog">
     <div class="settings-header">
-      <h3>Settings</h3>
+      <span class="settings-title-text">Settings</span>
       <button class="icon-btn" onclick="closeSettings()"><i class="fa-solid fa-xmark"></i></button>
     </div>
-    <div class="settings-body">
+    <div class="settings-layout">
 
-      <!-- ── AI Assistant ─────────────────────────────────────────── -->
-      <div class="settings-section">
-        <h4>AI Assistant</h4>
-        <div class="settings-field">
-          <label>Provider</label>
-          <div class="provider-toggle" id="provider-toggle">
-            <button id="provider-btn-anthropic" onclick="setAiProvider('anthropic')">Anthropic</button>
-            <button id="provider-btn-openai"    onclick="setAiProvider('openai')">OpenAI</button>
-          </div>
-        </div>
-        <div class="settings-field">
-          <label for="ai-model-sel">Model</label>
-          <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
-        </div>
-      </div>
+      <!-- ── Sidebar nav ──────────────────────────────────────────── -->
+      <nav class="settings-nav">
+        <button class="settings-nav-item active" data-target="section-ai" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-robot"></i><span>AI Assistant</span>
+        </button>
+        <button class="settings-nav-item" data-target="section-keys" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-key"></i><span>API Keys</span>
+        </button>
+        <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-microchip"></i><span>System</span>
+        </button>
+      </nav>
 
-      <!-- ── API Keys ─────────────────────────────────────────────── -->
-      <div class="settings-section">
-        <h4>API Keys</h4>
-        <p class="settings-desc" id="settings-setup-hint" style="display:none">
-          Enter your API key to get started. HuggingFace is optional but enables speaker diarization.
-        </p>
-        <div class="settings-field" id="key-anthropic-field">
-          <label for="key-anthropic">
-            Anthropic API Key <span class="settings-req" id="key-anthropic-req">required</span>
-          </label>
-          <p class="settings-hint">
-            Powers AI summaries and chat when using Anthropic.
-            <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Get a key</a>
-          </p>
-          <div class="key-input-row">
-            <input type="password" id="key-anthropic" placeholder="sk-ant-..." autocomplete="off" />
-            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-anthropic')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
-          </div>
-          <div class="key-status" id="key-anthropic-status"></div>
-        </div>
-        <div class="settings-field" id="key-openai-field">
-          <label for="key-openai">
-            OpenAI API Key <span class="settings-req" id="key-openai-req">required</span>
-          </label>
-          <p class="settings-hint">
-            Powers AI summaries and chat when using OpenAI.
-            <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Get a key</a>
-          </p>
-          <div class="key-input-row">
-            <input type="password" id="key-openai" placeholder="sk-..." autocomplete="off" />
-            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-openai')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
-          </div>
-          <div class="key-status" id="key-openai-status"></div>
-        </div>
-        <div class="settings-field">
-          <label for="key-huggingface">
-            HuggingFace Token <span class="settings-opt">optional</span>
-          </label>
-          <p class="settings-hint">
-            Enables speaker diarization (who said what).
-            <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Get a token</a>
-          </p>
-          <div class="key-input-row">
-            <input type="password" id="key-huggingface" placeholder="hf_..." autocomplete="off" />
-            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-huggingface')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
-          </div>
-          <div class="key-status" id="key-huggingface-status"></div>
-        </div>
-        <button class="btn btn-save-keys" onclick="saveApiKeys()">Save Keys</button>
-      </div>
+      <!-- ── Content panels ──────────────────────────────────────── -->
+      <div class="settings-content">
 
-      <!-- ── System ───────────────────────────────────────────────── -->
-      <div class="settings-section">
-        <h4>System</h4>
-        <div class="settings-info-row">
-          <span class="settings-info-label">CUDA (GPU)</span>
-          <span class="settings-info-val" id="settings-cuda-status">checking...</span>
+        <!-- AI Assistant -->
+        <div class="settings-panel active" id="section-ai">
+          <p class="settings-setup-hint" id="settings-setup-hint" style="display:none">
+            Enter your API keys to get started. HuggingFace is optional but enables speaker diarization.
+          </p>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Provider</div>
+                <div class="settings-row-desc">AI engine for summaries and chat</div>
+              </div>
+              <div class="provider-toggle" id="provider-toggle">
+                <button id="provider-btn-anthropic" onclick="setAiProvider('anthropic')">Anthropic</button>
+                <button id="provider-btn-openai"    onclick="setAiProvider('openai')">OpenAI</button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Model</div>
+                <div class="settings-row-desc">Which model to use for this provider</div>
+              </div>
+              <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
+            </div>
+          </div>
         </div>
-        <div class="settings-info-row">
-          <span class="settings-info-label">Updates</span>
-          <span class="settings-info-val" id="settings-update-status"></span>
+
+        <!-- API Keys -->
+        <div class="settings-panel" id="section-keys">
+          <div class="settings-group" id="key-anthropic-field">
+            <div class="settings-key-row">
+              <div class="settings-key-header">
+                <span class="settings-row-label">Anthropic API Key</span>
+                <span class="settings-req" id="key-anthropic-req">required</span>
+                <a class="settings-key-link" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Get a key →</a>
+              </div>
+              <div class="key-input-row">
+                <input type="password" id="key-anthropic" placeholder="sk-ant-..." autocomplete="off" />
+                <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-anthropic')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
+              </div>
+              <div class="key-status" id="key-anthropic-status"></div>
+            </div>
+          </div>
+          <div class="settings-group" id="key-openai-field">
+            <div class="settings-key-row">
+              <div class="settings-key-header">
+                <span class="settings-row-label">OpenAI API Key</span>
+                <span class="settings-req" id="key-openai-req">required</span>
+                <a class="settings-key-link" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Get a key →</a>
+              </div>
+              <div class="key-input-row">
+                <input type="password" id="key-openai" placeholder="sk-..." autocomplete="off" />
+                <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-openai')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
+              </div>
+              <div class="key-status" id="key-openai-status"></div>
+            </div>
+          </div>
+          <div class="settings-group">
+            <div class="settings-key-row">
+              <div class="settings-key-header">
+                <span class="settings-row-label">HuggingFace Token</span>
+                <span class="settings-opt">optional</span>
+                <a class="settings-key-link" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Get a token →</a>
+              </div>
+              <div class="key-input-row">
+                <input type="password" id="key-huggingface" placeholder="hf_..." autocomplete="off" />
+                <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-huggingface')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
+              </div>
+              <div class="key-status" id="key-huggingface-status"></div>
+            </div>
+          </div>
+          <button class="btn-save-keys" onclick="saveApiKeys()">Save Keys</button>
         </div>
-        <button class="btn-save-keys" id="check-update-btn" onclick="checkForUpdates()">Check for Updates</button>
+
+        <!-- System -->
+        <div class="settings-panel" id="section-system">
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">GPU Acceleration</div>
+                <div class="settings-row-desc">CUDA available for transcription &amp; diarization</div>
+              </div>
+              <span class="settings-info-val" id="settings-cuda-status">checking...</span>
+            </div>
+            <div class="settings-row" id="startup-row" style="display:none">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Launch at Startup</div>
+                <div class="settings-row-desc">Open Meeting Assistant when you log in</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="startup-toggle" onchange="setStartupLaunch(this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Updates</div>
+                <div class="settings-row-desc" id="settings-update-status"></div>
+              </div>
+              <button class="btn-settings-action" id="check-update-btn" onclick="checkForUpdates()">Check for Updates</button>
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>

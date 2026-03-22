@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1202,6 +1203,57 @@ def set_keys():
     _refresh_tray()
 
     return jsonify({"ok": True, "keys": config.get_key_status()})
+
+
+def _startup_lnk_path() -> Path:
+    appdata = os.environ.get("APPDATA", "")
+    return (
+        Path(appdata) / "Microsoft" / "Windows"
+        / "Start Menu" / "Programs" / "Startup"
+        / "Meeting Assistant.lnk"
+    )
+
+
+@app.route("/api/settings/startup")
+def get_startup():
+    if sys.platform != "win32":
+        return jsonify({"supported": False, "enabled": False})
+    return jsonify({"supported": True, "enabled": _startup_lnk_path().exists()})
+
+
+@app.route("/api/settings/startup", methods=["POST"])
+def set_startup():
+    if sys.platform != "win32":
+        return jsonify({"ok": False, "error": "Not supported on this platform"})
+    data = request.json or {}
+    enable = bool(data.get("enabled", False))
+    lnk = _startup_lnk_path()
+    if enable:
+        root = Path(__file__).parent
+        bat  = root / "launch.bat"
+        icon = root / "static" / "images" / "logo.ico"
+        ps = (
+            f"$ws = New-Object -ComObject WScript.Shell; "
+            f"$s = $ws.CreateShortcut('{lnk}'); "
+            f"$s.TargetPath = 'cmd.exe'; "
+            f"$s.Arguments = '/c \"\"{bat}\"\"'; "
+            f"$s.WorkingDirectory = '{root}'; "
+            f"$s.WindowStyle = 7; "
+            + (f"$s.IconLocation = '{icon}, 0'; " if icon.exists() else "")
+            + "$s.Save()"
+        )
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return jsonify({"ok": False, "error": "Failed to create startup shortcut"}), 500
+    else:
+        try:
+            lnk.unlink()
+        except FileNotFoundError:
+            pass
+    return jsonify({"ok": True, "enabled": lnk.exists()})
 
 
 @app.route("/api/settings/status")
