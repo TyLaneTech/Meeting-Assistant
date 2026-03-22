@@ -5005,6 +5005,7 @@ async function applyUpdate() {
     } else {
       statusEl.textContent = 'Restarting...';
       btn.textContent = 'Restarting...';
+      _pollUntilBack(btn, statusEl);
     }
   } catch (_) {
     statusEl.textContent = 'Update failed';
@@ -5012,6 +5013,26 @@ async function applyUpdate() {
     btn.disabled = false;
     btn.textContent = 'Retry Update';
   }
+}
+
+function _pollUntilBack(btn, statusEl) {
+  // Give the server a moment to begin shutting down before we start polling.
+  setTimeout(async () => {
+    for (;;) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const r = await fetch('/api/settings/status');
+        if (r.ok) {
+          statusEl.textContent = 'Updated successfully';
+          statusEl.className = 'settings-info-val val-ok';
+          btn.disabled = false;
+          btn.textContent = 'Check for Updates';
+          btn.onclick = checkForUpdates;
+          return;
+        }
+      } catch (_) { /* server still down, keep polling */ }
+    }
+  }, 2000);
 }
 
 function closeSettingsOnOverlay(e) {
