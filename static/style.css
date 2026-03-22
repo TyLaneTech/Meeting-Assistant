@@ -913,6 +913,7 @@ button#sidebar-close-btn {
 .noise-segment { opacity: 0.55; }
 .tn-pill-noise { font-style: italic; }
 .tn-pill-noise i { margin-right: 3px; font-size: 0.8em; }
+.tn-pill.tn-pill-solo { box-shadow: 0 0 0 2px currentColor; }
 .src-speaker.speaker-selected {
   outline: 2px solid currentColor;
   outline-offset: 2px;
@@ -1053,6 +1054,24 @@ button#sidebar-close-btn {
   text-align: center;
   padding: 1px 4px 0;
   font-style: italic;
+}
+.speaker-picker-noise-btn {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid #6e768160;
+  background: transparent;
+  color: #6e7681;
+  cursor: pointer;
+  text-align: left;
+  transition: background .1s, color .1s;
+  margin-top: 2px;
+}
+.speaker-picker-noise-btn:hover {
+  background: #6e768122;
+  color: #9ca3af;
 }
 
 /* ── Speaker Manager Dialog ───────────────────────────────────────────────── */

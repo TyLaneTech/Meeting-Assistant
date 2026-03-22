@@ -982,10 +982,20 @@ function connectSSE(afterSegId = 0) {
             const badge = document.createElement('span');
             badge.className = 'src-badge src-speaker src-noise';
             badge.dataset.speakerKey = source;
+            badge.dataset.segId = d.seg_id;
             badge.textContent = 'Noise';
             badge.style.backgroundColor = _NOISE_COLOR + '20';
             badge.style.color = _NOISE_COLOR;
             badge.style.borderColor = _NOISE_COLOR + '40';
+            badge.title = 'Click to reassign';
+            badge.addEventListener('click', e => {
+              if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                e.preventDefault(); e.stopPropagation();
+                _toggleTranscriptSegSelection(seg, { range: e.shiftKey });
+                return;
+              }
+              _editNoiseBadge(badge, seg);
+            });
             seg.appendChild(badge);
             seg.appendChild(document.createTextNode(d.text));
           } else {
@@ -1407,7 +1417,9 @@ let _autoScroll = true;
 
 // Transcript filter state
 let _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
-let _showNoise = false;  // noise segments hidden by default
+let _showNoise = false;       // noise segments hidden by default
+let _noiseSolo = false;       // true when noise is the only visible group
+let _manualNoiseKeys = new Set(); // speaker_keys manually marked as noise
 let _navState = { matches: [], currentIdx: -1 };
 
 // Set while the speaker picker dropdown is open - suppresses auto-scroll
@@ -2484,18 +2496,28 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   if (source in SOURCE_META) {
     const { label, cls } = SOURCE_META[source];
     seg.innerHTML = `<span class="src-badge ${cls}">${label}</span>${escapeHtml(text)}`;
-  } else if (source === _NOISE_LABEL) {
-    // Noise/filler segment — muted styling, no rename interaction
+  } else if (source === _NOISE_LABEL || labelOverride === _NOISE_LABEL) {
+    // Noise/filler segment — muted styling, click to reassign
+    if (labelOverride === _NOISE_LABEL) _manualNoiseKeys.add(source);
     seg.classList.add('noise-segment');
     seg.style.setProperty('--seg-color', _NOISE_COLOR);
     const badge = document.createElement('span');
     badge.className = 'src-badge src-speaker src-noise';
     badge.dataset.speakerKey = source;
+    if (segId != null) badge.dataset.segId = segId;
     badge.textContent = 'Noise';
     badge.style.backgroundColor = _NOISE_COLOR + '20';
     badge.style.color = _NOISE_COLOR;
     badge.style.borderColor = _NOISE_COLOR + '40';
-    badge.title = 'Auto-detected noise/filler';
+    badge.title = 'Click to reassign';
+    badge.addEventListener('click', e => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey) {
+        e.preventDefault(); e.stopPropagation();
+        _toggleTranscriptSegSelection(seg, { range: e.shiftKey });
+        return;
+      }
+      _editNoiseBadge(badge, seg);
+    });
     seg.appendChild(badge);
     seg.appendChild(document.createTextNode(text));
   } else {
@@ -2625,6 +2647,26 @@ function editSpeakerLabel(badge, speakerKey) {
     });
   }
 
+  // "Mark as Noise" button — suppresses segment and hides it with noise pill
+  const noiseBtn = document.createElement('button');
+  noiseBtn.className = 'speaker-picker-noise-btn';
+  noiseBtn.innerHTML = '<i class="fa-solid fa-volume-xmark"></i> Mark as Noise';
+  noiseBtn.addEventListener('mousedown', e => {
+    e.preventDefault();
+    if (committed) return;
+    committed = true;
+    _pickerOpen = false;
+    _clearHighlights();
+    picker.remove();
+    if (editMode === 'global') {
+      _markSpeakerAsNoise(speakerKey);
+    } else {
+      const targetSeg = badge.closest('.transcript-segment');
+      if (targetSeg) _markSegAsNoise(targetSeg);
+    }
+  });
+  picker.appendChild(noiseBtn);
+
   // Mode hint at the bottom
   const hint = document.createElement('div');
   hint.className = 'speaker-picker-hint';
@@ -2740,6 +2782,181 @@ async function persistSegmentOverride(segId, label) {
   });
 }
 
+// Apply noise DOM styling to a single badge+seg, wiring up the reassign click handler.
+function _applyNoiseStyle(seg, badge, segId) {
+  seg.classList.add('noise-segment');
+  seg.style.setProperty('--seg-color', _NOISE_COLOR);
+  badge.className = 'src-badge src-speaker src-noise';
+  badge.textContent = 'Noise';
+  badge.style.backgroundColor = _NOISE_COLOR + '20';
+  badge.style.color = _NOISE_COLOR;
+  badge.style.borderColor = _NOISE_COLOR + '40';
+  badge.title = 'Click to reassign';
+  badge.dataset.override = '1';
+  if (segId) badge.dataset.segId = segId;
+  // Replace element to clear old listeners, then re-add the noise click handler
+  const fresh = badge.cloneNode(true);
+  fresh.addEventListener('click', e => {
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      e.preventDefault(); e.stopPropagation();
+      _toggleTranscriptSegSelection(seg, { range: e.shiftKey });
+      return;
+    }
+    _editNoiseBadge(fresh, seg);
+  });
+  badge.replaceWith(fresh);
+}
+
+// Mark all DOM segments for a speaker_key as noise and persist overrides.
+async function _markSpeakerAsNoise(speakerKey) {
+  _manualNoiseKeys.add(speakerKey);
+  const segs = [...document.querySelectorAll(`#transcript .transcript-segment[data-transcript-source="${speakerKey}"]`)];
+  for (const seg of segs) {
+    const badge = seg.querySelector('.src-badge');
+    const segId = seg.dataset.segId || badge?.dataset.segId;
+    if (badge) _applyNoiseStyle(seg, badge, segId);
+    if (segId) persistSegmentOverride(segId, _NOISE_LABEL).catch(() => {});
+  }
+  applyTranscriptFilter();
+  _tnRefreshSpeakerPills();
+  _tnRefreshReassignDropdowns();
+}
+
+// Mark a single segment as noise and persist the override.
+async function _markSegAsNoise(seg) {
+  const source = seg.dataset.transcriptSource;
+  if (source) _manualNoiseKeys.add(source);
+  const badge = seg.querySelector('.src-badge');
+  const segId = seg.dataset.segId;
+  if (badge) _applyNoiseStyle(seg, badge, segId);
+  if (segId) persistSegmentOverride(segId, _NOISE_LABEL).catch(() => {});
+  _applyFilterToSeg(seg);
+  _tnRefreshSpeakerPills();
+  _tnRefreshReassignDropdowns();
+}
+
+// Open a picker on a noise badge so the user can reassign the segment to a real speaker.
+function _editNoiseBadge(badge, seg) {
+  document.querySelector('.speaker-picker')?.remove();
+  const segId = seg.dataset.segId;
+  const oldSource = seg.dataset.transcriptSource;
+
+  const picker = document.createElement('div');
+  picker.className = 'speaker-picker';
+  picker.style.borderColor = _NOISE_COLOR + '60';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'speaker-picker-input';
+  input.placeholder = 'Assign to speaker…';
+  input.style.borderColor = _NOISE_COLOR + '40';
+  input.style.color = _NOISE_COLOR;
+  picker.appendChild(input);
+
+  // Options: all non-noise speakers
+  const profiles = _getSortedSpeakerProfiles().filter(p => p.speaker_key !== _NOISE_LABEL);
+  profiles.forEach(p => {
+    const name = _speakerDisplayName(p.speaker_key) || p.speaker_key;
+    const color = _speakerColors[p.speaker_key] || speakerColor(p.speaker_key);
+    const opt = document.createElement('button');
+    opt.className = 'speaker-picker-opt';
+    opt.textContent = name;
+    opt.style.borderColor = color + '60';
+    opt.style.color = color;
+    opt.addEventListener('mousedown', e => { e.preventDefault(); commit(name, p.speaker_key); });
+    picker.appendChild(opt);
+  });
+
+  const hint = document.createElement('div');
+  hint.className = 'speaker-picker-hint';
+  hint.textContent = 'Un-noise: reassign this segment';
+  picker.appendChild(hint);
+
+  let committed = false;
+  const commit = (name, knownKey) => {
+    if (committed) return;
+    committed = true;
+    _pickerOpen = false;
+    picker.remove();
+    if (!name?.trim()) return;
+    _unNoiseSegment(seg, badge, name.trim(), segId, oldSource, knownKey);
+  };
+  const cancel = () => {
+    if (committed) return;
+    committed = true;
+    _pickerOpen = false;
+    picker.remove();
+  };
+
+  _pickerOpen = true;
+  document.body.appendChild(picker);
+  const rect = badge.getBoundingClientRect();
+  const pickerH = picker.offsetHeight;
+  const pickerW = picker.offsetWidth;
+  const spaceBelow = window.innerHeight - rect.bottom - 8;
+  const spaceAbove = rect.top - 8;
+  const top = (spaceBelow >= pickerH || spaceBelow >= spaceAbove) ? rect.bottom + 2 : rect.top - pickerH - 2;
+  const left = Math.min(rect.left, window.innerWidth - pickerW - 8);
+  picker.style.top = top + 'px';
+  picker.style.left = left + 'px';
+  input.focus();
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') commit(input.value);
+    if (e.key === 'Escape') cancel();
+  });
+  document.addEventListener('mousedown', function onOut(e) {
+    if (!picker.contains(e.target)) { cancel(); document.removeEventListener('mousedown', onOut); }
+  });
+}
+
+// Restore a noise segment back to a real speaker.
+function _unNoiseSegment(seg, badge, newName, segId, oldSource, knownKey) {
+  // Determine remaining noise count for oldSource BEFORE modifying badge
+  if (oldSource && _manualNoiseKeys.has(oldSource)) {
+    const remaining = document.querySelectorAll(
+      `#transcript .transcript-segment[data-transcript-source="${oldSource}"] .src-noise`
+    ).length;
+    if (remaining <= 1) _manualNoiseKeys.delete(oldSource);
+  }
+
+  // Resolve speaker key
+  const newKey = knownKey
+    || _getSortedSpeakerProfiles().find(p =>
+        (_speakerDisplayName(p.speaker_key) || p.speaker_key).toLowerCase() === newName.toLowerCase()
+      )?.speaker_key
+    || oldSource
+    || newName;
+
+  seg.dataset.transcriptSource = newKey;
+  seg.classList.remove('noise-segment');
+  _ensureSpeakerProfile(newKey);
+  const color = speakerColor(newKey);
+  seg.style.setProperty('--seg-color', color);
+
+  badge.className = 'src-badge src-speaker';
+  badge.textContent = newName;
+  badge.dataset.speakerKey = newKey;
+  badge.dataset.override = '1';
+  if (segId) badge.dataset.segId = segId;
+  badge.title = 'Click to rename';
+  badge.style.backgroundColor = color + '26';
+  badge.style.color = color;
+  badge.style.borderColor = color + '60';
+  badge.addEventListener('click', e => {
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      e.preventDefault(); e.stopPropagation();
+      _toggleTranscriptSegSelection(seg, { range: e.shiftKey });
+      return;
+    }
+    editSpeakerLabel(badge, newKey);
+  });
+
+  if (segId) persistSegmentOverride(segId, newName).catch(() => {});
+  _applyFilterToSeg(seg);
+  _tnRefreshSpeakerPills();
+  _tnRefreshReassignDropdowns();
+}
+
 function applySpeakerProfileUpdate(update) {
   const speakerKey = update.speaker_key || update.speakerKey;
   if (!speakerKey) return;
@@ -2835,11 +3052,12 @@ function _transcriptFilterActive() {
 function _applyFilterToSeg(seg) {
   const source  = seg.dataset.transcriptSource || '';
   // Always hide noise unless toggled visible
-  if (source === _NOISE_LABEL && !_showNoise) { seg.style.display = 'none'; return; }
+  if ((source === _NOISE_LABEL || _manualNoiseKeys.has(source)) && !_showNoise) { seg.style.display = 'none'; return; }
   if (!_transcriptFilterActive()) { seg.style.display = ''; return; }
   const speakers = _transcriptFilter.speakers;
-  // Speaker filter applies only to diarized speaker segments
-  if (speakers.size > 0 && !(source in SOURCE_META) && !speakers.has(source)) {
+  // Speaker filter applies only to diarized speaker segments — never hides noise (noise has its own toggle)
+  const isNoise = source === _NOISE_LABEL || _manualNoiseKeys.has(source);
+  if (speakers.size > 0 && !(source in SOURCE_META) && !speakers.has(source) && !isNoise) {
     seg.style.display = 'none'; return;
   }
   // Time range filter
@@ -3085,7 +3303,8 @@ function _tnRefreshSpeakerPills() {
   const noiseGroups = [];
   const speakerGroups = [];
   groups.forEach(g => {
-    if (g.speakerKeys.includes(_NOISE_LABEL)) noiseGroups.push(g);
+    if (g.speakerKeys.includes(_NOISE_LABEL) || g.speakerKeys.some(k => _manualNoiseKeys.has(k)))
+      noiseGroups.push(g);
     else speakerGroups.push(g);
   });
 
@@ -3116,28 +3335,56 @@ function _tnRefreshSpeakerPills() {
     container.appendChild(pill);
   });
 
-  // Noise toggle pill (separate from speaker filter logic)
-  noiseGroups.forEach(g => {
-    const count = g.speakerKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
-    if (count === 0) return;
+  // Single merged noise pill — all noise groups combined
+  const totalNoiseCount = noiseGroups.reduce(
+    (sum, g) => sum + g.speakerKeys.reduce((s2, k) => s2 + _speakerBadgeCount(k), 0), 0);
+  if (totalNoiseCount > 0) {
     const pill = document.createElement('button');
-    pill.className = 'tn-pill tn-pill-noise' + (_showNoise ? '' : ' tn-pill-off');
+    const active = _showNoise || _noiseSolo;
+    pill.className = 'tn-pill tn-pill-noise' + (active ? (_noiseSolo ? ' tn-pill-solo' : '') : ' tn-pill-off');
     pill.style.backgroundColor = _NOISE_COLOR + '33';
     pill.style.color = _NOISE_COLOR;
     pill.style.borderColor = _NOISE_COLOR + '60';
-    pill.innerHTML = `<i class="fa-solid fa-volume-xmark"></i> Noise <span class="tn-pill-count">${count}</span>`;
-    pill.title = `${count} noise/filler segment${count !== 1 ? 's' : ''} (hidden by default)\nClick to toggle`;
+    pill.innerHTML = `<i class="fa-solid fa-volume-xmark"></i> Noise <span class="tn-pill-count">${totalNoiseCount}</span>`;
+    pill.title = `${totalNoiseCount} noise/filler segment${totalNoiseCount !== 1 ? 's' : ''}\nClick to solo · Right-click to jump`;
     pill.addEventListener('click', () => {
-      _showNoise = !_showNoise;
+      if (_noiseSolo) {
+        // Un-solo → back to normal (noise hidden)
+        _noiseSolo = false;
+        _showNoise = false;
+        _transcriptFilter.speakers.clear();
+      } else if (_transcriptFilter.speakers.size > 0) {
+        // In speaker filter mode: toggle noise visibility alongside
+        _showNoise = !_showNoise;
+      } else if (_showNoise) {
+        // Noise visible, no filter → hide noise
+        _showNoise = false;
+      } else {
+        // Noise hidden, no filter → solo noise
+        _noiseSolo = true;
+        _showNoise = true;
+        _transcriptFilter.speakers = new Set(['__none__']);
+      }
       applyTranscriptFilter();
       _tnRefreshSpeakerPills();
       _updateFilterBtnState();
     });
+    pill.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      const noiseKeys = noiseGroups.flatMap(g => g.speakerKeys);
+      _tnJumpToNextSpeaker(noiseKeys, 1);
+    });
     container.appendChild(pill);
-  });
+  }
 }
 
 function _tnToggleSpeakerPill(keys, allKeys) {
+  // Exit noise-solo mode when clicking a speaker pill
+  if (_noiseSolo) {
+    _noiseSolo = false;
+    _showNoise = false;
+    _transcriptFilter.speakers.clear();
+  }
   const wasShowingAll = _transcriptFilter.speakers.size === 0;
 
   if (wasShowingAll) {
@@ -3240,7 +3487,7 @@ function _tnRefreshReassignDropdowns() {
     fromSel.appendChild(opt);
   });
 
-  // Rebuild "to" dropdown — includes all names plus ability to type new
+  // Rebuild "to" dropdown — includes all names, plus [Noise] option
   toSel.innerHTML = '<option value="" disabled selected>to…</option>';
   names.forEach(name => {
     const opt = document.createElement('option');
@@ -3248,6 +3495,14 @@ function _tnRefreshReassignDropdowns() {
     opt.textContent = name;
     toSel.appendChild(opt);
   });
+  const noiseSep = document.createElement('option');
+  noiseSep.disabled = true;
+  noiseSep.textContent = '──────────';
+  toSel.appendChild(noiseSep);
+  const noiseOpt = document.createElement('option');
+  noiseOpt.value = _NOISE_LABEL;
+  noiseOpt.textContent = '🔇 Mark as Noise';
+  toSel.appendChild(noiseOpt);
 }
 
 async function tnApplyReassign() {
@@ -3264,21 +3519,28 @@ async function tnApplyReassign() {
   });
 
   if (targets.length === 0) return;
-  if (!confirm(`Reassign ${targets.length} segment${targets.length !== 1 ? 's' : ''} from "${fromName}" to "${toName}"?`)) return;
 
-  for (const seg of targets) {
-    const badge = seg.querySelector('.src-speaker');
-    if (!badge) continue;
-    badge.textContent = toName;
-    badge.dataset.override = '1';
-    const segId = badge.dataset.segId || seg.dataset.segId;
-    if (segId) persistSegmentOverride(segId, toName).catch(() => {});
+  const toLabel = toName === _NOISE_LABEL ? 'Noise' : `"${toName}"`;
+  if (!confirm(`Reassign ${targets.length} segment${targets.length !== 1 ? 's' : ''} from "${fromName}" to ${toLabel}?`)) return;
+
+  if (toName === _NOISE_LABEL) {
+    // Collect unique speaker_keys from target segments and mark them as noise
+    const keys = new Set(targets.map(s => s.dataset.transcriptSource).filter(Boolean));
+    for (const k of keys) await _markSpeakerAsNoise(k);
+  } else {
+    for (const seg of targets) {
+      const badge = seg.querySelector('.src-speaker');
+      if (!badge) continue;
+      badge.textContent = toName;
+      badge.dataset.override = '1';
+      const segId = badge.dataset.segId || seg.dataset.segId;
+      if (segId) persistSegmentOverride(segId, toName).catch(() => {});
+    }
+    // Refresh the panel
+    _tnRefreshSpeakerPills();
+    _tnRefreshReassignDropdowns();
+    _tnRefreshStats();
   }
-
-  // Refresh the panel
-  _tnRefreshSpeakerPills();
-  _tnRefreshReassignDropdowns();
-  _tnRefreshStats();
 }
 
 // ── Time range filter ─────────────────────────────────────────────────────────
@@ -4067,6 +4329,8 @@ function clearAll() {
   _sessionLinks = {};
   _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
   _showNoise = false;
+  _noiseSolo = false;
+  _manualNoiseKeys = new Set();
   _navState = { matches: [], currentIdx: -1 };
   const tnSearch = document.getElementById('tn-search-input');
   if (tnSearch) tnSearch.value = '';
