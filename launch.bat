@@ -3,32 +3,42 @@ setlocal
 set "ROOT=%~dp0"
 set "VENV=%ROOT%.venv"
 
-:: ── Locate Python 3.12 ───────────────────────────────────────────────────────
-set "PY312="
+:: ── Locate Python 3.10, 3.11, or 3.12 ───────────────────────────────────────
+set "PYEXE="
 
-:: 1. Try the Windows Python Launcher (py -3.12) — resolves to the actual exe path
-py -3.12 --version >nul 2>&1
-if not errorlevel 1 (
-    for /f "delims=" %%P in ('py -3.12 -c "import sys; print(sys.executable)"') do set "PY312=%%P"
+:: 1. Try the Windows Python Launcher for each acceptable version (prefer newest)
+for %%V in (3.12 3.11 3.10) do (
+    if not defined PYEXE (
+        py -%%V --version >nul 2>&1
+        if not errorlevel 1 (
+            for /f "delims=" %%P in ('py -%%V -c "import sys; print(sys.executable)"') do set "PYEXE=%%P"
+        )
+    )
 )
-if defined PY312 goto :have_python
+if defined PYEXE goto :have_python
 
-:: 2. Check well-known install locations
+:: 2. Check well-known install locations (newest first)
 for %%P in (
     "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+    "%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
     "C:\Program Files\Python312\python.exe"
+    "C:\Program Files\Python311\python.exe"
+    "C:\Program Files\Python310\python.exe"
     "C:\Python312\python.exe"
-) do if exist %%P if not defined PY312 set "PY312=%%~P"
-if defined PY312 goto :have_python
+    "C:\Python311\python.exe"
+    "C:\Python310\python.exe"
+) do if exist %%P if not defined PYEXE set "PYEXE=%%~P"
+if defined PYEXE goto :have_python
 
-:: 3. Not found — install via winget
+:: 3. Not found — install Python 3.12 via winget
 echo.
-echo  Python 3.12 not found. Installing via winget...
+echo  Python 3.10, 3.11, or 3.12 not found. Installing Python 3.12 via winget...
 echo.
 winget install --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
 if errorlevel 1 (
     echo.
-    echo  winget install failed. Please install Python 3.12 manually:
+    echo  winget install failed. Please install Python 3.10+ manually:
     echo  https://www.python.org/downloads/
     echo.
     pause & exit /b 1
@@ -39,9 +49,9 @@ for %%P in (
     "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
     "C:\Program Files\Python312\python.exe"
     "C:\Python312\python.exe"
-) do if exist %%P if not defined PY312 set "PY312=%%~P"
+) do if exist %%P if not defined PYEXE set "PYEXE=%%~P"
 
-if not defined PY312 (
+if not defined PYEXE (
     echo.
     echo  Python 3.12 was installed but could not be located automatically.
     echo  Please close this window and run launch.bat again.
@@ -53,8 +63,8 @@ if not defined PY312 (
 
 :: ── Create venv if needed ────────────────────────────────────────────────────
 if not exist "%VENV%\Scripts\python.exe" (
-    echo  Creating Python 3.12 environment...
-    "%PY312%" -m venv "%VENV%"
+    echo  Creating Python environment...
+    "%PYEXE%" -m venv "%VENV%"
     if errorlevel 1 (
         echo  Failed to create virtual environment.
         pause & exit /b 1
