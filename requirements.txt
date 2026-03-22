@@ -30,6 +30,10 @@ pyaudiowpatch>=0.2.12.7
 # ── Signal processing / numerics ──────────────────────────────────────────────
 scipy>=1.11.0
 numpy>=1.26.0
+# Pinned to ensure a prebuilt wheel is available for Python 3.12 on Windows.
+# diart → pyannote.audio pulls this in transitively; older versions require
+# MSVC to compile from source and will fail on machines without Build Tools.
+matplotlib>=3.8.0
 
 # ── Web server & utilities ────────────────────────────────────────────────────
 python-dotenv>=1.0.0
