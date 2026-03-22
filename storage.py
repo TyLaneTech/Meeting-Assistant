@@ -350,6 +350,15 @@ def update_segment(segment_id: int, text: str, end_time: float) -> None:
         )
 
 
+def update_segment_source(segment_id: int, source: str) -> None:
+    """Update a segment's source/speaker label."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE transcript_segments SET source = ? WHERE id = ?",
+            (source, segment_id),
+        )
+
+
 def save_segment_label_override(segment_id: int, label: str | None) -> None:
     """Set or clear a per-segment label override."""
     with _conn() as conn:

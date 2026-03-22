@@ -966,21 +966,71 @@ function connectSSE(afterSegId = 0) {
     if (!state.isViewingPast && d.seg_id) {
       const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
       if (seg) {
-        // Update text node — preserve the badge, replace everything after it
-        const badge = seg.querySelector('.src-badge');
-        if (badge) {
-          // Remove all text nodes after the badge, then append updated text
-          while (badge.nextSibling) badge.nextSibling.remove();
-          seg.appendChild(document.createTextNode(d.text));
+        // Source changed (e.g. noise reclaimed as real speaker) — full re-render
+        if (d.source && d.source !== seg.dataset.transcriptSource) {
+          seg.dataset.transcriptSource = d.source;
+          seg.classList.remove('noise-segment');
+          seg.innerHTML = '';
+          // Re-render badge and text using the appendTranscript path
+          const source = d.source;
+          if (source in SOURCE_META) {
+            const { label, cls } = SOURCE_META[source];
+            seg.innerHTML = `<span class="src-badge ${cls}">${label}</span>${escapeHtml(d.text)}`;
+          } else if (source === _NOISE_LABEL) {
+            seg.classList.add('noise-segment');
+            seg.style.setProperty('--seg-color', _NOISE_COLOR);
+            const badge = document.createElement('span');
+            badge.className = 'src-badge src-speaker src-noise';
+            badge.dataset.speakerKey = source;
+            badge.textContent = 'Noise';
+            badge.style.backgroundColor = _NOISE_COLOR + '20';
+            badge.style.color = _NOISE_COLOR;
+            badge.style.borderColor = _NOISE_COLOR + '40';
+            seg.appendChild(badge);
+            seg.appendChild(document.createTextNode(d.text));
+          } else {
+            _ensureSpeakerProfile(source);
+            const color = speakerColor(source);
+            seg.style.setProperty('--seg-color', color);
+            const badge = document.createElement('span');
+            badge.className = 'src-badge src-speaker';
+            if (_sessionLinks[source]) badge.classList.add('speaker-linked');
+            badge.dataset.speakerKey = source;
+            badge.dataset.segId = d.seg_id;
+            badge.title = 'Click to rename';
+            badge.textContent = _speakerDisplayName(source) || source;
+            badge.style.backgroundColor = color + '26';
+            badge.style.color = color;
+            badge.style.borderColor = color + '60';
+            badge.addEventListener('click', ev => {
+              if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+                ev.preventDefault(); ev.stopPropagation();
+                _toggleTranscriptSegSelection(seg, { range: ev.shiftKey });
+                return;
+              }
+              editSpeakerLabel(badge, source);
+            });
+            seg.appendChild(badge);
+            seg.appendChild(document.createTextNode(d.text));
+          }
+          _applyFilterToSeg(seg);
         } else {
-          // Source-label segments (loopback/mic/both) use innerHTML with badge
-          const badgeHtml = seg.querySelector('.src-badge')?.outerHTML || '';
-          seg.innerHTML = badgeHtml + escapeHtml(d.text);
+          // Text/time update only — preserve the badge
+          const badge = seg.querySelector('.src-badge');
+          if (badge) {
+            while (badge.nextSibling) badge.nextSibling.remove();
+            seg.appendChild(document.createTextNode(d.text));
+          } else {
+            const badgeHtml = seg.querySelector('.src-badge')?.outerHTML || '';
+            seg.innerHTML = badgeHtml + escapeHtml(d.text);
+          }
         }
         if (d.end_time) seg.dataset.end = d.end_time;
         if (_autoScroll && !_pickerOpen) {
+          _programmaticScrollCount++;
           const el = document.getElementById('transcript');
           el.scrollTop = el.scrollHeight;
+          setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 100);
         }
       }
     }

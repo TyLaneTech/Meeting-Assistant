@@ -350,10 +350,20 @@ def _on_segment(
         if not sid:
             return
 
-        # Auto-detect noise/filler segments from diarized speakers
+        # Auto-detect noise/filler segments from diarized speakers.
+        # Only label as noise if this speaker hasn't produced any real
+        # (non-noise) segments yet — once confirmed, keep the speaker label.
+        original_source = None
         duration = end_time - start_time if end_time > start_time else 0.0
-        if source.startswith("Speaker") and _is_noise_segment(text, duration):
+        confirmed = _state.get("_confirmed_speakers", set())
+        if (source.startswith("Speaker")
+                and source not in confirmed
+                and _is_noise_segment(text, duration)):
+            original_source = source
             source = _NOISE_LABEL
+        elif source.startswith("Speaker"):
+            confirmed.add(source)
+            _state["_confirmed_speakers"] = confirmed
 
         segments = _state["segments"]
 
@@ -378,11 +388,27 @@ def _on_segment(
                 start_time = prev["start_time"]
 
         if not merged:
-            segments.append({
+            seg_entry = {
                 "text": text, "source": source,
                 "start_time": start_time, "end_time": end_time,
                 "_seg_id": None,  # filled after DB insert
-            })
+            }
+            if original_source:
+                seg_entry["_original_source"] = original_source
+            segments.append(seg_entry)
+
+        # If this speaker was just confirmed (first non-noise segment),
+        # retroactively reclaim any earlier noise segments from them.
+        reclaim_segs = []
+        if (original_source is None and source.startswith("Speaker")
+                and source in confirmed):
+            for seg in segments:
+                if (seg["source"] == _NOISE_LABEL
+                        and seg.get("_original_source") == source):
+                    seg["source"] = source
+                    del seg["_original_source"]
+                    if seg.get("_seg_id"):
+                        reclaim_segs.append(seg)
 
         _state["pending_segments"] += 1
         should_summarize = (
@@ -425,6 +451,15 @@ def _on_segment(
             "text": text, "source": source, "session_id": sid,
             "start_time": start_time, "end_time": end_time,
             "seg_id": seg_id,
+        })
+
+    # Reclaim noise segments that now belong to a confirmed speaker
+    for seg in reclaim_segs:
+        storage.update_segment_source(seg["_seg_id"], seg["source"])
+        _push("transcript_update", {
+            "seg_id": seg["_seg_id"], "text": seg["text"],
+            "end_time": seg["end_time"], "source": seg["source"],
+            "session_id": sid,
         })
 
     if should_summarize:
@@ -1019,6 +1054,7 @@ def start_recording():
             "speaker_audio_accum":    {},
             "speaker_emb_counts":     {},
             "fingerprint_dismissals": {},
+            "_confirmed_speakers":    set(),
         })
 
     verb = "Resumed" if resume_session_id else "Started"
