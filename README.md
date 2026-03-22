@@ -60,6 +60,8 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 
 ### Updating
 
+The program can be updated from the web page via the Settings pane. Or from the command line with the following:
+
 ```bash
 git pull
 ```
@@ -75,7 +77,7 @@ Then run `launch.bat`. Dependencies are installed automatically if `requirements
 ```
 Audio Input (WASAPI)
     │
-    ├── Loopback (desktop audio)     ──┐
+    ├── Loopback (desktop audio)─────────┐
     └── Microphone (WASAPI or browser) ──┤
                                          ▼
                               Source-Gated Mixer
@@ -94,7 +96,7 @@ Audio Input (WASAPI)
                            (per-speaker audio segments)
                                          │
                          ┌───────────────┼───────────────┐
-                         ▼               ▼               ▼
+                         ▼              ▼               ▼
                   Hallucination     Noise/Filler     Segment Merge
                    Detection        Detection      (same speaker,
                  (n-gram ratio)   (filler words,     gap < 2s)
@@ -436,9 +438,3 @@ Meeting Assistant/
 | `pystray` + `Pillow` | System tray icon and image processing |
 | `python-dotenv` | Environment variable loading |
 | `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` | CUDA runtime libraries (Windows GPU support) |
-
----
-
-## License
-
-This project is for personal use.
