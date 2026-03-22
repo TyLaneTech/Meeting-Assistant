@@ -375,6 +375,10 @@ def main():
                     _fatal("PyTorch install failed -- check your connection and retry")
                 _ok(f"PyTorch  {GRY}[CPU | fallback]{R}")
 
+    # Pre-install matplotlib from a binary wheel so diart's transitive pull
+    # never triggers a source build (which requires MSVC on Windows).
+    _pip("matplotlib>=3.8.0", "--only-binary", ":all:", "--quiet")
+
     # All other deps
     _info("Dependencies...")
     if not _pip_streaming("-r", "requirements.txt"):
