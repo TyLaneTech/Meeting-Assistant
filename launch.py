@@ -248,6 +248,35 @@ def _pip(*args, show_output=False):
     return subprocess.run(cmd).returncode == 0
 
 
+def _pip_streaming(*args):
+    """
+    Run pip install and print filtered progress lines in real time.
+    Shows download sizes and package names without the full pip noise.
+    """
+    cmd = [sys.executable, "-m", "pip", "install",
+           "--no-input", "--progress-bar", "off"] + list(args)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        lo = line.lower()
+        if "downloading" in lo:
+            # e.g. "Downloading torch-2.6.0+cu126-cp312-cp312-win_amd64.whl (2.6 GB)"
+            print(f"{GRY}         ↓ {line}{R}", flush=True)
+        elif "installing collected" in lo:
+            pkgs = line.replace("Installing collected packages:", "").strip()
+            print(f"{GRY}         ● Installing: {pkgs}{R}", flush=True)
+        elif "error" in lo and "pip" not in lo:
+            print(f"{RED}         {line}{R}", flush=True)
+    proc.wait()
+    return proc.returncode == 0
+
+
 def _torch_build() -> str:
     """
     Return the installed torch build variant, e.g. 'cu126', 'cpu', or ''
@@ -322,8 +351,8 @@ def main():
         if installed_build == "cpu":
             _ok(f"PyTorch  {GRY}[CPU]{R}")
         else:
-            _info("PyTorch [CPU]...")
-            if not _pip("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
+            _info(f"PyTorch [CPU]  {GRY}(this may take several minutes){R}")
+            if not _pip_streaming("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
                 _fatal("PyTorch install failed -- check your connection and retry")
             _ok(f"PyTorch  {GRY}[CPU]{R}")
     else:
@@ -331,24 +360,24 @@ def main():
             _ok(f"PyTorch  {GRY}[{whl} | GPU-accelerated]{R}")
         else:
             if installed_build:
-                _info(f"PyTorch: replacing {installed_build} build with {whl}...")
+                _info(f"PyTorch  {GRY}replacing {installed_build} → {whl}  (this may take several minutes){R}")
             else:
-                _info(f"PyTorch [{whl}]...  first run may take several minutes")
+                _info(f"PyTorch [{whl}]  {GRY}(this may take several minutes){R}")
             # --force-reinstall is required to replace a same-version CPU build
             # with a CUDA one (pip considers them equal by version number alone)
-            if _pip("torch", "torchaudio",
-                    "--force-reinstall",
-                    "--index-url", TORCH_INDEX + whl):
+            if _pip_streaming("torch", "torchaudio",
+                              "--force-reinstall",
+                              "--index-url", TORCH_INDEX + whl):
                 _ok(f"PyTorch  {GRY}[{whl} | GPU-accelerated]{R}")
             else:
                 _warn(f"GPU build failed -- falling back to CPU...")
-                if not _pip("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
+                if not _pip_streaming("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
                     _fatal("PyTorch install failed -- check your connection and retry")
                 _ok(f"PyTorch  {GRY}[CPU | fallback]{R}")
 
     # All other deps
     _info("Dependencies...")
-    if not _pip("-r", "requirements.txt"):
+    if not _pip_streaming("-r", "requirements.txt"):
         _warn("Some packages failed -- retrying with full output...")
         print()
         if not _pip("-r", "requirements.txt", show_output=True):
