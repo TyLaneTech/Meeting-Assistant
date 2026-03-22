@@ -1438,15 +1438,21 @@ const _NOISE_COLOR = '#6e7681';   // muted gray
 
 const _SPEAKER_PALETTE = [
   '#58a6ff', // blue
+  '#f47067', // red
   '#3fb950', // green
-  '#f78166', // red-orange
-  '#d2a8ff', // purple
-  '#ffa657', // orange
-  '#79c0ff', // light blue
-  '#56d364', // light green
-  '#ff7b72', // coral
-  '#bc8cff', // violet
+  '#d2a8ff', // lavender
+  '#f0883e', // orange
+  '#db61a2', // pink
   '#e3b341', // yellow
+  '#2dd4bf', // teal
+  '#a78bfa', // violet
+  '#79c0ff', // sky
+  '#ef6e4e', // tangerine
+  '#86e89d', // mint
+  '#f6c177', // peach
+  '#6cb6ff', // cornflower
+  '#ff9bce', // rose
+  '#768390', // slate
 ];
 let _speakerColorIdx = 0;
 
@@ -1651,7 +1657,13 @@ function _setGroupSelection(group, { toggle = false, range = false } = {}) {
     }
     _speakerSelectionAnchor = group.speakerKeys[0];
   } else {
-    _selectedSpeakerKeys = [...group.speakerKeys];
+    // Plain click: toggle if already the sole selection, otherwise select
+    const allSelected = group.speakerKeys.every(k => _selectedSpeakerKeys.includes(k));
+    if (allSelected && _selectedSpeakerKeys.length === group.speakerKeys.length) {
+      _selectedSpeakerKeys = [];
+    } else {
+      _selectedSpeakerKeys = [...group.speakerKeys];
+    }
     _speakerSelectionAnchor = group.speakerKeys[0];
   }
 
@@ -1682,7 +1694,12 @@ function _setSpeakerSelection(speakerKey, { toggle = false, range = false } = {}
     }
     _speakerSelectionAnchor = speakerKey;
   } else {
-    _selectedSpeakerKeys = [speakerKey];
+    // Plain click: toggle if already selected
+    if (_selectedSpeakerKeys.length === 1 && _selectedSpeakerKeys[0] === speakerKey) {
+      _selectedSpeakerKeys = [];
+    } else {
+      _selectedSpeakerKeys = [speakerKey];
+    }
     _speakerSelectionAnchor = speakerKey;
   }
 
@@ -2244,8 +2261,18 @@ function renderSpeakerManager() {
     btn.className = 'speaker-color-btn' + (_speakerDraftColor === color ? ' active' : '');
     btn.title = color;
     btn.style.backgroundColor = color;
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       _speakerDraftColor = color;
+      // Auto-apply color immediately if speakers are selected
+      if (_selectedSpeakerKeys.length && state.sessionId) {
+        const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ speaker_keys: _selectedSpeakerKeys, color }),
+        });
+        const data = await resp.json();
+        if (resp.ok) (data.speakers || []).forEach(applySpeakerProfileUpdate);
+      }
       renderSpeakerManager();
     });
     colorGridEl.appendChild(btn);
@@ -3366,52 +3393,227 @@ function _tnUpdateTimeLabels() {
 
 // ── Speaker statistics ────────────────────────────────────────────────────────
 
-function tnToggleStats() {
-  const body = document.getElementById('tn-stats-body');
-  if (!body) return;
-  const wasCollapsed = body.classList.contains('collapsed');
-  body.classList.toggle('collapsed');
-  if (wasCollapsed) _tnRefreshStats();
+// ── Analytics Panel ──────────────────────────────────────────────────────────
+
+let _analyticsBarObserver = null;
+let _analyticsTlObserver = null;
+
+function toggleAnalyticsPanel() {
+  const panel = document.getElementById('analytics-panel');
+  if (!panel) return;
+  const btn = document.getElementById('analytics-btn');
+  const isOpen = !panel.classList.contains('collapsed');
+  panel.classList.toggle('collapsed');
+  if (btn) btn.classList.toggle('active', !isOpen);
+  if (!isOpen) _refreshAnalytics();
 }
 
-function _tnRefreshStats() {
-  const body = document.getElementById('tn-stats-body');
-  if (!body || body.classList.contains('collapsed')) return;
-  body.innerHTML = '';
+function _refreshAnalytics() {
+  const panel = document.getElementById('analytics-panel');
+  if (!panel || panel.classList.contains('collapsed')) return;
 
   const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
   const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
 
+  // Gather per-speaker data
+  const speakerData = [];
+  let totalSegCount = 0;
+  let totalSpeakTime = 0;
+  let totalWords = 0;
+  let sessionStart = Infinity, sessionEnd = 0;
+
   groups.forEach(g => {
+    if (g.speakerKeys.includes(_NOISE_LABEL)) return;
     const keysSet = new Set(g.speakerKeys);
-    let segCount = 0;
-    let totalTime = 0;
+    let segCount = 0, speakTime = 0, words = 0;
+    const segments = [];
     allSegs.forEach(seg => {
       if (keysSet.has(seg.dataset.transcriptSource)) {
         segCount++;
         const s = parseFloat(seg.dataset.start || 0);
         const e = parseFloat(seg.dataset.end || 0);
-        if (e > s) totalTime += e - s;
+        if (e > s) {
+          speakTime += e - s;
+          segments.push({ start: s, end: e });
+          if (s < sessionStart) sessionStart = s;
+          if (e > sessionEnd) sessionEnd = e;
+        }
+        // Count words from text content (skip badge)
+        const badge = seg.querySelector('.src-badge');
+        let text = '';
+        for (let n = badge ? badge.nextSibling : seg.firstChild; n; n = n.nextSibling)
+          text += n.textContent || '';
+        words += text.trim().split(/\s+/).filter(w => w).length;
       }
     });
-
     if (segCount === 0) return;
-
     const color = g.color || speakerColor(g.speakerKeys[0]);
-    const item = document.createElement('div');
-    item.className = 'tn-stat-item';
-    item.innerHTML = `
-      <span class="tn-stat-dot" style="background:${color}"></span>
-      <span class="tn-stat-name">${escapeHtml(g.name)}</span>
-      <span class="tn-stat-value">${segCount} seg${segCount !== 1 ? 's' : ''}${totalTime > 0 ? ', ' + fmtDuration(totalTime) : ''}</span>
-    `;
-    body.appendChild(item);
+    speakerData.push({ name: g.name, color, segCount, speakTime, words, segments });
+    totalSegCount += segCount;
+    totalSpeakTime += speakTime;
+    totalWords += words;
   });
 
-  if (body.children.length === 0) {
-    body.innerHTML = '<span class="tn-stat-value" style="padding:2px 0">No speakers yet</span>';
+  // Sort by speaking time descending
+  speakerData.sort((a, b) => b.speakTime - a.speakTime);
+
+  const sessionDuration = sessionEnd > sessionStart ? sessionEnd - sessionStart : 0;
+  const wpm = totalSpeakTime > 0 ? Math.round(totalWords / (totalSpeakTime / 60)) : 0;
+
+  // ── KPIs ─────────────────────────────────────────
+  const kpiEl = document.getElementById('analytics-kpis');
+  kpiEl.innerHTML = '';
+
+  const kpis = [
+    { value: fmtDuration(sessionDuration), label: 'Duration' },
+    { value: speakerData.length, label: 'Speakers' },
+    { value: totalSegCount, label: 'Segments' },
+    { value: wpm, label: 'Avg WPM' },
+  ];
+  // Donut (left half)
+  const donutKpi = document.createElement('div');
+  donutKpi.className = 'analytics-kpi analytics-kpi-donut';
+  donutKpi.innerHTML = _buildDonutSVG(speakerData, 110);
+  kpiEl.appendChild(donutKpi);
+
+  // KPI grid (right half)
+  const kpiGrid = document.createElement('div');
+  kpiGrid.className = 'analytics-kpi-grid';
+  kpis.forEach(k => {
+    const card = document.createElement('div');
+    card.className = 'analytics-kpi';
+    card.innerHTML = `<span class="analytics-kpi-value">${k.value}</span><span class="analytics-kpi-label">${k.label}</span>`;
+    kpiGrid.appendChild(card);
+  });
+  kpiEl.appendChild(kpiGrid);
+
+  // ── Speaking Time Bars ───────────────────────────
+  const maxTime = speakerData.reduce((m, d) => Math.max(m, d.speakTime), 0);
+  const timeBars = document.getElementById('analytics-time-bars');
+  timeBars.innerHTML = '';
+  speakerData.forEach(d => {
+    const pct = maxTime > 0 ? (d.speakTime / maxTime) * 100 : 0;
+    const sharePct = totalSpeakTime > 0 ? Math.round((d.speakTime / totalSpeakTime) * 100) : 0;
+    const row = document.createElement('div');
+    row.className = 'analytics-bar-row';
+    row.innerHTML = `
+      <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${d.color}"></span>${escapeHtml(d.name)}</span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${d.color}"></span></span>
+      <span class="analytics-bar-value">${fmtDuration(d.speakTime)} (${sharePct}%)</span>
+    `;
+    timeBars.appendChild(row);
+  });
+
+  // ── Segment Count Bars ───────────────────────────
+  const maxSegs = speakerData.reduce((m, d) => Math.max(m, d.segCount), 0);
+  const segBars = document.getElementById('analytics-seg-bars');
+  segBars.innerHTML = '';
+  speakerData.forEach(d => {
+    const pct = maxSegs > 0 ? (d.segCount / maxSegs) * 100 : 0;
+    const row = document.createElement('div');
+    row.className = 'analytics-bar-row';
+    row.innerHTML = `
+      <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${d.color}"></span>${escapeHtml(d.name)}</span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${d.color}"></span></span>
+      <span class="analytics-bar-value">${d.segCount} seg${d.segCount !== 1 ? 's' : ''}</span>
+    `;
+    segBars.appendChild(row);
+  });
+
+  // ── Timeline ─────────────────────────────────────
+  const tlEl = document.getElementById('analytics-timeline');
+  tlEl.innerHTML = '';
+  if (sessionDuration > 0) {
+    let rowIdx = 0;
+    speakerData.forEach(d => {
+      const row = document.createElement('div');
+      row.className = 'analytics-tl-row';
+      let segsHtml = '';
+      d.segments.forEach(s => {
+        const left = ((s.start - sessionStart) / sessionDuration) * 100;
+        const width = Math.max(((s.end - s.start) / sessionDuration) * 100, 0.5);
+        segsHtml += `<span class="analytics-tl-seg" style="left:${left}%;width:${width}%;background:${d.color}"></span>`;
+      });
+      row.innerHTML = `
+        <span class="analytics-tl-label">${escapeHtml(d.name)}</span>
+        <span class="analytics-tl-track">${segsHtml}</span>
+      `;
+      row.dataset.rowIdx = rowIdx++;
+      tlEl.appendChild(row);
+    });
+
+    // Animate timeline rows in with stagger
+    if (_analyticsTlObserver) _analyticsTlObserver.disconnect();
+    _analyticsTlObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const row = entry.target;
+          const delay = parseInt(row.dataset.rowIdx) * 50;
+          setTimeout(() => {
+            row.classList.add('visible');
+            row.querySelectorAll('.analytics-tl-seg').forEach((seg, i) => {
+              setTimeout(() => seg.classList.add('visible'), i * 8);
+            });
+          }, delay);
+          _analyticsTlObserver.unobserve(row);
+        }
+      });
+    }, { root: panel, threshold: 0.1 });
+    tlEl.querySelectorAll('.analytics-tl-row').forEach(row => {
+      _analyticsTlObserver.observe(row);
+    });
   }
+
+  // Empty state
+  if (speakerData.length === 0) {
+    kpiEl.innerHTML = '<div class="analytics-kpi" style="flex:1;align-items:center;padding:20px"><span class="analytics-kpi-label">No speaker data yet</span></div>';
+    timeBars.innerHTML = '';
+    segBars.innerHTML = '';
+    tlEl.innerHTML = '';
+    return;
+  }
+
+  // Animate bars as they scroll into view
+  if (_analyticsBarObserver) _analyticsBarObserver.disconnect();
+  _analyticsBarObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const bar = entry.target.querySelector('.analytics-bar-fill');
+        if (bar) bar.style.width = bar.dataset.pct + '%';
+        _analyticsBarObserver.unobserve(entry.target);
+      }
+    });
+  }, { root: panel, threshold: 0.1 });
+  panel.querySelectorAll('.analytics-bar-row').forEach(row => {
+    _analyticsBarObserver.observe(row);
+  });
 }
+
+function _buildDonutSVG(speakerData, size) {
+  const total = speakerData.reduce((s, d) => s + d.speakTime, 0);
+  if (total === 0 || speakerData.length === 0) {
+    return `<div class="analytics-donut-wrap"><svg width="${size}" height="${size}" viewBox="0 0 36 36">
+      <circle cx="18" cy="18" r="13" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="7"/>
+    </svg></div>`;
+  }
+  const r = 13, c = 2 * Math.PI * r;
+  let offset = 0;
+  let arcs = '';
+  speakerData.forEach(d => {
+    const pct = d.speakTime / total;
+    const dash = pct * c;
+    const gap = c - dash;
+    arcs += `<circle cx="18" cy="18" r="${r}" fill="none" stroke="${d.color}" stroke-width="7"
+      stroke-dasharray="${dash} ${gap}" stroke-dashoffset="${-offset}"
+      transform="rotate(-90 18 18)" style="opacity:0.85"/>`;
+    offset += dash;
+  });
+  return `<div class="analytics-donut-wrap"><svg width="${size}" height="${size}" viewBox="0 0 36 36">${arcs}</svg></div>`;
+}
+
+// Keep tnToggleStats as a no-op for backwards compatibility
+function tnToggleStats() {}
+function _tnRefreshStats() {}
 
 // ── Clear all filters ─────────────────────────────────────────────────────────
 
@@ -3869,6 +4071,8 @@ function clearAll() {
   const tnSearch = document.getElementById('tn-search-input');
   if (tnSearch) tnSearch.value = '';
   document.getElementById('transcript-navigator')?.classList.add('collapsed');
+  document.getElementById('analytics-panel')?.classList.add('collapsed');
+  document.getElementById('analytics-btn')?.classList.remove('active');
   _updateFilterBtnState();
   closeSpeakerManager();
   const bar = document.getElementById('transcript-selection-bar');

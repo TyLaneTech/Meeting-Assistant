@@ -156,8 +156,26 @@
           </div>
           <div class="col-actions right">
             <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-magnifying-glass"></i></button>
+            <button class="icon-btn" id="analytics-btn" title="Session analytics" onclick="toggleAnalyticsPanel()"><i class="fa-solid fa-chart-pie"></i></button>
             <button class="icon-btn" title="Copy transcript" onclick="copyTranscript()"><i class="fa-solid fa-clipboard"></i></button>
             <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-solid fa-eraser"></i></button>
+          </div>
+        </div>
+
+        <!-- ── Analytics Panel ──────────────────────────────────────────── -->
+        <div id="analytics-panel" class="analytics-panel collapsed">
+          <div class="analytics-kpi-row" id="analytics-kpis"></div>
+          <div class="analytics-section">
+            <div class="analytics-section-title">Timeline</div>
+            <div class="analytics-timeline" id="analytics-timeline"></div>
+          </div>
+          <div class="analytics-section">
+            <div class="analytics-section-title">Speaking Time</div>
+            <div class="analytics-bars" id="analytics-time-bars"></div>
+          </div>
+          <div class="analytics-section">
+            <div class="analytics-section-title">Segment Count</div>
+            <div class="analytics-bars" id="analytics-seg-bars"></div>
           </div>
         </div>
 
@@ -197,13 +215,6 @@
               </div>
           </div>
           -->
-          <!-- Stats row (collapsible) -->
-          <div class="tn-row tn-stats-row">
-            <button class="tn-stats-toggle" onclick="tnToggleStats()"><i class="fa-solid fa-chart-bar"></i> Speaker Stats</button>
-            <div id="tn-stats-body" class="tn-stats-body collapsed"></div>
-          </div>
-
-
           <div class="tn-row tn-time-row">
             <i class="fa-solid fa-clock tn-time-icon"></i>
             <span id="tn-time-label-start" class="tn-time-label">0:00</span>
@@ -321,13 +332,13 @@
 
     <span class="speaker-editor-hint" id="speaker-editor-hint">Click · Ctrl multi · Shift range</span>
     <div class="speaker-manager-body">
+      <div class="speaker-color-grid" id="speaker-color-grid"></div>
       <div class="speaker-manager-list" id="speaker-manager-list"></div>
       <div class="speaker-editor">
         <div class="speaker-editor-row">
           <input id="speaker-editor-name" class="speaker-editor-input" list="speaker-name-options"
                  placeholder="Speaker name" />
           <datalist id="speaker-name-options"></datalist>
-          <div class="speaker-color-grid" id="speaker-color-grid"></div>
         </div>
         <div class="speaker-editor-actions">
           <div class="left-actions">
