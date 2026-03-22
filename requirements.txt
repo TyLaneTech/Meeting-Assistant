@@ -5,13 +5,6 @@ openai>=1.0.0
 # ── Transcription ─────────────────────────────────────────────────────────────
 faster-whisper>=1.0.0
 
-# ── NVIDIA CUDA DLLs (Windows) ────────────────────────────────────────────────
-# ctranslate2 (used by faster-whisper) needs cublas and cudnn DLLs to run on
-# GPU. These packages install the DLLs under site-packages/nvidia/*/bin/;
-# transcriber.py registers those paths via os.add_dll_directory() at startup
-# so no system CUDA Toolkit installation is required.
-nvidia-cublas-cu12
-nvidia-cudnn-cu12
 
 # ── Speaker diarization ───────────────────────────────────────────────────────
 # diart depends on torch/torchaudio/pyannote. A plain `pip install diart` pulls
