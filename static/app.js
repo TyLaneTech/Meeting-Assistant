@@ -4868,6 +4868,9 @@ async function openSettings() {
       row.style.display = 'none';
     }
   } catch (_) {}
+
+  // Audio params — load eagerly so panels are ready when clicked
+  _apRefresh();
 }
 
 /** Sync provider toggle buttons and model dropdown to the given values. */
@@ -5081,6 +5084,182 @@ function toggleKeyVis(inputId) {
   if (btn) btn.innerHTML = showing
     ? '<i class="fa-solid fa-eye-slash"></i>'
     : '<i class="fa-solid fa-eye"></i>';
+}
+
+// ── Audio Parameters ──────────────────────────────────────────────────────
+let _apCache = null;  // cached audio params response
+
+async function _apLoad() {
+  try {
+    _apCache = await fetch('/api/audio_params').then(r => r.json());
+  } catch (_) {}
+}
+
+function _apRenderSection(containerId, paramDefs, current) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML = '';
+  for (const [key, spec] of Object.entries(paramDefs)) {
+    const val = current[key] ?? spec.value;
+    const isDefault = Math.abs(val - spec.value) < 1e-9;
+    const unit = spec.unit ? `<span class="ap-unit">${spec.unit}</span>` : '';
+    const tooltip = spec.tooltip || spec.description;
+    const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
+
+    const param = document.createElement('div');
+    param.className = 'ap-param';
+    param.innerHTML = `
+      <div class="ap-header">
+        <span class="ap-label">${spec.label}</span>${unit}
+        <span class="ap-desc">${spec.description}</span>
+        <div class="ap-info-wrap">
+          <button class="ap-info-btn" tabindex="-1"><i class="fa-solid fa-circle-info"></i></button>
+          <div class="ap-tooltip">
+            <div class="ap-tooltip-title"><i class="fa-solid fa-circle-info"></i> ${spec.label}</div>
+            <div class="ap-tooltip-body">${tooltip}</div>
+            <div class="ap-tooltip-default">Default: <span>${spec.value}${spec.unit ? ' ' + spec.unit : ''}</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="ap-slider-row">
+        <input type="range" class="ap-slider" id="ap-slider-${key}"
+               min="${spec.min}" max="${spec.max}" step="${spec.step}" value="${val}"
+               style="background:linear-gradient(90deg,var(--accent) ${pct}%,var(--border) ${pct}%)">
+        <input type="number" class="ap-val-input" id="ap-${key}"
+               value="${val}" min="${spec.min}" max="${spec.max}" step="${spec.step}">
+        <button class="ap-reset${isDefault ? ' ap-reset-hidden' : ''}" id="ap-reset-${key}"
+                title="Reset to default (${spec.value})"
+                onclick="_apResetOne('${key}')">
+          <i class="fa-solid fa-rotate-right"></i>
+        </button>
+      </div>`;
+    container.appendChild(param);
+
+    // Bind tooltip to body for overflow escape
+    _apBindTooltip(param);
+
+    // Wire slider ↔ input sync
+    const slider = param.querySelector('.ap-slider');
+    const input  = param.querySelector('.ap-val-input');
+
+    slider.addEventListener('input', () => {
+      input.value = slider.value;
+      _apUpdateSliderFill(slider, spec);
+    });
+    slider.addEventListener('change', () => {
+      _apSave(key, parseFloat(slider.value));
+      _apToggleReset(key, parseFloat(slider.value), spec.value);
+    });
+    input.addEventListener('change', () => {
+      let v = parseFloat(input.value);
+      v = Math.min(spec.max, Math.max(spec.min, v));
+      input.value = v;
+      slider.value = v;
+      _apUpdateSliderFill(slider, spec);
+      _apSave(key, v);
+      _apToggleReset(key, v, spec.value);
+    });
+  }
+}
+
+function _apBindTooltip(paramEl) {
+  const btn = paramEl.querySelector('.ap-info-btn');
+  const tip = paramEl.querySelector('.ap-tooltip');
+  if (!btn || !tip) return;
+
+  // Move tooltip to body so it escapes any overflow:hidden/auto ancestors
+  document.body.appendChild(tip);
+
+  btn.addEventListener('mouseenter', () => {
+    const rect = btn.getBoundingClientRect();
+    tip.classList.remove('ap-arrow-down', 'ap-arrow-up');
+    tip.classList.add('ap-tooltip-visible');
+
+    // Temporarily show to measure height
+    const tipH = tip.offsetHeight;
+    const spaceAbove = rect.top;
+    const spaceBelow = window.innerHeight - rect.bottom;
+
+    if (spaceAbove > tipH + 12) {
+      // Show above
+      tip.style.top = (rect.top - tipH - 10) + 'px';
+      tip.classList.add('ap-arrow-down');
+    } else {
+      // Show below
+      tip.style.top = (rect.bottom + 10) + 'px';
+      tip.classList.add('ap-arrow-up');
+    }
+    // Align right edge to the button
+    let left = rect.right - 290;
+    if (left < 8) left = 8;
+    tip.style.left = left + 'px';
+  });
+
+  btn.addEventListener('mouseleave', () => {
+    tip.classList.remove('ap-tooltip-visible');
+  });
+}
+
+function _apUpdateSliderFill(slider, spec) {
+  const pct = ((slider.value - spec.min) / (spec.max - spec.min)) * 100;
+  slider.style.background = `linear-gradient(90deg,var(--accent) ${pct}%,var(--border) ${pct}%)`;
+}
+
+function _apToggleReset(key, val, defaultVal) {
+  const btn = document.getElementById(`ap-reset-${key}`);
+  if (btn) btn.classList.toggle('ap-reset-hidden', Math.abs(val - defaultVal) < 1e-9);
+}
+
+async function _apRefresh() {
+  await _apLoad();
+  if (!_apCache) return;
+  _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
+  _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
+}
+
+async function _apSave(key, value) {
+  try {
+    const res = await fetch('/api/audio_params', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [key]: value }),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      _apCache.current = res.audio_params;
+      // Update reset button visibility
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key]);
+      const resetBtn = document.getElementById(`ap-reset-${key}`);
+      if (resetBtn && spec) {
+        const isDefault = Math.abs(value - spec.value) < 1e-9;
+        resetBtn.classList.toggle('ap-reset-hidden', isDefault);
+      }
+    }
+  } catch (_) {}
+}
+
+async function _apResetOne(key) {
+  try {
+    const res = await fetch('/api/audio_params/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      _apCache.current = res.audio_params;
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key]);
+      if (spec) {
+        const input  = document.getElementById(`ap-${key}`);
+        const slider = document.getElementById(`ap-slider-${key}`);
+        if (input)  input.value  = spec.value;
+        if (slider) {
+          slider.value = spec.value;
+          _apUpdateSliderFill(slider, spec);
+        }
+      }
+      const resetBtn = document.getElementById(`ap-reset-${key}`);
+      if (resetBtn) resetBtn.classList.add('ap-reset-hidden');
+    }
+  } catch (_) {}
 }
 
 async function saveApiKeys() {

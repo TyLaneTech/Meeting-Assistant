@@ -1497,7 +1497,7 @@ button#sidebar-close-btn {
 
 /* ── Settings dialog ──────────────────────────────────────────────────────── */
 .settings-dialog {
-  max-width: 640px; width: 92vw; padding: 0;
+  max-width: 720px; width: 92vw; padding: 0;
   overflow: hidden; display: flex; flex-direction: column; max-height: 88vh;
 }
 .settings-header {
@@ -1509,7 +1509,7 @@ button#sidebar-close-btn {
 .settings-layout { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 
 .settings-nav {
-  width: 148px; flex-shrink: 0; background: var(--surface);
+  width: 158px; flex-shrink: 0; background: var(--surface);
   border-right: 1px solid var(--border); padding: 10px 8px;
   display: flex; flex-direction: column; gap: 2px;
 }
@@ -1542,8 +1542,11 @@ button#sidebar-close-btn {
 }
 
 .settings-group {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); overflow: hidden; margin-bottom: 12px;
+  background: #0c0f14bd;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 12px;
 }
 .settings-row {
   display: flex; align-items: center; justify-content: space-between;
@@ -2552,9 +2555,250 @@ div#summary.col-body {
 }
 
 button#transcript-filter-btn.active {
-    color: #ff4e4e;
+    color: #f16060;
 }
 
 button#analytics-btn.active {
     color: #60a6f1;
+}
+
+/* ── Audio parameter controls ────────────────────────────────────────────── */
+.ap-param {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+}
+.ap-param:last-child { border-bottom: none; }
+
+.ap-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+.ap-label {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--fg);
+}
+.ap-unit {
+    font-size: 10.5px;
+    color: var(--fg-muted);
+    font-weight: 400;
+}
+.ap-desc {
+    font-size: 10.5px;
+    color: var(--fg-muted);
+    margin-left: auto;
+    text-align: right;
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+/* Info icon + tooltip */
+.ap-info-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+.ap-info-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--fg-muted);
+    font-size: 10px;
+    cursor: pointer;
+    border-radius: 50%;
+    transition: color 0.15s, background 0.15s;
+}
+.ap-info-btn:hover {
+    color: var(--accent);
+    background: rgba(88,166,255,.1);
+}
+.ap-tooltip {
+    display: none;
+    position: fixed;
+    width: 290px;
+    padding: 14px 16px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 32px rgba(0,0,0,.45), 0 0 0 1px rgba(88,166,255,.08);
+    z-index: 10000;
+    pointer-events: none;
+    animation: apTooltipIn .15s ease-out;
+}
+.ap-tooltip.ap-tooltip-visible { display: block; }
+.ap-tooltip::after {
+    content: '';
+    position: absolute;
+    border: 6px solid transparent;
+}
+.ap-tooltip.ap-arrow-down::after {
+    top: 100%;
+    right: 14px;
+    border-top-color: var(--border);
+}
+.ap-tooltip.ap-arrow-up::after {
+    bottom: 100%;
+    right: 14px;
+    border-bottom-color: var(--border);
+}
+@keyframes apTooltipIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.ap-tooltip-title {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--fg);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.ap-tooltip-title i {
+    color: var(--accent);
+    font-size: 10px;
+}
+.ap-tooltip-body {
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--fg-muted);
+}
+.ap-tooltip-body b {
+    color: var(--fg);
+    font-weight: 600;
+}
+.ap-tooltip-body em {
+    color: var(--accent);
+    font-style: normal;
+    font-weight: 500;
+}
+.ap-tooltip-default {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    font-size: 10px;
+    color: var(--fg-muted);
+}
+.ap-tooltip-default span {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+/* Slider row */
+.ap-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+/* Custom range slider */
+.ap-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    outline: none;
+    cursor: pointer;
+    position: relative;
+}
+.ap-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--surface);
+    box-shadow: 0 1px 4px rgba(0,0,0,.35);
+    cursor: grab;
+    transition: transform 0.12s, box-shadow 0.12s;
+}
+.ap-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+    box-shadow: 0 0 0 4px rgba(88,166,255,.18), 0 1px 4px rgba(0,0,0,.35);
+}
+.ap-slider::-webkit-slider-thumb:active {
+    cursor: grabbing;
+    transform: scale(1.1);
+    box-shadow: 0 0 0 6px rgba(88,166,255,.15), 0 1px 4px rgba(0,0,0,.35);
+}
+.ap-slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--surface);
+    box-shadow: 0 1px 4px rgba(0,0,0,.35);
+    cursor: grab;
+    transition: transform 0.12s, box-shadow 0.12s;
+}
+.ap-slider::-moz-range-track {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+}
+
+/* Numeric input */
+.ap-val-input {
+    width: 62px;
+    padding: 5px 7px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    font-weight: 600;
+    background: var(--surface2);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    text-align: center;
+    -moz-appearance: textfield;
+    transition: border-color 0.15s;
+}
+.ap-val-input::-webkit-inner-spin-button,
+.ap-val-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.ap-val-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(88,166,255,.12);
+}
+
+/* Reset button */
+.ap-reset {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--fg-muted);
+    cursor: pointer;
+    font-size: 9px;
+    opacity: 0.5;
+    transition: all 0.15s;
+    flex-shrink: 0;
+}
+.ap-reset:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+    opacity: 1;
+    background: rgba(88,166,255,.06);
+}
+.ap-reset-hidden {
+    visibility: hidden;
+    pointer-events: none;
 }

@@ -446,6 +446,12 @@
         <button class="settings-nav-item" data-target="section-keys" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-key"></i><span>API Keys</span>
         </button>
+        <button class="settings-nav-item" data-target="section-transcription" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-waveform-lines"></i><span>Transcription</span>
+        </button>
+        <button class="settings-nav-item" data-target="section-diarization" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-users"></i><span>Diarization</span>
+        </button>
         <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-microchip"></i><span>System</span>
         </button>
@@ -525,6 +531,23 @@
             </div>
           </div>
           <button class="btn-save-keys" onclick="saveApiKeys()">Save Keys</button>
+        </div>
+
+        <!-- Transcription -->
+        <div class="settings-panel" id="section-transcription">
+          <div class="settings-group" id="ap-transcription-params">
+            <!-- Populated dynamically by JS -->
+          </div>
+        </div>
+
+        <!-- Diarization -->
+        <div class="settings-panel" id="section-diarization">
+          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
+            Pipeline parameters marked with <i class="fa-solid fa-rotate-right" style="font-size:9px"></i> require a session restart to take effect.
+          </p>
+          <div class="settings-group" id="ap-diarization-params">
+            <!-- Populated dynamically by JS -->
+          </div>
         </div>
 
         <!-- System -->

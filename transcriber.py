@@ -109,13 +109,6 @@ def _repetition_ratio(text: str, n: int = _HALLUCINATION_NGRAM) -> float:
 class Transcriber:
     TARGET_RATE = 16_000
     CHUNK_SIZE = 512           # Must match AudioCapture.CHUNK_SIZE
-    PROMPT_CHARS = 800         # Rolling context window fed as initial_prompt
-
-    # Pause-detection flush parameters
-    SILENCE_THRESHOLD   = 0.025  # RMS below this is considered silence (0–1 float)
-    SILENCE_DURATION_S  = 0.3   # Seconds of continuous silence before flushing
-    MIN_BUFFER_SECONDS  = 0.5   # Don't flush until at least this much audio is buffered
-    MAX_BUFFER_SECONDS  = 10.0   # Hard cap — flush regardless of silence
 
     def __init__(
         self,
@@ -137,6 +130,22 @@ class Transcriber:
         self.diarization_enabled = True  # Can be toggled via the UI
         self.fingerprint_callback: Callable | None = None
         # (speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None
+
+        # Tunable parameters — loaded from saved settings, reset-able to defaults
+        from default_audio_params import get_all_defaults
+        import settings as _settings
+        defaults = get_all_defaults()
+        saved = _settings.load().get("audio_params", {})
+        p = {**defaults, **saved}
+        self.silence_threshold   = float(p["silence_threshold"])
+        self.silence_duration    = float(p["silence_duration"])
+        self.min_buffer_seconds  = float(p["min_buffer_seconds"])
+        self.max_buffer_seconds  = float(p["max_buffer_seconds"])
+        self.beam_size           = int(p["beam_size"])
+        self.prompt_chars        = int(p["prompt_chars"])
+        self.vad_min_silence_ms  = int(p["vad_min_silence_ms"])
+        self.vad_speech_pad_ms   = int(p["vad_speech_pad_ms"])
+        self.compression_ratio_threshold = float(p["compression_ratio_threshold"])
 
     @property
     def device_info(self) -> str:
@@ -232,7 +241,7 @@ class Transcriber:
             if self.diarizer is not None:
                 self.diarizer.reset()
 
-            frames_per_window = int(self.MAX_BUFFER_SECONDS * file_rate)
+            frames_per_window = int(self.max_buffer_seconds * file_rate)
             offset = 0
 
             log.info(
@@ -350,7 +359,7 @@ class Transcriber:
 
         # Proactively clear context if it has itself become repetitive — this
         # prevents a contaminated prompt from seeding the next call.
-        prompt = self._context[-self.PROMPT_CHARS:]
+        prompt = self._context[-self.prompt_chars:]
         if prompt and _repetition_ratio(prompt) < _HALLUCINATION_THRESHOLD:
             log.warn("transcriber", "Context contaminated by repetition — clearing")
             self._context = ""
@@ -359,18 +368,19 @@ class Transcriber:
         try:
             segments, _ = self.model.transcribe(
                 audio,
-                beam_size=2,
+                beam_size=self.beam_size,
                 language="en",
                 vad_filter=use_vad,
                 vad_parameters=(
-                    {"min_silence_duration_ms": 300, "speech_pad_ms": 150}
+                    {
+                        "min_silence_duration_ms": self.vad_min_silence_ms,
+                        "speech_pad_ms": self.vad_speech_pad_ms,
+                    }
                     if use_vad else None
                 ),
                 condition_on_previous_text=True,
                 initial_prompt=prompt or None,
-                # Lower than the default 2.4 — when exceeded faster-whisper
-                # automatically retries without initial_prompt, breaking loops.
-                compression_ratio_threshold=2.0,
+                compression_ratio_threshold=self.compression_ratio_threshold,
                 word_timestamps=False,
             )
             parts = [seg.text.strip() for seg in segments if seg.text.strip()]
@@ -381,7 +391,7 @@ class Transcriber:
                     log.warn("transcriber", f"[{label}] Hallucination loop detected — discarding")
                     self._context = ""
                     return
-                self._context = (self._context + " " + text)[-self.PROMPT_CHARS * 2:]
+                self._context = (self._context + " " + text)[-self.prompt_chars * 2:]
                 preview = text[:60] + ("…" if len(text) > 60 else "")
                 log.info("transcriber", f"[{label}] {preview!r}")
                 self.on_text_callback(text, label, start_time, end_time)
@@ -415,9 +425,9 @@ class Transcriber:
         last_offset  = -1     # sample offset of the most recent chunk
 
         chunks_per_second      = self.sample_rate / self.CHUNK_SIZE
-        silence_chunk_thresh   = int(self.SILENCE_DURATION_S * chunks_per_second)
-        min_buffer_chunks      = int(self.MIN_BUFFER_SECONDS  * chunks_per_second)
-        max_buffer_chunks      = int(self.MAX_BUFFER_SECONDS  * chunks_per_second)
+        silence_chunk_thresh   = int(self.silence_duration * chunks_per_second)
+        min_buffer_chunks      = int(self.min_buffer_seconds  * chunks_per_second)
+        max_buffer_chunks      = int(self.max_buffer_seconds  * chunks_per_second)
 
         def _flush() -> None:
             nonlocal silence_chunks, first_offset, last_offset
@@ -460,7 +470,7 @@ class Transcriber:
                 samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32_768.0
                 rms = float(np.sqrt(np.mean(samples ** 2)))
 
-                if rms < self.SILENCE_THRESHOLD:
+                if rms < self.silence_threshold:
                     silence_chunks += 1
                 else:
                     silence_chunks = 0

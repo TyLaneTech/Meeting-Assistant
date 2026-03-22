@@ -112,11 +112,9 @@ warnings.filterwarnings(
     module="pyannote",
 )
 
-_MERGE_GAP_SECONDS = 0.1      # merge same-speaker turns with gaps smaller than this
-
-
 def _merge_turns(
     turns: list[tuple[str, float, float]],
+    merge_gap: float = 0.1,
 ) -> list[tuple[str, float, float]]:
     """Merge consecutive same-speaker turns with small gaps between them."""
     if not turns:
@@ -124,7 +122,7 @@ def _merge_turns(
     merged: list[tuple[str, float, float]] = [turns[0]]
     for label, start, end in turns[1:]:
         prev_label, prev_start, prev_end = merged[-1]
-        if label == prev_label and (start - prev_end) <= _MERGE_GAP_SECONDS:
+        if label == prev_label and (start - prev_end) <= merge_gap:
             merged[-1] = (prev_label, prev_start, end)
         else:
             merged.append((label, start, end))
@@ -151,21 +149,30 @@ class DiartDiarizer:
     """
 
     SAMPLE_RATE = 16_000
-    _STEP_SECONDS     = 0.5   # pipeline advances by this much per call
-    _DURATION_SECONDS = 5.0   # context window fed to the segmentation model
 
     def __init__(self, hf_token: str, device: str | None = None) -> None:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device_name = device
-        dev = torch.device(device)
-        log.info("diarizer", f"Loading diart pipeline on {dev}…")
+        self._dev = torch.device(device)
+        log.info("diarizer", f"Loading diart pipeline on {self._dev}…")
 
         from diart import SpeakerDiarization, SpeakerDiarizationConfig
         from diart.models import SegmentationModel, EmbeddingModel
 
+        # Load saved audio params
+        from default_audio_params import DIARIZATION_DEFAULTS
+        import settings as _settings
+        saved = _settings.load().get("audio_params", {})
+        p = {}
+        for key, spec in DIARIZATION_DEFAULTS.items():
+            p[key] = saved.get(key, spec["value"])
+
+        self._step_seconds     = float(p["step_seconds"])
+        self._duration_seconds = float(p["duration_seconds"])
+        self._merge_gap        = float(p["merge_gap_seconds"])
+
         # Load the same underlying models pyannote/speaker-diarization-3.1 uses.
-        # These are already cached locally if StreamingDiarizer was ever used.
         seg = SegmentationModel.from_pretrained(
             "pyannote/segmentation-3.0", use_hf_token=hf_token
         )
@@ -176,13 +183,13 @@ class DiartDiarizer:
         self._config = SpeakerDiarizationConfig(
             segmentation=seg,
             embedding=emb,
-            duration=self._DURATION_SECONDS,
-            step=self._STEP_SECONDS,
-            latency=self._STEP_SECONDS,
-            tau_active=0.5,    # voice-activity threshold (lower = more sensitive)
-            rho_update=0.422,  # centroid update threshold
-            delta_new=0.5,     # min embedding distance to create a new speaker (was 1.0 — too lenient)
-            device=dev,
+            duration=self._duration_seconds,
+            step=self._step_seconds,
+            latency=self._step_seconds,   # match step for minimal output delay
+            tau_active=float(p["tau_active"]),
+            rho_update=float(p["rho_update"]),
+            delta_new=float(p["delta_new"]),
+            device=self._dev,
         )
         self._pipeline = SpeakerDiarization(self._config)
 
@@ -194,7 +201,7 @@ class DiartDiarizer:
         # Map diart's internal speaker IDs → session-wide "Speaker N" labels
         self._speaker_map: dict[str, str] = {}
         self._next_label = 1
-        log.info("diarizer", f"diart ready on {dev}.")
+        log.info("diarizer", f"diart ready on {self._dev}.")
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -228,8 +235,8 @@ class DiartDiarizer:
         # Append new audio to the rolling buffer
         self._buf = np.concatenate([self._buf, audio])
 
-        duration_samples = int(self._DURATION_SECONDS * self.SAMPLE_RATE)
-        step_samples     = int(self._STEP_SECONDS     * self.SAMPLE_RATE)
+        duration_samples = int(self._duration_seconds * self.SAMPLE_RATE)
+        step_samples     = int(self._step_seconds     * self.SAMPLE_RATE)
 
         all_segs: list[tuple[str, float, float]] = []
 
@@ -250,8 +257,8 @@ class DiartDiarizer:
             if annotation is not None:
                 # Only use the annotation from the latest step slice to avoid
                 # re-emitting speech that was returned in a prior step.
-                step_end_abs   = self._buf_start_sec + self._DURATION_SECONDS
-                step_start_abs = step_end_abs - self._STEP_SECONDS
+                step_end_abs   = self._buf_start_sec + self._duration_seconds
+                step_start_abs = step_end_abs - self._step_seconds
 
                 for segment, _, raw_label in annotation.itertracks(yield_label=True):
                     # Clip segment to the latest step window
@@ -272,7 +279,7 @@ class DiartDiarizer:
 
             # Advance the buffer by one step
             self._buf = self._buf[step_samples:]
-            self._buf_start_sec += self._STEP_SECONDS
+            self._buf_start_sec += self._step_seconds
 
         all_segs.sort(key=lambda x: x[1])
 
@@ -286,7 +293,7 @@ class DiartDiarizer:
                 deduped.append((label, start, end))
         all_segs = deduped
 
-        merged = _merge_turns(all_segs)
+        merged = _merge_turns(all_segs, self._merge_gap)
 
         return merged
 
@@ -299,6 +306,16 @@ class DiartDiarizer:
         self._total_fed_sec = 0.0
         self._speaker_map.clear()
         self._next_label = 1
+
+    def apply_params(self, params: dict) -> None:
+        """Update runtime-tunable diarization parameters from settings.
+
+        Note: step_seconds, duration_seconds, tau_active, rho_update, and
+        delta_new are baked into the pipeline config at init time.  Changing
+        them requires a diarizer reload (next session start).  merge_gap is
+        applied immediately.
+        """
+        self._merge_gap = float(params.get("merge_gap_seconds", self._merge_gap))
 
     def merge_speakers(self, keep_label: str, merge_label: str) -> None:
         """Redirect all internal IDs mapped to merge_label → keep_label."""

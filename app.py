@@ -1419,6 +1419,75 @@ def set_preferences():
     return jsonify(updated)
 
 
+@app.route("/api/audio_params", methods=["GET"])
+def get_audio_params():
+    """Return current audio parameter values, defaults, and metadata."""
+    from default_audio_params import (
+        TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, get_all_defaults,
+    )
+    saved = settings.load().get("audio_params", {})
+    defaults = get_all_defaults()
+    current = {**defaults, **saved}
+    return jsonify({
+        "current": current,
+        "transcription": TRANSCRIPTION_DEFAULTS,
+        "diarization": DIARIZATION_DEFAULTS,
+    })
+
+
+@app.route("/api/audio_params", methods=["PUT"])
+def set_audio_params():
+    """Update one or more audio parameters."""
+    from default_audio_params import get_all_defaults
+    data = request.get_json(silent=True) or {}
+    all_settings = settings.load()
+    params = all_settings.get("audio_params", {})
+    defaults = get_all_defaults()
+    for key, val in data.items():
+        if key in defaults:
+            params[key] = val
+    settings.put("audio_params", params)
+    # Apply to running transcriber/diarizer
+    _apply_audio_params({**defaults, **params})
+    return jsonify({"ok": True, "audio_params": {**defaults, **params}})
+
+
+@app.route("/api/audio_params/reset", methods=["POST"])
+def reset_audio_param():
+    """Reset one or all audio parameters to defaults."""
+    from default_audio_params import get_all_defaults, get_default
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    all_settings = settings.load()
+    params = all_settings.get("audio_params", {})
+    if key:
+        params.pop(key, None)
+    else:
+        params = {}
+    settings.put("audio_params", params)
+    defaults = get_all_defaults()
+    current = {**defaults, **params}
+    _apply_audio_params(current)
+    return jsonify({"ok": True, "audio_params": current})
+
+
+def _apply_audio_params(params: dict) -> None:
+    """Push audio parameter values to the running transcriber."""
+    _transcriber.silence_threshold = float(params.get("silence_threshold", 0.025))
+    _transcriber.silence_duration  = float(params.get("silence_duration", 0.3))
+    _transcriber.min_buffer_seconds = float(params.get("min_buffer_seconds", 0.5))
+    _transcriber.max_buffer_seconds = float(params.get("max_buffer_seconds", 10.0))
+    _transcriber.beam_size         = int(params.get("beam_size", 2))
+    _transcriber.prompt_chars      = int(params.get("prompt_chars", 800))
+    _transcriber.vad_min_silence_ms = int(params.get("vad_min_silence_ms", 300))
+    _transcriber.vad_speech_pad_ms  = int(params.get("vad_speech_pad_ms", 150))
+    _transcriber.compression_ratio_threshold = float(
+        params.get("compression_ratio_threshold", 2.0)
+    )
+    if _transcriber.diarizer is not None:
+        _transcriber.diarizer.apply_params(params)
+
+
 @app.route("/api/models", methods=["GET"])
 def get_models():
     """Return current model config and available presets."""
