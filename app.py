@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
@@ -112,9 +113,11 @@ _state: dict = {
     "speaker_audio_accum":    {},  # speaker_key → {"audio": np.ndarray, "total_sec": float}
     "speaker_emb_counts":     {},  # speaker_key → int (embeddings extracted this session)
     "fingerprint_dismissals": {},  # speaker_key → set[global_id]
+    "speaker_offer_counts":   {},  # speaker_key → int (audio offers for diminishing returns)
 }
 _state_lock = threading.Lock()
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
+_fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
 _tray = None  # MeetingTray instance (set in main(), None if no tray)
 
 AUTO_SUMMARY_EVERY = 6  # trigger summary after this many new segments
@@ -265,6 +268,72 @@ def _build_session_meta(
     }
 
 
+# ── Noise / filler detection ──────────────────────────────────────────────────
+
+_NOISE_LABEL = "[Noise]"
+
+# Single filler words / sounds (case-insensitive, matched after stripping punctuation)
+_FILLER_WORDS = frozenset({
+    "um", "uh", "hm", "hmm", "huh", "mm", "mhm", "mmhmm", "ah", "oh",
+    "yeah", "yep", "yup", "nah", "nope", "okay", "ok", "hey", "hi",
+    "yes", "no", "so", "and", "but", "like", "right", "sure", "well",
+    "sorry", "thanks", "deal", "cool", "wow", "alright", "bye",
+    "heh", "hah", "ha", "lol",
+})
+
+# Patterns that are noise when they appear as the entire text
+_NOISE_PATTERNS = [
+    re.compile(r"^(ha|he|heh|hah|ho)+[.!?…]*$", re.I),           # laughter
+    re.compile(r"^[.…!?\-–—\s]+$"),                                # pure punctuation
+    re.compile(r"^(um|uh|ah|oh|hm|mm|mhm|mmhmm)[\s,.…!?]*$", re.I),  # pure filler sounds
+]
+
+_NOISE_STRIP_PUNCT = re.compile(r"[^\w\s]")
+
+
+def _is_noise_segment(text: str, duration: float) -> bool:
+    """Return True if *text* looks like filler / noise rather than real speech.
+
+    Criteria (all require the segment to be very short):
+    - Single filler word (e.g. "Yeah.", "Um...", "Okay")
+    - Two-word filler combos (e.g. "Sorry. Yeah.", "Heh heh.")
+    - Trailing-off fragment ≤3 words ending with "…" or "..."
+    - Matches a noise regex (laughter, pure punctuation)
+    - Duration under 1.5 s with ≤2 words
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    # Normalize
+    clean = _NOISE_STRIP_PUNCT.sub("", stripped).strip().lower()
+    words = clean.split()
+    word_count = len(words)
+
+    # Check noise regex patterns on full text
+    for pat in _NOISE_PATTERNS:
+        if pat.match(stripped):
+            return True
+
+    # Single filler word
+    if word_count == 1 and words[0] in _FILLER_WORDS:
+        return True
+
+    # Two filler words (e.g. "Sorry. Yeah.", "Heh heh.", "Oh okay")
+    if word_count == 2 and all(w in _FILLER_WORDS for w in words):
+        return True
+
+    # Short trailing fragment (≤3 words ending in … or ...)
+    if word_count <= 3 and (stripped.endswith("…") or stripped.endswith("...")):
+        return True
+
+    # Very short duration with very few words
+    if duration < 1.5 and word_count <= 2:
+        return True
+
+    return False
+
+
 # ── Transcription callback ────────────────────────────────────────────────────
 
 def _on_segment(
@@ -280,6 +349,11 @@ def _on_segment(
         sid = _state["session_id"]
         if not sid:
             return
+
+        # Auto-detect noise/filler segments from diarized speakers
+        duration = end_time - start_time if end_time > start_time else 0.0
+        if source.startswith("Speaker") and _is_noise_segment(text, duration):
+            source = _NOISE_LABEL
 
         segments = _state["segments"]
 
@@ -338,6 +412,7 @@ def _on_segment(
         storage.update_segment(merge_seg_id, text, end_time)
         _push("transcript_update", {
             "seg_id": merge_seg_id, "text": text, "end_time": end_time,
+            "session_id": sid,
         })
     else:
         seg_id = storage.save_segment(sid, text, source, start_time, end_time)
@@ -603,6 +678,8 @@ def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, sess
     _push("fingerprint_auto_applied", {"session_id": session_id, "speaker_key": speaker_key,
                                        "global_id": global_id, "name": name,
                                        "similarity": match["similarity"]})
+    _push("speaker_linked", {"session_id": session_id, "speaker_key": speaker_key,
+                              "global_id": global_id, "name": name})
     log.info("fingerprint", f"Auto-applied {name!r} → {speaker_key} (sim={match['similarity']:.2f})")
 
 
@@ -621,8 +698,15 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         if not sid:
             return
         counts = _state["speaker_emb_counts"]
-        if counts.get(speaker_key, 0) >= 3:
-            return  # enough embeddings already extracted this session
+        count = counts.get(speaker_key, 0)
+        if count >= 15:
+            return  # hard cap for this session
+        if count >= 5:
+            # Diminishing returns: only extract every 3rd opportunity
+            offers = _state["speaker_offer_counts"]
+            offers[speaker_key] = offers.get(speaker_key, 0) + 1
+            if offers[speaker_key] % 3 != 0:
+                return
         accum = _state["speaker_audio_accum"]
         if speaker_key not in accum:
             accum[speaker_key] = {"audio": audio.copy(), "total_sec": duration}
@@ -1472,6 +1556,36 @@ def update_segment_label(seg_id: int):
     if not label:
         return jsonify({"error": "label is required"}), 400
     storage.save_segment_label_override(seg_id, label)
+
+    # Train voice library from this correction
+    if fingerprint_db.ready:
+        def _train_from_override():
+            seg = storage.get_segment(seg_id)
+            if not seg:
+                return
+            wav_path = Path(__file__).parent / "data" / "audio" / f"{seg['session_id']}.wav"
+            if not wav_path.exists():
+                return
+            if seg["end_time"] - seg["start_time"] < fingerprint_db.MIN_DURATION_SEC:
+                return
+            profile = fingerprint_db.find_by_name(label)
+            if profile is None:
+                gid = fingerprint_db.create_global_speaker(label)
+            else:
+                gid = profile["id"]
+            emb = fingerprint_db.extract_embedding_from_wav(
+                str(wav_path), seg["start_time"], seg["end_time"])
+            if emb is not None:
+                fingerprint_db.add_embedding(gid, seg["session_id"], seg["source"], emb,
+                                             seg["end_time"] - seg["start_time"])
+                fingerprint_db.link_session_speaker(seg["session_id"], seg["source"], gid)
+                _push("speaker_linked", {
+                    "session_id": seg["session_id"], "speaker_key": seg["source"],
+                    "global_id": gid, "name": label,
+                })
+                log.info("fingerprint", f"Trained from segment override: {label!r} (seg {seg_id})")
+        _fp_executor.submit(_train_from_override)
+
     return jsonify({"ok": True})
 
 
@@ -1593,18 +1707,48 @@ def update_speaker_label(session_id: str):
                 log.info("fingerprint", f"Auto-created profile {label!r} from session label")
             else:
                 gid = profile["id"]
-                # If the profile exists but has a differently-cased name, keep
-                # the stored casing (don't rename just because of case difference).
             for k in keys:
                 existing = fingerprint_db.get_link(sid, k)
                 if existing != gid:
                     fingerprint_db.link_session_speaker(sid, k, gid)
-        threading.Thread(
-            target=_sync_voice_profile,
-            args=(session_id, [s["speaker_key"] for s in updated_speakers],
-                  name, color),
-            daemon=True,
-        ).start()
+                _push("speaker_linked", {
+                    "session_id": sid, "speaker_key": k,
+                    "global_id": gid, "name": label,
+                })
+            # Extract embeddings to strengthen the profile
+            for k in keys:
+                # Try live accumulator first
+                with _state_lock:
+                    accum = _state.get("speaker_audio_accum", {})
+                    seg_audio = accum.get(k, {}).get("audio")
+                    seg_audio = seg_audio.copy() if seg_audio is not None else None
+                if seg_audio is not None and len(seg_audio) / 16000 >= fingerprint_db.MIN_DURATION_SEC:
+                    emb = fingerprint_db.extract_embedding(seg_audio)
+                    if emb is not None:
+                        fingerprint_db.add_embedding(gid, sid, k, emb, len(seg_audio) / 16000)
+                        log.info("fingerprint", f"Added embedding from accumulator for {label!r}")
+                        continue
+                # Fallback: extract from WAV file (past session or accumulator empty)
+                wav_path = Path(__file__).parent / "data" / "audio" / f"{sid}.wav"
+                if wav_path.exists():
+                    segments = storage.get_segments_by_speaker(sid, k)
+                    added = 0
+                    for seg in segments:
+                        if added >= 5:
+                            break
+                        emb = fingerprint_db.extract_embedding_from_wav(
+                            str(wav_path), seg["start_time"], seg["end_time"])
+                        if emb is not None:
+                            fingerprint_db.add_embedding(gid, sid, k, emb,
+                                                         seg["end_time"] - seg["start_time"])
+                            added += 1
+                    if added:
+                        log.info("fingerprint", f"Added {added} embeddings from WAV for {label!r}")
+        _fp_executor.submit(
+            _sync_voice_profile,
+            session_id, [s["speaker_key"] for s in updated_speakers],
+            name, color,
+        )
     # ── End auto-link ──────────────────────────────────────────────────────────
 
     return jsonify({"ok": True, "speakers": updated_speakers})
@@ -1883,6 +2027,32 @@ def fp_speaker_sessions(global_id: str):
     return jsonify(sessions)
 
 
+@app.route("/api/fingerprint/speakers/bulk", methods=["DELETE"])
+def fp_bulk_delete():
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids", [])
+    if not ids or not isinstance(ids, list):
+        return jsonify({"error": "ids list is required"}), 400
+    for gid in ids:
+        fingerprint_db.delete_global_speaker(str(gid))
+    return jsonify({"ok": True, "deleted": len(ids)})
+
+
+@app.route("/api/fingerprint/speakers/bulk/optimize", methods=["POST"])
+def fp_bulk_optimize():
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids", [])
+    if not ids or not isinstance(ids, list):
+        return jsonify({"error": "ids list is required"}), 400
+    for gid in ids:
+        fingerprint_db.prune_embeddings(str(gid), keep_newest=30)
+    return jsonify({"ok": True, "optimized": len(ids)})
+
+
 @app.route("/api/fingerprint/confirm", methods=["POST"])
 def fp_confirm():
     """User accepted a fingerprint match suggestion."""
@@ -1920,6 +2090,13 @@ def fp_confirm():
         _push("speaker_label", {"session_id": session_id, "speaker_key": key,
                                  "name": name, "color": color})
 
+    # Push linked event for badge indicators
+    for key in keys_to_link:
+        _push("speaker_linked", {
+            "session_id": session_id, "speaker_key": key,
+            "global_id": global_id, "name": name,
+        })
+
     # Add embedding for this speaker_key from the latest stored embedding
     latest = fingerprint_db.get_latest_embedding(global_id, session_id, speaker_key)
     if latest is None:
@@ -1927,13 +2104,33 @@ def fp_confirm():
         with _state_lock:
             accum = _state.get("speaker_audio_accum", {})
             seg_audio = accum.get(speaker_key, {}).get("audio")
+            seg_audio = seg_audio.copy() if seg_audio is not None else None
 
         if seg_audio is not None and len(seg_audio) > 0:
             def _add_emb():
                 emb = fingerprint_db.extract_embedding(seg_audio)
                 if emb is not None:
                     fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0)
-            threading.Thread(target=_add_emb, daemon=True).start()
+            _fp_executor.submit(_add_emb)
+        else:
+            # Fallback: extract from WAV file
+            wav_path = Path(__file__).parent / "data" / "audio" / f"{session_id}.wav"
+            if wav_path.exists():
+                def _add_wav_embs():
+                    segments = storage.get_segments_by_speaker(session_id, speaker_key)
+                    added = 0
+                    for seg in segments:
+                        if added >= 3:
+                            break
+                        emb = fingerprint_db.extract_embedding_from_wav(
+                            str(wav_path), seg["start_time"], seg["end_time"])
+                        if emb is not None:
+                            fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb,
+                                                         seg["end_time"] - seg["start_time"])
+                            added += 1
+                    if added:
+                        log.info("fingerprint", f"Added {added} WAV embeddings on confirm for {name!r}")
+                _fp_executor.submit(_add_wav_embs)
 
     log.info("fingerprint", f"Confirmed {name!r} for {speaker_key} in session {session_id[:8]}")
     return jsonify({"ok": True})
@@ -1981,6 +2178,8 @@ def fp_link_session_speaker(session_id: str):
         return jsonify({"error": "Global speaker not found"}), 404
 
     fingerprint_db.link_session_speaker(session_id, speaker_key, global_id)
+    _push("speaker_linked", {"session_id": session_id, "speaker_key": speaker_key,
+                              "global_id": global_id, "name": profile["name"]})
     # Optionally apply the global name/color to this session speaker
     if data.get("apply_name"):
         storage.save_speaker_label(session_id, speaker_key, name=profile["name"], color=profile.get("color"))
@@ -2161,7 +2360,9 @@ def main() -> None:
 
         def _state_snapshot() -> dict:
             with _state_lock:
-                return {**_state}
+                snap = {**_state}
+            snap["ai_provider"] = settings.get("ai_provider", "anthropic")
+            return snap
 
         def _on_tray_quit(icon) -> None:
             # Same as /api/shutdown but called from the tray

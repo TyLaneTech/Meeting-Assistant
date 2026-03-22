@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Meeting Assistant</title>
   <link rel="icon" id="favicon" href="/static/images/logo.png" type="image/png">
+  <link rel="stylesheet" href="/static/fontAwesome/css/all.min.css">
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -17,21 +18,24 @@
   <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
-      <div style="display:flex;align-items:center;gap:4px">
-        <span class="sidebar-title">Sessions</span>
-        <button class="icon-btn emoji folder-btn" onclick="createFolder()" title="New folder">📁</button>
-        <button class="icon-btn emoji multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions">✅</button>
+      <div class="sidebar-header-pinned">
+        <button class="icon-btn new-session-btn" onclick="newSession()" title="New session"><i class="fa-solid fa-plus"></i></button>
+        <button class="icon-btn sidebar-toggle-btn" id="sidebar-close-btn" onclick="toggleSidebar()" title="Collapse sidebar"><i class="fa-solid fa-bars"></i></button>
       </div>
-      <div style="display:flex;align-items:center;gap:4px">
-        <button class="icon-btn emoji new-session-btn" onclick="newSession()" title="New session">➕</button>
-        <button class="icon-btn sidebar-toggle-btn" id="sidebar-close-btn" onclick="toggleSidebar()" title="Collapse sidebar">☰</button>
+      <div class="sidebar-header-row">
+        <span class="sidebar-title">Sessions</span>
+        <div class="sidebar-header-tools">
+          <button class="icon-btn folder-btn" onclick="createFolder()" title="New folder"><i class="fa-solid fa-folder-plus"></i></button>
+          <button class="icon-btn" onclick="openFingerprintPanel()" title="Voice Library"><i class="fa-solid fa-waveform-lines"></i></button>
+          <button class="icon-btn multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions"><i class="fa-solid fa-list-check"></i></button>
+        </div>
       </div>
     </div>
     <div class="sidebar-bulk-bar hidden" id="sidebar-bulk-bar">
       <span class="sidebar-bulk-count" id="sidebar-bulk-count">0 selected</span>
-      <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI">⟳ Titles</button>
-      <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()">✕ Delete</button>
-      <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()">✕</button>
+      <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI"><i class="fa-solid fa-arrows-rotate"></i> Titles</button>
+      <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()"><i class="fa-solid fa-trash"></i> Delete</button>
+      <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()"><i class="fa-solid fa-xmark"></i></button>
     </div>
     <div class="sidebar-body" id="session-list">
       <p class="sidebar-empty">No past sessions yet.</p>
@@ -39,7 +43,7 @@
     <div class="model-config" id="model-config">
       <button class="model-config-toggle" onclick="toggleModelConfig()">
         <span class="model-config-label">Models</span>
-        <span class="model-config-arrow" id="model-config-arrow">▸</span>
+        <span class="model-config-arrow" id="model-config-arrow"><i class="fa-solid fa-chevron-right"></i></span>
       </button>
       <div class="model-config-body hidden" id="model-config-body">
         <div class="model-config-row">
@@ -66,7 +70,7 @@
         <select id="viz-loopback-sel" class="viz-select" onchange="saveDeviceSelection()">
           <option value="">— loading —</option>
         </select>
-        <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list">↻</button>
+        <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list"><i class="fa-solid fa-rotate-right"></i></button>
       </div>
       <div class="viz-gain-row">
         <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
@@ -104,7 +108,7 @@
       </div>
 
       <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
-        ▶ Test Audio
+        <i class="fa-solid fa-play"></i> Test Audio
       </button>
     </div>
   </aside>
@@ -117,13 +121,13 @@
       <div class="topbar-left">
         <button class="icon-btn sidebar-toggle-btn" id="sidebar-open-btn"
                 onclick="toggleSidebar()" title="Open sessions sidebar"
-                style="display:none">☰</button>
+                style="display:none"><i class="fa-solid fa-bars"></i></button>
         <img id="brand-icon" class="brand-icon" src="/static/images/logo.png" alt="">
         <span class="brand-name">Meeting Assistant</span>
       </div>
       <div class="topbar-right">
         <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
-          <span class="btn-icon">▶</span> Start Recording
+          <span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording
         </button>
         <div class="status-pill" id="status-pill">
           <span class="status-dot" id="status-dot"></span>
@@ -132,10 +136,10 @@
         </div>
         <div class="topbar-sep"></div>
         <button class="btn btn-settings" onclick="openSettings()" title="Settings">
-          ⚙ Settings
+          <i class="fa-solid fa-gear"></i> Settings
         </button>
         <button class="btn btn-danger" onclick="confirmShutdown()" title="Stop the server and close">
-          ⏻ Shut Down
+          <i class="fa-solid fa-power-off"></i> Shut Down
         </button>
       </div>
     </header>
@@ -151,13 +155,75 @@
             <button class="icon-btn active" id="auto-scroll-btn" title="Auto-scroll to latest" onclick="toggleAutoScroll()">Auto</button>
           </div>
           <div class="col-actions right">
-            <button class="icon-btn emoji" title="Copy transcript" onclick="copyTranscript()">📋</button>
-            <button class="icon-btn emoji" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)">🔎</button>
-            <button class="icon-btn emoji" title="Clear transcript" onclick="clearTranscript()">❌</button>
+            <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-magnifying-glass"></i></button>
+            <button class="icon-btn" title="Copy transcript" onclick="copyTranscript()"><i class="fa-solid fa-clipboard"></i></button>
+            <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-solid fa-eraser"></i></button>
           </div>
         </div>
+
+        <!-- ── Transcript Navigator Panel ─────────────────────────────── -->
+        <div id="transcript-navigator" class="transcript-navigator collapsed">
+
+          <!-- Search with match navigation -->
+          <div class="tn-row tn-search-row">
+            <i class="fa-solid fa-magnifying-glass tn-search-icon"></i>
+            <input type="text" id="tn-search-input" class="tn-search-input" placeholder="Search transcript…" />
+            <span id="tn-match-count" class="tn-match-count"></span>
+            <button class="icon-btn tn-nav-btn" id="tn-prev-match" title="Previous match" onclick="tnPrevMatch()"><i class="fa-solid fa-chevron-up"></i></button>
+            <button class="icon-btn tn-nav-btn" id="tn-next-match" title="Next match" onclick="tnNextMatch()"><i class="fa-solid fa-chevron-down"></i></button>
+          </div>
+
+          <!-- Speaker filter pills -->
+          <div class="tn-row tn-speakers-row">
+            <button class="tn-pill tn-pill-meta" id="tn-pill-all" onclick="tnToggleAllSpeakers(true)" title="Show all speakers">All</button>
+            <button class="tn-pill tn-pill-meta" id="tn-pill-none" onclick="tnToggleAllSpeakers(false)" title="Hide all speakers">None</button>
+            <div id="tn-speaker-pills" class="tn-speaker-pills"></div>
+          </div>
+
+          <!-- Tools row: reassign + time range -->
+          <!-- --
+          <div class="tn-row tn-tools-row">
+            <div class="tn-reassign-group">
+              <div class="reassign-left">
+                <span class="tn-tool-label">Replace</span>
+                <select id="tn-reassign-from" class="tn-select"><option value="" disabled selected>from…</option></select>
+                <i class="fa-solid fa-arrow-right tn-arrow"></i>
+                <select id="tn-reassign-to" class="tn-select"><option value="" disabled selected>to…</option></select>
+              </div>
+              <div class="reassign-right">
+                <label class="tn-checkbox-label"><input type="checkbox" id="tn-reassign-visible-only" checked /> visible only</label>
+                <button class="tn-apply-btn" onclick="tnApplyReassign()"><i class="fa-solid fa-check"></i> Apply</button>
+              </div>
+              </div>
+          </div>
+          -->
+          <!-- Stats row (collapsible) -->
+          <div class="tn-row tn-stats-row">
+            <button class="tn-stats-toggle" onclick="tnToggleStats()"><i class="fa-solid fa-chart-bar"></i> Speaker Stats</button>
+            <div id="tn-stats-body" class="tn-stats-body collapsed"></div>
+          </div>
+
+
+          <div class="tn-row tn-time-row">
+            <i class="fa-solid fa-clock tn-time-icon"></i>
+            <span id="tn-time-label-start" class="tn-time-label">0:00</span>
+            <div class="tn-range-track" id="tn-range-track">
+              <div class="tn-range-fill" id="tn-range-fill"></div>
+              <input type="range" class="tn-range-handle tn-range-min" id="tn-range-min" min="0" max="100" value="0" step="0.5" />
+              <input type="range" class="tn-range-handle tn-range-max" id="tn-range-max" min="0" max="100" value="100" step="0.5" />
+            </div>
+            <span id="tn-time-label-end" class="tn-time-label">0:00</span>
+          </div>
+
+          <!-- Footer -->
+          <!--
+          <div class="tn-row tn-footer-row">
+            <button class="tn-clear-btn" onclick="tnClearAll()"><i class="fa-solid fa-xmark"></i> Clear all filters</button>
+            </div>-->
+        </div>
+
         <div id="playback-bar" class="playback-bar hidden">
-          <button class="icon-btn playback-play-btn" id="playback-play" onclick="togglePlayback()" title="Play/Pause">▶</button>
+          <button class="icon-btn playback-play-btn" id="playback-play" onclick="togglePlayback()" title="Play/Pause"><i class="fa-solid fa-play"></i></button>
           <span class="playback-time" id="playback-time">0:00</span>
           <input type="range" class="playback-seek" id="playback-seek" min="0" max="100" step="0.1" value="0"
                  oninput="seekPlayback(this.value)" />
@@ -176,7 +242,7 @@
           <input id="tsb-input" class="tsb-input" type="text" list="tsb-datalist" placeholder="Reassign to…" />
           <datalist id="tsb-datalist"></datalist>
           <button class="tsb-btn tsb-apply" onclick="applyTranscriptBulkReassign()">Apply</button>
-          <button class="tsb-btn tsb-clear" onclick="clearTranscriptSelection()">&#x2715;</button>
+          <button class="tsb-btn tsb-clear" onclick="clearTranscriptSelection()"><i class="fa-solid fa-xmark"></i></button>
         </div>
         <div id="transcript" class="col-body transcript-body">
           <p class="empty-hint">Transcript will appear here once recording starts.</p>
@@ -194,8 +260,8 @@
             <button class="icon-btn active" id="auto-summary-btn"
                     title="Toggle auto-summary" onclick="toggleAutoSummary()">Auto</button>
             <button class="icon-btn" id="summary-prompt-toggle"
-                    title="Custom summary instructions" onclick="toggleSummaryPrompt()">⚙</button>
-            <button class="icon-btn" title="Refresh summary" onclick="triggerSummary()">↻</button>
+                    title="Custom summary instructions" onclick="toggleSummaryPrompt()"><i class="fa-solid fa-gear"></i></button>
+            <button class="icon-btn" title="Refresh summary" onclick="triggerSummary()"><i class="fa-solid fa-rotate-right"></i></button>
           </div>
         </div>
         <div id="summary-prompt-area" class="summary-prompt-area hidden">
@@ -222,7 +288,7 @@
             <span class="col-subtitle" id="chat-model-label"></span>
           </div>
           <div class="col-actions">
-            <button class="icon-btn" title="Clear chat" onclick="clearChat()">✕</button>
+            <button class="icon-btn" title="Clear chat" onclick="clearChat()"><i class="fa-solid fa-xmark"></i></button>
           </div>
         </div>
         <div id="chat-messages" class="col-body chat-body">
@@ -250,7 +316,7 @@
     <div class="speaker-manager-header">
       <h3 class="speaker-manager-title">Speakers</h3>
       <p class="speaker-manager-subtitle" id="speaker-manager-subtitle">Manage speaker names, colors, and bulk assignments.</p>
-      <button class="icon-btn speaker-manager-close" onclick="closeSpeakerManager()">&#x2715;</button>
+      <button class="icon-btn speaker-manager-close" onclick="closeSpeakerManager()"><i class="fa-solid fa-xmark"></i></button>
     </div>
 
     <span class="speaker-editor-hint" id="speaker-editor-hint">Click · Ctrl multi · Shift range</span>
@@ -266,10 +332,10 @@
         <div class="speaker-editor-actions">
           <div class="left-actions">
             <button class="speaker-manager-btn speaker-manager-btn-primary" id="speaker-save-btn" onclick="applySpeakerEditor()">Save</button>
-            <button class="speaker-manager-btn speaker-manager-btn-secondary" id="speaker-add-btn" onclick="createSpeakerProfile()">+ Add</button>
+            <button class="speaker-manager-btn speaker-manager-btn-secondary" id="speaker-add-btn" onclick="createSpeakerProfile()"><i class="fa-solid fa-plus"></i> Add</button>
             <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="clearSpeakerSelection()">Clear</button>
           </div>
-          <button class="speaker-manager-btn speaker-manager-btn-ghost fp-lib-btn" onclick="openFingerprintPanel()" title="Manage cross-session voice profiles">Voice Library</button>
+          <button class="speaker-manager-btn speaker-manager-btn-ghost fp-lib-btn" onclick="openFingerprintPanel()" title="Manage cross-session voice profiles"><i class="fa-solid fa-waveform-lines"></i> Voice Library</button>
         </div>
       </div>
     </div>
@@ -298,11 +364,26 @@
     <div class="fingerprint-panel-header">
       <h3>Voice Library</h3>
       <p class="fingerprint-panel-subtitle">Cross-session speaker identity profiles</p>
-      <button class="icon-btn fingerprint-panel-close" onclick="closeFingerprintPanel()">&#x2715;</button>
+      <button class="icon-btn fingerprint-panel-close" onclick="closeFingerprintPanel()"><i class="fa-solid fa-xmark"></i></button>
     </div>
     <div class="fingerprint-panel-body">
       <div class="fingerprint-panel-list" id="fingerprint-profile-list">
-        <div class="fp-panel-empty">No voice profiles yet.</div>
+        <div class="fp-list-toolbar">
+          <input type="text" class="fp-search-input" id="fp-search-input" placeholder="Search profiles..." oninput="_fpFilterList()" />
+          <button type="button" class="icon-btn fp-select-toggle" id="fp-select-toggle" title="Select multiple" onclick="_fpToggleSelectMode()"><i class="fa-solid fa-check-double"></i></button>
+        </div>
+        <div class="fp-select-bar hidden" id="fp-select-bar">
+          <label class="fp-select-all-label"><input type="checkbox" id="fp-select-all" onchange="_fpToggleSelectAll(this.checked)" /> All</label>
+          <span class="fp-select-count" id="fp-select-count">0 selected</span>
+        </div>
+        <div class="fp-profile-scroll" id="fp-profile-scroll">
+          <div class="fp-panel-empty">No voice profiles yet.</div>
+        </div>
+        <div class="fp-bulk-actions hidden" id="fp-bulk-actions">
+          <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkOptimize()" title="Optimize selected"><i class="fa-solid fa-wand-magic-sparkles"></i> Optimize</button>
+          <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkMerge()" title="Merge selected into one"><i class="fa-solid fa-merge"></i> Merge</button>
+          <button class="speaker-manager-btn fp-detail-delete-btn fp-bulk-btn" onclick="_fpBulkDelete()" title="Delete selected"><i class="fa-solid fa-trash"></i> Delete</button>
+        </div>
       </div>
       <div class="fingerprint-panel-detail hidden" id="fingerprint-profile-detail">
         <div class="fp-detail-name-row">
@@ -332,7 +413,7 @@
       </div>
     </div>
     <div class="fingerprint-panel-footer">
-      <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpShowNew()">+ New Profile</button>
+      <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpShowNew()"><i class="fa-solid fa-plus"></i> New Profile</button>
     </div>
   </div>
 </div>
@@ -342,7 +423,7 @@
   <div class="dialog settings-dialog">
     <div class="settings-header">
       <h3>Settings</h3>
-      <button class="icon-btn" onclick="closeSettings()">&#x2715;</button>
+      <button class="icon-btn" onclick="closeSettings()"><i class="fa-solid fa-xmark"></i></button>
     </div>
     <div class="settings-body">
 
@@ -378,7 +459,7 @@
           </p>
           <div class="key-input-row">
             <input type="password" id="key-anthropic" placeholder="sk-ant-..." autocomplete="off" />
-            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-anthropic')" title="Show/hide">&#x25C9;</button>
+            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-anthropic')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
           </div>
           <div class="key-status" id="key-anthropic-status"></div>
         </div>
@@ -392,7 +473,7 @@
           </p>
           <div class="key-input-row">
             <input type="password" id="key-openai" placeholder="sk-..." autocomplete="off" />
-            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-openai')" title="Show/hide">&#x25C9;</button>
+            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-openai')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
           </div>
           <div class="key-status" id="key-openai-status"></div>
         </div>
@@ -406,7 +487,7 @@
           </p>
           <div class="key-input-row">
             <input type="password" id="key-huggingface" placeholder="hf_..." autocomplete="off" />
-            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-huggingface')" title="Show/hide">&#x25C9;</button>
+            <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-huggingface')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
           </div>
           <div class="key-status" id="key-huggingface-status"></div>
         </div>

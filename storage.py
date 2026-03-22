@@ -13,6 +13,7 @@ def _conn():
     DB_PATH.parent.mkdir(exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 3000")
     try:
         yield conn
         conn.commit()
@@ -287,6 +288,28 @@ def get_session(session_id: str) -> dict | None:
 
 
 # ── Transcript ────────────────────────────────────────────────────────────────
+
+def get_segment(segment_id: int) -> dict | None:
+    """Retrieve a single transcript segment by ID."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, session_id, text, source, start_time, end_time, label_override "
+            "FROM transcript_segments WHERE id = ?",
+            (segment_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_segments_by_speaker(session_id: str, speaker_key: str) -> list[dict]:
+    """Return all segments for a given speaker_key in a session, with timing info."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, start_time, end_time FROM transcript_segments "
+            "WHERE session_id = ? AND source = ? ORDER BY id",
+            (session_id, speaker_key),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
 
 def save_segment(
     session_id: str,

@@ -113,17 +113,18 @@ class MeetingTray:
         self._icon = pystray.Icon(
             name="Meeting Assistant",
             icon=self._pick_icon(),
-            title="Meeting Assistant",
+            title=self._pick_tooltip(),
             menu=self._build_menu(),
         )
         self._icon.run(setup=self._on_setup)
 
     def refresh(self) -> None:
-        """Update the icon image to reflect current state. Thread-safe."""
+        """Update the icon image and tooltip to reflect current state. Thread-safe."""
         if self._icon is None:
             return
         try:
             self._icon.icon = self._pick_icon()
+            self._icon.title = self._pick_tooltip()
             self._icon.update_menu()
         except Exception:
             pass
@@ -142,17 +143,21 @@ class MeetingTray:
         """Called once after the icon enters its event loop."""
         icon.visible = True
 
+    def _get_tray_state(self) -> str:
+        """Return the current tray state key."""
+        st = self._get_state()
+        provider = st.get("ai_provider", "anthropic")
+        if config.needs_setup(provider):
+            return "setup"
+        if st.get("is_recording"):
+            return "recording"
+        if st.get("model_ready"):
+            return "ready"
+        return "loading"
+
     def _pick_icon(self) -> "Image.Image":
         _ensure_icons()
-        st = self._get_state()
-        if config.needs_setup():
-            key = "setup"
-        elif st.get("is_recording"):
-            key = "recording"
-        elif st.get("model_ready"):
-            key = "ready"
-        else:
-            key = "loading"
+        key = self._get_tray_state()
         if key in _icons:
             return _icons[key]
         # Fallback: drawn icon if PNG assets were not found
@@ -163,6 +168,17 @@ class MeetingTray:
             "loading":   (110, 118, 129),
         }
         return _create_fallback_icon(fallbacks[key])
+
+    def _pick_tooltip(self) -> str:
+        """Return a tooltip string reflecting current state."""
+        key = self._get_tray_state()
+        tooltips = {
+            "setup":     "Meeting Assistant — Setup required",
+            "recording": "Meeting Assistant — Recording",
+            "ready":     "Meeting Assistant — Ready",
+            "loading":   "Meeting Assistant — Loading models…",
+        }
+        return tooltips.get(key, "Meeting Assistant")
 
     def _build_menu(self) -> "pystray.Menu":
         S = pystray.MenuItem  # shorthand

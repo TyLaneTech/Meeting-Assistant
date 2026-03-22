@@ -33,6 +33,7 @@ def _conn(db_path: Path):
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 3000")
     try:
         yield conn
         conn.commit()
@@ -260,6 +261,32 @@ class SpeakerFingerprintDB:
             return _normalize(emb)
         except Exception:
             log.warn("fingerprint", "Embedding extraction failed:")
+            traceback.print_exc()
+            return None
+
+    def extract_embedding_from_wav(
+        self, wav_path: str, start_sec: float, end_sec: float
+    ) -> np.ndarray | None:
+        """Extract a speaker embedding from a time slice of a WAV file."""
+        if not self._ready or end_sec - start_sec < _MIN_DURATION_SEC:
+            return None
+        try:
+            import wave
+            from scipy import signal as scipy_signal
+            with wave.open(wav_path, "rb") as wf:
+                rate = wf.getframerate()
+                channels = wf.getnchannels()
+                wf.setpos(int(start_sec * rate))
+                n_frames = int((end_sec - start_sec) * rate)
+                raw = wf.readframes(n_frames)
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if channels > 1:
+                audio = audio.reshape(-1, channels).mean(axis=1)
+            if rate != 16000:
+                audio = scipy_signal.resample_poly(audio, 16000, rate)
+            return self.extract_embedding(audio)
+        except Exception:
+            log.warn("fingerprint", f"WAV slice extraction failed ({start_sec:.1f}-{end_sec:.1f}s)")
             traceback.print_exc()
             return None
 

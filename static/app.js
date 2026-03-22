@@ -262,7 +262,7 @@ function jumpToTimestamp(seconds) {
     });
   }
   if (target) {
-    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    _doProgrammaticScroll(target, { behavior: 'smooth', block: 'center' });
     target.classList.add('playing');
     setTimeout(() => target.classList.remove('playing'), 2000);
   }
@@ -433,12 +433,18 @@ function _renderSidebar() {
     const header = document.createElement('div');
     header.className = 'folder-header';
     header.innerHTML = `
-      <button class="folder-toggle" onclick="_toggleFolder('${folder.id}')">${collapsed ? '▸' : '▾'}</button>
-      <span class="folder-icon">📁</span>
+      <button class="folder-toggle" onclick="_toggleFolder('${folder.id}')"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
+      <span class="folder-icon"><i class="fa-solid fa-folder"></i></span>
       <span class="folder-name" onclick="_toggleFolder('${folder.id}')">${escapeHtml(folder.name)}</span>
-      <button class="folder-action" title="Rename" onclick="renameFolderInline(event,'${folder.id}','${escapeHtml(folder.name).replace(/'/g, "\\'")}')">✎</button>
-      <button class="folder-action" title="Delete folder" onclick="deleteFolder(event,'${folder.id}')">✕</button>
       <span class="folder-count">${folderSessions.length}</span>`;
+
+    // ⋮ context menu button for folder
+    const folderMenuBtn = document.createElement('button');
+    folderMenuBtn.className = 'folder-menu-btn';
+    folderMenuBtn.title = 'More options';
+    folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+    folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
+    header.appendChild(folderMenuBtn);
     folderEl.appendChild(header);
 
     if (!collapsed) {
@@ -531,7 +537,7 @@ function _makeSessionEl(s) {
   const menuBtn = document.createElement('button');
   menuBtn.className = 'session-menu-btn';
   menuBtn.title = 'More options';
-  menuBtn.textContent = '⋮';
+  menuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
   menuBtn.addEventListener('click', e => { e.stopPropagation(); _openSessionMenu(e, s); });
   el.appendChild(menuBtn);
 
@@ -589,20 +595,20 @@ function _openSessionMenu(e, s) {
   if (s.has_audio) {
     const rea = document.createElement('div');
     rea.className = 'session-menu-item';
-    rea.textContent = '↺  Reanalyze';
+    rea.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i>  Reanalyze';
     rea.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); reanalyzeSession(ev, s.id); });
     menu.appendChild(rea);
   }
 
   const ren = document.createElement('div');
   ren.className = 'session-menu-item';
-  ren.textContent = '✎  Rename';
+  ren.innerHTML = '<i class="fa-solid fa-pen"></i>  Rename';
   ren.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); startEditTitle(ev, s.id, s.title); });
   menu.appendChild(ren);
 
   const del = document.createElement('div');
   del.className = 'session-menu-item session-menu-item-danger';
-  del.textContent = '✕  Delete';
+  del.innerHTML = '<i class="fa-solid fa-trash"></i>  Delete';
   del.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); deleteSession(ev, s.id); });
   menu.appendChild(del);
 
@@ -622,6 +628,51 @@ function _openSessionMenu(e, s) {
 
 function _closeSessionMenu() {
   const m = document.getElementById('session-menu-popup');
+  if (m) m.remove();
+}
+
+// ── Folder context menu ───────────────────────────────────────────────────────
+
+function _openFolderMenu(e, folder) {
+  _closeFolderMenu();
+  _closeSessionMenu();
+
+  const menu = document.createElement('div');
+  menu.className = 'session-menu';
+  menu.id = 'folder-menu-popup';
+
+  const ren = document.createElement('div');
+  ren.className = 'session-menu-item';
+  ren.innerHTML = '<i class="fa-solid fa-pen"></i>  Rename';
+  ren.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeFolderMenu();
+    renameFolderInline(ev, folder.id, folder.name);
+  });
+  menu.appendChild(ren);
+
+  const del = document.createElement('div');
+  del.className = 'session-menu-item session-menu-item-danger';
+  del.innerHTML = '<i class="fa-solid fa-trash"></i>  Delete';
+  del.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeFolderMenu();
+    deleteFolder(ev, folder.id);
+  });
+  menu.appendChild(del);
+
+  document.body.appendChild(menu);
+
+  // Position below the ⋮ button, clamp to viewport
+  const rect = e.currentTarget.getBoundingClientRect();
+  let left = rect.left + window.scrollX;
+  if (left + 160 > window.innerWidth) left = window.innerWidth - 164;
+  menu.style.top  = (rect.bottom + window.scrollY) + 'px';
+  menu.style.left = left + 'px';
+
+  setTimeout(() => document.addEventListener('click', _closeFolderMenu, { once: true }), 0);
+}
+
+function _closeFolderMenu() {
+  const m = document.getElementById('folder-menu-popup');
   if (m) m.remove();
 }
 
@@ -657,7 +708,8 @@ async function deleteFolder(e, folderId) {
 
 function renameFolderInline(e, folderId, currentName) {
   e.stopPropagation();
-  const nameEl = e.target.closest('.folder-header')?.querySelector('.folder-name');
+  const folderEl = document.querySelector(`.sidebar-folder[data-folder-id="${folderId}"]`);
+  const nameEl = folderEl?.querySelector('.folder-name');
   if (!nameEl) return;
 
   const input = document.createElement('input');
@@ -726,13 +778,13 @@ async function bulkRetitle() {
   const ids = [..._sidebarSelected];
   if (!ids.length) return;
   const btn = document.getElementById('sidebar-bulk-retitle');
-  if (btn) { btn.textContent = '⟳ …'; btn.disabled = true; }
+  if (btn) { btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> …'; btn.disabled = true; }
   await fetch('/api/sessions/bulk', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'retitle', session_ids: ids }),
   });
-  if (btn) { btn.textContent = '⟳ Titles'; btn.disabled = false; }
+  if (btn) { btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Titles'; btn.disabled = false; }
   refreshSidebar();
 }
 
@@ -903,12 +955,14 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('transcript', e => {
     const d = JSON.parse(e.data);
+    if (d.session_id && d.session_id !== state.sessionId) return;
     if (d.seg_id) _lastLiveSegId = Math.max(_lastLiveSegId, d.seg_id);
     if (!state.isViewingPast) appendTranscript(d.text, d.source || 'loopback', d.start_time, d.end_time, d.seg_id);
   });
 
   src.addEventListener('transcript_update', e => {
     const d = JSON.parse(e.data);
+    if (d.session_id && d.session_id !== state.sessionId) return;
     if (!state.isViewingPast && d.seg_id) {
       const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
       if (seg) {
@@ -1074,8 +1128,15 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('fingerprint_auto_applied', e => {
     const d = JSON.parse(e.data);
     if (d.session_id === state.sessionId) {
-      // speaker_label SSE already fired to rename — just show a brief log-style notice
       console.info(`[fingerprint] Auto-applied "${d.name}" → ${d.speaker_key} (${d.similarity})`);
+    }
+  });
+
+  src.addEventListener('speaker_linked', e => {
+    const d = JSON.parse(e.data);
+    if (d.session_id === state.sessionId) {
+      _sessionLinks[d.speaker_key] = { global_id: d.global_id, name: d.name };
+      _updateLinkedBadges();
     }
   });
 
@@ -1217,15 +1278,15 @@ function onStatus(d) {
 function updateRecordBtn() {
   const btn = document.getElementById('record-btn');
   if (state.isRecording) {
-    btn.innerHTML = '<span class="btn-icon">⏹</span> Stop Recording';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop Recording';
     btn.classList.add('recording');
     btn.classList.remove('resuming');
   } else if (state.isViewingPast) {
-    btn.innerHTML = '<span class="btn-icon">▶</span> Resume Session';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Resume Session';
     btn.classList.remove('recording');
     btn.classList.add('resuming');
   } else {
-    btn.innerHTML = '<span class="btn-icon">▶</span> Start Recording';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording';
     btn.classList.remove('recording');
     btn.classList.remove('resuming');
   }
@@ -1247,10 +1308,10 @@ function updateTestBtn() {
   if (!btn) return;
   btn.disabled = state.isRecording;
   if (state.isTesting) {
-    btn.textContent = '⏹ Stop Test';
+    btn.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Test';
     btn.classList.add('testing');
   } else {
-    btn.textContent = '▶ Test Audio';
+    btn.innerHTML = '<i class="fa-solid fa-play"></i> Test Audio';
     btn.classList.remove('testing');
   }
 }
@@ -1295,7 +1356,9 @@ const SOURCE_META = {
 let _autoScroll = true;
 
 // Transcript filter state
-let _transcriptFilter = { search: '', speakers: new Set() };
+let _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
+let _showNoise = false;  // noise segments hidden by default
+let _navState = { matches: [], currentIdx: -1 };
 
 // Set while the speaker picker dropdown is open - suppresses auto-scroll
 // so the transcript doesn't jump away while the user is typing a name.
@@ -1320,6 +1383,9 @@ let _transcriptSelectionAnchor = null;
 
 // Speakers added before a session exists; flushed to the API on session start
 let _pendingSpeakerProfiles = [];
+const _NOISE_LABEL = '[Noise]';
+const _NOISE_COLOR = '#6e7681';   // muted gray
+
 const _SPEAKER_PALETTE = [
   '#58a6ff', // blue
   '#3fb950', // green
@@ -1334,12 +1400,31 @@ const _SPEAKER_PALETTE = [
 ];
 let _speakerColorIdx = 0;
 
+// Voice library: speaker_key → { global_id, name } for the active session
+let _sessionLinks = {};
+
 function _isCustomSpeakerKey(speakerKey) {
   return typeof speakerKey === 'string' && speakerKey.startsWith('custom:');
 }
 
 function _speakerDisplayName(speakerKey) {
   return _speakerProfiles[speakerKey]?.name || _speakerLabels[speakerKey] || speakerKey;
+}
+
+/** Scan all speaker badges and add/remove the 'speaker-linked' class. */
+function _updateLinkedBadges() {
+  document.querySelectorAll('.src-badge.src-speaker').forEach(badge => {
+    const key = badge.dataset.speakerKey;
+    if (!key) return;
+    const link = _sessionLinks[key];
+    if (link) {
+      badge.classList.add('speaker-linked');
+      badge.title = `Saved voice profile: ${link.name || key}`;
+    } else {
+      badge.classList.remove('speaker-linked');
+      badge.title = 'Click to rename';
+    }
+  });
 }
 
 function _speakerNameKey(name, excludeKey = '') {
@@ -1394,6 +1479,7 @@ function _speakerBadgeCount(speakerKey) {
 }
 
 function speakerColor(speakerKey) {
+  if (speakerKey === _NOISE_LABEL) return _NOISE_COLOR;
   if (!_speakerColors[speakerKey]) {
     const myName = _speakerDisplayName(speakerKey);
     if (myName) {
@@ -1682,9 +1768,21 @@ async function _fpDismiss(toastData) {
 let _fpProfiles     = [];   // global speaker list
 let _fpSelectedId   = null; // currently selected global_id
 let _fpDetailColor  = '';
+let _fpSelectMode   = false;
+let _fpSelected     = new Set();  // selected global_ids for bulk ops
+let _fpSearchTerm   = '';
 
 async function openFingerprintPanel() {
   document.getElementById('fingerprint-panel-overlay').classList.remove('hidden');
+  // Reset search and select state
+  _fpSearchTerm = '';
+  _fpSelectMode = false;
+  _fpSelected.clear();
+  const searchInput = document.getElementById('fp-search-input');
+  if (searchInput) searchInput.value = '';
+  const selectToggle = document.getElementById('fp-select-toggle');
+  if (selectToggle) selectToggle.classList.remove('active');
+  document.getElementById('fp-select-bar')?.classList.add('hidden');
   await _fpLoadProfiles();
 }
 
@@ -1711,17 +1809,40 @@ async function _fpLoadProfiles() {
 }
 
 function _fpRenderProfileList() {
+  const scrollEl = document.getElementById('fp-profile-scroll');
   const listEl = document.getElementById('fingerprint-profile-list');
-  if (!_fpProfiles.length) {
-    listEl.innerHTML = '<div class="fp-panel-empty">No voice profiles yet. Use the "+ New Profile" button to create one.</div>';
+
+  // Apply select mode class
+  if (_fpSelectMode) listEl.classList.add('fp-select-mode');
+  else listEl.classList.remove('fp-select-mode');
+
+  // Filter by search
+  const term = _fpSearchTerm.toLowerCase();
+  const filtered = term
+    ? _fpProfiles.filter(p => p.name.toLowerCase().includes(term))
+    : _fpProfiles;
+
+  if (!filtered.length) {
+    scrollEl.innerHTML = `<div class="fp-panel-empty">${_fpProfiles.length ? 'No matching profiles.' : 'No voice profiles yet. Use the "+ New Profile" button to create one.'}</div>`;
+    _fpUpdateBulkUI();
     return;
   }
-  listEl.innerHTML = '';
-  _fpProfiles.forEach(p => {
+  scrollEl.innerHTML = '';
+  filtered.forEach(p => {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'fp-profile-row' + (_fpSelectedId === p.id ? ' selected' : '');
-    row.addEventListener('click', () => _fpSelectProfile(p.id));
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'fp-row-checkbox';
+    cb.checked = _fpSelected.has(p.id);
+    cb.addEventListener('click', e => { e.stopPropagation(); _fpToggleSelect(p.id, cb.checked); });
+
+    row.addEventListener('click', () => {
+      if (_fpSelectMode) { cb.checked = !cb.checked; _fpToggleSelect(p.id, cb.checked); }
+      else _fpSelectProfile(p.id);
+    });
 
     const swatch = document.createElement('span');
     swatch.className = 'speaker-row-swatch';
@@ -1732,10 +1853,12 @@ function _fpRenderProfileList() {
     main.innerHTML = `<div class="fp-profile-name">${p.name}</div>
       <div class="fp-profile-meta">${p.emb_count} sample${p.emb_count === 1 ? '' : 's'}</div>`;
 
+    row.appendChild(cb);
     row.appendChild(swatch);
     row.appendChild(main);
-    listEl.appendChild(row);
+    scrollEl.appendChild(row);
   });
+  _fpUpdateBulkUI();
 }
 
 async function _fpSelectProfile(globalId) {
@@ -1796,6 +1919,97 @@ async function _fpSelectProfile(globalId) {
   } catch (e) {
     document.getElementById('fp-detail-sessions').innerHTML = '';
   }
+}
+
+// ── Bulk selection helpers ───────────────────────────────────────────────────
+
+function _fpFilterList() {
+  _fpSearchTerm = (document.getElementById('fp-search-input').value || '').trim();
+  _fpRenderProfileList();
+}
+
+function _fpToggleSelectMode() {
+  _fpSelectMode = !_fpSelectMode;
+  const btn = document.getElementById('fp-select-toggle');
+  btn.classList.toggle('active', _fpSelectMode);
+  document.getElementById('fp-select-bar').classList.toggle('hidden', !_fpSelectMode);
+  if (!_fpSelectMode) { _fpSelected.clear(); }
+  _fpRenderProfileList();
+}
+
+function _fpToggleSelect(id, checked) {
+  if (checked) _fpSelected.add(id);
+  else _fpSelected.delete(id);
+  _fpUpdateBulkUI();
+}
+
+function _fpToggleSelectAll(checked) {
+  const term = _fpSearchTerm.toLowerCase();
+  const visible = term ? _fpProfiles.filter(p => p.name.toLowerCase().includes(term)) : _fpProfiles;
+  if (checked) visible.forEach(p => _fpSelected.add(p.id));
+  else visible.forEach(p => _fpSelected.delete(p.id));
+  _fpRenderProfileList();
+}
+
+function _fpUpdateBulkUI() {
+  const n = _fpSelected.size;
+  const countEl = document.getElementById('fp-select-count');
+  if (countEl) countEl.textContent = `${n} selected`;
+  const bulkEl = document.getElementById('fp-bulk-actions');
+  if (bulkEl) bulkEl.classList.toggle('hidden', !_fpSelectMode || n === 0);
+  const allCb = document.getElementById('fp-select-all');
+  if (allCb) {
+    const term = _fpSearchTerm.toLowerCase();
+    const visible = term ? _fpProfiles.filter(p => p.name.toLowerCase().includes(term)) : _fpProfiles;
+    allCb.checked = visible.length > 0 && visible.every(p => _fpSelected.has(p.id));
+  }
+}
+
+async function _fpBulkDelete() {
+  const ids = [..._fpSelected];
+  if (!ids.length) return;
+  const names = ids.map(id => _fpProfiles.find(p => p.id === id)?.name || id).join(', ');
+  if (!confirm(`Delete ${ids.length} profile${ids.length > 1 ? 's' : ''}?\n\n${names}\n\nThis cannot be undone.`)) return;
+  await fetch('/api/fingerprint/speakers/bulk', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  });
+  _fpSelected.clear();
+  if (ids.includes(_fpSelectedId)) _fpClearDetail();
+  await _fpLoadProfiles();
+}
+
+async function _fpBulkMerge() {
+  const ids = [..._fpSelected];
+  if (ids.length < 2) { alert('Select at least 2 profiles to merge.'); return; }
+  const names = ids.map(id => _fpProfiles.find(p => p.id === id)?.name || id);
+  const keepName = names[0];
+  if (!confirm(`Merge ${ids.length} profiles into "${keepName}"?\n\n${names.join(', ')}\n\nAll voice samples will be combined. This cannot be undone.`)) return;
+  const keepId = ids[0];
+  for (let i = 1; i < ids.length; i++) {
+    await fetch(`/api/fingerprint/speakers/${keepId}/merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_id: ids[i] }),
+    });
+  }
+  _fpSelected.clear();
+  _fpSelectedId = keepId;
+  await _fpLoadProfiles();
+}
+
+async function _fpBulkOptimize() {
+  const ids = [..._fpSelected];
+  if (!ids.length) return;
+  if (!confirm(`Optimize ${ids.length} profile${ids.length > 1 ? 's' : ''}? This prunes redundant voice samples.`)) return;
+  await fetch('/api/fingerprint/speakers/bulk/optimize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  });
+  await _fpLoadProfiles();
+  if (_fpSelectedId) _fpSelectProfile(_fpSelectedId);
 }
 
 function _fpClearDetail() {
@@ -1959,7 +2173,7 @@ function renderSpeakerManager() {
   const datalistEl = document.getElementById('speaker-name-options');
   if (!listEl || !colorGridEl || !inputEl || !hintEl || !subtitleEl || !datalistEl) return;
 
-  const profiles = _getSortedSpeakerProfiles();
+  const profiles = _getSortedSpeakerProfiles().filter(p => p.speaker_key !== _NOISE_LABEL);
   const groups = _groupProfilesByName(profiles);
   const selectedGroupCount = groups.filter(g => g.speakerKeys.some(k => _selectedSpeakerKeys.includes(k))).length;
 
@@ -2052,6 +2266,15 @@ function renderSpeakerManager() {
     main.appendChild(meta);
     row.appendChild(swatch);
     row.appendChild(main);
+    // Show linked indicator if any key in this group is linked to a global profile
+    const isLinked = group.speakerKeys.some(k => _sessionLinks[k]);
+    if (isLinked) {
+      const linkBadge = document.createElement('span');
+      linkBadge.className = 'speaker-row-linked';
+      linkBadge.innerHTML = '<i class="fa-solid fa-link"></i> Linked';
+      linkBadge.title = 'Linked to a voice library profile';
+      row.appendChild(linkBadge);
+    }
     row.appendChild(countEl);
     listEl.appendChild(row);
   });
@@ -2184,6 +2407,20 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   if (source in SOURCE_META) {
     const { label, cls } = SOURCE_META[source];
     seg.innerHTML = `<span class="src-badge ${cls}">${label}</span>${escapeHtml(text)}`;
+  } else if (source === _NOISE_LABEL) {
+    // Noise/filler segment — muted styling, no rename interaction
+    seg.classList.add('noise-segment');
+    seg.style.setProperty('--seg-color', _NOISE_COLOR);
+    const badge = document.createElement('span');
+    badge.className = 'src-badge src-speaker src-noise';
+    badge.dataset.speakerKey = source;
+    badge.textContent = 'Noise';
+    badge.style.backgroundColor = _NOISE_COLOR + '20';
+    badge.style.color = _NOISE_COLOR;
+    badge.style.borderColor = _NOISE_COLOR + '40';
+    badge.title = 'Auto-detected noise/filler';
+    seg.appendChild(badge);
+    seg.appendChild(document.createTextNode(text));
   } else {
     // Speaker label - assign accent color, make badge click-to-rename
     _ensureSpeakerProfile(source);
@@ -2194,10 +2431,13 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     seg.style.setProperty('--seg-color', color);
     const badge = document.createElement('span');
     badge.className = 'src-badge src-speaker';
+    if (_sessionLinks[source]) badge.classList.add('speaker-linked');
     badge.dataset.speakerKey = source;
     if (segId != null) badge.dataset.segId = segId;
     if (labelOverride) badge.dataset.override = '1';
-    badge.title = 'Click to rename';
+    badge.title = _sessionLinks[source]
+      ? `Saved voice profile: ${_sessionLinks[source].name || source}`
+      : 'Click to rename';
     badge.textContent = displayName;
     badge.style.backgroundColor = color + '26'; // ~15% opacity tint
     badge.style.color = color;
@@ -2216,12 +2456,22 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   }
 
   el.appendChild(seg);
+  // Extend time range slider if navigator is open (before filtering, so pinned max stays Infinity)
+  _tnExtendTimeRange();
   _applyFilterToSeg(seg);
+  // Highlight search matches in new segment if search is active
+  if (_transcriptFilter.search.trim() && seg.style.display !== 'none') {
+    _tnHighlightInSeg(seg);
+  }
   _highlightSelectedSpeakerBadges();
   if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
     renderSpeakerManager();
   }
-  if (_autoScroll && !_pickerOpen) el.scrollTop = el.scrollHeight;
+  if (_autoScroll && !_pickerOpen) {
+    _programmaticScrollCount++;
+    el.scrollTop = el.scrollHeight;
+    setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 100);
+  }
 }
 
 // Is this a default auto-generated speaker name? (e.g. "Speaker 1")
@@ -2496,30 +2746,52 @@ function copyTranscript() {
   if (result) navigator.clipboard.writeText(result).then(() => flashStatus('Copied!'));
 }
 
-/* ── Transcript filter ───────────────────────────────────────────────────── */
+/* ── Transcript Navigator ───────────────────────────────────────────────── */
 
 function _transcriptFilterActive() {
-  return _transcriptFilter.search.length > 0 || _transcriptFilter.speakers.size > 0;
+  return _transcriptFilter.search.length > 0
+    || _transcriptFilter.speakers.size > 0
+    || _transcriptFilter.timeMin > 0
+    || _transcriptFilter.timeMax < Infinity;
 }
 
 function _applyFilterToSeg(seg) {
-  if (!_transcriptFilterActive()) { seg.style.display = ''; return; }
   const source  = seg.dataset.transcriptSource || '';
-  const search  = _transcriptFilter.search.toLowerCase().trim();
+  // Always hide noise unless toggled visible
+  if (source === _NOISE_LABEL && !_showNoise) { seg.style.display = 'none'; return; }
+  if (!_transcriptFilterActive()) { seg.style.display = ''; return; }
   const speakers = _transcriptFilter.speakers;
   // Speaker filter applies only to diarized speaker segments
   if (speakers.size > 0 && !(source in SOURCE_META) && !speakers.has(source)) {
     seg.style.display = 'none'; return;
   }
-  // Search filter: match against full visible text
-  if (search && !seg.textContent.toLowerCase().includes(search)) {
-    seg.style.display = 'none'; return;
+  // Time range filter
+  if (_transcriptFilter.timeMin > 0 || _transcriptFilter.timeMax < Infinity) {
+    const segStart = parseFloat(seg.dataset.start || 0);
+    const segEnd   = parseFloat(seg.dataset.end || Infinity);
+    if (segEnd < _transcriptFilter.timeMin || segStart > _transcriptFilter.timeMax) {
+      seg.style.display = 'none'; return;
+    }
+  }
+  // Search filter: match against visible text (skip badge text for accuracy)
+  const search = _transcriptFilter.search.toLowerCase().trim();
+  if (search) {
+    // Get text content excluding badge labels
+    const textNodes = [];
+    seg.childNodes.forEach(n => {
+      if (n.nodeType === 3) textNodes.push(n.textContent);
+      else if (!n.classList?.contains('src-badge')) textNodes.push(n.textContent);
+    });
+    if (!textNodes.join('').toLowerCase().includes(search)) {
+      seg.style.display = 'none'; return;
+    }
   }
   seg.style.display = '';
 }
 
 function applyTranscriptFilter() {
   document.querySelectorAll('#transcript .transcript-segment').forEach(_applyFilterToSeg);
+  _tnHighlightMatches();
 }
 
 function _updateFilterBtnState() {
@@ -2527,133 +2799,594 @@ function _updateFilterBtnState() {
     ?.classList.toggle('active', _transcriptFilterActive());
 }
 
-function openTranscriptFilter(btn) {
-  // Toggle off if already open
-  if (document.getElementById('transcript-filter-popout')) {
-    _closeTranscriptFilter(); return;
+// ── Panel toggle ──────────────────────────────────────────────────────────────
+
+function openTranscriptFilter() {
+  const panel = document.getElementById('transcript-navigator');
+  if (!panel) return;
+  const isOpen = !panel.classList.contains('collapsed');
+  if (isOpen) {
+    panel.classList.add('collapsed');
+    return;
   }
-
-  // Group by name so diart fragments of the same speaker appear as one row
-  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
-
-  const popout = document.createElement('div');
-  popout.id = 'transcript-filter-popout';
-  popout.className = 'transcript-filter-popout';
-  // Prevent outside-click handler from firing immediately on the button click
-  popout.addEventListener('click', e => e.stopPropagation());
-
-  // ── Search row ──────────────────────────────────────────────────────────
-  const searchWrap = document.createElement('div');
-  searchWrap.className = 'tf-search-row';
-  const searchIcon = document.createElement('span');
-  searchIcon.className = 'tf-search-icon';
-  searchIcon.textContent = '🔎';
-  const searchInput = document.createElement('input');
-  searchInput.type = 'text';
-  searchInput.className = 'tf-search-input';
-  searchInput.placeholder = 'Search transcript…';
-  searchInput.value = _transcriptFilter.search;
-  searchInput.addEventListener('input', () => {
-    _transcriptFilter.search = searchInput.value;
-    applyTranscriptFilter();
-    _updateFilterBtnState();
-  });
-  searchWrap.appendChild(searchIcon);
-  searchWrap.appendChild(searchInput);
-  popout.appendChild(searchWrap);
-
-  // ── Speaker filter ──────────────────────────────────────────────────────
-  if (groups.length > 0) {
-    const heading = document.createElement('div');
-    heading.className = 'tf-section-heading';
-    heading.textContent = 'Speakers';
-    popout.appendChild(heading);
-
-    const totalGroups = groups.length;
-
-    groups.forEach(g => {
-      const row = document.createElement('label');
-      row.className = 'tf-speaker-row';
-      // Store all keys for this group so the change handler can expand them
-      row.dataset.speakerKeys = JSON.stringify(g.speakerKeys);
-
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.className = 'tf-speaker-cb';
-      // Checked = visible. Empty filter (no restriction) means all checked.
-      cb.checked = _transcriptFilter.speakers.size === 0
-        || g.speakerKeys.some(k => _transcriptFilter.speakers.has(k));
-
-      const dot = document.createElement('span');
-      dot.className = 'tf-speaker-dot';
-      dot.style.background = g.color || speakerColor(g.speakerKeys[0]);
-
-      const nameEl = document.createElement('span');
-      nameEl.className = 'tf-speaker-name';
-      nameEl.textContent = g.name;
-
-      row.appendChild(cb);
-      row.appendChild(dot);
-      row.appendChild(nameEl);
-      popout.appendChild(row);
-
-      cb.addEventListener('change', () => {
-        // Rebuild filter from current checkbox states, expanding groups → individual keys
-        const allRows = [...popout.querySelectorAll('.tf-speaker-row')];
-        const checkedKeys = new Set();
-        let checkedCount = 0;
-        allRows.forEach(r => {
-          if (r.querySelector('input').checked) {
-            JSON.parse(r.dataset.speakerKeys || '[]').forEach(k => checkedKeys.add(k));
-            checkedCount++;
-          }
-        });
-        // All or none checked → no filter (show everything)
-        _transcriptFilter.speakers = (checkedCount === 0 || checkedCount === totalGroups)
-          ? new Set()
-          : checkedKeys;
-        applyTranscriptFilter();
-        _updateFilterBtnState();
-      });
-    });
+  panel.classList.remove('collapsed');
+  _tnRefreshSpeakerPills();
+  _tnRefreshReassignDropdowns();
+  _tnRefreshTimeRange();
+  _tnRefreshStats();
+  const searchInput = document.getElementById('tn-search-input');
+  if (searchInput) {
+    searchInput.value = _transcriptFilter.search;
+    searchInput.focus();
   }
-
-  // ── Footer ──────────────────────────────────────────────────────────────
-  const footer = document.createElement('div');
-  footer.className = 'tf-footer';
-  const clearBtn = document.createElement('button');
-  clearBtn.className = 'tf-clear-btn';
-  clearBtn.textContent = 'Clear filters';
-  clearBtn.addEventListener('click', () => {
-    _transcriptFilter.search = '';
-    _transcriptFilter.speakers.clear();
-    applyTranscriptFilter();
-    _updateFilterBtnState();
-    _closeTranscriptFilter();
-  });
-  footer.appendChild(clearBtn);
-  popout.appendChild(footer);
-
-  document.body.appendChild(popout);
-
-  // Position below the button, right-aligned
-  const rect = btn.getBoundingClientRect();
-  popout.style.top   = (rect.bottom + 6) + 'px';
-  const popW = 240;
-  let left = rect.right - popW;
-  if (left < 8) left = 8;
-  popout.style.left  = left + 'px';
-  popout.style.width = popW + 'px';
-
-  searchInput.focus();
-  setTimeout(() => document.addEventListener('click', _closeTranscriptFilter, { once: true }), 0);
 }
 
-function _closeTranscriptFilter() {
-  document.getElementById('transcript-filter-popout')?.remove();
+// Wire up search input (called once on page load)
+function _tnInitSearch() {
+  const input = document.getElementById('tn-search-input');
+  if (!input) return;
+  let _debounce = null;
+  input.addEventListener('input', () => {
+    clearTimeout(_debounce);
+    _debounce = setTimeout(() => {
+      _transcriptFilter.search = input.value;
+      applyTranscriptFilter();
+      _updateFilterBtnState();
+    }, 120);
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.shiftKey ? tnPrevMatch() : tnNextMatch();
+    }
+    if (e.key === 'Escape') {
+      input.value = '';
+      _transcriptFilter.search = '';
+      applyTranscriptFilter();
+      _updateFilterBtnState();
+    }
+  });
+}
+
+// ── Search match highlighting ─────────────────────────────────────────────────
+
+function _tnStripMarks() {
+  document.querySelectorAll('#transcript .transcript-segment mark').forEach(mark => {
+    const parent = mark.parentNode;
+    mark.replaceWith(document.createTextNode(mark.textContent));
+    parent.normalize();
+  });
+}
+
+function _tnHighlightMatches() {
+  _tnStripMarks();
+  _navState.matches = [];
+  _navState.currentIdx = -1;
+
+  const search = _transcriptFilter.search.trim();
+  if (!search) {
+    _tnUpdateMatchCount();
+    return;
+  }
+
+  const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(escaped, 'gi');
+
+  document.querySelectorAll('#transcript .transcript-segment').forEach(seg => {
+    if (seg.style.display === 'none') return;
+    // Only highlight in text nodes that are NOT inside a badge
+    const textNodes = [];
+    seg.childNodes.forEach(n => {
+      if (n.nodeType === 3) textNodes.push(n);
+      else if (!n.classList?.contains('src-badge') && !n.classList?.contains('speaker-picker')) {
+        // Walk into child elements (like <mark> remnants after normalize)
+        const walker = document.createTreeWalker(n, NodeFilter.SHOW_TEXT);
+        let tn;
+        while ((tn = walker.nextNode())) textNodes.push(tn);
+      }
+    });
+
+    for (const textNode of textNodes) {
+      const text = textNode.textContent;
+      const parts = [];
+      let lastIdx = 0;
+      let match;
+      re.lastIndex = 0;
+      while ((match = re.exec(text)) !== null) {
+        if (match.index > lastIdx) {
+          parts.push(document.createTextNode(text.slice(lastIdx, match.index)));
+        }
+        const mark = document.createElement('mark');
+        mark.textContent = match[0];
+        _navState.matches.push(mark);
+        parts.push(mark);
+        lastIdx = re.lastIndex;
+      }
+      if (parts.length > 0) {
+        if (lastIdx < text.length) {
+          parts.push(document.createTextNode(text.slice(lastIdx)));
+        }
+        const frag = document.createDocumentFragment();
+        parts.forEach(p => frag.appendChild(p));
+        textNode.replaceWith(frag);
+      }
+    }
+  });
+
+  if (_navState.matches.length > 0) _navState.currentIdx = 0;
+  _tnUpdateMatchCount();
+  _tnScrollToCurrentMatch();
+}
+
+function _tnUpdateMatchCount() {
+  const el = document.getElementById('tn-match-count');
+  if (!el) return;
+  const n = _navState.matches.length;
+  if (n === 0 && !_transcriptFilter.search.trim()) {
+    el.textContent = '';
+  } else if (n === 0) {
+    el.textContent = 'No matches';
+  } else {
+    el.textContent = `${_navState.currentIdx + 1} of ${n}`;
+  }
+}
+
+function _tnScrollToCurrentMatch() {
+  document.querySelectorAll('#transcript mark.tn-current-match').forEach(m => m.classList.remove('tn-current-match'));
+  if (_navState.currentIdx < 0 || _navState.currentIdx >= _navState.matches.length) return;
+  const mark = _navState.matches[_navState.currentIdx];
+  mark.classList.add('tn-current-match');
+  _doProgrammaticScroll(mark, { block: 'center', behavior: 'smooth' });
+}
+
+// Highlight search matches in a single segment (used for live-added segments)
+function _tnHighlightInSeg(seg) {
+  const search = _transcriptFilter.search.trim();
+  if (!search) return;
+  const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(escaped, 'gi');
+
+  const textNodes = [];
+  seg.childNodes.forEach(n => {
+    if (n.nodeType === 3) textNodes.push(n);
+    else if (!n.classList?.contains('src-badge') && !n.classList?.contains('speaker-picker')) {
+      const walker = document.createTreeWalker(n, NodeFilter.SHOW_TEXT);
+      let tn;
+      while ((tn = walker.nextNode())) textNodes.push(tn);
+    }
+  });
+
+  for (const textNode of textNodes) {
+    const text = textNode.textContent;
+    const parts = [];
+    let lastIdx = 0;
+    let match;
+    re.lastIndex = 0;
+    while ((match = re.exec(text)) !== null) {
+      if (match.index > lastIdx) parts.push(document.createTextNode(text.slice(lastIdx, match.index)));
+      const mark = document.createElement('mark');
+      mark.textContent = match[0];
+      _navState.matches.push(mark);
+      parts.push(mark);
+      lastIdx = re.lastIndex;
+    }
+    if (parts.length > 0) {
+      if (lastIdx < text.length) parts.push(document.createTextNode(text.slice(lastIdx)));
+      const frag = document.createDocumentFragment();
+      parts.forEach(p => frag.appendChild(p));
+      textNode.replaceWith(frag);
+    }
+  }
+  _tnUpdateMatchCount();
+}
+
+function tnNextMatch() {
+  if (_navState.matches.length === 0) return;
+  _navState.currentIdx = (_navState.currentIdx + 1) % _navState.matches.length;
+  _tnUpdateMatchCount();
+  _tnScrollToCurrentMatch();
+}
+
+function tnPrevMatch() {
+  if (_navState.matches.length === 0) return;
+  _navState.currentIdx = (_navState.currentIdx - 1 + _navState.matches.length) % _navState.matches.length;
+  _tnUpdateMatchCount();
+  _tnScrollToCurrentMatch();
+}
+
+// ── Speaker pills ─────────────────────────────────────────────────────────────
+
+function _tnRefreshSpeakerPills() {
+  const container = document.getElementById('tn-speaker-pills');
+  if (!container) return;
+  container.innerHTML = '';
+  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
+  const allKeys = new Set();
+  groups.forEach(g => g.speakerKeys.forEach(k => allKeys.add(k)));
+
+  // Separate noise group from regular speakers
+  const noiseGroups = [];
+  const speakerGroups = [];
+  groups.forEach(g => {
+    if (g.speakerKeys.includes(_NOISE_LABEL)) noiseGroups.push(g);
+    else speakerGroups.push(g);
+  });
+
+  speakerGroups.forEach(g => {
+    const color = g.color || speakerColor(g.speakerKeys[0]);
+    const count = g.speakerKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
+    const isOn = _transcriptFilter.speakers.size === 0
+      || g.speakerKeys.some(k => _transcriptFilter.speakers.has(k));
+
+    const pill = document.createElement('button');
+    pill.className = 'tn-pill' + (isOn ? '' : ' tn-pill-off');
+    pill.style.backgroundColor = color + '33';
+    pill.style.color = color;
+    pill.style.borderColor = color + '60';
+    pill.dataset.speakerKeys = JSON.stringify(g.speakerKeys);
+    pill.innerHTML = `${escapeHtml(g.name)} <span class="tn-pill-count">${count}</span>`;
+    pill.title = `${g.name} — ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`;
+
+    pill.addEventListener('click', () => {
+      _tnToggleSpeakerPill(g.speakerKeys, allKeys);
+    });
+
+    pill.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      _tnJumpToNextSpeaker(g.speakerKeys, 1);
+    });
+
+    container.appendChild(pill);
+  });
+
+  // Noise toggle pill (separate from speaker filter logic)
+  noiseGroups.forEach(g => {
+    const count = g.speakerKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
+    if (count === 0) return;
+    const pill = document.createElement('button');
+    pill.className = 'tn-pill tn-pill-noise' + (_showNoise ? '' : ' tn-pill-off');
+    pill.style.backgroundColor = _NOISE_COLOR + '33';
+    pill.style.color = _NOISE_COLOR;
+    pill.style.borderColor = _NOISE_COLOR + '60';
+    pill.innerHTML = `<i class="fa-solid fa-volume-xmark"></i> Noise <span class="tn-pill-count">${count}</span>`;
+    pill.title = `${count} noise/filler segment${count !== 1 ? 's' : ''} (hidden by default)\nClick to toggle`;
+    pill.addEventListener('click', () => {
+      _showNoise = !_showNoise;
+      applyTranscriptFilter();
+      _tnRefreshSpeakerPills();
+      _updateFilterBtnState();
+    });
+    container.appendChild(pill);
+  });
+}
+
+function _tnToggleSpeakerPill(keys, allKeys) {
+  const wasShowingAll = _transcriptFilter.speakers.size === 0;
+
+  if (wasShowingAll) {
+    // First click when all are showing: solo this speaker (hide all others)
+    _transcriptFilter.speakers = new Set(keys);
+  } else {
+    // Check if this group is currently visible
+    const isOn = keys.some(k => _transcriptFilter.speakers.has(k));
+    if (isOn) {
+      keys.forEach(k => _transcriptFilter.speakers.delete(k));
+      // If none left, show all
+      if (_transcriptFilter.speakers.size === 0) {
+        // all off → show all
+      }
+    } else {
+      keys.forEach(k => _transcriptFilter.speakers.add(k));
+      // If all are now on, clear filter
+      if (allKeys && _transcriptFilter.speakers.size >= allKeys.size) {
+        _transcriptFilter.speakers.clear();
+      }
+    }
+  }
+
+  applyTranscriptFilter();
+  _updateFilterBtnState();
+  _tnRefreshSpeakerPills();
+}
+
+function tnToggleAllSpeakers(showAll) {
+  if (showAll) {
+    _transcriptFilter.speakers.clear();
+  } else {
+    // Add ALL speaker keys to hide everything
+    const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
+    const allKeys = new Set();
+    groups.forEach(g => g.speakerKeys.forEach(k => allKeys.add(k)));
+    // Set speakers to a set with a sentinel to trigger filtering
+    // But the filter logic says: if speakers.size > 0 and source NOT in set → hide
+    // So we need the set to contain NO real keys → use a dummy key
+    _transcriptFilter.speakers = new Set(['__none__']);
+  }
+  applyTranscriptFilter();
+  _updateFilterBtnState();
+  _tnRefreshSpeakerPills();
+}
+
+function _tnJumpToNextSpeaker(speakerKeys, direction) {
+  const keysSet = new Set(speakerKeys);
+  const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+  const transcriptEl = document.getElementById('transcript');
+  const scrollTop = transcriptEl.scrollTop;
+  const containerTop = transcriptEl.getBoundingClientRect().top;
+
+  // Find segments matching these speaker keys
+  const matching = allSegs.filter(seg =>
+    seg.style.display !== 'none' && keysSet.has(seg.dataset.transcriptSource)
+  );
+  if (matching.length === 0) return;
+
+  // Find first segment below current viewport center
+  const viewCenter = scrollTop + transcriptEl.clientHeight / 2;
+  let target = null;
+  if (direction > 0) {
+    target = matching.find(seg => seg.offsetTop > viewCenter + 10);
+    if (!target) target = matching[0]; // wrap around
+  } else {
+    for (let i = matching.length - 1; i >= 0; i--) {
+      if (matching[i].offsetTop < viewCenter - 10) { target = matching[i]; break; }
+    }
+    if (!target) target = matching[matching.length - 1]; // wrap around
+  }
+
+  if (target) {
+    _doProgrammaticScroll(target, { block: 'center', behavior: 'smooth' });
+    target.classList.add('playing');
+    setTimeout(() => target.classList.remove('playing'), 1500);
+  }
+}
+
+// ── Quick reassign ────────────────────────────────────────────────────────────
+
+function _tnRefreshReassignDropdowns() {
+  const fromSel = document.getElementById('tn-reassign-from');
+  const toSel = document.getElementById('tn-reassign-to');
+  if (!fromSel || !toSel) return;
+
+  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
+  const names = [];
+  groups.forEach(g => {
+    const name = g.name;
+    if (name && !names.includes(name)) names.push(name);
+  });
+
+  // Rebuild "from" dropdown
+  fromSel.innerHTML = '<option value="" disabled selected>from…</option>';
+  names.forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    fromSel.appendChild(opt);
+  });
+
+  // Rebuild "to" dropdown — includes all names plus ability to type new
+  toSel.innerHTML = '<option value="" disabled selected>to…</option>';
+  names.forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    toSel.appendChild(opt);
+  });
+}
+
+async function tnApplyReassign() {
+  const fromName = document.getElementById('tn-reassign-from')?.value;
+  const toName   = document.getElementById('tn-reassign-to')?.value;
+  if (!fromName || !toName || fromName === toName) return;
+
+  const visibleOnly = document.getElementById('tn-reassign-visible-only')?.checked;
+  const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+  const targets = allSegs.filter(seg => {
+    if (visibleOnly && seg.style.display === 'none') return false;
+    const badge = seg.querySelector('.src-speaker');
+    return badge && badge.textContent.trim().toLowerCase() === fromName.toLowerCase();
+  });
+
+  if (targets.length === 0) return;
+  if (!confirm(`Reassign ${targets.length} segment${targets.length !== 1 ? 's' : ''} from "${fromName}" to "${toName}"?`)) return;
+
+  for (const seg of targets) {
+    const badge = seg.querySelector('.src-speaker');
+    if (!badge) continue;
+    badge.textContent = toName;
+    badge.dataset.override = '1';
+    const segId = badge.dataset.segId || seg.dataset.segId;
+    if (segId) persistSegmentOverride(segId, toName).catch(() => {});
+  }
+
+  // Refresh the panel
+  _tnRefreshSpeakerPills();
+  _tnRefreshReassignDropdowns();
+  _tnRefreshStats();
+}
+
+// ── Time range filter ─────────────────────────────────────────────────────────
+
+let _tnRangeMaxPinned = true; // true = max handle tracks the live end of the timeline
+
+function _tnGetTimelineBounds() {
+  const allSegs = document.querySelectorAll('#transcript .transcript-segment[data-start]');
+  let minT = Infinity, maxT = 0;
+  allSegs.forEach(seg => {
+    const s = parseFloat(seg.dataset.start || 0);
+    const e = parseFloat(seg.dataset.end || 0);
+    if (s < minT) minT = s;
+    if (e > maxT) maxT = e;
+  });
+  if (minT === Infinity) { minT = 0; maxT = 0; }
+  return { minT, maxT };
+}
+
+function _tnRefreshTimeRange() {
+  const { minT, maxT } = _tnGetTimelineBounds();
+
+  const rangeMin = document.getElementById('tn-range-min');
+  const rangeMax = document.getElementById('tn-range-max');
+  if (!rangeMin || !rangeMax) return;
+
+  rangeMin.min = rangeMax.min = 0;
+  rangeMin.max = rangeMax.max = maxT || 100;
+  rangeMin.value = _transcriptFilter.timeMin || 0;
+
+  if (_tnRangeMaxPinned || _transcriptFilter.timeMax === Infinity) {
+    rangeMax.value = maxT;
+    _transcriptFilter.timeMax = Infinity;
+    _tnRangeMaxPinned = true;
+  } else {
+    rangeMax.value = Math.min(_transcriptFilter.timeMax, maxT);
+  }
+
+  _tnUpdateRangeFill();
+  _tnUpdateTimeLabels();
+
+  // Remove old listeners by replacing elements
+  const newMin = rangeMin.cloneNode(true);
+  const newMax = rangeMax.cloneNode(true);
+  rangeMin.replaceWith(newMin);
+  rangeMax.replaceWith(newMax);
+
+  newMin.addEventListener('input', () => {
+    if (parseFloat(newMin.value) > parseFloat(newMax.value)) newMin.value = newMax.value;
+    _transcriptFilter.timeMin = parseFloat(newMin.value);
+    _tnUpdateRangeFill();
+    _tnUpdateTimeLabels();
+    applyTranscriptFilter();
+    _updateFilterBtnState();
+  });
+  newMax.addEventListener('input', () => {
+    if (parseFloat(newMax.value) < parseFloat(newMin.value)) newMax.value = newMin.value;
+    const maxVal = parseFloat(newMax.max);
+    const atEnd = parseFloat(newMax.value) >= maxVal - 0.5;
+    _tnRangeMaxPinned = atEnd;
+    _transcriptFilter.timeMax = atEnd ? Infinity : parseFloat(newMax.value);
+    _tnUpdateRangeFill();
+    _tnUpdateTimeLabels();
+    applyTranscriptFilter();
+    _updateFilterBtnState();
+  });
+}
+
+// Called when new segments arrive during live recording to extend the slider
+function _tnExtendTimeRange() {
+  const panel = document.getElementById('transcript-navigator');
+  if (!panel || panel.classList.contains('collapsed')) return;
+
+  const { maxT } = _tnGetTimelineBounds();
+  const rangeMin = document.getElementById('tn-range-min');
+  const rangeMax = document.getElementById('tn-range-max');
+  if (!rangeMin || !rangeMax) return;
+
+  // Extend the slider max to cover new segments
+  rangeMin.max = rangeMax.max = maxT || 100;
+
+  // If pinned to the end, keep the max handle at the right edge
+  if (_tnRangeMaxPinned) {
+    rangeMax.value = maxT;
+    _transcriptFilter.timeMax = Infinity;
+  }
+
+  _tnUpdateRangeFill();
+  _tnUpdateTimeLabels();
+}
+
+function _tnUpdateRangeFill() {
+  const fill = document.getElementById('tn-range-fill');
+  const rangeMin = document.getElementById('tn-range-min');
+  const rangeMax = document.getElementById('tn-range-max');
+  if (!fill || !rangeMin || !rangeMax) return;
+  const max = parseFloat(rangeMin.max) || 100;
+  const lo = parseFloat(rangeMin.value) / max * 100;
+  const hi = parseFloat(rangeMax.value) / max * 100;
+  fill.style.left = lo + '%';
+  fill.style.right = (100 - hi) + '%';
+}
+
+function _tnUpdateTimeLabels() {
+  const rangeMin = document.getElementById('tn-range-min');
+  const rangeMax = document.getElementById('tn-range-max');
+  const labelStart = document.getElementById('tn-time-label-start');
+  const labelEnd = document.getElementById('tn-time-label-end');
+  if (labelStart && rangeMin) labelStart.textContent = fmtDuration(parseFloat(rangeMin.value));
+  if (labelEnd && rangeMax) labelEnd.textContent = fmtDuration(parseFloat(rangeMax.value));
+}
+
+// ── Speaker statistics ────────────────────────────────────────────────────────
+
+function tnToggleStats() {
+  const body = document.getElementById('tn-stats-body');
+  if (!body) return;
+  const wasCollapsed = body.classList.contains('collapsed');
+  body.classList.toggle('collapsed');
+  if (wasCollapsed) _tnRefreshStats();
+}
+
+function _tnRefreshStats() {
+  const body = document.getElementById('tn-stats-body');
+  if (!body || body.classList.contains('collapsed')) return;
+  body.innerHTML = '';
+
+  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
+  const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+
+  groups.forEach(g => {
+    const keysSet = new Set(g.speakerKeys);
+    let segCount = 0;
+    let totalTime = 0;
+    allSegs.forEach(seg => {
+      if (keysSet.has(seg.dataset.transcriptSource)) {
+        segCount++;
+        const s = parseFloat(seg.dataset.start || 0);
+        const e = parseFloat(seg.dataset.end || 0);
+        if (e > s) totalTime += e - s;
+      }
+    });
+
+    if (segCount === 0) return;
+
+    const color = g.color || speakerColor(g.speakerKeys[0]);
+    const item = document.createElement('div');
+    item.className = 'tn-stat-item';
+    item.innerHTML = `
+      <span class="tn-stat-dot" style="background:${color}"></span>
+      <span class="tn-stat-name">${escapeHtml(g.name)}</span>
+      <span class="tn-stat-value">${segCount} seg${segCount !== 1 ? 's' : ''}${totalTime > 0 ? ', ' + fmtDuration(totalTime) : ''}</span>
+    `;
+    body.appendChild(item);
+  });
+
+  if (body.children.length === 0) {
+    body.innerHTML = '<span class="tn-stat-value" style="padding:2px 0">No speakers yet</span>';
+  }
+}
+
+// ── Clear all filters ─────────────────────────────────────────────────────────
+
+function tnClearAll() {
+  _transcriptFilter.search = '';
+  _transcriptFilter.speakers.clear();
+  _transcriptFilter.timeMin = 0;
+  _transcriptFilter.timeMax = Infinity;
+  _tnRangeMaxPinned = true;
+  _navState.matches = [];
+  _navState.currentIdx = -1;
+  _tnStripMarks();
+  applyTranscriptFilter();
+  _updateFilterBtnState();
+
+  // Reset UI
+  const searchInput = document.getElementById('tn-search-input');
+  if (searchInput) searchInput.value = '';
+  _tnRefreshSpeakerPills();
+  _tnRefreshTimeRange();
+  _tnRefreshStats();
 }
 
 function clearTranscript() {
+  if (!confirm('Clear the transcript? The transcript will need to be reanalyzed for speaker labeling.')) return;
   document.getElementById('transcript').innerHTML =
     '<p class="empty-hint">Transcript cleared.</p>';
 }
@@ -2753,13 +3486,17 @@ function initPlayback(sessionId) {
 
   _playbackAudio.ontimeupdate = () => {
     const t = _playbackAudio.currentTime;
+    // Skip filtered-out segments during playback
+    if (!_playbackAudio.paused && _transcriptFilterActive()) {
+      _skipFilteredAudio(t);
+    }
     document.getElementById('playback-time').textContent = fmtTime(t);
-    document.getElementById('playback-seek').value = t;
-    highlightPlayingSegment(t);
+    document.getElementById('playback-seek').value = _playbackAudio.currentTime;
+    highlightPlayingSegment(_playbackAudio.currentTime);
   };
 
   _playbackAudio.onended = () => {
-    document.getElementById('playback-play').textContent = '▶';
+    document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-play"></i>';
     clearPlayingHighlight();
   };
 }
@@ -2769,7 +3506,7 @@ function destroyPlayback() {
   _playbackAudio.removeAttribute('src');
   _playbackActive = false;
   document.getElementById('playback-bar').classList.add('hidden');
-  document.getElementById('playback-play').textContent = '▶';
+  document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-play"></i>';
   document.getElementById('playback-time').textContent = '0:00';
   document.getElementById('playback-duration').textContent = '0:00';
   document.getElementById('playback-seek').value = 0;
@@ -2780,10 +3517,10 @@ function togglePlayback() {
   if (!_playbackActive) return;
   if (_playbackAudio.paused) {
     _playbackAudio.play();
-    document.getElementById('playback-play').textContent = '⏸';
+    document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-pause"></i>';
   } else {
     _playbackAudio.pause();
-    document.getElementById('playback-play').textContent = '▶';
+    document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-play"></i>';
   }
 }
 
@@ -2797,7 +3534,7 @@ function seekToTime(t) {
   _playbackAudio.currentTime = t;
   if (_playbackAudio.paused) {
     _playbackAudio.play();
-    document.getElementById('playback-play').textContent = '⏸';
+    document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-pause"></i>';
   }
 }
 
@@ -2806,7 +3543,55 @@ function setPlaybackSpeed(val) {
   savePref('playback_speed', val);
 }
 
+// Build a sorted list of visible time ranges from transcript segments
+function _getVisibleTimeRanges() {
+  const ranges = [];
+  document.querySelectorAll('#transcript .transcript-segment[data-start]').forEach(seg => {
+    if (seg.style.display === 'none') return;
+    ranges.push({
+      start: parseFloat(seg.dataset.start),
+      end:   parseFloat(seg.dataset.end),
+    });
+  });
+  ranges.sort((a, b) => a.start - b.start);
+  return ranges;
+}
+
+let _lastSkipTime = -1;
+function _skipFilteredAudio(t) {
+  // Avoid repeated skipping at the same position
+  if (Math.abs(t - _lastSkipTime) < 0.3) return;
+
+  const ranges = _getVisibleTimeRanges();
+  if (ranges.length === 0) return;
+
+  // Check if current time is inside any visible range
+  for (const r of ranges) {
+    if (t >= r.start && t < r.end) return; // playing a visible segment, all good
+  }
+
+  // Current time is in a hidden gap — find the next visible range
+  for (const r of ranges) {
+    if (r.start > t) {
+      _lastSkipTime = r.start;
+      _playbackAudio.currentTime = r.start;
+      return;
+    }
+  }
+
+  // Past all visible segments — let playback end naturally
+}
+
 let _currentPlayingSeg = null;
+let _programmaticScrollCount = 0; // incremented before programmatic scrolls, decremented on scroll event
+
+function _doProgrammaticScroll(el, opts) {
+  _programmaticScrollCount++;
+  el.scrollIntoView(opts);
+  // Scroll events fire asynchronously; decrement after they settle
+  setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 600);
+}
+
 function highlightPlayingSegment(t) {
   const segs = document.querySelectorAll('.transcript-segment[data-start]');
   let found = null;
@@ -2820,7 +3605,9 @@ function highlightPlayingSegment(t) {
   _currentPlayingSeg = found;
   if (found) {
     found.classList.add('playing');
-    found.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    if (_autoScroll) {
+      _doProgrammaticScroll(found, { behavior: 'smooth', block: 'center' });
+    }
   }
 }
 
@@ -2934,6 +3721,13 @@ async function loadSession(sessionId) {
     });
   }
 
+  // Load voice library links for badge indicators
+  _sessionLinks = {};
+  fetch(`/api/fingerprint/sessions/${sessionId}/links`)
+    .then(r => r.json())
+    .then(links => { _sessionLinks = links || {}; _updateLinkedBadges(); })
+    .catch(() => {});
+
   data.segments?.forEach(s =>
     appendTranscript(s.text, s.source || 'loopback', s.start_time, s.end_time,
                      s.id, s.label_override)
@@ -3018,6 +3812,14 @@ function clearAll() {
   _transcriptSelectedSegs.clear();
   _transcriptSelectionAnchor = null;
   _pendingSpeakerProfiles = [];
+  _sessionLinks = {};
+  _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
+  _showNoise = false;
+  _navState = { matches: [], currentIdx: -1 };
+  const tnSearch = document.getElementById('tn-search-input');
+  if (tnSearch) tnSearch.value = '';
+  document.getElementById('transcript-navigator')?.classList.add('collapsed');
+  _updateFilterBtnState();
   closeSpeakerManager();
   const bar = document.getElementById('transcript-selection-bar');
   if (bar) bar.classList.add('hidden');
@@ -3327,7 +4129,7 @@ function toggleModelConfig() {
   const body  = document.getElementById('model-config-body');
   const arrow = document.getElementById('model-config-arrow');
   const hidden = body.classList.toggle('hidden');
-  arrow.textContent = hidden ? '▸' : '▾';
+  arrow.innerHTML = hidden ? '<i class="fa-solid fa-chevron-right"></i>' : '<i class="fa-solid fa-chevron-down"></i>';
 }
 
 async function loadModelConfig() {
@@ -3454,8 +4256,12 @@ function toggleAutoScroll() {
   _autoScroll = !_autoScroll;
   updateAutoScrollBtn();
   if (_autoScroll) {
-    const el = document.getElementById('transcript');
-    el.scrollTop = el.scrollHeight;
+    if (_playbackActive && _currentPlayingSeg) {
+      _doProgrammaticScroll(_currentPlayingSeg, { behavior: 'smooth', block: 'center' });
+    } else {
+      const el = document.getElementById('transcript');
+      el.scrollTop = el.scrollHeight;
+    }
   }
 }
 
@@ -3696,7 +4502,12 @@ function closeSettingsOnOverlay(e) {
 
 function toggleKeyVis(inputId) {
   const el = document.getElementById(inputId);
-  el.type = el.type === 'password' ? 'text' : 'password';
+  const showing = el.type === 'password';
+  el.type = showing ? 'text' : 'password';
+  const btn = el.parentElement.querySelector('.key-vis-btn');
+  if (btn) btn.innerHTML = showing
+    ? '<i class="fa-solid fa-eye-slash"></i>'
+    : '<i class="fa-solid fa-eye"></i>';
 }
 
 async function saveApiKeys() {
@@ -3748,14 +4559,27 @@ async function saveApiKeys() {
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 
-// Disable auto-scroll when the user scrolls up in the transcript; re-enable
-// when they scroll back to the bottom.
+// Auto-scroll behavior:
+// - Live recording: disable when user scrolls up, re-enable at bottom
+// - Playback: disable on user-initiated scroll only, re-enable via button click
 document.getElementById('transcript').addEventListener('scroll', () => {
-  const el = document.getElementById('transcript');
-  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-  if (_autoScroll !== atBottom) {
-    _autoScroll = atBottom;
-    updateAutoScrollBtn();
+  // Ignore programmatic scrolls (from playback tracking, seek, button clicks, etc.)
+  if (_programmaticScrollCount > 0) return;
+
+  if (_playbackActive && !_playbackAudio.paused) {
+    // During playback, only user-initiated scrolls disable auto-scroll
+    if (_autoScroll) {
+      _autoScroll = false;
+      updateAutoScrollBtn();
+    }
+  } else {
+    // Live mode: re-enable at bottom
+    const el = document.getElementById('transcript');
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (_autoScroll !== atBottom) {
+      _autoScroll = atBottom;
+      updateAutoScrollBtn();
+    }
   }
 });
 
@@ -3771,6 +4595,7 @@ fetch('/api/ai_settings')
   .catch(() => {});
 startVizLoop();
 initGainSliders();
+_tnInitSearch();
 // Load preferences first, then init components that depend on saved values
 loadPreferences().then(() => {
   loadAudioDevices();
@@ -3786,8 +4611,17 @@ loadSummaryPrompt();
     openSettings();
     history.replaceState(null, '', location.pathname);
   } else if (params.has('session')) {
-    // Defer until sidebar + status have loaded so the UI is ready
-    setTimeout(() => loadSession(params.get('session')), 0);
+    // Defer until status has loaded — if the session is actively recording,
+    // the SSE status+replay events handle everything; only call loadSession
+    // for past (non-recording) sessions.
+    const _pendingSessionId = params.get('session');
+    fetch('/api/status').then(r => r.json()).then(st => {
+      if (st.recording && st.session_id === _pendingSessionId) {
+        // Active recording — SSE status event will set state; don't call loadSession
+        return;
+      }
+      loadSession(_pendingSessionId);
+    }).catch(() => loadSession(_pendingSessionId));
   }
 }
 
