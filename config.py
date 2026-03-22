@@ -6,13 +6,18 @@ This module has NO imports from other project files to avoid circular dependenci
 import os
 from pathlib import Path
 
-# Suppress HuggingFace symlinks warning on Windows (symlinks require Developer Mode
-# or admin rights; caching still works fine without them).
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-
 from dotenv import load_dotenv, set_key
 
 ENV_PATH = Path(__file__).parent / ".env"
+
+# Pre-load .env early so HuggingFace environment flags are applied before any
+# model imports happen (app.py imports transcriber before calling ensure_env()).
+if ENV_PATH.exists():
+    load_dotenv(str(ENV_PATH))
+
+# Suppress HuggingFace symlinks warning on Windows (symlinks require Developer Mode
+# or admin rights; caching still works fine without them).
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 REQUIRED_KEYS = {
     "ANTHROPIC_API_KEY": {
@@ -53,6 +58,10 @@ def ensure_env() -> None:
             "",
             "# Suppress HuggingFace symlinks warning on Windows (caching still works without them)",
             "HF_HUB_DISABLE_SYMLINKS_WARNING=1",
+            "",
+            "# Set to 1 if model downloads fail with SSL certificate errors.",
+            "# This is common on corporate networks with SSL inspection proxies.",
+            "# HF_HUB_DISABLE_SSL_VERIFICATION=0",
             "",
             "# Server port (default: 6969)",
             "# PORT=6969",
