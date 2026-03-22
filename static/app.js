@@ -1743,6 +1743,9 @@ let _fpToastActive = null;       // currently displayed toast data
 let _fpToastTimer  = null;
 
 function _fpEnqueueToast(data) {
+  // Skip if the top match is the speaker's current name (already applied)
+  const top = data.matches && data.matches[0];
+  if (top && data.current_name && top.name === data.current_name) return;
   // Replace any existing entry for the same speaker_key in the queue
   _fpToastQueue = _fpToastQueue.filter(d => d.speaker_key !== data.speaker_key);
   _fpToastQueue.push(data);

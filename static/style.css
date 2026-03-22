@@ -2554,3 +2554,7 @@ div#summary.col-body {
 button#transcript-filter-btn.active {
     color: #ff4e4e;
 }
+
+button#analytics-btn.active {
+    color: #60a6f1;
+}

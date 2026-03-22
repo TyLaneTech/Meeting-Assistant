@@ -18,23 +18,19 @@ from typing import Callable
 
 import wave
 
-# ── Windows: register CUDA DLL directories ────────────────────────────────
-# PyTorch (torch) ships its own cuBLAS/cuDNN DLLs inside torch/lib/.
-# ctranslate2 (used by faster-whisper) needs to find those same DLLs.
-# Registering torch/lib via add_dll_directory makes them visible to all
-# native extensions without requiring a system CUDA Toolkit installation.
-# We do NOT use the standalone nvidia-cublas-cu12/nvidia-cudnn-cu12 packages
-# because they can introduce a conflicting cuDNN version alongside the one
-# already bundled inside the torch and ctranslate2 wheels, causing crashes
-# such as "Could not load symbol cudnnGetLibConfig".
+# ── Windows: register nvidia pip-package DLL directories ──────────────────
+# nvidia-cublas-cu12 / nvidia-cudnn-cu12 etc. install their DLLs under
+# site-packages/nvidia/*/bin/ but don't add that to PATH or the Windows DLL
+# search path. os.add_dll_directory() fixes this before ctranslate2 or torch
+# try to load cublas / cudnn.
 if sys.platform == "win32":
+    import glob as _glob
+    import site
     try:
-        import importlib.util as _ilu
-        _torch_spec = _ilu.find_spec("torch")
-        if _torch_spec and _torch_spec.origin:
-            _torch_lib = os.path.join(os.path.dirname(_torch_spec.origin), "lib")
-            if os.path.isdir(_torch_lib):
-                os.add_dll_directory(_torch_lib)
+        for _sp in site.getsitepackages():
+            for _d in _glob.glob(os.path.join(_sp, "nvidia", "*", "bin")):
+                if os.path.isdir(_d):
+                    os.add_dll_directory(_d)
     except Exception:
         pass
 

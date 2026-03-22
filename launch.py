@@ -54,6 +54,61 @@ def _fatal(msg):
     input("Press Enter to exit...")
     sys.exit(1)
 
+# ── uv helpers ────────────────────────────────────────────────────────────────
+
+UV = ""  # resolved in main()
+
+def _find_uv() -> str:
+    """Locate the uv binary."""
+    found = shutil.which("uv")
+    if found:
+        return found
+    # Common install locations on Windows
+    for candidate in [
+        Path.home() / ".local" / "bin" / "uv.exe",
+        Path.home() / ".local" / "bin" / "uv",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+def _uv(*args, show_output=False):
+    """Run uv pip install with the given args. Returns True on success."""
+    cmd = [UV, "pip", "install"]
+    if not show_output:
+        cmd.append("--quiet")
+    cmd.extend(args)
+    return subprocess.run(cmd).returncode == 0
+
+
+def _uv_streaming(*args):
+    """
+    Run uv pip install and print filtered progress lines in real time.
+    """
+    cmd = [UV, "pip", "install"] + list(args)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        lo = line.lower()
+        if any(k in lo for k in ("downloading", "downloaded", "prepared",
+                                   "resolved", "installed", "updated",
+                                   "uninstalled")):
+            print(f"{GRY}         {line}{R}", flush=True)
+        elif "error" in lo:
+            print(f"{RED}         {line}{R}", flush=True)
+        elif line.startswith("+") or line.startswith("-"):
+            print(f"{GRY}         {line}{R}", flush=True)
+    proc.wait()
+    return proc.returncode == 0
+
+
 # ── Venv helpers ──────────────────────────────────────────────────────────────
 
 VENV_DIR = Path(__file__).parent / ".venv"
@@ -119,7 +174,11 @@ def _ensure_venv():
 
     if need_create:
         _info("Creating Python environment (one-time setup)...")
-        r = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)])
+        uv = _find_uv()
+        if uv:
+            r = subprocess.run([uv, "venv", str(VENV_DIR), "--python", "3.12", "--seed"])
+        else:
+            r = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)])
         if r.returncode != 0:
             _fatal("Failed to create virtual environment.")
 
@@ -238,44 +297,6 @@ def _detect_gpu():
     except FileNotFoundError:
         return "cpu", "", ""
 
-# ── pip helpers ───────────────────────────────────────────────────────────────
-
-def _pip(*args, show_output=False):
-    cmd = [sys.executable, "-m", "pip", "install"]
-    if not show_output:
-        cmd.append("--quiet")
-    cmd.extend(args)
-    return subprocess.run(cmd).returncode == 0
-
-
-def _pip_streaming(*args):
-    """
-    Run pip install and print filtered progress lines in real time.
-    Shows download sizes and package names without the full pip noise.
-    """
-    cmd = [sys.executable, "-m", "pip", "install",
-           "--no-input", "--progress-bar", "off"] + list(args)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    for raw in proc.stdout:
-        line = raw.strip()
-        if not line:
-            continue
-        lo = line.lower()
-        if "downloading" in lo:
-            # e.g. "Downloading torch-2.6.0+cu126-cp312-cp312-win_amd64.whl (2.6 GB)"
-            print(f"{GRY}         ↓ {line}{R}", flush=True)
-        elif "installing collected" in lo:
-            pkgs = line.replace("Installing collected packages:", "").strip()
-            print(f"{GRY}         ● Installing: {pkgs}{R}", flush=True)
-        elif "error" in lo and "pip" not in lo:
-            print(f"{RED}         {line}{R}", flush=True)
-    proc.wait()
-    return proc.returncode == 0
-
 
 def _torch_build() -> str:
     """
@@ -300,8 +321,18 @@ def _torch_build() -> str:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global UV
+
     os.chdir(Path(__file__).parent)
     _ensure_venv()   # re-execs into .venv if not already running inside it
+
+    # Ensure uv can find the active venv
+    os.environ["VIRTUAL_ENV"] = str(VENV_DIR)
+
+    UV = _find_uv()
+    if not UV:
+        _fatal("uv not found. Please run launch.bat or install uv: https://docs.astral.sh/uv/")
+
     os.system("cls" if sys.platform == "win32" else "clear")
 
     # Banner
@@ -333,16 +364,15 @@ def main():
     else:
         print(f"{GRN}  [OK] {gpu_name}  {GRY}|  CUDA {cuda_ver}{R}")
 
+    # uv version
+    try:
+        uv_ver = subprocess.run([UV, "--version"], capture_output=True, text=True)
+        _ok(f"uv  {GRY}{uv_ver.stdout.strip()}{R}")
+    except Exception:
+        _ok("uv")
+
     # ── Packages ──────────────────────────────────────────────────────────────
     _section("PACKAGES")
-
-    # pip
-    #_info("pip...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
-        capture_output=True,
-    )
-    _ok("pip")
 
     # PyTorch — only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
@@ -351,8 +381,8 @@ def main():
         if installed_build == "cpu":
             _ok(f"PyTorch  {GRY}[CPU]{R}")
         else:
-            _info(f"PyTorch [CPU]  {GRY}(this may take several minutes){R}")
-            if not _pip_streaming("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
+            _info(f"PyTorch [CPU]  {GRY}(downloading...){R}")
+            if not _uv_streaming("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
                 _fatal("PyTorch install failed -- check your connection and retry")
             _ok(f"PyTorch  {GRY}[CPU]{R}")
     else:
@@ -360,45 +390,33 @@ def main():
             _ok(f"PyTorch  {GRY}[{whl} | GPU-accelerated]{R}")
         else:
             if installed_build:
-                _info(f"PyTorch  {GRY}replacing {installed_build} → {whl}  (this may take several minutes){R}")
+                _info(f"PyTorch  {GRY}replacing {installed_build} → {whl}{R}")
             else:
-                _info(f"PyTorch [{whl}]  {GRY}(this may take several minutes){R}")
-            # --force-reinstall is required to replace a same-version CPU build
-            # with a CUDA one (pip considers them equal by version number alone)
-            if _pip_streaming("torch", "torchaudio",
-                              "--force-reinstall",
-                              "--index-url", TORCH_INDEX + whl):
+                _info(f"PyTorch [{whl}]  {GRY}(downloading...){R}")
+            # --reinstall-package is more targeted than pip's --force-reinstall
+            if _uv_streaming("torch", "torchaudio",
+                             "--reinstall-package", "torch",
+                             "--reinstall-package", "torchaudio",
+                             "--index-url", TORCH_INDEX + whl):
                 _ok(f"PyTorch  {GRY}[{whl} | GPU-accelerated]{R}")
             else:
                 _warn(f"GPU build failed -- falling back to CPU...")
-                if not _pip_streaming("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
+                if not _uv_streaming("torch", "torchaudio", "--index-url", TORCH_INDEX + "cpu"):
                     _fatal("PyTorch install failed -- check your connection and retry")
                 _ok(f"PyTorch  {GRY}[CPU | fallback]{R}")
 
     # Pre-install matplotlib from a binary wheel so diart's transitive pull
     # never triggers a source build (which requires MSVC on Windows).
-    _pip("matplotlib>=3.8.0", "--only-binary", ":all:", "--quiet")
+    _uv("matplotlib>=3.8.0", "--only-binary", "matplotlib")
 
     # All other deps
     _info("Dependencies...")
-    if not _pip_streaming("-r", "requirements.txt"):
+    if not _uv_streaming("-r", "requirements.txt"):
         _warn("Some packages failed -- retrying with full output...")
         print()
-        if not _pip("-r", "requirements.txt", show_output=True):
+        if not _uv("-r", "requirements.txt", show_output=True):
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
-
-    # diart → pyannote.audio pulls in onnxruntime-gpu and nvidia-cudnn-cu12
-    # as transitive deps. onnxruntime-gpu was built against cuDNN 8, but
-    # torch cu12x bundles cuDNN 9 — the cudnnGetLibConfig symbol was removed
-    # in cuDNN 9, causing a fatal C-level crash. We must do this cleanup
-    # *after* requirements install so diart can't pull them back in.
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y",
-         "onnxruntime-gpu", "nvidia-cudnn-cu12", "nvidia-cublas-cu12"],
-        capture_output=True,
-    )
-    _pip("onnxruntime>=1.17.0", "--quiet")
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print()
