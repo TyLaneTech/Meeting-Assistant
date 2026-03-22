@@ -63,8 +63,8 @@ fingerprint_db._inference = None
 _saved_prefs = settings.load()
 
 ai = AIAssistant(
-    provider=_saved_prefs.get("ai_provider", "anthropic"),
-    model=_saved_prefs.get("ai_model", "claude-sonnet-4-6"),
+    provider=_saved_prefs.get("ai_provider", "openai"),
+    model=_saved_prefs.get("ai_model", "gpt-4o"),
 )
 log.info("ai", f"Provider: {ai.provider}, model: {ai.model}")
 
@@ -1186,7 +1186,7 @@ def set_keys():
             changed.append(key_name)
 
     # Reload AI client if the active provider's key changed
-    active_provider = settings.get("ai_provider", "anthropic")
+    active_provider = settings.get("ai_provider", "openai")
     provider_key = "OPENAI_API_KEY" if active_provider == "openai" else "ANTHROPIC_API_KEY"
     if provider_key in changed:
         ai.reload_client()
@@ -1207,7 +1207,7 @@ def set_keys():
 @app.route("/api/settings/status")
 def settings_status():
     """Combined status for the settings page: keys, CUDA, setup state."""
-    provider = settings.get("ai_provider", "anthropic")
+    provider = settings.get("ai_provider", "openai")
     return jsonify({
         "needs_setup": config.needs_setup(provider),
         "cuda_available": CUDA_AVAILABLE,
@@ -1248,12 +1248,12 @@ _OPENAI_EXCLUDE = (
 
 def _models_for_provider(provider: str) -> list[dict]:
     """Return the configured model list for a provider."""
-    return _AI_MODELS.get(provider, _AI_MODELS["anthropic"])
+    return _AI_MODELS.get(provider, _AI_MODELS["openai"])
 
 
 def _normalize_ai_selection(provider: str, model: str | None) -> tuple[str, str]:
     """Ensure provider/model are valid and aligned with each other."""
-    provider = provider if provider in _AI_MODELS else "anthropic"
+    provider = provider if provider in _AI_MODELS else "openai"
     valid_ids = {m["id"] for m in _models_for_provider(provider)}
     if model in valid_ids:
         return provider, model
@@ -2361,7 +2361,7 @@ def main() -> None:
     port = int(os.getenv("PORT", 6969))
     url = f"http://127.0.0.1:{port}"
 
-    _active_provider = settings.get("ai_provider", "anthropic")
+    _active_provider = settings.get("ai_provider", "openai")
 
     if config.needs_setup(_active_provider):
         log.warn("app", "First-run setup required — browser will open to configure API keys.")
@@ -2397,7 +2397,7 @@ def main() -> None:
         def _state_snapshot() -> dict:
             with _state_lock:
                 snap = {**_state}
-            snap["ai_provider"] = settings.get("ai_provider", "anthropic")
+            snap["ai_provider"] = settings.get("ai_provider", "openai")
             return snap
 
         def _on_tray_quit(icon) -> None:

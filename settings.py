@@ -37,8 +37,8 @@ DEFAULTS: dict = {
     "auto_summary": True,
 
     # AI provider and model
-    "ai_provider": "anthropic",
-    "ai_model": "claude-sonnet-4-6",
+    "ai_provider": "openai",
+    "ai_model": "gpt-5.3",
 }
 
 

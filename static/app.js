@@ -4877,11 +4877,11 @@ function _applyAiConfig(provider, model, modelsByProvider = AI_MODELS) {
   });
   sel.disabled = models.length === 0;
 
-  // Highlight active provider's key field
+  // Show only the active provider's key field
   const anthField = document.getElementById('key-anthropic-field');
   const oaiField  = document.getElementById('key-openai-field');
-  anthField.style.opacity = provider === 'anthropic' ? '1' : '0.5';
-  oaiField.style.opacity  = provider === 'openai'    ? '1' : '0.5';
+  anthField.style.display = provider === 'anthropic' ? '' : 'none';
+  oaiField.style.display  = provider === 'openai'    ? '' : 'none';
 }
 
 async function setAiProvider(provider) {
