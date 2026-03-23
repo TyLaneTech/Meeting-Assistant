@@ -73,6 +73,15 @@ class AudioCapture:
         self.loopback_gain: float = 1.0
         self.mic_gain: float = 1.0
 
+        # Echo cancellation parameters (disabled by default — enable for speaker+mic setups)
+        self.echo_cancel_enabled: bool = False
+        self.echo_gate_ratio: float = 2.0
+        self.echo_silence_floor: float = 0.005
+        self.echo_spectral_sub: float = 0.6
+        self.echo_hold_ms: int = 150
+        self.echo_crossfade_ms: int = 30
+        self.echo_mic_suppress_db: int = -18
+
         # Rolling sample buffers for the FFT spectrum visualizer (post-gain)
         self._lb_fft_buf:  collections.deque = collections.deque(maxlen=_FFT_SIZE)
         self._mic_fft_buf: collections.deque = collections.deque(maxlen=_FFT_SIZE)
@@ -391,6 +400,11 @@ class AudioCapture:
         # downstream audio_queue backs up.
         max_buf_samples = int((self.sample_rate or 48000) * 3.0)
 
+        # Echo cancellation state
+        _ec_hold_remaining = 0          # samples remaining in gate hold
+        _ec_prev_gate: str = "both"     # previous gate decision
+        _ec_crossfade_pos = 0           # current crossfade position (0 = done)
+
         while self.is_running:
             try:
                 got_data = False
@@ -462,18 +476,80 @@ class AudioCapture:
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
 
-                        # Source-gated mixing: only use the dominant source's
-                        # audio to prevent speaker-to-mic bleed (echo) from
-                        # duplicating remote speech in the transcription.
-                        if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
-                            src = "loopback"
-                            mixed = lb_chunk
-                        elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
-                            src = "mic"
-                            mixed = mic_chunk
+                        # ── Source-gated mixing with optional echo cancellation ──
+                        if self.echo_cancel_enabled:
+                            floor = self.echo_silence_floor
+                            ratio = self.echo_gate_ratio
+                            hold_samples = int(self.echo_hold_ms * (self.sample_rate or 16000) / 1000)
+                            crossfade_samples = int(self.echo_crossfade_ms * (self.sample_rate or 16000) / 1000)
+                            suppress_gain = 10 ** (self.echo_mic_suppress_db / 20.0)  # dB → linear
+
+                            # Determine raw gate decision
+                            if mic_rms < floor or lb_rms > mic_rms * ratio:
+                                raw_gate = "loopback"
+                            elif lb_rms < floor or mic_rms > lb_rms * ratio:
+                                raw_gate = "mic"
+                            else:
+                                raw_gate = "both"
+
+                            # Hold: if loopback was dominant, keep mic suppressed
+                            # for hold_samples after loopback drops
+                            if raw_gate == "loopback":
+                                _ec_hold_remaining = hold_samples
+                            elif _ec_hold_remaining > 0:
+                                _ec_hold_remaining -= self.CHUNK_SIZE
+                                if _ec_hold_remaining > 0 and raw_gate != "loopback":
+                                    raw_gate = "loopback"
+
+                            # Spectral subtraction: remove loopback frequencies from mic
+                            if raw_gate in ("mic", "both") and self.echo_spectral_sub > 0 and lb_rms > floor:
+                                fft_size = len(mic_chunk)
+                                mic_fft = np.fft.rfft(mic_chunk, n=fft_size)
+                                lb_fft = np.fft.rfft(lb_chunk, n=fft_size)
+                                mic_mag = np.abs(mic_fft)
+                                lb_mag = np.abs(lb_fft)
+                                # Subtract scaled loopback magnitude; floor at 0
+                                cleaned_mag = np.maximum(mic_mag - lb_mag * self.echo_spectral_sub, 0.0)
+                                # Preserve original phase
+                                mic_phase = np.angle(mic_fft)
+                                mic_chunk = np.fft.irfft(cleaned_mag * np.exp(1j * mic_phase), n=fft_size).astype(np.float32)
+
+                            # Build the mixed output based on gate decision
+                            if raw_gate == "loopback":
+                                target = lb_chunk + mic_chunk * suppress_gain
+                                src = "loopback"
+                            elif raw_gate == "mic":
+                                target = mic_chunk
+                                src = "mic"
+                            else:
+                                target = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
+                                src = "both"
+
+                            # Crossfade when gate state changes
+                            if raw_gate != _ec_prev_gate and crossfade_samples > 0:
+                                _ec_crossfade_pos = crossfade_samples
+                            _ec_prev_gate = raw_gate
+
+                            if _ec_crossfade_pos > 0:
+                                fade_len = min(_ec_crossfade_pos, len(target))
+                                fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                                fade_out = 1.0 - fade_in
+                                # Blend the tail of the previous output with the new target
+                                target[:fade_len] = target[:fade_len] * fade_in + lb_chunk[:fade_len] * fade_out
+                                _ec_crossfade_pos -= fade_len
+
+                            mixed = np.clip(target, -1.0, 1.0)
                         else:
-                            src = "both"
-                            mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
+                            # Basic source gating (original behaviour — no echo cancellation)
+                            if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
+                                src = "loopback"
+                                mixed = lb_chunk
+                            elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
+                                src = "mic"
+                                mixed = mic_chunk
+                            else:
+                                src = "both"
+                                mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
                     else:
                         self.mic_level = 0.0
                         mixed = lb_chunk

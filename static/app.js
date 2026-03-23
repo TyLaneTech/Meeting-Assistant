@@ -5097,17 +5097,67 @@ async function _apLoad() {
 
 function _apRenderSection(containerId, paramDefs, current) {
   const container = document.getElementById(containerId);
-  if (!container) return;
+  if (!container || !paramDefs) return;
   container.innerHTML = '';
+
+  // Find any toggle master key in this section (controls enabled state of siblings)
+  let toggleMasterKey = null;
+  for (const [k, s] of Object.entries(paramDefs)) {
+    if (s.type === 'toggle') { toggleMasterKey = k; break; }
+  }
+
   for (const [key, spec] of Object.entries(paramDefs)) {
     const val = current[key] ?? spec.value;
     const isDefault = Math.abs(val - spec.value) < 1e-9;
     const unit = spec.unit ? `<span class="ap-unit">${spec.unit}</span>` : '';
     const tooltip = spec.tooltip || spec.description;
-    const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
 
     const param = document.createElement('div');
     param.className = 'ap-param';
+    param.dataset.apKey = key;
+
+    if (spec.type === 'toggle') {
+      // Render as a toggle switch
+      const checked = parseInt(val) ? 'checked' : '';
+      param.innerHTML = `
+        <div class="ap-header">
+          <span class="ap-label">${spec.label}</span>
+          <span class="ap-desc">${spec.description}</span>
+          <div class="ap-info-wrap">
+            <button class="ap-info-btn" tabindex="-1"><i class="fa-solid fa-circle-info"></i></button>
+            <div class="ap-tooltip">
+              <div class="ap-tooltip-title"><i class="fa-solid fa-circle-info"></i> ${spec.label}</div>
+              <div class="ap-tooltip-body">${tooltip}</div>
+              <div class="ap-tooltip-default">Default: <span>Off</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="ap-slider-row" style="justify-content:flex-start;gap:10px">
+          <label class="toggle-switch">
+            <input type="checkbox" id="ap-toggle-${key}" ${checked}>
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="ap-toggle-label" id="ap-toggle-label-${key}" style="font-size:12px;color:var(--fg-muted)">${checked ? 'Enabled' : 'Disabled'}</span>
+        </div>`;
+      container.appendChild(param);
+      _apBindTooltip(param);
+
+      const cb = param.querySelector(`#ap-toggle-${key}`);
+      const lbl = param.querySelector(`#ap-toggle-label-${key}`);
+      cb.addEventListener('change', () => {
+        const v = cb.checked ? 1 : 0;
+        lbl.textContent = cb.checked ? 'Enabled' : 'Disabled';
+        _apSave(key, v);
+        // Enable/disable sibling params in this section
+        _apSetSectionEnabled(containerId, key, cb.checked);
+      });
+      continue;
+    }
+
+    // Standard slider param
+    const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
+    const isDisabled = (toggleMasterKey && key !== toggleMasterKey && !parseInt(current[toggleMasterKey] ?? 0));
+
     param.innerHTML = `
       <div class="ap-header">
         <span class="ap-label">${spec.label}</span>${unit}
@@ -5124,15 +5174,19 @@ function _apRenderSection(containerId, paramDefs, current) {
       <div class="ap-slider-row">
         <input type="range" class="ap-slider" id="ap-slider-${key}"
                min="${spec.min}" max="${spec.max}" step="${spec.step}" value="${val}"
-               style="background:linear-gradient(90deg,var(--accent) ${pct}%,var(--border) ${pct}%)">
+               style="background:linear-gradient(90deg,var(--accent) ${pct}%,var(--border) ${pct}%)"
+               ${isDisabled ? 'disabled' : ''}>
         <input type="number" class="ap-val-input" id="ap-${key}"
-               value="${val}" min="${spec.min}" max="${spec.max}" step="${spec.step}">
+               value="${val}" min="${spec.min}" max="${spec.max}" step="${spec.step}"
+               ${isDisabled ? 'disabled' : ''}>
         <button class="ap-reset${isDefault ? ' ap-reset-hidden' : ''}" id="ap-reset-${key}"
                 title="Reset to default (${spec.value})"
-                onclick="_apResetOne('${key}')">
+                onclick="_apResetOne('${key}')"
+                ${isDisabled ? 'disabled' : ''}>
           <i class="fa-solid fa-rotate-right"></i>
         </button>
       </div>`;
+    if (isDisabled) param.classList.add('ap-disabled');
     container.appendChild(param);
 
     // Bind tooltip to body for overflow escape
@@ -5159,6 +5213,18 @@ function _apRenderSection(containerId, paramDefs, current) {
       _apSave(key, v);
       _apToggleReset(key, v, spec.value);
     });
+  }
+}
+
+function _apSetSectionEnabled(containerId, toggleKey, enabled) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  for (const param of container.querySelectorAll('.ap-param')) {
+    if (param.dataset.apKey === toggleKey) continue;
+    param.classList.toggle('ap-disabled', !enabled);
+    for (const el of param.querySelectorAll('input, button')) {
+      el.disabled = !enabled;
+    }
   }
 }
 
@@ -5210,11 +5276,120 @@ function _apToggleReset(key, val, defaultVal) {
   if (btn) btn.classList.toggle('ap-reset-hidden', Math.abs(val - defaultVal) < 1e-9);
 }
 
+// ── Echo Cancellation Presets ─────────────────────────────────────────────
+const _ecPresets = {
+  mild: {
+    label: 'Mild',
+    description: 'Light touch — small room, mic close to mouth, minor speaker bleed',
+    icon: 'fa-volume-low',
+    values: {
+      echo_cancel_enabled: 1,
+      echo_gate_ratio: 3.0,
+      echo_silence_floor: 0.005,
+      echo_spectral_sub: 0.3,
+      echo_hold_ms: 80,
+      echo_crossfade_ms: 30,
+      echo_mic_suppress_db: -8,
+    },
+  },
+  moderate: {
+    label: 'Moderate',
+    description: 'Balanced — typical webcam mic with nearby desktop speakers',
+    icon: 'fa-volume',
+    values: {
+      echo_cancel_enabled: 1,
+      echo_gate_ratio: 2.0,
+      echo_silence_floor: 0.008,
+      echo_spectral_sub: 0.6,
+      echo_hold_ms: 150,
+      echo_crossfade_ms: 30,
+      echo_mic_suppress_db: -18,
+    },
+  },
+  aggressive: {
+    label: 'Aggressive',
+    description: 'Strong suppression — loud speakers, mic far from mouth',
+    icon: 'fa-volume-high',
+    values: {
+      echo_cancel_enabled: 1,
+      echo_gate_ratio: 1.5,
+      echo_silence_floor: 0.015,
+      echo_spectral_sub: 1.0,
+      echo_hold_ms: 250,
+      echo_crossfade_ms: 20,
+      echo_mic_suppress_db: -24,
+    },
+  },
+  maximum: {
+    label: 'Maximum',
+    description: 'Nuclear option — heavy echo in an open room, priority is eliminating duplicates',
+    icon: 'fa-shield-halved',
+    values: {
+      echo_cancel_enabled: 1,
+      echo_gate_ratio: 1.2,
+      echo_silence_floor: 0.025,
+      echo_spectral_sub: 1.4,
+      echo_hold_ms: 400,
+      echo_crossfade_ms: 10,
+      echo_mic_suppress_db: -30,
+    },
+  },
+};
+
+function _ecRenderPresets() {
+  const bar = document.getElementById('echo-preset-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  for (const [id, preset] of Object.entries(_ecPresets)) {
+    const btn = document.createElement('button');
+    btn.className = 'echo-preset-btn';
+    btn.id = `echo-preset-${id}`;
+    btn.title = preset.description;
+    btn.innerHTML = `<i class="fa-solid ${preset.icon}"></i> ${preset.label}`;
+    btn.addEventListener('click', () => _ecApplyPreset(id));
+    bar.appendChild(btn);
+  }
+  _ecHighlightActivePreset();
+}
+
+function _ecHighlightActivePreset() {
+  if (!_apCache) return;
+  const cur = _apCache.current;
+  for (const [id, preset] of Object.entries(_ecPresets)) {
+    const btn = document.getElementById(`echo-preset-${id}`);
+    if (!btn) continue;
+    const matches = Object.entries(preset.values).every(([k, v]) =>
+      Math.abs((cur[k] ?? 0) - v) < 1e-6
+    );
+    btn.classList.toggle('active', matches);
+  }
+}
+
+async function _ecApplyPreset(presetId) {
+  const preset = _ecPresets[presetId];
+  if (!preset) return;
+  try {
+    const res = await fetch('/api/audio_params', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(preset.values),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      _apCache.current = res.audio_params;
+      // Re-render the echo params section to reflect new values
+      _apRenderSection('ap-echo-params', _apCache.echo_cancellation, _apCache.current);
+      _ecHighlightActivePreset();
+    }
+  } catch (_) {}
+}
+
 async function _apRefresh() {
   await _apLoad();
   if (!_apCache) return;
   _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
   _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
+  _apRenderSection('ap-echo-params',          _apCache.echo_cancellation, _apCache.current);
+  _ecRenderPresets();
 }
 
 async function _apSave(key, value) {
@@ -5227,11 +5402,15 @@ async function _apSave(key, value) {
     if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
       // Update reset button visibility
-      const spec = (_apCache.transcription[key] || _apCache.diarization[key]);
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]));
       const resetBtn = document.getElementById(`ap-reset-${key}`);
       if (resetBtn && spec) {
         const isDefault = Math.abs(value - spec.value) < 1e-9;
         resetBtn.classList.toggle('ap-reset-hidden', isDefault);
+      }
+      // Update preset highlight if an echo param changed
+      if (_apCache.echo_cancellation && key in _apCache.echo_cancellation) {
+        _ecHighlightActivePreset();
       }
     }
   } catch (_) {}
@@ -5246,14 +5425,25 @@ async function _apResetOne(key) {
     }).then(r => r.json());
     if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
-      const spec = (_apCache.transcription[key] || _apCache.diarization[key]);
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]));
       if (spec) {
-        const input  = document.getElementById(`ap-${key}`);
-        const slider = document.getElementById(`ap-slider-${key}`);
-        if (input)  input.value  = spec.value;
-        if (slider) {
-          slider.value = spec.value;
-          _apUpdateSliderFill(slider, spec);
+        if (spec.type === 'toggle') {
+          const cb = document.getElementById(`ap-toggle-${key}`);
+          const lbl = document.getElementById(`ap-toggle-label-${key}`);
+          if (cb) { cb.checked = !!spec.value; }
+          if (lbl) { lbl.textContent = spec.value ? 'Enabled' : 'Disabled'; }
+          // Find which container this toggle belongs to and update siblings
+          const paramEl = cb?.closest('.ap-param');
+          const container = paramEl?.parentElement;
+          if (container) _apSetSectionEnabled(container.id, key, !!spec.value);
+        } else {
+          const input  = document.getElementById(`ap-${key}`);
+          const slider = document.getElementById(`ap-slider-${key}`);
+          if (input)  input.value  = spec.value;
+          if (slider) {
+            slider.value = spec.value;
+            _apUpdateSliderFill(slider, spec);
+          }
         }
       }
       const resetBtn = document.getElementById(`ap-reset-${key}`);

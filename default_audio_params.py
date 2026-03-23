@@ -303,11 +303,144 @@ DIARIZATION_DEFAULTS = {
     },
 }
 
+ECHO_CANCELLATION_DEFAULTS = {
+    "echo_cancel_enabled": {
+        "value": 0,
+        "label": "Enable Echo Cancellation",
+        "description": "Master switch for speaker/mic echo suppression.",
+        "tooltip": (
+            "Enables advanced echo cancellation for setups where the microphone "
+            "picks up audio from desktop speakers (e.g. webcam mic + external "
+            "speakers). When disabled, only basic source-gated mixing is used.<br><br>"
+            "<b>Leave disabled</b> if you use headphones or a headset \u2014 echo "
+            "cancellation is unnecessary and may slightly reduce audio quality.<br>"
+            "<b>Enable</b> if you hear duplicated transcriptions caused by the mic "
+            "picking up speaker output."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+    },
+    "echo_gate_ratio": {
+        "value": 2.0,
+        "label": "Gate Ratio",
+        "description": "How much louder one source must be to gate the other.",
+        "tooltip": (
+            "Controls the source-gating threshold. When one audio source (loopback "
+            "or mic) is louder than the other by this ratio, the quieter source is "
+            "suppressed entirely.<br><br>"
+            "<b>Lower values</b> (e.g. 1.5) gate more aggressively \u2014 good for "
+            "strong echo but may cut off overlapping speech.<br>"
+            "<b>Higher values</b> (e.g. 4.0) are more permissive, allowing both "
+            "sources through when levels are closer."
+        ),
+        "min": 1.2,
+        "max": 6.0,
+        "step": 0.1,
+        "type": "number",
+    },
+    "echo_silence_floor": {
+        "value": 0.005,
+        "label": "Silence Floor",
+        "description": "RMS level below which a source is treated as silent.",
+        "tooltip": (
+            "Audio sources with an RMS energy below this threshold are considered "
+            "silent and ignored during source gating. Raising this helps reject "
+            "low-level echo bleed that sits just above the noise floor.<br><br>"
+            "<b>Lower values</b> are more sensitive \u2014 very quiet signals still "
+            "count as active.<br>"
+            "<b>Higher values</b> reject more background noise and faint echo, "
+            "but may suppress quiet speakers."
+        ),
+        "min": 0.001,
+        "max": 0.05,
+        "step": 0.001,
+        "type": "number",
+    },
+    "echo_spectral_sub": {
+        "value": 0.6,
+        "label": "Spectral Subtraction",
+        "description": "Strength of frequency-domain echo removal from mic.",
+        "tooltip": (
+            "When the loopback (speaker) audio is active, its frequency spectrum "
+            "is subtracted from the microphone signal to remove echo. This targets "
+            "the specific frequencies being played through the speakers.<br><br>"
+            "<b>Higher values</b> remove more echo but may introduce artifacts or "
+            "thin out the local speaker's voice.<br>"
+            "<b>Lower values</b> are gentler, preserving voice quality but leaving "
+            "more residual echo.<br>"
+            "<b>0</b> disables spectral subtraction entirely (gating only)."
+        ),
+        "min": 0.0,
+        "max": 1.5,
+        "step": 0.05,
+        "type": "number",
+    },
+    "echo_hold_ms": {
+        "value": 150,
+        "label": "Gate Hold Time",
+        "unit": "ms",
+        "description": "How long gating persists after the dominant source drops.",
+        "tooltip": (
+            "After the loopback audio drops below the gating threshold, the mic "
+            "remains suppressed for this many milliseconds. This catches the tail "
+            "end of echo that lingers after the speaker stops.<br><br>"
+            "<b>Longer hold times</b> catch more echo tail but add latency before "
+            "the local speaker's mic reopens.<br>"
+            "<b>Shorter hold times</b> reopen the mic faster, reducing perceived "
+            "delay but risking echo bleed on the trailing edge."
+        ),
+        "min": 0,
+        "max": 500,
+        "step": 10,
+        "type": "int",
+    },
+    "echo_crossfade_ms": {
+        "value": 30,
+        "label": "Crossfade Duration",
+        "unit": "ms",
+        "description": "Smooth transition time when switching between sources.",
+        "tooltip": (
+            "When the gate switches from one source to another, a short crossfade "
+            "prevents audible clicks and pops. Longer crossfades sound smoother "
+            "but may briefly mix both sources.<br><br>"
+            "<b>10\u201330 ms</b> is typical for clean transitions.<br>"
+            "<b>0 ms</b> gives instant hard switching (may cause clicks)."
+        ),
+        "min": 0,
+        "max": 100,
+        "step": 5,
+        "type": "int",
+    },
+    "echo_mic_suppress_db": {
+        "value": -18,
+        "label": "Mic Suppression",
+        "unit": "dB",
+        "description": "Attenuation applied to mic when loopback is dominant.",
+        "tooltip": (
+            "Instead of fully muting the mic during loopback-dominant periods, "
+            "this controls how much the mic signal is attenuated. Allows some "
+            "local speech to bleed through even during active echo suppression.<br><br>"
+            "<b>\u221224 dB or lower</b> is near-total suppression (strongest echo "
+            "rejection).<br>"
+            "<b>\u22126 dB</b> allows significant mic passthrough (minimal echo "
+            "rejection).<br>"
+            "<b>0 dB</b> disables suppression entirely (mic always at full level)."
+        ),
+        "min": -30,
+        "max": 0,
+        "step": 1,
+        "type": "int",
+    },
+}
+
 
 def get_all_defaults() -> dict:
     """Return a flat dict of param_name -> default_value for all parameters."""
     flat = {}
-    for d in (TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS):
+    for d in (TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
+              ECHO_CANCELLATION_DEFAULTS):
         for key, spec in d.items():
             flat[key] = spec["value"]
     return flat
@@ -315,7 +448,8 @@ def get_all_defaults() -> dict:
 
 def get_default(key: str):
     """Return the default value for a single parameter, or None."""
-    for d in (TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS):
+    for d in (TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
+              ECHO_CANCELLATION_DEFAULTS):
         if key in d:
             return d[key]["value"]
     return None

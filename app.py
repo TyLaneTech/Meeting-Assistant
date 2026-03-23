@@ -1026,6 +1026,18 @@ def start_recording():
         existing_seg_count = 0
 
     capture = AudioCapture(_audio_queue)
+
+    # Apply echo cancellation settings to the new capture instance
+    from default_audio_params import get_all_defaults
+    _ec_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
+    capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
+    capture.echo_gate_ratio     = float(_ec_params.get("echo_gate_ratio", 2.0))
+    capture.echo_silence_floor  = float(_ec_params.get("echo_silence_floor", 0.005))
+    capture.echo_spectral_sub   = float(_ec_params.get("echo_spectral_sub", 0.6))
+    capture.echo_hold_ms        = int(_ec_params.get("echo_hold_ms", 150))
+    capture.echo_crossfade_ms   = int(_ec_params.get("echo_crossfade_ms", 30))
+    capture.echo_mic_suppress_db = int(_ec_params.get("echo_mic_suppress_db", -18))
+
     if not resume_session_id:
         # Set up WAV recording before starting capture (sample_rate resolved in start())
         wav_dir = Path(__file__).parent / "data" / "audio"
@@ -1423,7 +1435,8 @@ def set_preferences():
 def get_audio_params():
     """Return current audio parameter values, defaults, and metadata."""
     from default_audio_params import (
-        TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, get_all_defaults,
+        TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
+        ECHO_CANCELLATION_DEFAULTS, get_all_defaults,
     )
     saved = settings.load().get("audio_params", {})
     defaults = get_all_defaults()
@@ -1432,6 +1445,7 @@ def get_audio_params():
         "current": current,
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
+        "echo_cancellation": ECHO_CANCELLATION_DEFAULTS,
     })
 
 
@@ -1472,7 +1486,7 @@ def reset_audio_param():
 
 
 def _apply_audio_params(params: dict) -> None:
-    """Push audio parameter values to the running transcriber."""
+    """Push audio parameter values to the running transcriber and audio capture."""
     _transcriber.silence_threshold = float(params.get("silence_threshold", 0.025))
     _transcriber.silence_duration  = float(params.get("silence_duration", 0.3))
     _transcriber.min_buffer_seconds = float(params.get("min_buffer_seconds", 0.5))
@@ -1486,6 +1500,18 @@ def _apply_audio_params(params: dict) -> None:
     )
     if _transcriber.diarizer is not None:
         _transcriber.diarizer.apply_params(params)
+
+    # Push echo cancellation params to the active AudioCapture instance
+    with _state_lock:
+        capture = _state.get("audio_capture")
+    if capture is not None:
+        capture.echo_cancel_enabled = bool(int(params.get("echo_cancel_enabled", 0)))
+        capture.echo_gate_ratio     = float(params.get("echo_gate_ratio", 2.0))
+        capture.echo_silence_floor  = float(params.get("echo_silence_floor", 0.005))
+        capture.echo_spectral_sub   = float(params.get("echo_spectral_sub", 0.6))
+        capture.echo_hold_ms        = int(params.get("echo_hold_ms", 150))
+        capture.echo_crossfade_ms   = int(params.get("echo_crossfade_ms", 30))
+        capture.echo_mic_suppress_db = int(params.get("echo_mic_suppress_db", -18))
 
 
 @app.route("/api/models", methods=["GET"])

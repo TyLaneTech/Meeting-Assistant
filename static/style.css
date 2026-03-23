@@ -1497,8 +1497,13 @@ button#sidebar-close-btn {
 
 /* ── Settings dialog ──────────────────────────────────────────────────────── */
 .settings-dialog {
-  max-width: 720px; width: 92vw; padding: 0;
-  overflow: hidden; display: flex; flex-direction: column; max-height: 88vh;
+  max-width: 770px;
+  width: 92vw;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: 88vh;
 }
 .settings-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -1509,16 +1514,32 @@ button#sidebar-close-btn {
 .settings-layout { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 
 .settings-nav {
-  width: 158px; flex-shrink: 0; background: var(--surface);
-  border-right: 1px solid var(--border); padding: 10px 8px;
-  display: flex; flex-direction: column; gap: 2px;
+  width: fit-content;
+  flex-shrink: 0;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .settings-nav-item {
-  display: flex; align-items: center; gap: 9px; padding: 9px 11px;
-  border-radius: var(--radius-sm); background: none; border: none; cursor: pointer;
-  color: var(--fg-muted); font-size: 12.5px; font-weight: 500;
-  font-family: var(--font-ui); text-align: left; width: 100%;
-  transition: background 0.13s, color 0.13s; white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  font-family: var(--font-ui);
+  text-align: left;
+  width: fit-content;
+  transition: background 0.13s, color 0.13s;
+  white-space: nowrap;
 }
 .settings-nav-item i { width: 15px; text-align: center; font-size: 13px; }
 .settings-nav-item:hover { background: var(--surface2); color: var(--fg); }
@@ -2801,4 +2822,52 @@ button#analytics-btn.active {
 .ap-reset-hidden {
     visibility: hidden;
     pointer-events: none;
+}
+.ap-disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+.ap-toggle-label {
+    user-select: none;
+}
+
+/* ── Echo Cancellation Presets ──────────────────────────────────── */
+.echo-preset-bar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 2px 0 0;
+}
+.echo-preset-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 7px 10px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-weight: 500;
+    font-family: var(--font-ui);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+.echo-preset-btn:hover {
+    background: var(--surface3, var(--surface2));
+    color: var(--fg);
+    border-color: var(--fg-muted);
+}
+.echo-preset-btn.active {
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+    font-weight: 700;
+}
+.echo-preset-btn i {
+    font-size: 11px;
 }
