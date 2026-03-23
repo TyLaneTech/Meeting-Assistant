@@ -390,6 +390,9 @@ let _sidebarCollapsed   = (() => {        // collapsed folder IDs — persisted 
 let _sidebarAllSessions = [];             // last fetch result
 let _sidebarFolders     = [];             // last fetch result
 let _sidebarDragIds     = [];             // IDs being dragged
+let _sidebarDragType    = 'session';      // 'session' | 'folder'
+let _dragIndicator      = null;           // reusable drop indicator element
+let _dragDescendants    = new Set();      // descendants of dragged folder (cycle prevention)
 
 async function refreshSidebar() {
   const [sessions, folders] = await Promise.all([
@@ -401,11 +404,159 @@ async function refreshSidebar() {
   _renderSidebar();
 }
 
+// ── Folder tree helpers ───────────────────────────────────────────────────────
+
+/** Build a map: parentId → child folders (sorted by sort_order). */
+function _buildChildMap(folders) {
+  const map = new Map();  // key = parent_id (null for top-level)
+  for (const f of folders) {
+    const key = f.parent_id || null;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(f);
+  }
+  return map;
+}
+
+/** Collect all descendant folder IDs of a given folder. */
+function _getDescendantIds(folderId, childMap) {
+  const result = new Set();
+  const stack = [folderId];
+  while (stack.length) {
+    const id = stack.pop();
+    const children = childMap.get(id) || [];
+    for (const c of children) {
+      result.add(c.id);
+      stack.push(c.id);
+    }
+  }
+  return result;
+}
+
+/** Count sessions recursively (folder + all sub-folders). */
+function _countSessionsRecursive(folderId, childMap, sessionsByFolder) {
+  let count = (sessionsByFolder.get(folderId) || []).length;
+  for (const child of (childMap.get(folderId) || [])) {
+    count += _countSessionsRecursive(child.id, childMap, sessionsByFolder);
+  }
+  return count;
+}
+
+// ── Drag-and-drop helpers ─────────────────────────────────────────────────────
+
+function _ensureDragIndicator() {
+  if (!_dragIndicator) {
+    _dragIndicator = document.createElement('div');
+    _dragIndicator.className = 'drop-indicator';
+  }
+  return _dragIndicator;
+}
+
+function _removeDragIndicator() {
+  if (_dragIndicator && _dragIndicator.parentNode) {
+    _dragIndicator.remove();
+  }
+}
+
+/** Determine drop zone: 'before', 'after', or 'center' (only for folders). */
+function _getDropZone(e, el, isFolder) {
+  const rect = el.getBoundingClientRect();
+  const y = e.clientY - rect.top;
+  const h = rect.height;
+  if (isFolder) {
+    if (y < h * 0.28) return 'before';
+    if (y > h * 0.72) return 'after';
+    return 'center';
+  }
+  return y < h * 0.5 ? 'before' : 'after';
+}
+
+/** Show the drop indicator line before or after an element. */
+function _showDropIndicator(el, position) {
+  const ind = _ensureDragIndicator();
+  if (position === 'before') {
+    el.parentNode.insertBefore(ind, el);
+  } else {
+    el.parentNode.insertBefore(ind, el.nextSibling);
+  }
+}
+
+/** Attach drag-over / drop handlers to a session element for reordering. */
+function _attachSessionDragHandlers(el, s) {
+  el.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    // Only show reorder indicator for sessions inside a folder
+    if (!s.folder_id) return;
+    if (_sidebarDragIds.includes(s.id) && _sidebarDragType === 'session') return;
+    const zone = _getDropZone(e, el, false);
+    _removeDragIndicator();
+    _showDropIndicator(el, zone);
+  });
+  el.addEventListener('dragleave', e => {
+    if (!el.contains(e.relatedTarget)) _removeDragIndicator();
+  });
+  el.addEventListener('drop', e => {
+    _removeDragIndicator();
+    // Ungrouped sessions: let the event bubble to the ungrouped zone container
+    if (!s.folder_id) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const zone = _getDropZone(e, el, false);
+    _handleDrop(s.id, 'session', zone, s.folder_id);
+  });
+}
+
+/** Check if a folder drop target is invalid (self or descendant of dragged folder). */
+function _isFolderDropBlocked(folderId) {
+  return _sidebarDragType === 'folder'
+    && (_sidebarDragIds.includes(folderId) || _dragDescendants.has(folderId));
+}
+
+/** Attach drag-over / drop handlers to a folder header for reorder + nest. */
+function _attachFolderDragHandlers(headerEl, folderEl, folder) {
+  headerEl.addEventListener('dragover', e => {
+    // Block self/descendant drops — don't call preventDefault so browser rejects the drop
+    if (_isFolderDropBlocked(folder.id)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+
+    const zone = _getDropZone(e, headerEl, true);
+    _removeDragIndicator();
+    folderEl.classList.remove('drag-over');
+    if (zone === 'center') {
+      folderEl.classList.add('drag-over');
+    } else {
+      _showDropIndicator(folderEl, zone);
+    }
+  });
+  headerEl.addEventListener('dragleave', e => {
+    if (!headerEl.contains(e.relatedTarget)) {
+      folderEl.classList.remove('drag-over');
+      _removeDragIndicator();
+    }
+  });
+  headerEl.addEventListener('drop', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    folderEl.classList.remove('drag-over');
+    _removeDragIndicator();
+    if (_isFolderDropBlocked(folder.id)) return;
+    const zone = _getDropZone(e, headerEl, true);
+    if (zone === 'center') {
+      _handleDropIntoFolder(folder.id);
+    } else {
+      _handleDrop(folder.id, 'folder', zone, folder.parent_id);
+    }
+  });
+}
+
+// ── Render sidebar ────────────────────────────────────────────────────────────
+
 function _renderSidebar() {
   const sessions = _sidebarAllSessions;
   const folders  = _sidebarFolders;
   const list     = document.getElementById('session-list');
-  const hasAny   = sessions.length > 0;
+  const hasAny   = sessions.length > 0 || folders.length > 0;
 
   if (!hasAny) {
     list.innerHTML = '<p class="sidebar-empty">No past sessions yet.</p>';
@@ -413,32 +564,114 @@ function _renderSidebar() {
     return;
   }
 
+  // Build lookup structures
+  const childMap = _buildChildMap(folders);
+  const sessionsByFolder = new Map();
+  for (const s of sessions) {
+    const key = s.folder_id || null;
+    if (!sessionsByFolder.has(key)) sessionsByFolder.set(key, []);
+    sessionsByFolder.get(key).push(s);
+  }
+  // Sort sessions within each folder by sort_order
+  for (const [, arr] of sessionsByFolder) {
+    arr.sort((a, b) => a.sort_order - b.sort_order);
+  }
+
+  const folderIds = new Set(folders.map(f => f.id));
   const fragment = document.createDocumentFragment();
 
-  // ── Folder sections ───────────────────────────────────────────────────────
-  for (const folder of folders) {
-    const folderSessions = sessions.filter(s => s.folder_id === folder.id);
+  // Render folder tree recursively from top-level
+  _renderFolderSubtree(null, 0, fragment, childMap, sessionsByFolder, folderIds);
+
+  // Ungrouped sessions (no folder or deleted folder) — also acts as a drop
+  // target to remove sessions from folders.
+  const ungroupedZone = document.createElement('div');
+  ungroupedZone.className = 'sidebar-ungrouped-zone';
+
+  const ungrouped = sessions.filter(s => !s.folder_id || !folderIds.has(s.folder_id));
+  if (ungrouped.length) {
+    ungrouped.sort((a, b) => b.started_at.localeCompare(a.started_at));
+    const groups = groupByDate(ungrouped);
+    for (const [label, items] of groups) {
+      const groupEl = document.createElement('div');
+      groupEl.className = 'session-group';
+      groupEl.textContent = label;
+      ungroupedZone.appendChild(groupEl);
+      items.forEach(s => {
+        const el = _makeSessionEl(s);
+        _attachSessionDragHandlers(el, s);
+        ungroupedZone.appendChild(el);
+      });
+    }
+  }
+
+  // Drag-over / drop on the entire ungrouped zone to uncategorize
+  ungroupedZone.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    ungroupedZone.classList.add('drag-over');
+  });
+  ungroupedZone.addEventListener('dragleave', e => {
+    if (!ungroupedZone.contains(e.relatedTarget)) {
+      ungroupedZone.classList.remove('drag-over');
+    }
+  });
+  ungroupedZone.addEventListener('drop', e => {
+    e.preventDefault();
+    ungroupedZone.classList.remove('drag-over');
+    if (_sidebarDragType === 'session') {
+      _handleDropIntoFolder(null);
+    } else if (_sidebarDragType === 'folder') {
+      _handleDropFolderToTopLevel();
+    }
+  });
+
+  fragment.appendChild(ungroupedZone);
+
+  list.innerHTML = '';
+  list.appendChild(fragment);
+  _updateBulkBar();
+}
+
+function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds) {
+  const children = childMap.get(parentId) || [];
+  for (const folder of children) {
+    const folderSessions = sessionsByFolder.get(folder.id) || [];
+    const totalCount = _countSessionsRecursive(folder.id, childMap, sessionsByFolder);
     const collapsed = _sidebarCollapsed.has(folder.id);
 
     const folderEl = document.createElement('div');
     folderEl.className = 'sidebar-folder';
     folderEl.dataset.folderId = folder.id;
 
-    // Drop target behavior
-    folderEl.addEventListener('dragover', e => { e.preventDefault(); folderEl.classList.add('drag-over'); });
-    folderEl.addEventListener('dragleave', e => { if (!folderEl.contains(e.relatedTarget)) folderEl.classList.remove('drag-over'); });
-    folderEl.addEventListener('drop', e => { e.preventDefault(); folderEl.classList.remove('drag-over'); _dropIntoFolder(folder.id); });
 
     // Folder header
     const header = document.createElement('div');
     header.className = 'folder-header';
-    header.innerHTML = `
-      <button class="folder-toggle" onclick="_toggleFolder('${folder.id}')"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
-      <span class="folder-icon"><i class="fa-solid fa-folder"></i></span>
-      <span class="folder-name" onclick="_toggleFolder('${folder.id}')">${escapeHtml(folder.name)}</span>
-      <span class="folder-count">${folderSessions.length}</span>`;
+    header.draggable = true;
 
-    // ⋮ context menu button for folder
+    // Drag start for folder
+    header.addEventListener('dragstart', e => {
+      e.stopPropagation();
+      _sidebarDragType = 'folder';
+      _sidebarDragIds = [folder.id];
+      _dragDescendants = _getDescendantIds(folder.id, childMap);
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', JSON.stringify([folder.id]));
+      folderEl.classList.add('dragging');
+    });
+    header.addEventListener('dragend', () => {
+      folderEl.classList.remove('dragging');
+      _removeDragIndicator();
+      _dragDescendants.clear();
+    });
+
+    header.innerHTML = `
+      <button class="folder-toggle" onclick="event.stopPropagation(); _toggleFolder('${folder.id}')"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
+      <span class="folder-icon"><i class="fa-solid fa-folder${collapsed ? '' : '-open'}"></i></span>
+      <span class="folder-name" onclick="_toggleFolder('${folder.id}')">${escapeHtml(folder.name)}</span>
+      <span class="folder-count">${totalCount}</span>`;
+
     const folderMenuBtn = document.createElement('button');
     folderMenuBtn.className = 'folder-menu-btn';
     folderMenuBtn.title = 'More options';
@@ -447,36 +680,52 @@ function _renderSidebar() {
     header.appendChild(folderMenuBtn);
     folderEl.appendChild(header);
 
+    _attachFolderDragHandlers(header, folderEl, folder);
+
     if (!collapsed) {
       const body = document.createElement('div');
       body.className = 'folder-body';
-      if (folderSessions.length === 0) {
-        body.innerHTML = '<div class="folder-empty">Drop sessions here</div>';
+
+      // Render child folders first
+      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds);
+
+      if (folderSessions.length === 0 && !(childMap.get(folder.id) || []).length) {
+        body.innerHTML += '<div class="folder-empty">Drop sessions here</div>';
       } else {
-        folderSessions.forEach(s => body.appendChild(_makeSessionEl(s)));
+        for (const s of folderSessions) {
+          const el = _makeSessionEl(s);
+          _attachSessionDragHandlers(el, s);
+          body.appendChild(el);
+        }
       }
+
+      // Drop zone for empty area inside folder body
+      body.addEventListener('dragover', e => {
+        if (_isFolderDropBlocked(folder.id)) return;
+        if (e.target === body || e.target.classList.contains('folder-empty')) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          folderEl.classList.add('drag-over');
+        }
+      });
+      body.addEventListener('dragleave', e => {
+        if (!body.contains(e.relatedTarget)) folderEl.classList.remove('drag-over');
+      });
+      body.addEventListener('drop', e => {
+        if (_isFolderDropBlocked(folder.id)) return;
+        if (e.target === body || e.target.classList.contains('folder-empty')) {
+          e.preventDefault();
+          e.stopPropagation();
+          folderEl.classList.remove('drag-over');
+          _handleDropIntoFolder(folder.id);
+        }
+      });
+
       folderEl.appendChild(body);
     }
 
-    fragment.appendChild(folderEl);
+    container.appendChild(folderEl);
   }
-
-  // ── Ungrouped sessions by date ────────────────────────────────────────────
-  const ungrouped = sessions.filter(s => !s.folder_id || !folders.find(f => f.id === s.folder_id));
-  if (ungrouped.length) {
-    const groups = groupByDate(ungrouped);
-    for (const [label, items] of groups) {
-      const groupEl = document.createElement('div');
-      groupEl.className = 'session-group';
-      groupEl.textContent = label;
-      fragment.appendChild(groupEl);
-      items.forEach(s => fragment.appendChild(_makeSessionEl(s)));
-    }
-  }
-
-  list.innerHTML = '';
-  list.appendChild(fragment);
-  _updateBulkBar();
 }
 
 function _makeSessionEl(s) {
@@ -490,6 +739,7 @@ function _makeSessionEl(s) {
   el.draggable  = true;
 
   el.addEventListener('dragstart', e => {
+    _sidebarDragType = 'session';
     _sidebarDragIds = isSelected && _sidebarSelected.size > 1
       ? [..._sidebarSelected]
       : [s.id];
@@ -497,7 +747,7 @@ function _makeSessionEl(s) {
     e.dataTransfer.setData('text/plain', JSON.stringify(_sidebarDragIds));
     el.classList.add('dragging');
   });
-  el.addEventListener('dragend', () => el.classList.remove('dragging'));
+  el.addEventListener('dragend', () => { el.classList.remove('dragging'); _removeDragIndicator(); });
 
   el.addEventListener('click', e => {
     if (e.ctrlKey || e.metaKey || _sidebarMultiselect) {
@@ -511,7 +761,6 @@ function _makeSessionEl(s) {
   const dot = document.createElement('div');
   dot.className = `session-dot${isLive ? ' live' : ''}`;
 
-  // Checkbox — only visible when sidebar is in multiselect mode (CSS-controlled)
   const cb = document.createElement('input');
   cb.type = 'checkbox';
   cb.className = 'session-checkbox';
@@ -533,7 +782,6 @@ function _makeSessionEl(s) {
   el.appendChild(dot);
   el.appendChild(info);
 
-  // ⋮ context menu button — replaces the individual reanalyze/rename/delete buttons
   const menuBtn = document.createElement('button');
   menuBtn.className = 'session-menu-btn';
   menuBtn.title = 'More options';
@@ -641,6 +889,15 @@ function _openFolderMenu(e, folder) {
   menu.className = 'session-menu';
   menu.id = 'folder-menu-popup';
 
+  const sub = document.createElement('div');
+  sub.className = 'session-menu-item';
+  sub.innerHTML = '<i class="fa-solid fa-folder-plus"></i>  New subfolder';
+  sub.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeFolderMenu();
+    createSubfolder(folder.id);
+  });
+  menu.appendChild(sub);
+
   const ren = document.createElement('div');
   ren.className = 'session-menu-item';
   ren.innerHTML = '<i class="fa-solid fa-pen"></i>  Rename';
@@ -696,12 +953,62 @@ async function createFolder() {
   refreshSidebar();
 }
 
+async function createSubfolder(parentId) {
+  const name = prompt('Subfolder name:');
+  if (!name?.trim()) return;
+  // Expand the parent folder so the new subfolder is visible
+  _sidebarCollapsed.delete(parentId);
+  try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+  await fetch('/api/folders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name.trim(), parent_id: parentId }),
+  });
+  refreshSidebar();
+}
+
 async function deleteFolder(e, folderId) {
   e.stopPropagation();
   const folder = _sidebarFolders.find(f => f.id === folderId);
-  if (!confirm(`Delete folder "${folder?.name || folderId}"? Sessions will be uncategorized.`)) return;
-  await fetch(`/api/folders/${folderId}`, { method: 'DELETE' });
-  _sidebarCollapsed.delete(folderId);
+  const folderName = folder?.name || folderId;
+
+  // Count all sessions and subfolders recursively
+  const childMap = _buildChildMap(_sidebarFolders);
+  const allFolderIds = new Set();
+  const stack = [folderId];
+  while (stack.length) {
+    const id = stack.pop();
+    allFolderIds.add(id);
+    for (const c of (childMap.get(id) || [])) stack.push(c.id);
+  }
+  const sessionCount = _sidebarAllSessions.filter(s => allFolderIds.has(s.folder_id)).length;
+  const subfolderCount = allFolderIds.size - 1; // exclude the folder itself
+
+  // Build a descriptive warning
+  const parts = [];
+  if (sessionCount) parts.push(`${sessionCount} session${sessionCount > 1 ? 's' : ''}`);
+  if (subfolderCount) parts.push(`${subfolderCount} subfolder${subfolderCount > 1 ? 's' : ''}`);
+  const contentsDesc = parts.length ? parts.join(' and ') : null;
+
+  let deleteContents = false;
+  if (contentsDesc) {
+    const msg = `Delete folder "${folderName}"?\n\n`
+      + `This folder contains ${contentsDesc}.\n\n`
+      + `• OK = permanently delete the folder and all its contents\n`
+      + `• Cancel = keep everything`;
+    if (!confirm(msg)) return;
+    deleteContents = true;
+  } else {
+    if (!confirm(`Delete empty folder "${folderName}"?`)) return;
+  }
+
+  await fetch(`/api/folders/${folderId}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ delete_contents: deleteContents }),
+  });
+  // Clean up collapsed state for this folder and any subfolders
+  for (const id of allFolderIds) _sidebarCollapsed.delete(id);
   try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
   refreshSidebar();
 }
@@ -742,18 +1049,141 @@ function renameFolderInline(e, folderId, currentName) {
   });
 }
 
-function _dropIntoFolder(folderId) {
+// ── Drop handlers ─────────────────────────────────────────────────────────────
+
+function _handleDropIntoFolder(folderId) {
   const ids = _sidebarDragIds.length ? _sidebarDragIds : [];
   if (!ids.length) return;
-  fetch('/api/sessions/bulk', {
+
+  if (_sidebarDragType === 'folder') {
+    // Safety: never drop a folder into itself or its own descendant
+    if (ids.includes(folderId)) return;
+    if (ids.some(id => _dragDescendants.has(folderId))) return;
+    // Move folder(s) into another folder as sub-folders
+    const payload = ids.map((id, i) => ({ id, sort_order: i, parent_id: folderId }));
+    fetch('/api/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folders: payload }),
+    }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+  } else {
+    // Move session(s) into folder
+    fetch('/api/sessions/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'move', session_ids: ids, folder_id: folderId }),
+    }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+  }
+}
+
+function _handleDropFolderToTopLevel() {
+  const ids = _sidebarDragIds.length ? _sidebarDragIds : [];
+  if (!ids.length || _sidebarDragType !== 'folder') return;
+  // Move to top level at the end
+  const topFolders = _sidebarFolders.filter(f => !f.parent_id);
+  const maxOrder = topFolders.reduce((m, f) => Math.max(m, f.sort_order || 0), 0);
+  const payload = ids.map((id, i) => ({ id, sort_order: maxOrder + 1 + i, parent_id: null }));
+  fetch('/api/reorder', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'move', session_ids: ids, folder_id: folderId }),
-  }).then(() => {
-    _sidebarSelected.clear();
-    refreshSidebar();
-  });
+    body: JSON.stringify({ folders: payload }),
+  }).then(() => refreshSidebar());
 }
+
+function _handleDrop(targetId, targetType, zone, parentContext) {
+  // parentContext = folder_id for sessions, parent_id for folders
+  if (_sidebarDragType === 'session' && targetType === 'session') {
+    _reorderSessions(targetId, zone, parentContext);
+  } else if (_sidebarDragType === 'folder' && targetType === 'folder') {
+    _reorderFolders(targetId, zone);
+  } else if (_sidebarDragType === 'session' && targetType === 'folder') {
+    // Session dropped on edge of a folder — treat as drop into the folder
+    _handleDropIntoFolder(targetId);
+  } else if (_sidebarDragType === 'folder' && targetType === 'session') {
+    // Folder dropped on a session edge — ignore (doesn't make sense)
+    return;
+  }
+}
+
+function _reorderSessions(targetSessionId, zone, folderId) {
+  if (!_sidebarDragIds.length) return;
+  // Only reorder within the same folder
+  const targetSession = _sidebarAllSessions.find(s => s.id === targetSessionId);
+  if (!targetSession) return;
+  const inFolder = targetSession.folder_id;
+
+  // Get sibling sessions in this folder, sorted by current sort_order
+  const siblings = _sidebarAllSessions
+    .filter(s => s.folder_id === inFolder)
+    .sort((a, b) => a.sort_order - b.sort_order);
+
+  // Remove dragged items from the list
+  const dragSet = new Set(_sidebarDragIds);
+  const remaining = siblings.filter(s => !dragSet.has(s.id));
+  const dragged = siblings.filter(s => dragSet.has(s.id));
+
+  // Also handle cross-folder moves: sessions being dragged from another folder
+  const draggedAll = _sidebarDragIds.map(id =>
+    _sidebarAllSessions.find(s => s.id === id)
+  ).filter(Boolean);
+
+  // Find insertion index
+  const targetIdx = remaining.findIndex(s => s.id === targetSessionId);
+  const insertIdx = zone === 'before' ? targetIdx : targetIdx + 1;
+
+  // Insert dragged sessions at the new position
+  remaining.splice(insertIdx, 0, ...draggedAll);
+
+  // Assign sequential sort_order and ensure folder_id is correct
+  const payload = remaining.map((s, i) => ({
+    id: s.id,
+    sort_order: i,
+    folder_id: inFolder,
+  }));
+
+  fetch('/api/reorder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessions: payload }),
+  }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+}
+
+function _reorderFolders(targetFolderId, zone) {
+  if (!_sidebarDragIds.length) return;
+  const targetFolder = _sidebarFolders.find(f => f.id === targetFolderId);
+  if (!targetFolder) return;
+  const parentId = targetFolder.parent_id || null;
+
+  // Get sibling folders under the same parent
+  const siblings = _sidebarFolders
+    .filter(f => (f.parent_id || null) === parentId)
+    .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+
+  const dragSet = new Set(_sidebarDragIds);
+  const remaining = siblings.filter(f => !dragSet.has(f.id));
+  const draggedAll = _sidebarDragIds.map(id =>
+    _sidebarFolders.find(f => f.id === id)
+  ).filter(Boolean);
+
+  const targetIdx = remaining.findIndex(f => f.id === targetFolderId);
+  const insertIdx = zone === 'before' ? targetIdx : targetIdx + 1;
+  remaining.splice(insertIdx, 0, ...draggedAll);
+
+  const payload = remaining.map((f, i) => ({
+    id: f.id,
+    sort_order: i,
+    parent_id: parentId,
+  }));
+
+  fetch('/api/reorder', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folders: payload }),
+  }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+}
+
+// Legacy alias for any remaining references
+function _dropIntoFolder(folderId) { _handleDropIntoFolder(folderId); }
 
 // ── Bulk actions ──────────────────────────────────────────────────────────────
 

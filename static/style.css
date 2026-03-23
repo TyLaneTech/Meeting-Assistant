@@ -139,8 +139,8 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 .session-item {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 8px 12px 8px 14px;
+  gap: 6px;
+  padding: 5px 12px 5px 14px;
   cursor: pointer;
   border-radius: 0;
   transition: background .12s;
@@ -165,8 +165,8 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 }
 
 .session-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--fg-subtle);
   margin-top: 5px;
@@ -215,7 +215,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   opacity: 0;
   transition: opacity .12s, color .12s;
   flex-shrink: 0;
-  margin-top: 7px;
+  margin-top: 4px;
 }
 .session-item:hover .session-menu-btn { opacity: 1; }
 .session-menu-btn:hover { color: var(--fg); }
@@ -287,8 +287,29 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 }
 .session-item.dragging { opacity: .5; }
 
+/* ── Drop indicator (reorder) ─────────────────────────────────────────── */
+.drop-indicator {
+    height: 2px;
+    background: var(--accent);
+    border-radius: 1px;
+    margin: 0 8px;
+    pointer-events: none;
+    flex-shrink: 0;
+}
+
+/* ── Ungrouped sessions drop zone ─────────────────────────────────────── */
+.sidebar-ungrouped-zone {
+    flex: 1;
+    min-height: 40px;
+    transition: background .15s;
+}
+.sidebar-ungrouped-zone.drag-over {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
 /* ── Folders ──────────────────────────────────────────────────────────────── */
 .sidebar-folder { border-bottom: 1px solid var(--border); }
+.sidebar-folder.dragging { opacity: .5; }
 .sidebar-folder.drag-over > .folder-header { background: color-mix(in srgb, var(--accent) 15%, transparent); }
 .folder-header {
   display: flex;
@@ -298,6 +319,8 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   cursor: default;
   user-select: none;
 }
+.folder-header[draggable="true"] { cursor: grab; }
+.folder-header[draggable="true"]:active { cursor: grabbing; }
 .folder-toggle {
   background: none;
   border: none;
@@ -336,7 +359,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 }
 .folder-header:hover .folder-menu-btn { opacity: 1; }
 .folder-menu-btn:hover { color: var(--fg); }
-.folder-body { padding-left: 8px; }
+.folder-body { padding-left: 12px; }
 .folder-empty {
   padding: 8px 14px;
   font-size: 11px;

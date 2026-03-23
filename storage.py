@@ -97,6 +97,8 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             )""",
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT DEFAULT NULL",
+            "ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE folders ADD COLUMN parent_id TEXT DEFAULT NULL",
         ]:
             try:
                 conn.execute(migration)
@@ -166,7 +168,8 @@ def list_sessions() -> list[dict]:
     audio_dir = DB_PATH.parent / "audio"
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, started_at, ended_at, folder_id FROM sessions ORDER BY started_at DESC"
+            "SELECT id, title, started_at, ended_at, folder_id, sort_order"
+            " FROM sessions ORDER BY started_at DESC"
         ).fetchall()
     return [
         {**dict(r), "has_audio": (audio_dir / f"{r['id']}.wav").exists()}
@@ -179,19 +182,24 @@ def list_sessions() -> list[dict]:
 def list_folders() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT id, name, sort_order, created_at FROM folders ORDER BY sort_order ASC, created_at ASC"
+            "SELECT id, name, sort_order, parent_id, created_at"
+            " FROM folders ORDER BY sort_order ASC, created_at ASC"
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def create_folder(name: str) -> str:
+def create_folder(name: str, parent_id: str | None = None) -> str:
     fid = str(uuid.uuid4())
     now = _now()
     with _conn() as conn:
-        max_order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) FROM folders").fetchone()[0]
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM folders WHERE parent_id IS ?",
+            (parent_id,),
+        ).fetchone()[0]
         conn.execute(
-            "INSERT INTO folders (id, name, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (fid, name.strip(), max_order + 1, now, now),
+            "INSERT INTO folders (id, name, sort_order, parent_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (fid, name.strip(), max_order + 1, parent_id, now, now),
         )
     return fid
 
@@ -204,11 +212,72 @@ def rename_folder(folder_id: str, name: str) -> None:
         )
 
 
-def delete_folder(folder_id: str) -> None:
-    """Delete folder and unassign all sessions in it."""
+def delete_folder(folder_id: str, delete_contents: bool = False) -> list[str]:
+    """Delete a folder.
+
+    If *delete_contents* is True, recursively delete all child folders and
+    their sessions (including WAV files).  Returns the list of deleted
+    session IDs so the caller can clear active-session state if needed.
+
+    If False, sessions are uncategorized and child folders are reparented.
+    """
+    deleted_session_ids: list[str] = []
     with _conn() as conn:
-        conn.execute("UPDATE sessions SET folder_id=NULL WHERE folder_id=?", (folder_id,))
-        conn.execute("DELETE FROM folders WHERE id=?", (folder_id,))
+        if delete_contents:
+            # Collect all folder IDs to delete (recursive)
+            all_folder_ids = []
+            stack = [folder_id]
+            while stack:
+                fid = stack.pop()
+                all_folder_ids.append(fid)
+                children = conn.execute(
+                    "SELECT id FROM folders WHERE parent_id=?", (fid,)
+                ).fetchall()
+                stack.extend(r["id"] for r in children)
+
+            # Collect and delete sessions in all those folders
+            placeholders = ",".join("?" * len(all_folder_ids))
+            rows = conn.execute(
+                f"SELECT id FROM sessions WHERE folder_id IN ({placeholders})",
+                all_folder_ids,
+            ).fetchall()
+            deleted_session_ids = [r["id"] for r in rows]
+
+            for sid in deleted_session_ids:
+                conn.execute("DELETE FROM transcript_segments WHERE session_id=?", (sid,))
+                conn.execute("DELETE FROM summaries WHERE session_id=?", (sid,))
+                conn.execute("DELETE FROM chat_messages WHERE session_id=?", (sid,))
+                conn.execute("DELETE FROM speaker_labels WHERE session_id=?", (sid,))
+                conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+
+            # Delete all collected folders
+            conn.execute(
+                f"DELETE FROM folders WHERE id IN ({placeholders})",
+                all_folder_ids,
+            )
+        else:
+            parent = conn.execute(
+                "SELECT parent_id FROM folders WHERE id=?", (folder_id,)
+            ).fetchone()
+            parent_id = parent["parent_id"] if parent else None
+            conn.execute(
+                "UPDATE folders SET parent_id=? WHERE parent_id=?",
+                (parent_id, folder_id),
+            )
+            conn.execute("UPDATE sessions SET folder_id=NULL WHERE folder_id=?", (folder_id,))
+            conn.execute("DELETE FROM folders WHERE id=?", (folder_id,))
+
+    # Clean up WAV files outside the transaction
+    audio_dir = DB_PATH.parent / "audio"
+    for sid in deleted_session_ids:
+        wav_path = audio_dir / f"{sid}.wav"
+        if wav_path.exists():
+            try:
+                wav_path.unlink()
+            except OSError:
+                pass
+
+    return deleted_session_ids
 
 
 def set_session_folder(session_id: str, folder_id: str | None) -> None:
@@ -223,10 +292,37 @@ def bulk_set_folder(session_ids: list[str], folder_id: str | None) -> None:
     if not session_ids:
         return
     with _conn() as conn:
+        # Assign to folder with sort_order at the end
+        max_order = 0
+        if folder_id:
+            max_order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) FROM sessions WHERE folder_id=?",
+                (folder_id,),
+            ).fetchone()[0]
         conn.executemany(
-            "UPDATE sessions SET folder_id=? WHERE id=?",
-            [(folder_id, sid) for sid in session_ids],
+            "UPDATE sessions SET folder_id=?, sort_order=? WHERE id=?",
+            [(folder_id, max_order + 1 + i, sid) for i, sid in enumerate(session_ids)],
         )
+
+
+def bulk_reorder(folders: list[dict] | None = None,
+                 sessions: list[dict] | None = None) -> None:
+    """Batch-update sort_order (and parent_id/folder_id) for folders and sessions.
+
+    folders:  list of {id, sort_order, parent_id}
+    sessions: list of {id, sort_order, folder_id}
+    """
+    with _conn() as conn:
+        if folders:
+            conn.executemany(
+                "UPDATE folders SET sort_order=?, parent_id=?, updated_at=? WHERE id=?",
+                [(f["sort_order"], f.get("parent_id"), _now(), f["id"]) for f in folders],
+            )
+        if sessions:
+            conn.executemany(
+                "UPDATE sessions SET sort_order=?, folder_id=? WHERE id=?",
+                [(s["sort_order"], s.get("folder_id"), s["id"]) for s in sessions],
+            )
 
 
 def reset_session_transcript(session_id: str) -> None:

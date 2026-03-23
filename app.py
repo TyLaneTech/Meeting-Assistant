@@ -2060,23 +2060,41 @@ def create_folder():
     name = (data.get("name") or "").strip()
     if not name:
         return jsonify({"error": "name is required"}), 400
-    fid = storage.create_folder(name)
+    parent_id = data.get("parent_id") or None
+    fid = storage.create_folder(name, parent_id=parent_id)
     return jsonify({"ok": True, "id": fid}), 201
 
 
 @app.route("/api/folders/<folder_id>", methods=["PATCH"])
-def rename_folder(folder_id: str):
+def patch_folder(folder_id: str):
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "name is required"}), 400
-    storage.rename_folder(folder_id, name)
+    if name:
+        storage.rename_folder(folder_id, name)
     return jsonify({"ok": True})
 
 
 @app.route("/api/folders/<folder_id>", methods=["DELETE"])
 def delete_folder(folder_id: str):
-    storage.delete_folder(folder_id)
+    data = request.get_json(silent=True) or {}
+    delete_contents = bool(data.get("delete_contents"))
+    deleted_ids = storage.delete_folder(folder_id, delete_contents=delete_contents)
+    # Clear active session state if it was deleted
+    if deleted_ids:
+        with _state_lock:
+            if _state["session_id"] in deleted_ids and not _state["is_recording"]:
+                _state["session_id"] = None
+    return jsonify({"ok": True, "deleted_sessions": len(deleted_ids)})
+
+
+@app.route("/api/reorder", methods=["POST"])
+def reorder():
+    """Batch-update sort order and parent/folder assignments."""
+    data = request.get_json(silent=True) or {}
+    storage.bulk_reorder(
+        folders=data.get("folders"),
+        sessions=data.get("sessions"),
+    )
     return jsonify({"ok": True})
 
 
