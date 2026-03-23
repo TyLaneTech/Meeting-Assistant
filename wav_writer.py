@@ -25,6 +25,8 @@ class WavWriter:
 
     def write(self, int16_bytes: bytes) -> int:
         """Write PCM data. Returns the sample offset *before* this write."""
+        if self._wf is None:
+            return -1
         offset = self._total_samples
         self._wf.writeframes(int16_bytes)
         # Each sample is 2 bytes (Int16 mono)

@@ -4442,6 +4442,14 @@ function seekPlayback(val) {
   _playbackAudio.currentTime = parseFloat(val);
 }
 
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && _playbackActive
+      && !e.target.closest('input, textarea, select, [contenteditable]')) {
+    e.preventDefault();
+    togglePlayback();
+  }
+});
+
 function seekToTime(t) {
   if (!_playbackActive) return;
   _playbackAudio.currentTime = t;
@@ -4460,7 +4468,13 @@ function setPlaybackSpeed(val) {
 function _getVisibleTimeRanges() {
   const ranges = [];
   document.querySelectorAll('#transcript .transcript-segment[data-start]').forEach(seg => {
-    if (seg.style.display === 'none') return;
+    if (seg.style.display === 'none') {
+      // Noise segments are hidden by default but their audio should still play.
+      // Only skip segments hidden by an active speaker/search filter.
+      const source = seg.dataset.transcriptSource || '';
+      const isNoise = source === _NOISE_LABEL || _manualNoiseKeys.has(source);
+      if (!isNoise) return;
+    }
     ranges.push({
       start: parseFloat(seg.dataset.start),
       end:   parseFloat(seg.dataset.end),
@@ -5746,120 +5760,12 @@ function _apToggleReset(key, val, defaultVal) {
   if (btn) btn.classList.toggle('ap-reset-hidden', Math.abs(val - defaultVal) < 1e-9);
 }
 
-// ── Echo Cancellation Presets ─────────────────────────────────────────────
-const _ecPresets = {
-  mild: {
-    label: 'Mild',
-    description: 'Light touch — small room, mic close to mouth, minor speaker bleed',
-    icon: 'fa-volume-low',
-    values: {
-      echo_cancel_enabled: 1,
-      echo_gate_ratio: 3.0,
-      echo_silence_floor: 0.005,
-      echo_spectral_sub: 0.3,
-      echo_hold_ms: 80,
-      echo_crossfade_ms: 30,
-      echo_mic_suppress_db: -8,
-    },
-  },
-  moderate: {
-    label: 'Moderate',
-    description: 'Balanced — typical webcam mic with nearby desktop speakers',
-    icon: 'fa-volume',
-    values: {
-      echo_cancel_enabled: 1,
-      echo_gate_ratio: 2.0,
-      echo_silence_floor: 0.008,
-      echo_spectral_sub: 0.6,
-      echo_hold_ms: 150,
-      echo_crossfade_ms: 30,
-      echo_mic_suppress_db: -18,
-    },
-  },
-  aggressive: {
-    label: 'Aggressive',
-    description: 'Strong suppression — loud speakers, mic far from mouth',
-    icon: 'fa-volume-high',
-    values: {
-      echo_cancel_enabled: 1,
-      echo_gate_ratio: 1.5,
-      echo_silence_floor: 0.015,
-      echo_spectral_sub: 1.0,
-      echo_hold_ms: 250,
-      echo_crossfade_ms: 20,
-      echo_mic_suppress_db: -24,
-    },
-  },
-  maximum: {
-    label: 'Maximum',
-    description: 'Nuclear option — heavy echo in an open room, priority is eliminating duplicates',
-    icon: 'fa-shield-halved',
-    values: {
-      echo_cancel_enabled: 1,
-      echo_gate_ratio: 1.2,
-      echo_silence_floor: 0.025,
-      echo_spectral_sub: 1.4,
-      echo_hold_ms: 400,
-      echo_crossfade_ms: 10,
-      echo_mic_suppress_db: -30,
-    },
-  },
-};
-
-function _ecRenderPresets() {
-  const bar = document.getElementById('echo-preset-bar');
-  if (!bar) return;
-  bar.innerHTML = '';
-  for (const [id, preset] of Object.entries(_ecPresets)) {
-    const btn = document.createElement('button');
-    btn.className = 'echo-preset-btn';
-    btn.id = `echo-preset-${id}`;
-    btn.title = preset.description;
-    btn.innerHTML = `<i class="fa-solid ${preset.icon}"></i> ${preset.label}`;
-    btn.addEventListener('click', () => _ecApplyPreset(id));
-    bar.appendChild(btn);
-  }
-  _ecHighlightActivePreset();
-}
-
-function _ecHighlightActivePreset() {
-  if (!_apCache) return;
-  const cur = _apCache.current;
-  for (const [id, preset] of Object.entries(_ecPresets)) {
-    const btn = document.getElementById(`echo-preset-${id}`);
-    if (!btn) continue;
-    const matches = Object.entries(preset.values).every(([k, v]) =>
-      Math.abs((cur[k] ?? 0) - v) < 1e-6
-    );
-    btn.classList.toggle('active', matches);
-  }
-}
-
-async function _ecApplyPreset(presetId) {
-  const preset = _ecPresets[presetId];
-  if (!preset) return;
-  try {
-    const res = await fetch('/api/audio_params', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(preset.values),
-    }).then(r => r.json());
-    if (res.ok && _apCache) {
-      _apCache.current = res.audio_params;
-      // Re-render the echo params section to reflect new values
-      _apRenderSection('ap-echo-params', _apCache.echo_cancellation, _apCache.current);
-      _ecHighlightActivePreset();
-    }
-  } catch (_) {}
-}
-
 async function _apRefresh() {
   await _apLoad();
   if (!_apCache) return;
   _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
   _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
   _apRenderSection('ap-echo-params',          _apCache.echo_cancellation, _apCache.current);
-  _ecRenderPresets();
 }
 
 async function _apSave(key, value) {
@@ -5877,10 +5783,6 @@ async function _apSave(key, value) {
       if (resetBtn && spec) {
         const isDefault = Math.abs(value - spec.value) < 1e-9;
         resetBtn.classList.toggle('ap-reset-hidden', isDefault);
-      }
-      // Update preset highlight if an echo param changed
-      if (_apCache.echo_cancellation && key in _apCache.echo_cancellation) {
-        _ecHighlightActivePreset();
       }
     }
   } catch (_) {}

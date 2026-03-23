@@ -73,14 +73,8 @@ class AudioCapture:
         self.loopback_gain: float = 1.0
         self.mic_gain: float = 1.0
 
-        # Echo cancellation parameters (disabled by default — enable for speaker+mic setups)
+        # Echo cancellation (disabled by default — enable for speaker+mic setups)
         self.echo_cancel_enabled: bool = False
-        self.echo_gate_ratio: float = 2.0
-        self.echo_silence_floor: float = 0.005
-        self.echo_spectral_sub: float = 0.6
-        self.echo_hold_ms: int = 150
-        self.echo_crossfade_ms: int = 30
-        self.echo_mic_suppress_db: int = -18
 
         # Rolling sample buffers for the FFT spectrum visualizer (post-gain)
         self._lb_fft_buf:  collections.deque = collections.deque(maxlen=_FFT_SIZE)
@@ -400,26 +394,12 @@ class AudioCapture:
         # downstream audio_queue backs up.
         max_buf_samples = int((self.sample_rate or 48000) * 3.0)
 
-        # Echo cancellation state
-        _ec_hold_remaining = 0          # samples remaining in gate hold
-        _ec_prev_gate: str = "both"     # previous gate decision
-        _ec_crossfade_pos = 0           # current crossfade position (0 = done)
-
-        # Overlap-add spectral subtraction state.  We use a frame twice the
-        # chunk size (1024 samples ≈ 64 ms at 16 kHz) with 50 % overlap so
-        # that consecutive output frames blend seamlessly — eliminating the
-        # chunk-boundary discontinuities that cause choppy audio.
-        _ec_ola_frame = self.CHUNK_SIZE * 2          # 1024
-        _ec_ola_hop   = self.CHUNK_SIZE              # 512 — matches chunk cadence
-        # Periodic Hann window — satisfies COLA (constant-overlap-add) at
-        # 50 % overlap: w[k] + w[k + N/2] = 1.0 for all k.  np.hanning()
-        # returns a symmetric window that does NOT satisfy COLA, so we
-        # build the periodic variant explicitly.
-        n = np.arange(_ec_ola_frame)
-        _ec_ola_window = (0.5 - 0.5 * np.cos(2 * np.pi * n / _ec_ola_frame)).astype(np.float32)
-        _ec_mic_prev  = np.zeros(_ec_ola_hop, dtype=np.float32)   # previous mic chunk
-        _ec_lb_prev   = np.zeros(_ec_ola_hop, dtype=np.float32)   # previous lb chunk
-        _ec_ola_tail  = np.zeros(_ec_ola_hop, dtype=np.float32)   # overlap tail from last frame
+        # WebRTC AEC state — lazily initialised when echo cancellation is enabled
+        _aec_processor = None
+        _aec_frame_size = 0
+        _aec_mic_buf = np.array([], dtype=np.float32)
+        _aec_lb_buf  = np.array([], dtype=np.float32)
+        _aec_out_buf = np.array([], dtype=np.float32)
 
         while self.is_running:
             try:
@@ -492,117 +472,77 @@ class AudioCapture:
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
 
-                        # ── Source-gated mixing with optional echo cancellation ──
+                        # ── WebRTC AEC: clean echo from mic using loopback as reference ──
                         if self.echo_cancel_enabled:
-                            floor = self.echo_silence_floor
-                            ratio = self.echo_gate_ratio
-                            hold_samples = int(self.echo_hold_ms * (self.sample_rate or 16000) / 1000)
-                            crossfade_samples = int(self.echo_crossfade_ms * (self.sample_rate or 16000) / 1000)
-                            suppress_gain = 10 ** (self.echo_mic_suppress_db / 20.0)  # dB → linear
+                            # Lazy-init the AEC processor (or re-init on sample rate change)
+                            if _aec_processor is None or _aec_frame_size == 0:
+                                try:
+                                    from aec_audio_processing import AudioProcessor
+                                    _aec_processor = AudioProcessor(
+                                        enable_aec=True, enable_ns=False, enable_agc=False,
+                                    )
+                                    sr = self.sample_rate or 16000
+                                    _aec_processor.set_stream_format(sr, 1)
+                                    _aec_processor.set_reverse_stream_format(sr, 1)
+                                    _aec_frame_size = _aec_processor.get_frame_size()
+                                    log.info("audio", f"WebRTC AEC initialised @ {sr} Hz, "
+                                                      f"frame={_aec_frame_size} samples")
+                                except Exception:
+                                    traceback.print_exc()
+                                    _aec_processor = None
 
-                            # Determine raw gate decision
-                            if mic_rms < floor or lb_rms > mic_rms * ratio:
-                                raw_gate = "loopback"
-                            elif lb_rms < floor or mic_rms > lb_rms * ratio:
-                                raw_gate = "mic"
-                            else:
-                                raw_gate = "both"
+                            if _aec_processor is not None:
+                                # Accumulate samples for AEC processing (needs exact 10 ms frames)
+                                _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
+                                _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
 
-                            # Hold: if loopback was dominant, keep mic suppressed
-                            # for hold_samples after loopback drops
-                            if raw_gate == "loopback":
-                                _ec_hold_remaining = hold_samples
-                            elif _ec_hold_remaining > 0:
-                                _ec_hold_remaining -= self.CHUNK_SIZE
-                                if _ec_hold_remaining > 0 and raw_gate != "loopback":
-                                    raw_gate = "loopback"
+                                cleaned_parts: list[np.ndarray] = []
+                                while (len(_aec_mic_buf) >= _aec_frame_size
+                                       and len(_aec_lb_buf) >= _aec_frame_size):
+                                    mf = _aec_mic_buf[:_aec_frame_size]
+                                    lf = _aec_lb_buf[:_aec_frame_size]
+                                    _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
+                                    _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
 
-                            # Spectral subtraction via windowed overlap-add.
-                            # Assembles a full frame from the previous + current
-                            # chunk, applies a Hann window, subtracts the loopback
-                            # spectrum, then overlap-adds the two halves so output
-                            # is continuous across chunk boundaries.
-                            if raw_gate in ("mic", "both") and self.echo_spectral_sub > 0 and lb_rms > floor:
-                                # Build full frame: [prev_chunk | current_chunk]
-                                mic_frame = np.concatenate((_ec_mic_prev, mic_chunk))
-                                lb_frame  = np.concatenate((_ec_lb_prev,  lb_chunk))
+                                    lb_i16 = (lf * 32767).astype(np.int16).tobytes()
+                                    mic_i16 = (mf * 32767).astype(np.int16).tobytes()
+                                    _aec_processor.process_reverse_stream(lb_i16)
+                                    result = _aec_processor.process_stream(mic_i16)
+                                    cleaned_parts.append(
+                                        np.frombuffer(result, dtype=np.int16)
+                                          .astype(np.float32) / 32768.0
+                                    )
 
-                                # Hann window → FFT
-                                mic_fft = np.fft.rfft(mic_frame * _ec_ola_window)
-                                lb_fft  = np.fft.rfft(lb_frame  * _ec_ola_window)
+                                # Append cleaned frames to output buffer
+                                if cleaned_parts:
+                                    _aec_out_buf = np.concatenate(
+                                        (_aec_out_buf, *cleaned_parts)
+                                    )
 
-                                mic_mag   = np.abs(mic_fft)
-                                lb_mag    = np.abs(lb_fft)
-                                mic_phase = np.angle(mic_fft)
+                                # Pull a CHUNK_SIZE piece from the output buffer
+                                if len(_aec_out_buf) >= self.CHUNK_SIZE:
+                                    mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
+                                    _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
+                                    mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
+                                # else: not enough cleaned audio yet — use the original mic_chunk
+                        elif _aec_processor is not None:
+                            # Echo cancellation was just disabled — tear down
+                            _aec_processor = None
+                            _aec_frame_size = 0
+                            _aec_mic_buf = np.array([], dtype=np.float32)
+                            _aec_lb_buf  = np.array([], dtype=np.float32)
+                            _aec_out_buf = np.array([], dtype=np.float32)
 
-                                # Subtract with a spectral floor at 8 % of the
-                                # original mic magnitude — prevents "musical noise"
-                                # (the robotic artefact from bins hitting zero).
-                                spec_floor  = mic_mag * 0.08
-                                cleaned_mag = np.maximum(
-                                    mic_mag - lb_mag * self.echo_spectral_sub,
-                                    spec_floor,
-                                )
-
-                                # IFFT (no synthesis window — single-window OLA
-                                # with the periodic Hann satisfies COLA, so the
-                                # overlap-add reconstructs with unity gain).
-                                cleaned = np.fft.irfft(
-                                    cleaned_mag * np.exp(1j * mic_phase),
-                                    n=_ec_ola_frame,
-                                ).astype(np.float32)
-
-                                # Overlap-add: first half blends with previous
-                                # frame's tail; second half becomes the new tail.
-                                mic_chunk = _ec_ola_tail + cleaned[:_ec_ola_hop]
-                                _ec_ola_tail = cleaned[_ec_ola_hop:].copy()
-
-                            else:
-                                # Spectral subtraction didn't run — reset the
-                                # overlap tail so a stale tail doesn't bleed
-                                # into the next frame when subtraction resumes.
-                                _ec_ola_tail[:] = 0.0
-
-                            # Remember chunks for next frame's overlap
-                            _ec_mic_prev = mic_chunk.copy()
-                            _ec_lb_prev  = lb_chunk.copy()
-
-                            # Build the mixed output based on gate decision
-                            if raw_gate == "loopback":
-                                target = lb_chunk + mic_chunk * suppress_gain
-                                src = "loopback"
-                            elif raw_gate == "mic":
-                                target = mic_chunk
-                                src = "mic"
-                            else:
-                                target = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
-                                src = "both"
-
-                            # Crossfade when gate state changes
-                            if raw_gate != _ec_prev_gate and crossfade_samples > 0:
-                                _ec_crossfade_pos = crossfade_samples
-                            _ec_prev_gate = raw_gate
-
-                            if _ec_crossfade_pos > 0:
-                                fade_len = min(_ec_crossfade_pos, len(target))
-                                fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-                                fade_out = 1.0 - fade_in
-                                # Blend the tail of the previous output with the new target
-                                target[:fade_len] = target[:fade_len] * fade_in + lb_chunk[:fade_len] * fade_out
-                                _ec_crossfade_pos -= fade_len
-
-                            mixed = np.clip(target, -1.0, 1.0)
+                        # Source gating — decides which stream to send to the transcriber
+                        if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
+                            src = "loopback"
+                            mixed = lb_chunk
+                        elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
+                            src = "mic"
+                            mixed = mic_chunk
                         else:
-                            # Basic source gating (original behaviour — no echo cancellation)
-                            if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
-                                src = "loopback"
-                                mixed = lb_chunk
-                            elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
-                                src = "mic"
-                                mixed = mic_chunk
-                            else:
-                                src = "both"
-                                mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
+                            src = "both"
+                            mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
                     else:
                         self.mic_level = 0.0
                         mixed = lb_chunk

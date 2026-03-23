@@ -27,6 +27,10 @@ diart
 # Its wheel bundles PortAudio, so no system library install is needed.
 pyaudiowpatch>=0.2.12.7
 
+# ── Echo cancellation ───────────────────────────────────────────────────────
+# WebRTC AEC3 bindings — removes speaker echo from the microphone signal.
+aec-audio-processing>=1.0.0
+
 # ── Signal processing / numerics ──────────────────────────────────────────────
 scipy>=1.11.0
 numpy>=1.26.0

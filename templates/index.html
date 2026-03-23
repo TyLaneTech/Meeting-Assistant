@@ -562,20 +562,9 @@
         <!-- Echo Cancellation -->
         <div class="settings-panel" id="section-echo">
           <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
-            For speaker + open mic setups. Prevents the mic from picking up desktop audio and creating duplicate transcriptions.
+            Uses WebRTC AEC to remove speaker audio that bleeds into the microphone.
             Leave disabled if you use headphones.
           </p>
-          <div class="settings-group" id="echo-presets-group">
-            <div class="ap-param">
-              <div class="ap-header">
-                <span class="ap-label">Presets</span>
-                <span class="ap-desc">Quick-start configurations for common setups</span>
-              </div>
-              <div class="echo-preset-bar" id="echo-preset-bar">
-                <!-- Populated dynamically by JS -->
-              </div>
-            </div>
-          </div>
           <div class="settings-group" id="ap-echo-params">
             <!-- Populated dynamically by JS -->
           </div>
