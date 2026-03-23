@@ -857,6 +857,9 @@ async function reanalyzeSession(e, sessionId) {
     document.getElementById('record-btn').disabled = true;
   }
 
+  // Keep playback available during reanalysis — the WAV file still exists
+  initPlayback(sessionId);
+
   const customPrompt = document.getElementById('summary-custom-prompt')?.value || '';
   const resp = await fetch(`/api/sessions/${sessionId}/reanalyze`, {
     method: 'POST',
@@ -1054,7 +1057,7 @@ function connectSSE(afterSegId = 0) {
     // Append only segments we don't already have (deduplicates on brief reconnects)
     (d.segments || []).forEach(s => {
       if (s.id && s.id <= _lastLiveSegId) return;
-      appendTranscript(s.text, s.source || 'loopback', s.start_time, s.end_time, s.id, s.label_override);
+      appendTranscript(s.text, s.source_override || s.source || 'loopback', s.start_time, s.end_time, s.id, s.label_override, s.source_override ? s.source : null);
       if (s.id) _lastLiveSegId = Math.max(_lastLiveSegId, s.id);
     });
     // Restore summary if we don't already have one rendered
@@ -1209,7 +1212,7 @@ function connectSSE(afterSegId = 0) {
       '<p class="empty-hint">Summary will regenerate after reanalysis completes.</p>';
     document.getElementById('chat-messages').innerHTML =
       '<p class="empty-hint">Ask questions about the meeting here.</p>';
-    destroyPlayback();
+    // Keep playback active — the WAV file still exists during reanalysis
   });
 
   src.addEventListener('reanalysis_start', e => {
@@ -1220,6 +1223,8 @@ function connectSSE(afterSegId = 0) {
     const text = document.getElementById('status-text');
     dot.className    = 'status-dot recording';
     text.textContent = 'Reanalyzing…';
+    // Ensure playback is available during reanalysis
+    if (!_playbackActive && state.sessionId) initPlayback(state.sessionId);
     refreshSidebar();
   });
 
@@ -1419,6 +1424,7 @@ let _autoScroll = true;
 let _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
 let _showNoise = false;       // noise segments hidden by default
 let _noiseSolo = false;       // true when noise is the only visible group
+let _showOriginalKeys = false; // show original speaker keys instead of display names
 let _manualNoiseKeys = new Set(); // speaker_keys manually marked as noise
 let _navState = { matches: [], currentIdx: -1 };
 
@@ -1783,6 +1789,10 @@ function _fpShowNextToast() {
   }
 
   toast.classList.remove('hidden');
+  // Re-trigger entrance animation
+  toast.style.animation = 'none';
+  toast.offsetHeight; // force reflow
+  toast.style.animation = '';
 
   if (_fpToastTimer) clearTimeout(_fpToastTimer);
   _fpToastTimer = setTimeout(() => fpToastSkip(), 12000);
@@ -1798,22 +1808,30 @@ function fpToastToggleOther() {
   document.getElementById('fp-toast-other-list').classList.toggle('hidden');
 }
 
+function _fpAnimateOut(cb) {
+  const toast = document.getElementById('fp-match-toast');
+  document.getElementById('fp-toast-other-list').classList.add('hidden');
+  toast.classList.add('fp-toast-out');
+  toast.addEventListener('animationend', function handler() {
+    toast.removeEventListener('animationend', handler);
+    toast.classList.remove('fp-toast-out');
+    toast.classList.add('hidden');
+    if (cb) cb();
+  }, { once: true });
+}
+
 function fpToastSkip() {
   if (!_fpToastActive) return;
   _fpDismiss(_fpToastActive);
   _fpToastActive = null;
-  document.getElementById('fp-match-toast').classList.add('hidden');
-  document.getElementById('fp-toast-other-list').classList.add('hidden');
   if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
-  setTimeout(() => _fpShowNextToast(), 400);
+  _fpAnimateOut(() => setTimeout(_fpShowNextToast, 300));
 }
 
 function _fpHideToast() {
   _fpToastActive = null;
-  document.getElementById('fp-match-toast').classList.add('hidden');
-  document.getElementById('fp-toast-other-list').classList.add('hidden');
   if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
-  setTimeout(() => _fpShowNextToast(), 400);
+  _fpAnimateOut(() => setTimeout(_fpShowNextToast, 300));
 }
 
 async function _fpConfirm(toastData, globalId) {
@@ -2185,7 +2203,9 @@ function _toggleTranscriptSegSelection(segEl, { range = false } = {}) {
     const toIdx   = allSegs.indexOf(segEl);
     if (fromIdx !== -1 && toIdx !== -1) {
       const [start, end] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
-      allSegs.slice(start, end + 1).forEach(el => _transcriptSelectedSegs.add(el));
+      allSegs.slice(start, end + 1).forEach(el => {
+        if (el.style.display !== 'none') _transcriptSelectedSegs.add(el);
+      });
     }
   } else if (_transcriptSelectedSegs.has(segEl)) {
     _transcriptSelectedSegs.delete(segEl);
@@ -2207,21 +2227,77 @@ function _updateTranscriptSelectionUI() {
     bar.classList.remove('hidden');
     const countEl = document.getElementById('tsb-count');
     if (countEl) countEl.textContent = `${count} segment${count === 1 ? '' : 's'} selected`;
-    const dl = document.getElementById('tsb-datalist');
-    if (dl) {
-      dl.innerHTML = '';
-      const names = new Set();
-      Object.values(_speakerProfiles).forEach(p => { if (p.name) names.add(p.name); });
-      Object.values(_speakerLabels).forEach(n => { if (n) names.add(n); });
-      names.forEach(name => {
-        const opt = document.createElement('option');
-        opt.value = name;
-        dl.appendChild(opt);
-      });
-    }
+    const input = document.getElementById('tsb-input');
+    if (input) input.value = '';
   } else {
     bar.classList.add('hidden');
+    document.getElementById('tsb-autocomplete')?.classList.add('hidden');
   }
+}
+
+function _tsbGetSpeakerNames() {
+  const names = [];
+  const seen = new Set();
+  _getSortedSpeakerProfiles().forEach(p => {
+    const name = (p.name || '').trim();
+    if (!name || seen.has(name)) return;
+    if (!p.custom && _isDefaultName(name)) return;
+    seen.add(name);
+    const color = p.color || _speakerColors[p.speaker_key] || speakerColor(p.speaker_key);
+    names.push({ name, color });
+  });
+  names.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return names;
+}
+
+function _tsbFilterAutocomplete() {
+  const input = document.getElementById('tsb-input');
+  const list = document.getElementById('tsb-autocomplete');
+  if (!input || !list) return;
+
+  const query = input.value.trim().toLowerCase();
+  const names = _tsbGetSpeakerNames();
+  const filtered = query
+    ? names.filter(n => n.name.toLowerCase().includes(query))
+    : names;
+
+  list.innerHTML = '';
+  if (filtered.length === 0) {
+    list.classList.add('hidden');
+    return;
+  }
+
+  filtered.forEach(entry => {
+    const opt = document.createElement('button');
+    opt.className = 'tsb-ac-opt';
+    opt.innerHTML = `<span class="tsb-ac-dot" style="background:${entry.color}"></span>${escapeHtml(entry.name)}`;
+    opt.style.color = entry.color;
+    opt.addEventListener('mousedown', e => {
+      e.preventDefault();
+      input.value = entry.name;
+      list.classList.add('hidden');
+    });
+    list.appendChild(opt);
+  });
+  list.classList.remove('hidden');
+}
+
+// Wire up autocomplete events (called once on page load)
+function _tsbInitAutocomplete() {
+  const input = document.getElementById('tsb-input');
+  if (!input) return;
+  input.addEventListener('input', _tsbFilterAutocomplete);
+  input.addEventListener('focus', _tsbFilterAutocomplete);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); applyTranscriptBulkReassign(); }
+    if (e.key === 'Escape') { document.getElementById('tsb-autocomplete')?.classList.add('hidden'); }
+  });
+  // Close on outside click
+  document.addEventListener('mousedown', e => {
+    if (!document.getElementById('tsb-input-wrap')?.contains(e.target)) {
+      document.getElementById('tsb-autocomplete')?.classList.add('hidden');
+    }
+  });
 }
 
 function clearTranscriptSelection() {
@@ -2231,19 +2307,92 @@ function clearTranscriptSelection() {
 }
 
 async function applyTranscriptBulkReassign() {
-  const name = (document.getElementById('tsb-input')?.value || '').trim();
-  if (!name) return;
-  for (const segEl of _transcriptSelectedSegs) {
-    const badge = segEl.querySelector('.src-speaker');
-    if (!badge) continue;
-    badge.textContent = name;
-    badge.dataset.override = '1';
-    const segId = badge.dataset.segId || segEl.dataset.segId;
-    if (segId) persistSegmentOverride(segId, name).catch(() => {});
-  }
   const input = document.getElementById('tsb-input');
-  if (input) input.value = '';
+  const name = (input?.value || '').trim();
+  if (!name) return;
+  document.getElementById('tsb-autocomplete')?.classList.add('hidden');
+
+  // Resolve the target speaker_key for the given display name.
+  // If a speaker with this name already exists, reuse their key so
+  // the reassigned segments group properly in filters/analytics.
+  // If the name is brand new, create a custom speaker key + profile.
+  let targetKey = _speakerNameKey(name)
+    || _getSortedSpeakerProfiles().find(p =>
+        (_speakerDisplayName(p.speaker_key) || p.speaker_key).toLowerCase() === name.toLowerCase()
+      )?.speaker_key
+    || null;
+
+  if (!targetKey && name !== _NOISE_LABEL) {
+    targetKey = `custom:${Date.now()}`;
+    applySpeakerProfileUpdate({ speaker_key: targetKey, name });
+    if (_speakerProfiles[targetKey]) _speakerProfiles[targetKey].custom = true;
+    persistSpeakerLabel(targetKey, name).catch(() => {});
+  }
+
+  for (const segEl of _transcriptSelectedSegs) {
+    const source = segEl.dataset.transcriptSource;
+    if (!source || source in SOURCE_META) continue;
+
+    const badge = segEl.querySelector('.src-badge');
+    if (!badge) continue;
+    const segId = badge.dataset.segId || segEl.dataset.segId;
+
+    if (name === _NOISE_LABEL) {
+      _manualNoiseKeys.add(source);
+      if (badge) _applyNoiseStyle(segEl, badge, segId);
+      if (segId) persistSegmentOverride(segId, _NOISE_LABEL).catch(() => {});
+      continue;
+    }
+
+    // Per-segment reassignment: update DOM source attribution + visual
+    const newKey = targetKey || source;  // fall back to original key if no match
+    if (newKey !== source) segEl.dataset.originalSource = source;
+    segEl.dataset.transcriptSource = newKey;
+    _ensureSpeakerProfile(newKey);
+    const color = speakerColor(newKey);
+    segEl.style.setProperty('--seg-color', color);
+
+    // If this was a noise segment, restore normal styling
+    if (segEl.classList.contains('noise-segment')) {
+      if (_manualNoiseKeys.has(source)) {
+        const remaining = document.querySelectorAll(
+          `#transcript .transcript-segment[data-transcript-source="${source}"] .src-noise`
+        ).length;
+        if (remaining <= 1) _manualNoiseKeys.delete(source);
+      }
+      segEl.classList.remove('noise-segment');
+    }
+
+    badge.className = 'src-badge src-speaker';
+    badge.textContent = name;
+    badge.dataset.speakerKey = newKey;
+    badge.dataset.override = '1';
+    badge.title = 'Click to rename';
+    badge.style.backgroundColor = color + '26';
+    badge.style.color = color;
+    badge.style.borderColor = color + '60';
+
+    // Re-wire badge click handler (clone to clear old listeners)
+    const fresh = badge.cloneNode(true);
+    fresh.addEventListener('click', (function(k) {
+      return function(e) {
+        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+          e.preventDefault(); e.stopPropagation();
+          _toggleTranscriptSegSelection(segEl, { range: e.shiftKey });
+          return;
+        }
+        editSpeakerLabel(fresh, k);
+      };
+    })(newKey));
+    badge.replaceWith(fresh);
+
+    if (segId) persistSegmentOverride(segId, name, newKey !== source ? newKey : null).catch(() => {});
+  }
+
   clearTranscriptSelection();
+  applyTranscriptFilter();
+  _tnRefreshSpeakerPills();
+  _tnRefreshReassignDropdowns();
 }
 
 function renderSpeakerManager() {
@@ -2474,13 +2623,14 @@ async function applySpeakerEditor() {
   renderSpeakerManager();
 }
 
-function appendTranscript(text, source, startTime, endTime, segId, labelOverride) {
+function appendTranscript(text, source, startTime, endTime, segId, labelOverride, originalSource) {
   const el = document.getElementById('transcript');
   el.querySelector('.empty-hint')?.remove();
 
   const seg = document.createElement('div');
   seg.className = 'transcript-segment';
   seg.dataset.transcriptSource = source;  // used by filter
+  if (originalSource) seg.dataset.originalSource = originalSource;  // original diarizer key before reassignment
 
   // Store segment DB id for per-segment overrides
   if (segId != null) seg.dataset.segId = segId;
@@ -2508,7 +2658,15 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     badge.className = 'src-badge src-speaker src-noise';
     badge.dataset.speakerKey = source;
     if (segId != null) badge.dataset.segId = segId;
-    badge.textContent = 'Noise';
+    if (_showOriginalKeys && source !== _NOISE_LABEL) {
+      badge.textContent = source;
+      const alias = document.createElement('span');
+      alias.className = 'badge-alias';
+      alias.textContent = 'Noise';
+      badge.appendChild(alias);
+    } else {
+      badge.textContent = 'Noise';
+    }
     badge.style.backgroundColor = _NOISE_COLOR + '20';
     badge.style.color = _NOISE_COLOR;
     badge.style.borderColor = _NOISE_COLOR + '40';
@@ -2540,7 +2698,12 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     badge.title = _sessionLinks[source]
       ? `Saved voice profile: ${_sessionLinks[source].name || source}`
       : 'Click to rename';
-    badge.textContent = displayName;
+    // Show original key (with alias) when toggle is active, unless per-segment override
+    if (_showOriginalKeys && !labelOverride) {
+      _setBadgeLabel(badge, source);
+    } else {
+      badge.textContent = displayName;
+    }
     badge.style.backgroundColor = color + '26'; // ~15% opacity tint
     badge.style.color = color;
     badge.style.borderColor = color + '60';
@@ -2610,15 +2773,28 @@ function editSpeakerLabel(badge, speakerKey) {
   input.style.color = color;
   picker.appendChild(input);
 
+  // Scrollable options container
+  const optionsWrap = document.createElement('div');
+  optionsWrap.className = 'speaker-picker-options';
+  picker.appendChild(optionsWrap);
+
   // Collect unique display names already assigned (excluding this key's current name)
   const existingNames = _speakerOptionNames(currentName, speakerKey);
+  const meetingNameSet = new Set(existingNames.map(n => n.toLowerCase()));
 
-  // Option buttons for existing labels
+  // Option buttons for existing meeting labels (section header)
+  if (existingNames.length > 0) {
+    const secLabel = document.createElement('div');
+    secLabel.className = 'speaker-picker-section';
+    secLabel.textContent = 'Meeting speakers';
+    optionsWrap.appendChild(secLabel);
+  }
   existingNames.forEach(name => {
     const optKey = _speakerNameKey(name, speakerKey);
     const optColor = (optKey && (_speakerColors[optKey] || speakerColor(optKey))) || color;
     const opt = document.createElement('button');
     opt.className = 'speaker-picker-opt';
+    opt.dataset.optName = name.toLowerCase();
     opt.textContent = name;
     opt.style.borderColor = optColor + '60';
     opt.style.color = optColor;
@@ -2626,8 +2802,66 @@ function editSpeakerLabel(badge, speakerKey) {
       e.preventDefault();
       commit(name);
     });
-    picker.appendChild(opt);
+    optionsWrap.appendChild(opt);
   });
+
+  // Voice Library section — populated asynchronously
+  const vlSection = document.createElement('div');
+  vlSection.className = 'speaker-picker-section speaker-picker-vl-section';
+  vlSection.style.display = 'none';
+  vlSection.textContent = 'Voice Library';
+  optionsWrap.appendChild(vlSection);
+
+  fetch('/api/fingerprint/speakers').then(r => r.json()).then(speakers => {
+    if (!speakers || !speakers.length) return;
+    const vlOpts = [];
+    speakers.forEach(sp => {
+      const name = (sp.name || '').trim();
+      if (!name || meetingNameSet.has(name.toLowerCase())) return;
+      if (name.toLowerCase() === currentName.toLowerCase()) return;
+      const opt = document.createElement('button');
+      opt.className = 'speaker-picker-opt speaker-picker-vl-opt';
+      opt.dataset.optName = name.toLowerCase();
+      opt.textContent = name;
+      const vlColor = sp.color || 'var(--fg-muted)';
+      opt.style.borderColor = vlColor + '60';
+      opt.style.color = vlColor;
+      opt.addEventListener('mousedown', e => {
+        e.preventDefault();
+        commit(name);
+      });
+      vlOpts.push(opt);
+    });
+    if (vlOpts.length > 0) {
+      vlSection.style.display = '';
+      vlOpts.forEach(o => optionsWrap.appendChild(o));
+      // Apply current filter if user already typed something
+      const typed = input.value.trim().toLowerCase();
+      if (typed && typed !== currentName.toLowerCase()) _filterPickerOpts(typed);
+    }
+  }).catch(() => {});
+
+  // Filter function for options
+  function _filterPickerOpts(query) {
+    let meetingVisible = 0, vlVisible = 0;
+    optionsWrap.querySelectorAll('.speaker-picker-opt').forEach(opt => {
+      const name = opt.dataset.optName || '';
+      const show = !query || name.includes(query);
+      opt.style.display = show ? '' : 'none';
+      if (show) {
+        if (opt.classList.contains('speaker-picker-vl-opt')) vlVisible++;
+        else meetingVisible++;
+      }
+    });
+    // Hide section headers when no items visible
+    optionsWrap.querySelectorAll('.speaker-picker-section').forEach(sec => {
+      if (sec.classList.contains('speaker-picker-vl-section')) {
+        sec.style.display = vlVisible > 0 ? '' : 'none';
+      } else {
+        sec.style.display = meetingVisible > 0 ? '' : 'none';
+      }
+    });
+  }
 
   // Highlight all matching badges when in global mode
   const _highlighted = [];
@@ -2731,14 +2965,19 @@ function editSpeakerLabel(badge, speakerKey) {
   input.focus();
   input.select();
 
-  // In global mode, show a live merge hint when the typed name matches an existing speaker
-  if (editMode === 'global') {
-    input.addEventListener('input', () => {
-      const typed = input.value.trim().toLowerCase();
+  // Live filter + merge hint on input
+  input.addEventListener('input', () => {
+    const typed = input.value.trim().toLowerCase();
+    // Filter option buttons
+    _filterPickerOpts(typed);
+
+    // In global mode, show a live merge hint when the typed name matches an existing speaker
+    if (editMode === 'global') {
       if (!typed || typed === currentName.toLowerCase()) {
         hint.textContent = isDefault
           ? `Renames all ${speakerKey} segments (${_highlighted.length + 1})`
           : `Renames all ${_highlighted.length + 1} segments for "${currentName}"`;
+        hint.style.color = '';
         return;
       }
       const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
@@ -2757,8 +2996,8 @@ function editSpeakerLabel(badge, speakerKey) {
           : `Renames all ${_highlighted.length + 1} segments for "${currentName}"`;
         hint.style.color = '';
       }
-    });
-  }
+    }
+  });
 
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter')  { e.preventDefault(); commit(input.value); }
@@ -2777,11 +3016,13 @@ function editSpeakerLabel(badge, speakerKey) {
   });
 }
 
-async function persistSegmentOverride(segId, label) {
+async function persistSegmentOverride(segId, label, sourceOverride = null) {
+  const body = { label };
+  if (sourceOverride) body.source_override = sourceOverride;
   await fetch(`/api/segments/${segId}/label`, {
     method:  'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ label }),
+    body:    JSON.stringify(body),
   });
 }
 
@@ -2789,8 +3030,17 @@ async function persistSegmentOverride(segId, label) {
 function _applyNoiseStyle(seg, badge, segId) {
   seg.classList.add('noise-segment');
   seg.style.setProperty('--seg-color', _NOISE_COLOR);
+  const speakerKey = badge.dataset.speakerKey || seg.dataset.transcriptSource || '';
   badge.className = 'src-badge src-speaker src-noise';
-  badge.textContent = 'Noise';
+  if (_showOriginalKeys && speakerKey) {
+    badge.textContent = speakerKey;
+    const alias = document.createElement('span');
+    alias.className = 'badge-alias';
+    alias.textContent = 'Noise';
+    badge.appendChild(alias);
+  } else {
+    badge.textContent = 'Noise';
+  }
   badge.style.backgroundColor = _NOISE_COLOR + '20';
   badge.style.color = _NOISE_COLOR;
   badge.style.borderColor = _NOISE_COLOR + '40';
@@ -2856,10 +3106,14 @@ function _editNoiseBadge(badge, seg) {
   input.style.color = _NOISE_COLOR;
   picker.appendChild(input);
 
-  // Options: all non-noise speakers
-  const profiles = _getSortedSpeakerProfiles().filter(p => p.speaker_key !== _NOISE_LABEL);
+  // Options: all non-noise speakers, deduplicated by display name
+  const profiles = _getSortedSpeakerProfiles().filter(p => p.speaker_key !== _NOISE_LABEL && !_manualNoiseKeys.has(p.speaker_key));
+  const seenNames = new Set();
   profiles.forEach(p => {
     const name = _speakerDisplayName(p.speaker_key) || p.speaker_key;
+    const nameLower = name.toLowerCase();
+    if (seenNames.has(nameLower)) return;
+    seenNames.add(nameLower);
     const color = _speakerColors[p.speaker_key] || speakerColor(p.speaker_key);
     const opt = document.createElement('button');
     opt.className = 'speaker-picker-opt';
@@ -2954,7 +3208,7 @@ function _unNoiseSegment(seg, badge, newName, segId, oldSource, knownKey) {
     editSpeakerLabel(badge, newKey);
   });
 
-  if (segId) persistSegmentOverride(segId, newName).catch(() => {});
+  if (segId) persistSegmentOverride(segId, newName, newKey !== oldSource ? newKey : null).catch(() => {});
   _applyFilterToSeg(seg);
   _tnRefreshSpeakerPills();
   _tnRefreshReassignDropdowns();
@@ -2978,13 +3232,16 @@ function applySpeakerProfileUpdate(update) {
   if (!_speakerColors[speakerKey]) speakerColor(speakerKey);
 
   document.querySelectorAll(`[data-speaker-key="${speakerKey}"]`).forEach(el => {
-    if (el.tagName === 'SPAN' && !el.dataset.override) el.textContent = nextName;
+    if (el.tagName === 'SPAN' && !el.dataset.override) {
+      _setBadgeLabel(el, speakerKey);
+    }
   });
   _applySpeakerColor(speakerKey, _speakerColors[speakerKey]);
   _highlightSelectedSpeakerBadges();
   if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
     renderSpeakerManager();
   }
+  _tnRefreshSpeakerPills();
 }
 
 function _applySpeakerColor(speakerKey, color) {
@@ -3054,13 +3311,15 @@ function _transcriptFilterActive() {
 
 function _applyFilterToSeg(seg) {
   const source  = seg.dataset.transcriptSource || '';
-  // Always hide noise unless toggled visible
-  if ((source === _NOISE_LABEL || _manualNoiseKeys.has(source)) && !_showNoise) { seg.style.display = 'none'; return; }
+  // Always hide noise unless toggled visible (or in original-key mode where noise shows as regular pills)
+  if ((source === _NOISE_LABEL || _manualNoiseKeys.has(source)) && !_showNoise && !_showOriginalKeys) { seg.style.display = 'none'; return; }
   if (!_transcriptFilterActive()) { seg.style.display = ''; return; }
   const speakers = _transcriptFilter.speakers;
-  // Speaker filter applies only to diarized speaker segments — never hides noise (noise has its own toggle)
+  // In original-key mode, noise segments are treated as regular speakers for filtering.
+  // In normal mode, noise has its own toggle so we exempt it from the speaker filter.
   const isNoise = source === _NOISE_LABEL || _manualNoiseKeys.has(source);
-  if (speakers.size > 0 && !(source in SOURCE_META) && !speakers.has(source) && !isNoise) {
+  const exemptNoise = isNoise && !_showOriginalKeys;
+  if (speakers.size > 0 && !(source in SOURCE_META) && !speakers.has(source) && !exemptNoise) {
     seg.style.display = 'none'; return;
   }
   // Time range filter
@@ -3294,21 +3553,101 @@ function tnPrevMatch() {
 
 // ── Speaker pills ─────────────────────────────────────────────────────────────
 
+function tnToggleKeyLabels() {
+  _showOriginalKeys = !_showOriginalKeys;
+  const btn = document.getElementById('tn-pill-keys-toggle');
+  if (btn) btn.classList.toggle('active', _showOriginalKeys);
+  _tnRefreshSpeakerPills();
+  _tnRefreshTranscriptBadges();
+  applyTranscriptFilter();
+}
+
+// Update all transcript segment badges to show either original speaker keys
+// or display names, depending on _showOriginalKeys state.
+function _tnRefreshTranscriptBadges() {
+  document.querySelectorAll('#transcript .transcript-segment').forEach(seg => {
+    const badge = seg.querySelector('.src-badge.src-speaker');
+    if (!badge) return;
+    const speakerKey = badge.dataset.speakerKey;
+    if (!speakerKey) return;
+
+    const isNoise = badge.classList.contains('src-noise');
+    if (isNoise) {
+      // Noise badges: show original key with "Noise" alias in original-key mode
+      badge.querySelector('.badge-alias')?.remove();
+      if (_showOriginalKeys) {
+        badge.textContent = speakerKey;
+        const alias = document.createElement('span');
+        alias.className = 'badge-alias';
+        alias.textContent = 'Noise';
+        badge.appendChild(alias);
+      } else {
+        badge.textContent = 'Noise';
+      }
+      return;
+    }
+
+    if (badge.dataset.override) return;  // per-segment overrides keep their custom text
+    _setBadgeLabel(badge, speakerKey);
+  });
+}
+
+// Set badge text content, adding an alias subtitle when in original-key mode
+// and the speaker has a display name different from the key.
+function _setBadgeLabel(badge, speakerKey) {
+  const displayName = _speakerDisplayName(speakerKey) || speakerKey;
+  // Remove any existing alias span
+  badge.querySelector('.badge-alias')?.remove();
+
+  if (_showOriginalKeys) {
+    badge.childNodes.forEach(n => { if (n.nodeType === 3) n.remove(); });
+    badge.textContent = speakerKey;
+    if (displayName !== speakerKey) {
+      const alias = document.createElement('span');
+      alias.className = 'badge-alias';
+      alias.textContent = displayName;
+      badge.appendChild(alias);
+    }
+  } else {
+    badge.textContent = displayName;
+  }
+}
+
 function _tnRefreshSpeakerPills() {
   const container = document.getElementById('tn-speaker-pills');
   if (!container) return;
   container.innerHTML = '';
-  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
+
+  const profiles = _getSortedSpeakerProfiles();
+  // In original-key mode, each speaker key is its own group (no name-based merging)
+  const groups = _showOriginalKeys
+    ? profiles.map(p => ({
+        name:        p.speaker_key,
+        displayName: p.name || p.speaker_key,
+        color:       p.color || null,
+        speakerKeys: [p.speaker_key],
+        custom:      p.custom || false,
+      }))
+    : _groupProfilesByName(profiles);
+
   const allKeys = new Set();
   groups.forEach(g => g.speakerKeys.forEach(k => allKeys.add(k)));
 
-  // Separate noise group from regular speakers
+  // Separate noise group from regular speakers (skip in original-key mode — show all individually)
   const noiseGroups = [];
   const speakerGroups = [];
   groups.forEach(g => {
-    if (g.speakerKeys.includes(_NOISE_LABEL) || g.speakerKeys.some(k => _manualNoiseKeys.has(k)))
+    if (!_showOriginalKeys && (g.speakerKeys.includes(_NOISE_LABEL) || g.speakerKeys.some(k => _manualNoiseKeys.has(k))))
       noiseGroups.push(g);
     else speakerGroups.push(g);
+  });
+
+  // Sort: labeled speakers first (alphabetical), then unlabeled (alphabetical)
+  speakerGroups.sort((a, b) => {
+    const aDefault = _isDefaultName(a.name);
+    const bDefault = _isDefaultName(b.name);
+    if (aDefault !== bDefault) return aDefault ? 1 : -1;
+    return a.name.localeCompare(b.name, undefined, { numeric: true });
   });
 
   speakerGroups.forEach(g => {
@@ -3323,8 +3662,15 @@ function _tnRefreshSpeakerPills() {
     pill.style.color = color;
     pill.style.borderColor = color + '60';
     pill.dataset.speakerKeys = JSON.stringify(g.speakerKeys);
-    pill.innerHTML = `${escapeHtml(g.name)} <span class="tn-pill-count">${count}</span>`;
-    pill.title = `${g.name} — ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`;
+
+    // In original-key mode, show key name with display name subtitle if different
+    const pillLabel = _showOriginalKeys && g.displayName && g.displayName !== g.name
+      ? `${escapeHtml(g.name)} <span class="tn-pill-alias">${escapeHtml(g.displayName)}</span>`
+      : escapeHtml(g.name);
+    pill.innerHTML = `${pillLabel} <span class="tn-pill-count">${count}</span>`;
+    pill.title = _showOriginalKeys && g.displayName && g.displayName !== g.name
+      ? `${g.name} → ${g.displayName} — ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`
+      : `${g.name} — ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`;
 
     pill.addEventListener('click', () => {
       _tnToggleSpeakerPill(g.speakerKeys, allKeys);
@@ -3687,8 +4033,11 @@ function _refreshAnalytics() {
   let totalWords = 0;
   let sessionStart = Infinity, sessionEnd = 0;
 
+  // Aggregate noise data separately
+  let noiseData = { name: 'Noise', color: _NOISE_COLOR, segCount: 0, speakTime: 0, words: 0, segments: [] };
+
   groups.forEach(g => {
-    if (g.speakerKeys.includes(_NOISE_LABEL)) return;
+    const isNoise = g.speakerKeys.includes(_NOISE_LABEL) || g.speakerKeys.some(k => _manualNoiseKeys.has(k));
     const keysSet = new Set(g.speakerKeys);
     let segCount = 0, speakTime = 0, words = 0;
     const segments = [];
@@ -3712,11 +4061,18 @@ function _refreshAnalytics() {
       }
     });
     if (segCount === 0) return;
-    const color = g.color || speakerColor(g.speakerKeys[0]);
-    speakerData.push({ name: g.name, color, segCount, speakTime, words, segments });
-    totalSegCount += segCount;
-    totalSpeakTime += speakTime;
-    totalWords += words;
+    if (isNoise) {
+      noiseData.segCount += segCount;
+      noiseData.speakTime += speakTime;
+      noiseData.words += words;
+      noiseData.segments.push(...segments);
+    } else {
+      const color = g.color || speakerColor(g.speakerKeys[0]);
+      speakerData.push({ name: g.name, color, segCount, speakTime, words, segments });
+      totalSegCount += segCount;
+      totalSpeakTime += speakTime;
+      totalWords += words;
+    }
   });
 
   // Sort by speaking time descending
@@ -3768,6 +4124,17 @@ function _refreshAnalytics() {
     `;
     timeBars.appendChild(row);
   });
+  if (noiseData.segCount > 0) {
+    const pct = maxTime > 0 ? (noiseData.speakTime / maxTime) * 100 : 0;
+    const row = document.createElement('div');
+    row.className = 'analytics-bar-row analytics-bar-noise';
+    row.innerHTML = `
+      <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${_NOISE_COLOR}"></span>Noise</span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${_NOISE_COLOR}"></span></span>
+      <span class="analytics-bar-value">${fmtDuration(noiseData.speakTime)}</span>
+    `;
+    timeBars.appendChild(row);
+  }
 
   // ── Segment Count Bars ───────────────────────────
   const maxSegs = speakerData.reduce((m, d) => Math.max(m, d.segCount), 0);
@@ -3784,6 +4151,17 @@ function _refreshAnalytics() {
     `;
     segBars.appendChild(row);
   });
+  if (noiseData.segCount > 0) {
+    const pct = maxSegs > 0 ? (noiseData.segCount / maxSegs) * 100 : 0;
+    const row = document.createElement('div');
+    row.className = 'analytics-bar-row analytics-bar-noise';
+    row.innerHTML = `
+      <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${_NOISE_COLOR}"></span>Noise</span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${_NOISE_COLOR}"></span></span>
+      <span class="analytics-bar-value">${noiseData.segCount} seg${noiseData.segCount !== 1 ? 's' : ''}</span>
+    `;
+    segBars.appendChild(row);
+  }
 
   // ── Timeline ─────────────────────────────────────
   const tlEl = document.getElementById('analytics-timeline');
@@ -3806,6 +4184,24 @@ function _refreshAnalytics() {
       row.dataset.rowIdx = rowIdx++;
       tlEl.appendChild(row);
     });
+
+    // Noise timeline row
+    if (noiseData.segCount > 0) {
+      const row = document.createElement('div');
+      row.className = 'analytics-tl-row analytics-tl-noise';
+      let segsHtml = '';
+      noiseData.segments.forEach(s => {
+        const left = ((s.start - sessionStart) / sessionDuration) * 100;
+        const width = Math.max(((s.end - s.start) / sessionDuration) * 100, 0.5);
+        segsHtml += `<span class="analytics-tl-seg" style="left:${left}%;width:${width}%;background:${_NOISE_COLOR}"></span>`;
+      });
+      row.innerHTML = `
+        <span class="analytics-tl-label">Noise</span>
+        <span class="analytics-tl-track">${segsHtml}</span>
+      `;
+      row.dataset.rowIdx = rowIdx++;
+      tlEl.appendChild(row);
+    }
 
     // Animate timeline rows in with stagger
     if (_analyticsTlObserver) _analyticsTlObserver.disconnect();
@@ -4246,8 +4642,8 @@ async function loadSession(sessionId) {
     .catch(() => {});
 
   data.segments?.forEach(s =>
-    appendTranscript(s.text, s.source || 'loopback', s.start_time, s.end_time,
-                     s.id, s.label_override)
+    appendTranscript(s.text, s.source_override || s.source || 'loopback', s.start_time, s.end_time,
+                     s.id, s.label_override, s.source_override ? s.source : null)
   );
 
   // Restore summary prompt for this session
@@ -4334,6 +4730,9 @@ function clearAll() {
   _showNoise = false;
   _noiseSolo = false;
   _manualNoiseKeys = new Set();
+  _showOriginalKeys = false;
+  const keysToggleBtn = document.getElementById('tn-pill-keys-toggle');
+  if (keysToggleBtn) keysToggleBtn.classList.remove('active');
   _navState = { matches: [], currentIdx: -1 };
   const tnSearch = document.getElementById('tn-search-input');
   if (tnSearch) tnSearch.value = '';
@@ -4988,12 +5387,16 @@ async function checkForUpdates() {
       statusEl.className = 'settings-info-val val-ok';
       btn.disabled = false;
       btn.textContent = 'Check for Updates';
+      // Hide topbar update button if it was showing
+      document.getElementById('topbar-update-btn')?.classList.add('hidden');
     } else {
       statusEl.textContent = `${data.commits_behind} update${data.commits_behind !== 1 ? 's' : ''} available`;
       statusEl.className = 'settings-info-val val-warn';
       btn.disabled = false;
       btn.textContent = 'Update & Restart';
       btn.onclick = applyUpdate;
+      // Also show topbar update button
+      _showTopbarUpdate(data.commits_behind);
     }
   } catch (_) {
     statusEl.textContent = 'Check failed';
@@ -5011,6 +5414,10 @@ async function applyUpdate() {
   statusEl.textContent = 'Pulling latest changes...';
   statusEl.className = 'settings-info-val';
 
+  // Also disable topbar button if visible
+  const tbBtn = document.getElementById('topbar-update-btn');
+  if (tbBtn) { tbBtn.disabled = true; tbBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Updating...'; }
+
   try {
     const res = await fetch('/api/update/apply', { method: 'POST' });
     const data = await res.json();
@@ -5020,37 +5427,100 @@ async function applyUpdate() {
       statusEl.className = 'settings-info-val val-warn';
       btn.disabled = false;
       btn.textContent = 'Retry Update';
+      if (tbBtn) { tbBtn.disabled = false; tbBtn.innerHTML = '<i class="fa-solid fa-download"></i> Retry'; }
     } else {
       statusEl.textContent = 'Restarting...';
       btn.textContent = 'Restarting...';
-      _pollUntilBack(btn, statusEl);
+      if (tbBtn) { tbBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restarting...'; }
+      _pollUntilBack();
     }
   } catch (_) {
     statusEl.textContent = 'Update failed';
     statusEl.className = 'settings-info-val val-warn';
     btn.disabled = false;
     btn.textContent = 'Retry Update';
+    if (tbBtn) { tbBtn.disabled = false; tbBtn.innerHTML = '<i class="fa-solid fa-download"></i> Retry'; }
   }
 }
 
-function _pollUntilBack(btn, statusEl) {
+function _pollUntilBack() {
   // Give the server a moment to begin shutting down before we start polling.
+  // Once the server is back, refresh the page to pick up any new code.
   setTimeout(async () => {
     for (;;) {
       await new Promise(r => setTimeout(r, 1500));
       try {
         const r = await fetch('/api/settings/status');
         if (r.ok) {
-          statusEl.textContent = 'Updated successfully';
-          statusEl.className = 'settings-info-val val-ok';
-          btn.disabled = false;
-          btn.textContent = 'Check for Updates';
-          btn.onclick = checkForUpdates;
+          location.reload();
           return;
         }
       } catch (_) { /* server still down, keep polling */ }
     }
   }, 2000);
+}
+
+// ── Topbar update indicator ──────────────────────────────────────────────
+
+function _showTopbarUpdate(commitsBehind) {
+  const btn = document.getElementById('topbar-update-btn');
+  if (!btn) return;
+  btn.classList.remove('hidden');
+  btn.disabled = false;
+  const s = commitsBehind !== 1 ? 's' : '';
+  btn.title = `${commitsBehind} update${s} available`;
+  btn.innerHTML = `<i class="fa-solid fa-download"></i> Update`;
+}
+
+async function topbarApplyUpdate() {
+  const btn = document.getElementById('topbar-update-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Updating...';
+
+  try {
+    const res = await fetch('/api/update/apply', { method: 'POST' });
+    const data = await res.json();
+
+    if (data.error) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fa-solid fa-download"></i> Retry';
+      btn.title = `Update failed: ${data.error}`;
+    } else {
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restarting...';
+      _pollUntilBack();
+    }
+  } catch (_) {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fa-solid fa-download"></i> Retry';
+    btn.title = 'Update failed — click to retry';
+  }
+}
+
+// Silent update check — shows the topbar button only if updates are found.
+// Errors are silently ignored.
+async function _silentUpdateCheck() {
+  try {
+    const res = await fetch('/api/update/check');
+    const data = await res.json();
+    if (!data.error && !data.up_to_date && data.commits_behind > 0) {
+      _showTopbarUpdate(data.commits_behind);
+    }
+  } catch (_) { /* silent — don't bother the user if offline */ }
+}
+
+// Periodic update check — runs every 15 minutes, but only when idle
+// (no recording in progress).  Stops once an update is found.
+let _updateCheckInterval = null;
+function _startPeriodicUpdateCheck() {
+  // Run once on startup
+  _silentUpdateCheck();
+  // Then every 15 minutes while idle
+  _updateCheckInterval = setInterval(() => {
+    // Skip if already showing update button or recording is active
+    if (!document.getElementById('topbar-update-btn')?.classList.contains('hidden')) return;
+    if (state.isRecording) return;
+    _silentUpdateCheck();
+  }, 15 * 60 * 1000);
 }
 
 function switchSettingsSection(btn) {
@@ -5538,12 +6008,14 @@ fetch('/api/ai_settings')
 startVizLoop();
 initGainSliders();
 _tnInitSearch();
+_tsbInitAutocomplete();
 // Load preferences first, then init components that depend on saved values
 loadPreferences().then(() => {
   loadAudioDevices();
   loadModelConfig();
 });
 loadSummaryPrompt();
+_startPeriodicUpdateCheck();
 
 // Auto-open settings if ?settings=1 or ?setup=1 is in the URL
 // Auto-load session if ?session=<id> is in the URL

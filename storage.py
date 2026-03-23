@@ -64,6 +64,7 @@ def init_db() -> None:
             "ALTER TABLE transcript_segments ADD COLUMN start_time REAL NOT NULL DEFAULT 0",
             "ALTER TABLE transcript_segments ADD COLUMN end_time REAL NOT NULL DEFAULT 0",
             "ALTER TABLE transcript_segments ADD COLUMN label_override TEXT DEFAULT NULL",
+            "ALTER TABLE transcript_segments ADD COLUMN source_override TEXT DEFAULT NULL",
             "ALTER TABLE speaker_labels ADD COLUMN color TEXT",
             "ALTER TABLE speaker_labels ADD COLUMN global_id TEXT DEFAULT NULL",
             # Global cross-session speaker identity tables
@@ -249,7 +250,7 @@ def get_session(session_id: str) -> dict | None:
             return None
 
         segments = conn.execute(
-            "SELECT id, text, source, start_time, end_time, label_override "
+            "SELECT id, text, source, start_time, end_time, label_override, source_override "
             "FROM transcript_segments WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
@@ -274,7 +275,8 @@ def get_session(session_id: str) -> dict | None:
         "segments": [
             {"id": r["id"], "text": r["text"], "source": r["source"],
              "start_time": r["start_time"], "end_time": r["end_time"],
-             "label_override": r["label_override"]}
+             "label_override": r["label_override"],
+             "source_override": r["source_override"]}
             for r in segments
         ],
         "summary": summary_row["content"] if summary_row else "",
@@ -293,7 +295,7 @@ def get_segment(segment_id: int) -> dict | None:
     """Retrieve a single transcript segment by ID."""
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, session_id, text, source, start_time, end_time, label_override "
+            "SELECT id, session_id, text, source, start_time, end_time, label_override, source_override "
             "FROM transcript_segments WHERE id = ?",
             (segment_id,),
         ).fetchone()
@@ -365,6 +367,15 @@ def save_segment_label_override(segment_id: int, label: str | None) -> None:
         conn.execute(
             "UPDATE transcript_segments SET label_override = ? WHERE id = ?",
             (label, segment_id),
+        )
+
+
+def save_segment_source_override(segment_id: int, source_override: str | None) -> None:
+    """Set or clear a per-segment speaker-key reassignment."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE transcript_segments SET source_override = ? WHERE id = ?",
+            (source_override, segment_id),
         )
 
 

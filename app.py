@@ -1742,6 +1742,10 @@ def update_segment_label(seg_id: int):
         return jsonify({"error": "label is required"}), 400
     storage.save_segment_label_override(seg_id, label)
 
+    # Persist speaker-key reassignment if provided
+    source_override = (data.get("source_override") or "").strip() or None
+    storage.save_segment_source_override(seg_id, source_override)
+
     # Train voice library from this correction (skip for noise labels)
     if fingerprint_db.ready and label != _NOISE_LABEL:
         def _train_from_override():

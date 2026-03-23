@@ -135,6 +135,9 @@
           <span id="recording-duration" class="recording-duration hidden"></span>
         </div>
         <div class="topbar-sep"></div>
+        <button class="btn btn-update hidden" id="topbar-update-btn" onclick="topbarApplyUpdate()" title="Update available">
+          <i class="fa-solid fa-download"></i> Update
+        </button>
         <button class="btn btn-settings" onclick="openSettings()" title="Settings">
           <i class="fa-solid fa-gear"></i> Settings
         </button>
@@ -196,6 +199,7 @@
             <button class="tn-pill tn-pill-meta" id="tn-pill-all" onclick="tnToggleAllSpeakers(true)" title="Show all speakers">All</button>
             <button class="tn-pill tn-pill-meta" id="tn-pill-none" onclick="tnToggleAllSpeakers(false)" title="Hide all speakers">None</button>
             <div id="tn-speaker-pills" class="tn-speaker-pills"></div>
+            <button class="tn-pill tn-pill-meta tn-pill-toggle" id="tn-pill-keys-toggle" onclick="tnToggleKeyLabels()" title="Toggle between display names and original speaker keys"><i class="fa-solid fa-tags"></i></button>
           </div>
 
           <!-- Tools row: reassign + time range -->
@@ -250,8 +254,10 @@
         </div>
         <div id="transcript-selection-bar" class="transcript-selection-bar hidden">
           <span class="tsb-count" id="tsb-count">0 segments selected</span>
-          <input id="tsb-input" class="tsb-input" type="text" list="tsb-datalist" placeholder="Reassign to…" />
-          <datalist id="tsb-datalist"></datalist>
+          <div class="tsb-input-wrap" id="tsb-input-wrap">
+            <input id="tsb-input" class="tsb-input" type="text" placeholder="Reassign to…" autocomplete="off" />
+            <div class="tsb-autocomplete hidden" id="tsb-autocomplete"></div>
+          </div>
           <button class="tsb-btn tsb-apply" onclick="applyTranscriptBulkReassign()">Apply</button>
           <button class="tsb-btn tsb-clear" onclick="clearTranscriptSelection()"><i class="fa-solid fa-xmark"></i></button>
         </div>

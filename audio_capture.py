@@ -405,6 +405,22 @@ class AudioCapture:
         _ec_prev_gate: str = "both"     # previous gate decision
         _ec_crossfade_pos = 0           # current crossfade position (0 = done)
 
+        # Overlap-add spectral subtraction state.  We use a frame twice the
+        # chunk size (1024 samples ≈ 64 ms at 16 kHz) with 50 % overlap so
+        # that consecutive output frames blend seamlessly — eliminating the
+        # chunk-boundary discontinuities that cause choppy audio.
+        _ec_ola_frame = self.CHUNK_SIZE * 2          # 1024
+        _ec_ola_hop   = self.CHUNK_SIZE              # 512 — matches chunk cadence
+        # Periodic Hann window — satisfies COLA (constant-overlap-add) at
+        # 50 % overlap: w[k] + w[k + N/2] = 1.0 for all k.  np.hanning()
+        # returns a symmetric window that does NOT satisfy COLA, so we
+        # build the periodic variant explicitly.
+        n = np.arange(_ec_ola_frame)
+        _ec_ola_window = (0.5 - 0.5 * np.cos(2 * np.pi * n / _ec_ola_frame)).astype(np.float32)
+        _ec_mic_prev  = np.zeros(_ec_ola_hop, dtype=np.float32)   # previous mic chunk
+        _ec_lb_prev   = np.zeros(_ec_ola_hop, dtype=np.float32)   # previous lb chunk
+        _ec_ola_tail  = np.zeros(_ec_ola_hop, dtype=np.float32)   # overlap tail from last frame
+
         while self.is_running:
             try:
                 got_data = False
@@ -501,18 +517,55 @@ class AudioCapture:
                                 if _ec_hold_remaining > 0 and raw_gate != "loopback":
                                     raw_gate = "loopback"
 
-                            # Spectral subtraction: remove loopback frequencies from mic
+                            # Spectral subtraction via windowed overlap-add.
+                            # Assembles a full frame from the previous + current
+                            # chunk, applies a Hann window, subtracts the loopback
+                            # spectrum, then overlap-adds the two halves so output
+                            # is continuous across chunk boundaries.
                             if raw_gate in ("mic", "both") and self.echo_spectral_sub > 0 and lb_rms > floor:
-                                fft_size = len(mic_chunk)
-                                mic_fft = np.fft.rfft(mic_chunk, n=fft_size)
-                                lb_fft = np.fft.rfft(lb_chunk, n=fft_size)
-                                mic_mag = np.abs(mic_fft)
-                                lb_mag = np.abs(lb_fft)
-                                # Subtract scaled loopback magnitude; floor at 0
-                                cleaned_mag = np.maximum(mic_mag - lb_mag * self.echo_spectral_sub, 0.0)
-                                # Preserve original phase
+                                # Build full frame: [prev_chunk | current_chunk]
+                                mic_frame = np.concatenate((_ec_mic_prev, mic_chunk))
+                                lb_frame  = np.concatenate((_ec_lb_prev,  lb_chunk))
+
+                                # Hann window → FFT
+                                mic_fft = np.fft.rfft(mic_frame * _ec_ola_window)
+                                lb_fft  = np.fft.rfft(lb_frame  * _ec_ola_window)
+
+                                mic_mag   = np.abs(mic_fft)
+                                lb_mag    = np.abs(lb_fft)
                                 mic_phase = np.angle(mic_fft)
-                                mic_chunk = np.fft.irfft(cleaned_mag * np.exp(1j * mic_phase), n=fft_size).astype(np.float32)
+
+                                # Subtract with a spectral floor at 8 % of the
+                                # original mic magnitude — prevents "musical noise"
+                                # (the robotic artefact from bins hitting zero).
+                                spec_floor  = mic_mag * 0.08
+                                cleaned_mag = np.maximum(
+                                    mic_mag - lb_mag * self.echo_spectral_sub,
+                                    spec_floor,
+                                )
+
+                                # IFFT (no synthesis window — single-window OLA
+                                # with the periodic Hann satisfies COLA, so the
+                                # overlap-add reconstructs with unity gain).
+                                cleaned = np.fft.irfft(
+                                    cleaned_mag * np.exp(1j * mic_phase),
+                                    n=_ec_ola_frame,
+                                ).astype(np.float32)
+
+                                # Overlap-add: first half blends with previous
+                                # frame's tail; second half becomes the new tail.
+                                mic_chunk = _ec_ola_tail + cleaned[:_ec_ola_hop]
+                                _ec_ola_tail = cleaned[_ec_ola_hop:].copy()
+
+                            else:
+                                # Spectral subtraction didn't run — reset the
+                                # overlap tail so a stale tail doesn't bleed
+                                # into the next frame when subtraction resumes.
+                                _ec_ola_tail[:] = 0.0
+
+                            # Remember chunks for next frame's overlap
+                            _ec_mic_prev = mic_chunk.copy()
+                            _ec_lb_prev  = lb_chunk.copy()
 
                             # Build the mixed output based on gate decision
                             if raw_gate == "loopback":
