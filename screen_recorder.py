@@ -367,8 +367,8 @@ PRESETS = {
         "scale": "1280:-2",
     },
     "performance": {
-        "label": "Performance",
-        "description": "Low CPU usage with decent quality (default)",
+        "label": "Performance (Default)",
+        "description": "Low CPU usage with decent quality",
         "framerate": 10,
         "crf": 32,
         "preset": "ultrafast",

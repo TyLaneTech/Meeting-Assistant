@@ -169,10 +169,11 @@ class AudioCapture:
 
     # ── WAV recording ──────────────────────────────────────────────────────
 
-    def start_wav(self, path: str) -> None:
+    def start_wav(self, path: str, append: bool = False) -> None:
         """Open a WAV file for recording.  Call before start()."""
         # sample_rate isn't known yet — defer opening until start() sets it.
         self._wav_path = path
+        self._wav_append = append
 
     def stop_wav(self) -> None:
         """Finalize and close the WAV file."""
@@ -259,7 +260,8 @@ class AudioCapture:
 
         # Open WAV writer now that sample_rate is known
         if hasattr(self, "_wav_path") and self._wav_path:
-            self.wav_writer = WavWriter(self._wav_path, self.sample_rate)
+            append = getattr(self, "_wav_append", False)
+            self.wav_writer = WavWriter(self._wav_path, self.sample_rate, append=append)
             self._wav_path = None
 
         self.is_running = True

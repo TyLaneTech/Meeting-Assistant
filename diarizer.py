@@ -297,15 +297,21 @@ class DiartDiarizer:
 
         return merged
 
-    def reset(self) -> None:
-        """Clear all state for a new recording session."""
+    def reset(self, next_label: int = 1) -> None:
+        """Clear all state for a new recording session.
+
+        Args:
+            next_label: Starting number for new speaker labels.  On resume,
+                        pass max-existing + 1 so new speakers don't collide
+                        with labels from previous recording segments.
+        """
         from diart import SpeakerDiarization
         self._pipeline = SpeakerDiarization(self._config)
         self._buf = np.zeros(0, dtype=np.float32)
         self._buf_start_sec = 0.0
         self._total_fed_sec = 0.0
         self._speaker_map.clear()
-        self._next_label = 1
+        self._next_label = next_label
 
     def apply_params(self, params: dict) -> None:
         """Update runtime-tunable diarization parameters from settings.

@@ -79,6 +79,93 @@ function _saveLayoutCache(updates) {
   } catch (_) {}
 }
 
+/* ── Pane toggle ──────────────────────────────────────────────────────────── */
+let _paneVisible = [true, true, true]; // [transcript, summary, chat]
+
+function togglePane(idx) {
+  // Don't allow hiding the last visible pane
+  const visibleCount = _paneVisible.filter(Boolean).length;
+  if (_paneVisible[idx] && visibleCount <= 1) return;
+
+  _paneVisible[idx] = !_paneVisible[idx];
+
+  const btns = [
+    document.getElementById('pane-toggle-transcript'),
+    document.getElementById('pane-toggle-summary'),
+    document.getElementById('pane-toggle-chat'),
+  ];
+  _paneVisible.forEach((vis, i) => {
+    if (btns[i]) btns[i].classList.toggle('active', vis);
+  });
+
+  _applyPaneLayout();
+}
+
+function _applyPaneLayout() {
+  const HANDLE_PX = 4;
+  const MIN_COL_PX = 160;
+  const workspace = document.querySelector('.workspace');
+  if (!workspace) return;
+
+  const cols = workspace.querySelectorAll('.col');
+  const handles = workspace.querySelectorAll('.col-resize-handle');
+
+  // Determine which visible columns are adjacent in the rendered layout
+  // and need a handle between them
+  const visIndices = [];
+  _paneVisible.forEach((vis, i) => { if (vis) visIndices.push(i); });
+
+  // Hide all columns and handles first; reset handle data attrs to originals
+  cols.forEach((col, i) => { col.style.display = _paneVisible[i] ? '' : 'none'; });
+  handles.forEach((h, i) => {
+    h.style.display = 'none';
+    h.dataset.left = String(i);
+    h.dataset.right = String(i + 1);
+  });
+
+  // Show handles between consecutively-rendered visible columns.
+  // Re-purpose the first available hidden handle for non-adjacent pairs.
+  const neededHandles = Math.max(0, visIndices.length - 1);
+  let handleIdx = 0;
+  for (let i = 0; i < visIndices.length - 1; i++) {
+    const li = visIndices[i];
+    const ri = visIndices[i + 1];
+    // Prefer the handle that originally sits between li and ri
+    const natural = Array.from(handles).find(
+      h => parseInt(h.dataset.left) === li && parseInt(h.dataset.right) === ri
+    );
+    if (natural) {
+      natural.style.display = '';
+    } else {
+      // Non-adjacent pair (e.g. 0 & 2 with 1 hidden) — show whichever handle is free
+      for (; handleIdx < handles.length; handleIdx++) {
+        if (handles[handleIdx].style.display === 'none') {
+          handles[handleIdx].style.display = '';
+          // Update data attrs so resize dragging works correctly
+          handles[handleIdx].dataset.left = String(li);
+          handles[handleIdx].dataset.right = String(ri);
+          handleIdx++;
+          break;
+        }
+      }
+    }
+  }
+
+  // Build grid template
+  const handleCount = neededHandles;
+  const total = workspace.offsetWidth - HANDLE_PX * handleCount;
+  const visFracs = _colProportions.filter((_, i) => _paneVisible[i]);
+  const fracSum = visFracs.reduce((a, b) => a + b, 0);
+  const widths = visFracs.map(f => Math.max(MIN_COL_PX, Math.round(total * f / fracSum)));
+
+  const parts = [];
+  for (let i = 0; i < widths.length; i++) {
+    if (i > 0) parts.push(`${HANDLE_PX}px`);
+    parts.push(`${widths[i]}px`);
+  }
+  workspace.style.gridTemplateColumns = parts.join(' ');
+}
+
 /* ── Resizable columns ────────────────────────────────────────────────────── */
 // Relative column proportions — updated when user drags; loaded from settings on init.
 // Seeded from localStorage cache immediately so the IIFE below uses the right values.
@@ -90,6 +177,11 @@ let _colProportions = (() => {
 })();
 
 function recalcColWidths() {
+  // If any panes are hidden, use the pane-aware layout
+  if (_paneVisible.some(v => !v)) {
+    _applyPaneLayout();
+    return;
+  }
   const HANDLE_PX = 4;
   const MIN_COL_PX = 160;
   const workspace = document.querySelector('.workspace');
@@ -113,17 +205,32 @@ function recalcColWidths() {
   const numCols   = workspace.querySelectorAll('.col').length;
   if (!numCols || !handles.length) return;
 
+  function getVisibleIndices() {
+    return _paneVisible.map((v, i) => v ? i : -1).filter(i => i >= 0);
+  }
+
   function getPixelWidths() {
-    const total   = workspace.offsetWidth - HANDLE_PX * handles.length;
-    const fracSum = _colProportions.reduce((a, b) => a + b, 0);
-    return _colProportions.map(f => Math.max(MIN_COL_PX, Math.round(total * f / fracSum)));
+    const vis = getVisibleIndices();
+    const visHandles = Math.max(0, vis.length - 1);
+    const total = workspace.offsetWidth - HANDLE_PX * visHandles;
+    const visFracs = vis.map(i => _colProportions[i]);
+    const fracSum = visFracs.reduce((a, b) => a + b, 0);
+    // Return full 3-element array; hidden columns get 0
+    const result = [0, 0, 0];
+    vis.forEach((ci, vi) => {
+      result[ci] = Math.max(MIN_COL_PX, Math.round(total * visFracs[vi] / fracSum));
+    });
+    return result;
   }
 
   function applyWidths(widths) {
-    const template = widths.map((w, i) =>
-      i < widths.length - 1 ? `${w}px ${HANDLE_PX}px` : `${w}px`
-    ).join(' ');
-    workspace.style.gridTemplateColumns = template;
+    const vis = getVisibleIndices();
+    const parts = [];
+    vis.forEach((ci, vi) => {
+      if (vi > 0) parts.push(`${HANDLE_PX}px`);
+      parts.push(`${widths[ci]}px`);
+    });
+    workspace.style.gridTemplateColumns = parts.join(' ');
   }
 
   applyWidths(getPixelWidths());
@@ -131,8 +238,10 @@ function recalcColWidths() {
   handles.forEach(handle => {
     handle.addEventListener('mousedown', e => {
       e.preventDefault();
-      const li = parseInt(handle.dataset.left,  10);
+      // data-left/data-right always store original column indices (0,1,2)
+      const li = parseInt(handle.dataset.left, 10);
       const ri = parseInt(handle.dataset.right, 10);
+
       let widths       = getPixelWidths();
       const startX     = e.clientX;
       const startLeft  = widths[li];
@@ -158,8 +267,10 @@ function recalcColWidths() {
         document.body.style.cursor     = '';
         document.body.style.userSelect = '';
         // Convert current pixel widths → proportions and save to settings + cache
-        const total = widths.reduce((a, b) => a + b, 0);
-        _colProportions = widths.map(w => w / total);
+        const vis = getVisibleIndices();
+        const visWidths = vis.map(i => widths[i]);
+        const total = visWidths.reduce((a, b) => a + b, 0);
+        vis.forEach((ci, vi) => { _colProportions[ci] = visWidths[vi] / total; });
         if (typeof savePref === 'function') savePref('col_proportions', _colProportions);
         _saveLayoutCache({ col_proportions: _colProportions });
         document.removeEventListener('mousemove', onMove);
@@ -1482,11 +1593,11 @@ async function bulkDelete() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action: 'delete', session_ids: ids }),
   });
-  if (ids.includes(state.sessionId) && !state.isRecording) {
-    state.sessionId = null; state.isViewingPast = false;
-    clearAll(); history.pushState({}, '', '/');
-  }
   _sidebarSelected.clear();
+  if (ids.includes(state.sessionId) && !state.isRecording) {
+    newSession();
+    return;
+  }
   refreshSidebar();
 }
 
@@ -1550,8 +1661,8 @@ async function deleteSession(e, sessionId) {
   e.stopPropagation();
   await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
   if (sessionId === state.sessionId && !state.isRecording) {
-    state.sessionId = null;
-    clearAll();
+    newSession();
+    return;
   }
   refreshSidebar();
 }
@@ -1895,6 +2006,7 @@ function connectSSE(afterSegId = 0) {
     const entry = _sidebarAllSessions.find(s => s.id === d.session_id);
     if (entry) { entry.title = d.title; _renderSidebar(); }
     else refreshSidebar();
+    if (d.session_id === state.sessionId) updateTopbarSessionTitle();
   });
 
   src.addEventListener('speaker_label', e => {
@@ -2043,19 +2155,23 @@ function onStatus(d) {
       _updateBrandIcons(true);
       if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
       if (_pendingSpeakerProfiles.length) _flushPendingSpeakers(d.session_id);
+      refreshSidebar();
     } else if (!d.recording) {
       stopDurationCounter();
       _updateBrandIcons(false);
       _updateScreenRecordingStatus(false);
       _stopScreenPreview();
+      // Transition to "viewing past" so Resume Session button appears
+      if (state.sessionId) state.isViewingPast = true;
+      updateRecordBtn();
       refreshSidebar();
       // The WAV is finalized before this event fires, so playback is available
       // immediately - no need to reload the page or click the session.
-      if (!state.isViewingPast && state.sessionId) {
+      if (state.isViewingPast && state.sessionId) {
         initPlayback(state.sessionId);
         // Check if a screen recording was saved for this session
         fetch(`/api/sessions/${state.sessionId}`).then(r => r.json()).then(s => {
-          if (s.has_video) initVideo(state.sessionId);
+          if (s.has_video) initVideo(state.sessionId, s.video_offset);
         }).catch(() => {});
       }
     }
@@ -2077,8 +2193,28 @@ function onStatus(d) {
   _syncRecordBtnDisabled();
 }
 
+function updateTopbarSessionTitle() {
+  const el = document.getElementById('topbar-session-title');
+  if (!el) return;
+  if (!state.sessionId) {
+    el.classList.add('hidden');
+    el.textContent = '';
+    return;
+  }
+  const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
+  const title = entry?.title || '';
+  if (title) {
+    el.textContent = title;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+    el.textContent = '';
+  }
+}
+
 function updateRecordBtn() {
   const btn = document.getElementById('record-btn');
+  updateTopbarSessionTitle();
   if (state.isRecording) {
     btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop Recording';
     btn.classList.add('recording');
@@ -2189,6 +2325,18 @@ function _clearSegmentRegistry() {
   _segmentRegistry  = [];
   _segmentTimes     = [];
   _visibleRangesCache = null;
+  // Reset collapse state
+  _collapseActive = false;
+  const colBtn = document.getElementById('transcript-collapse-toggle');
+  if (colBtn) { colBtn.classList.add('hidden'); colBtn.classList.remove('active'); }
+  _removeCollapse();
+  // Reset minimap state
+  _minimapActive = false;
+  const mmBtn = document.getElementById('transcript-minimap-toggle');
+  if (mmBtn) { mmBtn.classList.add('hidden'); mmBtn.classList.remove('active'); }
+  const mmEl = document.getElementById('transcript-minimap');
+  if (mmEl) mmEl.classList.add('hidden');
+  if (_minimapPlayheadEl) { _minimapPlayheadEl.style.display = 'none'; }
 }
 
 // speaker_key → display name for the session currently in view
@@ -3516,6 +3664,9 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     el.scrollTop = el.scrollHeight;
     setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 100);
   }
+  _updateCollapseFabVisibility();
+  _updateMinimapFabVisibility();
+  _refreshMinimap();
 }
 
 // Is this a default auto-generated speaker name? (e.g. "Speaker 1")
@@ -4021,6 +4172,7 @@ function applySpeakerProfileUpdate(update) {
     renderSpeakerManager();
   }
   _tnRefreshSpeakerPills();
+  _refreshMinimap();
 }
 
 function _applySpeakerColor(speakerKey, color) {
@@ -4076,7 +4228,22 @@ function copyTranscript() {
   });
   while (lines.length && !lines[lines.length - 1]) lines.pop();
   const result = lines.join('\n');
-  if (result) navigator.clipboard.writeText(result).then(() => flashStatus('Copied!'));
+  if (result) navigator.clipboard.writeText(result).then(() => {
+    flashStatus('Copied!');
+    const btn = document.getElementById('btn-copy-transcript');
+    if (btn) {
+      const icon = btn.querySelector('i');
+      if (icon) {
+        icon.className = 'fa-solid fa-check';
+        icon.style.color = '#3fb950';
+        clearTimeout(btn._copyTimer);
+        btn._copyTimer = setTimeout(() => {
+          icon.className = 'fa-solid fa-clipboard';
+          icon.style.color = '';
+        }, 2000);
+      }
+    }
+  });
 }
 
 /* ── Transcript Navigator ───────────────────────────────────────────────── */
@@ -4129,6 +4296,7 @@ function applyTranscriptFilter() {
   _segmentRegistry.forEach(_applyFilterToSeg);
   _visibleRangesCache = null;  // filter changed — invalidate cached ranges
   _tnHighlightMatches();
+  _refreshMinimap();
 }
 
 function _updateFilterBtnState() {
@@ -5189,6 +5357,7 @@ function initPlayback(sessionId) {
     document.getElementById('playback-time').textContent = fmtTime(t);
     document.getElementById('playback-seek').value = _playbackAudio.currentTime;
     highlightPlayingSegment(_playbackAudio.currentTime);
+    _updateMinimapPlayhead(t);
   };
 
   _playbackAudio.onended = () => {
@@ -5298,9 +5467,40 @@ let _programmaticScrollCount = 0; // incremented before programmatic scrolls, de
 
 function _doProgrammaticScroll(el, opts) {
   _programmaticScrollCount++;
-  el.scrollIntoView(opts);
-  // Scroll events fire asynchronously; decrement after they settle
-  setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 600);
+  const container = el.closest('.col-body');
+  if (!container) {
+    el.scrollIntoView({ ...opts, behavior: 'instant' });
+    setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 100);
+    return;
+  }
+
+  // Calculate target scroll position
+  const elRect = el.getBoundingClientRect();
+  const cRect = container.getBoundingClientRect();
+  const elCenter = elRect.top + elRect.height / 2 - cRect.top + container.scrollTop;
+  const target = elCenter - container.clientHeight / 2;
+  const start = container.scrollTop;
+  const delta = Math.max(0, Math.min(target, container.scrollHeight - container.clientHeight)) - start;
+
+  if (Math.abs(delta) < 2) {
+    _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1);
+    return;
+  }
+
+  // Fast ease-out animation (~150ms)
+  const duration = 150;
+  const t0 = performance.now();
+  function step(now) {
+    const p = Math.min((now - t0) / duration, 1);
+    const ease = 1 - (1 - p) * (1 - p); // quadratic ease-out
+    container.scrollTop = start + delta * ease;
+    if (p < 1) {
+      requestAnimationFrame(step);
+    } else {
+      setTimeout(() => { _programmaticScrollCount = Math.max(0, _programmaticScrollCount - 1); }, 50);
+    }
+  }
+  requestAnimationFrame(step);
 }
 
 function highlightPlayingSegment(t) {
@@ -5333,9 +5533,11 @@ function clearPlayingHighlight() {
 /* ── Video viewer ────────────────────────────────────────────────────────── */
 let _videoAvailable = false;
 let _videoVisible   = false;
+let _videoOffset    = 0; // audio seconds where the video file starts (>0 on resumed sessions)
 const _playbackVideo = document.getElementById('playback-video');
 
-function initVideo(sessionId) {
+function initVideo(sessionId, offset) {
+  _videoOffset = offset || 0;
   const video = _playbackVideo;
   video.src = `/api/sessions/${sessionId}/video`;
   video.load();
@@ -5349,8 +5551,19 @@ function initVideo(sessionId) {
 
   // When video metadata loads, ensure time is synced
   video.onloadedmetadata = () => {
-    video.currentTime = _playbackAudio.currentTime;
+    _syncVideoToAudio();
   };
+
+  // Restore video viewer visibility from saved preference
+  if (_prefs.video_viewer_open) {
+    _videoVisible = true;
+    document.getElementById('video-viewer').classList.remove('hidden');
+    document.getElementById('playback-video-toggle').classList.add('active');
+    video.onloadedmetadata = () => {
+      _syncVideoToAudio();
+      if (!_playbackAudio.paused) video.play().catch(() => {});
+    };
+  }
 }
 
 function destroyVideo() {
@@ -5359,6 +5572,7 @@ function destroyVideo() {
   _playbackVideo.load();
   _videoAvailable = false;
   _videoVisible = false;
+  _videoOffset = 0;
   document.getElementById('video-viewer').classList.add('hidden');
   document.getElementById('playback-video-toggle').classList.add('hidden');
   const btn = document.getElementById('playback-video-toggle');
@@ -5370,6 +5584,7 @@ function toggleVideoViewer() {
   _videoVisible = !_videoVisible;
   document.getElementById('video-viewer').classList.toggle('hidden', !_videoVisible);
   document.getElementById('playback-video-toggle').classList.toggle('active', _videoVisible);
+  savePref('video_viewer_open', _videoVisible);
   if (_videoVisible) {
     // Sync video to current audio position
     _syncVideoToAudio();
@@ -5379,11 +5594,83 @@ function toggleVideoViewer() {
   }
 }
 
+function _audioToVideoTime(audioTime) {
+  return Math.max(0, audioTime - _videoOffset);
+}
+
+// Video seek — cancels any in-flight seek before issuing a new one
+let _videoScrubbing = false;    // true while the user is dragging the seek bar
+let _videoSeekDebounce = 0;     // timeout id for debounced seek during scrub
+
+function _cancelVideoSeek() {
+  clearTimeout(_videoSeekDebounce);
+  _videoSeekDebounce = 0;
+  // Abort any in-flight seek by forcing the video to stop loading the old frame
+  if (_playbackVideo.seeking) {
+    // Re-assign the same src won't help, but we can let the next
+    // currentTime assignment naturally cancel the pending seek.
+  }
+}
+
+function _seekVideoImmediate(targetTime) {
+  _cancelVideoSeek();
+  _playbackVideo.currentTime = targetTime;
+}
+
+function _seekVideoDebounced(targetTime, delayMs) {
+  _cancelVideoSeek();
+  _videoSeekDebounce = setTimeout(() => {
+    _playbackVideo.currentTime = targetTime;
+  }, delayMs);
+}
+
 function _syncVideoToAudio() {
   if (!_videoAvailable || !_videoVisible) return;
-  const drift = Math.abs(_playbackVideo.currentTime - _playbackAudio.currentTime);
+  const expected = _audioToVideoTime(_playbackAudio.currentTime);
+  const drift = Math.abs(_playbackVideo.currentTime - expected);
   if (drift > 0.3) {
-    _playbackVideo.currentTime = _playbackAudio.currentTime;
+    _seekVideoImmediate(expected);
+  }
+}
+
+// Wire up scrub detection on the seek bar
+let _wasPlayingBeforeScrub = false;
+{
+  const seekBar = document.getElementById('playback-seek');
+  if (seekBar) {
+    seekBar.addEventListener('mousedown', () => {
+      _videoScrubbing = true;
+      _cancelVideoSeek();
+      // Pause both audio and video during scrub
+      _wasPlayingBeforeScrub = !_playbackAudio.paused;
+      if (_wasPlayingBeforeScrub) {
+        _playbackAudio.pause();
+        document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-pause"></i>';
+      }
+      if (_videoAvailable && !_playbackVideo.paused) _playbackVideo.pause();
+    });
+    // Use window-level mouseup so we catch it even if cursor leaves the bar
+    window.addEventListener('mouseup', () => {
+      if (!_videoScrubbing) return;
+      _videoScrubbing = false;
+      _cancelVideoSeek();
+      if (_videoAvailable && _videoVisible) {
+        // Seek video to final position, wait for frame to decode, then resume both
+        const target = _audioToVideoTime(_playbackAudio.currentTime);
+        _playbackVideo.currentTime = target;
+        if (_wasPlayingBeforeScrub) {
+          _playbackVideo.addEventListener('seeked', function onSeeked() {
+            _playbackVideo.removeEventListener('seeked', onSeeked);
+            _playbackAudio.play();
+            _playbackVideo.play().catch(() => {});
+          });
+        }
+      } else if (_wasPlayingBeforeScrub) {
+        // No video — just resume audio
+        _playbackAudio.play();
+      }
+      _wasPlayingBeforeScrub = false;
+    });
   }
 }
 
@@ -5404,7 +5691,13 @@ const _origSeekPlayback = seekPlayback;
 seekPlayback = function(val) {
   _origSeekPlayback(val);
   if (_videoAvailable) {
-    _playbackVideo.currentTime = parseFloat(val);
+    if (_videoScrubbing) {
+      // During scrub: debounce — only seek after user pauses dragging for 100ms
+      _seekVideoDebounced(_audioToVideoTime(parseFloat(val)), 100);
+    } else {
+      // Direct seek (click on bar, or programmatic): immediate
+      _seekVideoImmediate(_audioToVideoTime(parseFloat(val)));
+    }
   }
 };
 
@@ -5412,7 +5705,8 @@ const _origSeekToTime = seekToTime;
 seekToTime = function(t) {
   _origSeekToTime(t);
   if (_videoAvailable) {
-    _playbackVideo.currentTime = t;
+    _cancelVideoSeek();
+    _seekVideoImmediate(_audioToVideoTime(t));
     if (_videoVisible && !_playbackVideo.paused !== !_playbackAudio.paused) {
       if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
       else _playbackVideo.pause();
@@ -5428,7 +5722,7 @@ setPlaybackSpeed = function(val) {
 
 // Periodic drift correction — runs on audio's timeupdate
 _playbackAudio.addEventListener('timeupdate', () => {
-  if (_videoAvailable && _videoVisible && !_playbackAudio.paused) {
+  if (_videoAvailable && _videoVisible && !_playbackAudio.paused && !_videoScrubbing) {
     _syncVideoToAudio();
     // Keep play state in sync (filter skipping can pause/seek audio)
     if (_playbackVideo.paused) _playbackVideo.play().catch(() => {});
@@ -5455,8 +5749,8 @@ _playbackAudio.addEventListener('play', () => {
 
 /* ── Live screen preview ─────────────────────────────────────────────────── */
 let _screenPreviewVisible = false;
-let _screenPreviewTimer   = null;
-const _SCREEN_PREVIEW_INTERVAL = 1500; // ms between frame refreshes
+let _screenPreviewRunning = false;
+const _SCREEN_PREVIEW_DELAY = 500; // ms between frames (after previous completes)
 
 function toggleScreenPreview() {
   _screenPreviewVisible = !_screenPreviewVisible;
@@ -5464,22 +5758,32 @@ function toggleScreenPreview() {
   const btn   = document.getElementById('screen-preview-toggle');
   if (panel) panel.classList.toggle('hidden', !_screenPreviewVisible);
   if (btn)   btn.classList.toggle('active', _screenPreviewVisible);
-  if (_screenPreviewVisible) {
-    // Load first frame immediately, then refresh on interval
-    _refreshScreenPreview();
-    _screenPreviewTimer = setInterval(_refreshScreenPreview, _SCREEN_PREVIEW_INTERVAL);
-  } else {
-    clearInterval(_screenPreviewTimer);
-    _screenPreviewTimer = null;
+  if (_screenPreviewVisible && !_screenPreviewRunning) {
+    _screenPreviewLoop();
   }
 }
 
-
-function _refreshScreenPreview() {
+async function _screenPreviewLoop() {
+  _screenPreviewRunning = true;
   const img = document.getElementById('screen-preview-img');
-  if (!img || !_screenPreviewVisible) return;
-  // Append timestamp to bust cache
-  img.src = '/api/screen/preview?_=' + Date.now();
+  while (_screenPreviewVisible && img) {
+    try {
+      const resp = await fetch('/api/screen/preview?_=' + Date.now());
+      if (!_screenPreviewVisible) break;
+      if (resp.ok) {
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const prev = img.src;
+        img.src = url;
+        if (!img.dataset.loaded) img.dataset.loaded = '1';
+        // Revoke old blob URL to avoid memory leaks
+        if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+      }
+    } catch (_) {}
+    // Wait before next frame — ensures sequential, never piling up
+    await new Promise(r => setTimeout(r, _SCREEN_PREVIEW_DELAY));
+  }
+  _screenPreviewRunning = false;
 }
 
 function _showScreenPreviewToggle(show) {
@@ -5489,12 +5793,414 @@ function _showScreenPreviewToggle(show) {
 
 function _stopScreenPreview() {
   _screenPreviewVisible = false;
-  clearInterval(_screenPreviewTimer);
-  _screenPreviewTimer = null;
   const panel = document.getElementById('screen-preview');
   const btn   = document.getElementById('screen-preview-toggle');
+  const img   = document.getElementById('screen-preview-img');
   if (panel) panel.classList.add('hidden');
   if (btn)   { btn.classList.add('hidden'); btn.classList.remove('active'); }
+  if (img)   delete img.dataset.loaded;
+}
+
+/* ── Transcript collapse (consecutive speaker runs) ──────────────────────── */
+const _COLLAPSE_THRESHOLD = 20;  // min segments before showing the FAB
+const _COLLAPSE_RUN_MIN   = 2;   // min consecutive same-speaker segments to group
+let _collapseActive = false;
+
+function toggleTranscriptCollapse() {
+  _collapseActive = !_collapseActive;
+  const btn = document.getElementById('transcript-collapse-toggle');
+  if (btn) btn.classList.toggle('active', _collapseActive);
+  if (_collapseActive) {
+    _applyCollapse();
+  } else {
+    _removeCollapse();
+  }
+}
+
+/** Build consecutive same-speaker runs and collapse them.
+ *  After building strict runs, merges adjacent runs from the same speaker
+ *  when they are separated by short (≤2 segment) runs from other speakers,
+ *  producing larger, more uniform groups.
+ */
+function _applyCollapse() {
+  const el = document.getElementById('transcript');
+  if (!el) return;
+  // Remove any existing group summaries first
+  _removeCollapse();
+
+  // Build strict runs of consecutive segments by the same speaker
+  const segs = Array.from(el.querySelectorAll('.transcript-segment'));
+  if (!segs.length) return;
+
+  let strictRuns = [];
+  let currentRun = null;
+
+  for (const seg of segs) {
+    if (seg.style.display === 'none') continue; // filtered out
+    const badge = seg.querySelector('.src-badge');
+    const key = badge?.dataset.speakerKey || seg.dataset.transcriptSource || '';
+    if (currentRun && currentRun.key === key) {
+      currentRun.segs.push(seg);
+    } else {
+      if (currentRun) strictRuns.push(currentRun);
+      currentRun = { key, segs: [seg] };
+    }
+  }
+  if (currentRun) strictRuns.push(currentRun);
+
+  // Merge pass: absorb short interstitial runs (≤2 segs) between same-speaker groups
+  const merged = [strictRuns[0]];
+  for (let i = 1; i < strictRuns.length; i++) {
+    const prev = merged[merged.length - 1];
+    const curr = strictRuns[i];
+    // Look ahead: is there a same-speaker group after a short gap?
+    if (curr.segs.length <= 2 && i + 1 < strictRuns.length && strictRuns[i + 1].key === prev.key) {
+      // Absorb the short gap and the next same-speaker run into prev
+      prev.segs.push(...curr.segs, ...strictRuns[i + 1].segs);
+      i++; // skip the next run (already absorbed)
+    } else if (curr.key === prev.key) {
+      // Same speaker, just merge directly
+      prev.segs.push(...curr.segs);
+    } else {
+      merged.push(curr);
+    }
+  }
+
+  // Collapse runs that meet the minimum count
+  for (const run of merged) {
+    if (run.segs.length < _COLLAPSE_RUN_MIN) continue;
+
+    const first = run.segs[0];
+    const last  = run.segs[run.segs.length - 1];
+    const badge = first.querySelector('.src-badge');
+    const name  = badge?.textContent?.trim() || run.key;
+    const color = first.style.getPropertyValue('--seg-color') || 'var(--accent-dim)';
+
+    // Time range
+    const startT = parseFloat(first.dataset.start || '0');
+    const endT   = parseFloat(last.dataset.end || last.dataset.start || '0');
+
+    // Create summary row
+    const summary = document.createElement('div');
+    summary.className = 'transcript-group-summary';
+    summary.style.setProperty('--seg-color', color);
+    summary.dataset.collapseGroup = '1';
+
+    const chevron = document.createElement('i');
+    chevron.className = 'fa-solid fa-chevron-right group-chevron';
+    summary.appendChild(chevron);
+
+    // Speaker badge clone
+    const badgeClone = badge.cloneNode(true);
+    badgeClone.style.cursor = 'default';
+    summary.appendChild(badgeClone);
+
+    // Time span
+    if (endT > 0) {
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'group-time';
+      timeSpan.textContent = `${fmtTime(startT)} – ${fmtTime(endT)}`;
+      summary.appendChild(timeSpan);
+    }
+
+    // Count
+    const countSpan = document.createElement('span');
+    countSpan.className = 'group-count';
+    countSpan.textContent = `${run.segs.length} segments`;
+    summary.appendChild(countSpan);
+
+    // Click to expand/collapse the group
+    summary._groupSegs = run.segs;
+    summary.addEventListener('click', () => {
+      const expanded = summary.classList.toggle('expanded');
+      for (const seg of summary._groupSegs) {
+        seg.style.display = expanded ? '' : 'none';
+        seg.dataset.collapsedHidden = expanded ? '' : '1';
+      }
+    });
+
+    // Insert summary before first segment, hide all segments
+    first.parentNode.insertBefore(summary, first);
+    for (const seg of run.segs) {
+      seg.style.display = 'none';
+      seg.dataset.collapsedHidden = '1';
+    }
+  }
+}
+
+/** Remove all collapse summaries and restore segment visibility. */
+function _removeCollapse() {
+  const el = document.getElementById('transcript');
+  if (!el) return;
+  // Restore segments hidden by collapse (not by filter)
+  el.querySelectorAll('[data-collapsed-hidden]').forEach(seg => {
+    delete seg.dataset.collapsedHidden;
+    seg.style.display = '';
+  });
+  el.querySelectorAll('.transcript-group-summary').forEach(s => s.remove());
+  // Re-apply transcript filter in case some segments should still be hidden
+  if (typeof applyTranscriptFilter === 'function') applyTranscriptFilter();
+}
+
+/** Show or hide the collapse FAB based on segment count. */
+function _updateCollapseFabVisibility() {
+  const btn = document.getElementById('transcript-collapse-toggle');
+  if (!btn) return;
+  const show = _segmentRegistry.length >= _COLLAPSE_THRESHOLD;
+  btn.classList.toggle('hidden', !show);
+  if (!show && _collapseActive) {
+    _collapseActive = false;
+    btn.classList.remove('active');
+    _removeCollapse();
+  }
+}
+
+/* ── Transcript minimap ──────────────────────────────────────────────────── */
+const _MINIMAP_THRESHOLD  = 10;     // min segments before FAB appears
+const _MINIMAP_SEG_GAP    = 1;      // px gap between rendered blocks
+let _minimapActive        = false;
+let _minimapDragging      = false;
+let _minimapRafPending    = false;
+let _minimapPlayheadEl    = null;    // lazily created playhead line
+
+function toggleTranscriptMinimap() {
+  _minimapActive = !_minimapActive;
+  const btn  = document.getElementById('transcript-minimap-toggle');
+  const wrap = document.getElementById('transcript-minimap');
+  if (btn)  btn.classList.toggle('active', _minimapActive);
+  if (wrap) wrap.classList.toggle('hidden', !_minimapActive);
+  if (_minimapActive) {
+    _renderMinimap();
+    _updateMinimapViewport();
+  }
+}
+
+/** Gather segment data for the minimap: color + proportional height. */
+function _minimapSegmentData() {
+  const transcript = document.getElementById('transcript');
+  if (!transcript) return [];
+  const segs = transcript.querySelectorAll('.transcript-segment');
+  const data = [];
+  for (const seg of segs) {
+    if (seg.style.display === 'none') continue;
+    const color = seg.style.getPropertyValue('--seg-color') || '#8b949e';
+    // Use element height for accurate proportions
+    const h = seg.offsetHeight || 40;
+    data.push({ color, height: h, el: seg });
+  }
+  return data;
+}
+
+/** Render the minimap canvas with colored blocks per segment. */
+function _renderMinimap() {
+  if (!_minimapActive) return;
+  const canvas = document.getElementById('minimap-canvas');
+  const container = document.getElementById('transcript-minimap');
+  if (!canvas || !container) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+
+  canvas.width  = cw * dpr;
+  canvas.height = ch * dpr;
+  canvas.style.width  = cw + 'px';
+  canvas.style.height = ch + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cw, ch);
+
+  const segData = _minimapSegmentData();
+  if (!segData.length) return;
+
+  // Calculate total content height for scaling
+  const totalHeight = segData.reduce((sum, s) => sum + s.height, 0);
+  const scale = ch / totalHeight;
+  const padding = 3;  // horizontal padding
+  const blockWidth = cw - padding * 2;
+  const minBlockH = 2;  // minimum visible block height
+  const gap = _MINIMAP_SEG_GAP * scale;
+
+  let y = 0;
+  for (const seg of segData) {
+    const blockH = Math.max(minBlockH, seg.height * scale - gap);
+    // Parse hex color and draw with slight transparency for depth
+    ctx.fillStyle = seg.color;
+    ctx.globalAlpha = 0.55;
+    // Rounded rect
+    const r = Math.min(2, blockH / 2);
+    _roundRect(ctx, padding, y, blockWidth, blockH, r);
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
+    y += blockH + gap;
+  }
+}
+
+/** Draw a rounded rectangle path. */
+function _roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+/** Update the viewport indicator position to match transcript scroll. */
+function _updateMinimapViewport() {
+  if (!_minimapActive) return;
+  const transcript = document.getElementById('transcript');
+  const viewport   = document.getElementById('minimap-viewport');
+  const container  = document.getElementById('transcript-minimap');
+  if (!transcript || !viewport || !container) return;
+
+  const scrollH   = transcript.scrollHeight;
+  const clientH   = transcript.clientHeight;
+  const scrollTop = transcript.scrollTop;
+  const mapH      = container.clientHeight;
+
+  if (scrollH <= clientH) {
+    // Everything fits — viewport covers full minimap
+    viewport.style.top    = '0px';
+    viewport.style.height = mapH + 'px';
+    return;
+  }
+
+  const ratio      = mapH / scrollH;
+  const vpHeight   = Math.max(12, clientH * ratio);
+  const vpTop      = (scrollTop / scrollH) * mapH;
+
+  viewport.style.top    = Math.min(vpTop, mapH - vpHeight) + 'px';
+  viewport.style.height = vpHeight + 'px';
+}
+
+/** Update playhead position on the minimap during playback. */
+function _updateMinimapPlayhead(audioTime) {
+  if (!_minimapActive || !_playbackActive) return;
+  const container = document.getElementById('transcript-minimap');
+  if (!container) return;
+
+  // Find the segment closest to current playback time
+  if (!_segmentTimes.length) return;
+  let idx = -1;
+  for (let i = 0; i < _segmentTimes.length; i++) {
+    if (_segmentTimes[i].start <= audioTime) idx = i;
+    else break;
+  }
+  if (idx < 0) {
+    if (_minimapPlayheadEl) _minimapPlayheadEl.style.display = 'none';
+    return;
+  }
+
+  // Map segment position to minimap Y coordinate
+  const transcript = document.getElementById('transcript');
+  if (!transcript) return;
+  const segEl     = _segmentTimes[idx].el;
+  const segTop    = segEl.offsetTop;
+  const scrollH   = transcript.scrollHeight;
+  const mapH      = container.clientHeight;
+
+  if (scrollH <= 0) return;
+  const yPos = (segTop / scrollH) * mapH;
+
+  // Lazily create playhead element
+  if (!_minimapPlayheadEl) {
+    _minimapPlayheadEl = document.createElement('div');
+    _minimapPlayheadEl.className = 'minimap-playhead';
+    container.appendChild(_minimapPlayheadEl);
+  }
+  _minimapPlayheadEl.style.display = '';
+  _minimapPlayheadEl.style.top = yPos + 'px';
+}
+
+/** Scroll the transcript based on a click/drag Y position on the minimap. */
+function _minimapScrollTo(clientY) {
+  const container  = document.getElementById('transcript-minimap');
+  const transcript = document.getElementById('transcript');
+  if (!container || !transcript) return;
+
+  const rect = container.getBoundingClientRect();
+  const yRatio = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+
+  const maxScroll = transcript.scrollHeight - transcript.clientHeight;
+  transcript.scrollTop = yRatio * maxScroll;
+}
+
+// Minimap click and drag handlers
+{
+  const minimapEl = document.getElementById('transcript-minimap');
+  if (minimapEl) {
+    minimapEl.addEventListener('mousedown', e => {
+      e.preventDefault();
+      _minimapDragging = true;
+      _minimapScrollTo(e.clientY);
+    });
+
+    window.addEventListener('mousemove', e => {
+      if (!_minimapDragging) return;
+      e.preventDefault();
+      _minimapScrollTo(e.clientY);
+    });
+
+    window.addEventListener('mouseup', () => {
+      _minimapDragging = false;
+    });
+  }
+}
+
+// Sync minimap viewport on transcript scroll
+{
+  const transcript = document.getElementById('transcript');
+  if (transcript) {
+    transcript.addEventListener('scroll', () => {
+      if (_minimapRafPending) return;
+      _minimapRafPending = true;
+      requestAnimationFrame(() => {
+        _minimapRafPending = false;
+        _updateMinimapViewport();
+      });
+    });
+  }
+}
+
+// Re-render minimap on window resize
+window.addEventListener('resize', () => {
+  if (_minimapActive) {
+    _renderMinimap();
+    _updateMinimapViewport();
+  }
+});
+
+/** Show or hide the minimap FAB based on segment count. */
+function _updateMinimapFabVisibility() {
+  const btn = document.getElementById('transcript-minimap-toggle');
+  if (!btn) return;
+  const show = _segmentRegistry.length >= _MINIMAP_THRESHOLD;
+  btn.classList.toggle('hidden', !show);
+  if (!show && _minimapActive) {
+    _minimapActive = false;
+    btn.classList.remove('active');
+    document.getElementById('transcript-minimap')?.classList.add('hidden');
+  }
+}
+
+/** Full minimap refresh — re-render canvas + viewport. */
+let _minimapRefreshTimer = 0;
+/** Throttled minimap refresh — avoids re-rendering on every live segment. */
+function _refreshMinimap() {
+  if (!_minimapActive) return;
+  if (_minimapRefreshTimer) return;  // already scheduled
+  _minimapRefreshTimer = requestAnimationFrame(() => {
+    _minimapRefreshTimer = 0;
+    _renderMinimap();
+    _updateMinimapViewport();
+  });
 }
 
 /* ── Chat ────────────────────────────────────────────────────────────────── */
@@ -5936,7 +6642,7 @@ async function loadSession(sessionId) {
 
   // Show playback bar if audio is available
   if (data.has_audio) initPlayback(sessionId);
-  if (data.has_video) initVideo(sessionId);
+  if (data.has_video) initVideo(sessionId, data.video_offset);
 
   if (data.summary) {
     const sumEl = document.getElementById('summary');
@@ -6005,6 +6711,9 @@ function _finishBulkLoad() {
   if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
     renderSpeakerManager();
   }
+  _updateCollapseFabVisibility();
+  _updateMinimapFabVisibility();
+  _refreshMinimap();
 }
 
 /* ── Shutdown ────────────────────────────────────────────────────────────── */
@@ -6626,7 +7335,9 @@ async function openSettings() {
   // Audio params — load eagerly so panels are ready when clicked
   _apRefresh().then(() => _syncScreenToggle());
 
-  // Screen recording presets + ffmpeg status
+  // Presets for all sections
+  loadTranscriptionPresets();
+  loadDiarizationPresets();
   loadScreenPresets();
   loadScreenDisplays();
 }
@@ -7132,8 +7843,46 @@ async function _apSave(key, value) {
       }
       // Keep sidebar screen toggle in sync with settings panel
       if (key === 'screen_record_enabled') _syncScreenToggle();
+      // Switch preset to "Custom" when a parameter is manually changed
+      _switchToCustomPreset(key);
     }
   } catch (_) {}
+}
+
+function _switchToCustomPreset(key) {
+  if (_apCache?.transcription?.[key]) {
+    const sel = document.getElementById('transcription-preset-sel');
+    if (sel && sel.value !== 'custom') {
+      sel.value = 'custom';
+      const desc = document.getElementById('transcription-preset-desc');
+      if (desc) desc.textContent = 'Manually configure all parameters';
+      fetch('/api/transcription/presets', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preset: 'custom' }),
+      }).catch(() => {});
+    }
+  } else if (_apCache?.diarization?.[key]) {
+    const sel = document.getElementById('diarization-preset-sel');
+    if (sel && sel.value !== 'custom') {
+      sel.value = 'custom';
+      const desc = document.getElementById('diarization-preset-desc');
+      if (desc) desc.textContent = 'Manually configure all parameters';
+      fetch('/api/diarization/presets', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preset: 'custom' }),
+      }).catch(() => {});
+    }
+  } else if (_apCache?.screen_recording?.[key] && key !== 'screen_record_enabled') {
+    const sel = document.getElementById('screen-preset-sel');
+    if (sel && sel.value !== 'custom') {
+      sel.value = 'custom';
+      const desc = document.getElementById('screen-preset-desc');
+      if (desc) desc.textContent = 'Manually configure all parameters';
+      setScreenPreset('custom');
+    }
+  }
 }
 
 async function _apResetOne(key) {
@@ -7168,6 +7917,116 @@ async function _apResetOne(key) {
       }
       const resetBtn = document.getElementById(`ap-reset-${key}`);
       if (resetBtn) resetBtn.classList.add('ap-reset-hidden');
+    }
+  } catch (_) {}
+}
+
+// ── Transcription & Diarization Presets ───────────────────────────────────
+
+let _transcriptionPresetsData = null;
+let _diarizationPresetsData = null;
+
+async function loadTranscriptionPresets() {
+  try {
+    _transcriptionPresetsData = await fetch('/api/transcription/presets').then(r => r.json());
+    _renderPresetDropdown('transcription', _transcriptionPresetsData);
+  } catch (_) {}
+}
+
+async function loadDiarizationPresets() {
+  try {
+    _diarizationPresetsData = await fetch('/api/diarization/presets').then(r => r.json());
+    _renderPresetDropdown('diarization', _diarizationPresetsData);
+  } catch (_) {}
+}
+
+function _renderPresetDropdown(section, data) {
+  const sel = document.getElementById(`${section}-preset-sel`);
+  if (!sel || !data) return;
+  sel.innerHTML = '';
+  for (const [id, p] of Object.entries(data.presets)) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = p.label;
+    if (id === data.selected) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  const desc = document.getElementById(`${section}-preset-desc`);
+  const preset = data.presets[data.selected];
+  if (desc && preset) desc.textContent = preset.description;
+}
+
+async function setTranscriptionPreset(presetId) {
+  try {
+    const res = await fetch('/api/transcription/presets', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset: presetId }),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      if (res.audio_params) _apCache.current = res.audio_params;
+      _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
+    }
+    const desc = document.getElementById('transcription-preset-desc');
+    if (desc && _transcriptionPresetsData?.presets[presetId]) {
+      desc.textContent = _transcriptionPresetsData.presets[presetId].description;
+    }
+  } catch (_) {}
+}
+
+async function setDiarizationPreset(presetId) {
+  try {
+    const res = await fetch('/api/diarization/presets', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset: presetId }),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      if (res.audio_params) _apCache.current = res.audio_params;
+      _apRenderSection('ap-diarization-params', _apCache.diarization, _apCache.current);
+    }
+    const desc = document.getElementById('diarization-preset-desc');
+    if (desc && _diarizationPresetsData?.presets[presetId]) {
+      desc.textContent = _diarizationPresetsData.presets[presetId].description;
+    }
+  } catch (_) {}
+}
+
+async function resetSection(section) {
+  try {
+    const res = await fetch('/api/audio_params/reset_section', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ section }),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      _apCache.current = res.audio_params;
+      // Re-render the appropriate section
+      const sectionMap = {
+        transcription: ['ap-transcription-params', 'transcription'],
+        diarization: ['ap-diarization-params', 'diarization'],
+        screen_recording: ['ap-screen-params', 'screen_recording'],
+      };
+      const [containerId, cacheKey] = sectionMap[section] || [];
+      if (containerId && _apCache[cacheKey]) {
+        _apRenderSection(containerId, _apCache[cacheKey], _apCache.current);
+      }
+      // Reset preset dropdown to default
+      if (section === 'transcription') {
+        _renderPresetDropdown('transcription', {
+          ..._transcriptionPresetsData,
+          selected: _transcriptionPresetsData?.default || 'balanced',
+        });
+      } else if (section === 'diarization') {
+        _renderPresetDropdown('diarization', {
+          ..._diarizationPresetsData,
+          selected: _diarizationPresetsData?.default || 'balanced',
+        });
+      } else if (section === 'screen_recording') {
+        _renderScreenPresetDropdown(_screenPresetsData?.default || 'performance');
+      }
+      // Sync screen toggle if needed
+      if (section === 'screen_recording') _syncScreenToggle();
     }
   } catch (_) {}
 }

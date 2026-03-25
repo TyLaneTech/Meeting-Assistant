@@ -419,6 +419,140 @@ SCREEN_RECORDING_DEFAULTS = {
     },
 }
 
+# ── Transcription Presets ─────────────────────────────────────────────────────
+
+TRANSCRIPTION_PRESETS = {
+    "responsive": {
+        "label": "Responsive",
+        "description": "Fast updates, shorter segments — ideal for live captioning",
+        "values": {
+            "silence_threshold": 0.03,
+            "silence_duration": 0.2,
+            "min_buffer_seconds": 0.3,
+            "max_buffer_seconds": 6.0,
+            "beam_size": 1,
+            "prompt_chars": 400,
+            "vad_min_silence_ms": 200,
+            "vad_speech_pad_ms": 100,
+            "compression_ratio_threshold": 2.0,
+        },
+    },
+    "balanced": {
+        "label": "Balanced (Default)",
+        "description": "Good accuracy with reasonable latency — recommended for most meetings",
+        "values": {
+            "silence_threshold": 0.025,
+            "silence_duration": 0.3,
+            "min_buffer_seconds": 0.5,
+            "max_buffer_seconds": 10.0,
+            "beam_size": 2,
+            "prompt_chars": 800,
+            "vad_min_silence_ms": 300,
+            "vad_speech_pad_ms": 150,
+            "compression_ratio_threshold": 2.0,
+        },
+    },
+    "accurate": {
+        "label": "Accurate",
+        "description": "Higher accuracy with longer context — more latency, better results",
+        "values": {
+            "silence_threshold": 0.02,
+            "silence_duration": 0.5,
+            "min_buffer_seconds": 1.0,
+            "max_buffer_seconds": 15.0,
+            "beam_size": 4,
+            "prompt_chars": 1200,
+            "vad_min_silence_ms": 400,
+            "vad_speech_pad_ms": 200,
+            "compression_ratio_threshold": 2.2,
+        },
+    },
+    "quality": {
+        "label": "Quality",
+        "description": "Maximum accuracy — significant latency, best for post-processing",
+        "values": {
+            "silence_threshold": 0.015,
+            "silence_duration": 0.7,
+            "min_buffer_seconds": 1.5,
+            "max_buffer_seconds": 20.0,
+            "beam_size": 5,
+            "prompt_chars": 1600,
+            "vad_min_silence_ms": 500,
+            "vad_speech_pad_ms": 250,
+            "compression_ratio_threshold": 2.4,
+        },
+    },
+    "custom": {
+        "label": "Custom",
+        "description": "Manually configure all parameters",
+        "values": {},
+    },
+}
+
+TRANSCRIPTION_DEFAULT_PRESET = "balanced"
+
+
+# ── Diarization Presets ──────────────────────────────────────────────────────
+
+DIARIZATION_PRESETS = {
+    "responsive": {
+        "label": "Responsive",
+        "description": "Fast speaker detection — may over-segment in noisy environments",
+        "values": {
+            "step_seconds": 0.15,
+            "duration_seconds": 4.0,
+            "tau_active": 0.4,
+            "rho_update": 0.5,
+            "delta_new": 0.4,
+            "merge_gap_seconds": 0.05,
+        },
+    },
+    "balanced": {
+        "label": "Balanced (Default)",
+        "description": "Good speaker tracking for typical meetings — recommended",
+        "values": {
+            "step_seconds": 0.25,
+            "duration_seconds": 5.0,
+            "tau_active": 0.5,
+            "rho_update": 0.422,
+            "delta_new": 0.5,
+            "merge_gap_seconds": 0.1,
+        },
+    },
+    "conservative": {
+        "label": "Conservative",
+        "description": "Fewer false speaker changes — better for small groups",
+        "values": {
+            "step_seconds": 0.35,
+            "duration_seconds": 5.0,
+            "tau_active": 0.6,
+            "rho_update": 0.35,
+            "delta_new": 0.7,
+            "merge_gap_seconds": 0.2,
+        },
+    },
+    "large_meeting": {
+        "label": "Large Meeting",
+        "description": "Tuned for 5+ speakers — sensitive detection, stable centroids",
+        "values": {
+            "step_seconds": 0.2,
+            "duration_seconds": 5.0,
+            "tau_active": 0.45,
+            "rho_update": 0.3,
+            "delta_new": 0.35,
+            "merge_gap_seconds": 0.15,
+        },
+    },
+    "custom": {
+        "label": "Custom",
+        "description": "Manually configure all parameters",
+        "values": {},
+    },
+}
+
+DIARIZATION_DEFAULT_PRESET = "balanced"
+
+
 _ALL_DEFAULTS_DICTS = (
     TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
     ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,

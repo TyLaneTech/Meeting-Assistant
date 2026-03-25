@@ -38,6 +38,11 @@ import settings
 import storage
 from ai_assistant import AIAssistant
 from audio_capture import AudioCapture, enumerate_audio_devices
+from default_audio_params import (
+    TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
+    TRANSCRIPTION_PRESETS, TRANSCRIPTION_DEFAULT_PRESET,
+    DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
+)
 from screen_recorder import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
 from speaker_db import SpeakerFingerprintDB
 import text_embeddings
@@ -1037,6 +1042,7 @@ def get_session(session_id: str):
     video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
     data["has_audio"] = wav_path.exists()
     data["has_video"] = video_path.exists()
+    data["video_offset"] = float(settings.get(f"video_offset_{session_id}", 0))
     return jsonify(data)
 
 
@@ -1152,6 +1158,20 @@ def start_recording():
         existing_labels    = {p["speaker_key"]: p["name"]
                                for p in sess.get("speaker_profiles", [])}
         existing_seg_count = len(existing_segments)
+        # Determine next speaker label number so resumed diarizer doesn't
+        # collide with existing speaker keys (e.g. "Speaker 1", "Speaker 2").
+        all_speaker_keys = set(existing_labels.keys()) | {
+            s["source"] for s in sess.get("segments", [])
+        }
+        max_label = 0
+        for k in all_speaker_keys:
+            parts = k.rsplit(" ", 1)
+            if len(parts) == 2 and parts[0] == "Speaker":
+                try:
+                    max_label = max(max_label, int(parts[1]))
+                except ValueError:
+                    pass
+        next_speaker_label = max_label + 1
     else:
         session_id         = storage.create_session(title)
         existing_segments  = []
@@ -1159,6 +1179,7 @@ def start_recording():
         existing_chat      = []
         existing_labels    = {}
         existing_seg_count = 0
+        next_speaker_label = 1
 
     capture = AudioCapture(_audio_queue)
 
@@ -1167,10 +1188,10 @@ def start_recording():
     _ec_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
 
-    if not resume_session_id:
-        # Set up WAV recording before starting capture (sample_rate resolved in start())
-        wav_dir = Path(__file__).parent / "data" / "audio"
-        capture.start_wav(str(wav_dir / f"{session_id}.wav"))
+    # Set up WAV recording — append to existing file on resume
+    wav_dir = Path(__file__).parent / "data" / "audio"
+    wav_path = str(wav_dir / f"{session_id}.wav")
+    capture.start_wav(wav_path, append=bool(resume_session_id))
     try:
         capture.start(
             loopback_index=loopback_device,
@@ -1182,7 +1203,8 @@ def start_recording():
             storage.end_session(session_id)
         return jsonify({"error": str(e)}), 500
 
-    _transcriber.start(capture.sample_rate, capture.channels)
+    _transcriber.start(capture.sample_rate, capture.channels,
+                       next_speaker_label=next_speaker_label)
 
     with _state_lock:
         _state.update({
@@ -1200,6 +1222,14 @@ def start_recording():
             "fingerprint_dismissals": {},
             "_confirmed_speakers":    set(),
         })
+
+    # ── Compute video offset for resumed sessions ────────────────────────
+    # When resuming, the WAV writer opened in append mode knows the existing
+    # sample count. Use it so video sync knows the audio offset.
+    video_offset = 0.0
+    if resume_session_id and capture.wav_writer:
+        video_offset = capture.wav_writer.elapsed_seconds
+    settings.put(f"video_offset_{session_id}", video_offset)
 
     # ── Screen recording (optional) ────────────────────────────────────────
     screen_recording_active = False
@@ -1653,6 +1683,107 @@ def reset_audio_param():
     current = {**defaults, **params}
     _apply_audio_params(current)
     return jsonify({"ok": True, "audio_params": current})
+
+
+@app.route("/api/audio_params/reset_section", methods=["POST"])
+def reset_audio_section():
+    """Reset all parameters in a specific section to defaults."""
+    from default_audio_params import get_all_defaults
+    section_map = {
+        "transcription": TRANSCRIPTION_DEFAULTS,
+        "diarization": DIARIZATION_DEFAULTS,
+        "screen_recording": SCREEN_RECORDING_DEFAULTS,
+    }
+    data = request.get_json(silent=True) or {}
+    section = data.get("section")
+    if section not in section_map:
+        return jsonify({"error": "Invalid section"}), 400
+
+    section_keys = set(section_map[section].keys())
+    all_settings = settings.load()
+    params = all_settings.get("audio_params", {})
+    for k in section_keys:
+        params.pop(k, None)
+    settings.put("audio_params", params)
+
+    # Reset preset selection to default for this section
+    preset_defaults = {
+        "transcription": ("transcription_preset", TRANSCRIPTION_DEFAULT_PRESET),
+        "diarization": ("diarization_preset", DIARIZATION_DEFAULT_PRESET),
+        "screen_recording": ("screen_preset", SCREEN_DEFAULT_PRESET),
+    }
+    if section in preset_defaults:
+        pkey, pval = preset_defaults[section]
+        settings.put(pkey, pval)
+
+    defaults = get_all_defaults()
+    current = {**defaults, **params}
+    _apply_audio_params(current)
+    return jsonify({"ok": True, "audio_params": current})
+
+
+@app.route("/api/transcription/presets", methods=["GET"])
+def get_transcription_presets():
+    """Return transcription preset definitions."""
+    return jsonify({
+        "presets": TRANSCRIPTION_PRESETS,
+        "default": TRANSCRIPTION_DEFAULT_PRESET,
+        "selected": settings.get("transcription_preset", TRANSCRIPTION_DEFAULT_PRESET),
+    })
+
+
+@app.route("/api/transcription/presets", methods=["PUT"])
+def set_transcription_preset():
+    """Apply a transcription preset."""
+    from default_audio_params import get_all_defaults
+    data = request.get_json(silent=True) or {}
+    preset_id = data.get("preset", TRANSCRIPTION_DEFAULT_PRESET)
+    if preset_id not in TRANSCRIPTION_PRESETS or preset_id == "custom":
+        settings.put("transcription_preset", preset_id)
+        return jsonify({"ok": True, "preset": preset_id})
+
+    param_updates = TRANSCRIPTION_PRESETS[preset_id]["values"]
+    all_settings = settings.load()
+    params = all_settings.get("audio_params", {})
+    params.update(param_updates)
+    settings.put("audio_params", params)
+    settings.put("transcription_preset", preset_id)
+
+    current = {**get_all_defaults(), **params}
+    _apply_audio_params(current)
+    return jsonify({"ok": True, "preset": preset_id, "audio_params": current})
+
+
+@app.route("/api/diarization/presets", methods=["GET"])
+def get_diarization_presets():
+    """Return diarization preset definitions."""
+    return jsonify({
+        "presets": DIARIZATION_PRESETS,
+        "default": DIARIZATION_DEFAULT_PRESET,
+        "selected": settings.get("diarization_preset", DIARIZATION_DEFAULT_PRESET),
+    })
+
+
+@app.route("/api/diarization/presets", methods=["PUT"])
+def set_diarization_preset():
+    """Apply a diarization preset."""
+    from default_audio_params import get_all_defaults
+    data = request.get_json(silent=True) or {}
+    preset_id = data.get("preset", DIARIZATION_DEFAULT_PRESET)
+    if preset_id not in DIARIZATION_PRESETS or preset_id == "custom":
+        settings.put("diarization_preset", preset_id)
+        return jsonify({"ok": True, "preset": preset_id})
+
+    param_updates = DIARIZATION_PRESETS[preset_id]["values"]
+    all_settings = settings.load()
+    params = all_settings.get("audio_params", {})
+    params.update(param_updates)
+    settings.put("audio_params", params)
+    settings.put("diarization_preset", preset_id)
+
+    current = {**get_all_defaults(), **params}
+    _apply_audio_params(current)
+    return jsonify({"ok": True, "preset": preset_id, "audio_params": current})
 
 
 def _apply_audio_params(params: dict) -> None:

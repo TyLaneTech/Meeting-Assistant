@@ -226,12 +226,12 @@ class Transcriber:
         self.diarizer = None
         self.load_diarizer(hf_token, device=device)
 
-    def start(self, sample_rate: int, channels: int) -> None:
+    def start(self, sample_rate: int, channels: int, next_speaker_label: int = 1) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self._context = ""
         if self.diarizer is not None:
-            self.diarizer.reset()
+            self.diarizer.reset(next_label=next_speaker_label)
         self.is_running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
