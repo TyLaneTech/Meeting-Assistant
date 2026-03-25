@@ -14,8 +14,11 @@ Usage:
 import sqlite3
 import traceback
 import uuid
+import warnings
 from contextlib import contextmanager
 from datetime import datetime
+import logging
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +29,62 @@ _SUGGEST_THRESHOLD    = 0.70   # cosine sim → push fingerprint_match SSE
 _AUTO_APPLY_THRESHOLD = 0.82   # cosine sim → apply silently
 _MIN_DURATION_SEC     = 2.5    # minimum audio before extracting embedding
 _EMB_DIM              = 256    # WeSpeaker embedding dimension
+
+_SUPPRESSED_LOAD_SUBSTRINGS = (
+    "Warning: You are sending unauthenticated requests to the HF Hub.",
+    "Please set a HF_TOKEN to enable higher rate limits and faster downloads.",
+    "BertModel LOAD REPORT",
+    "embeddings.position_ids | UNEXPECTED",
+    "UNEXPECTED    :can be ignored",
+)
+
+
+class _FilteredStream:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+        self._buffer = ""
+
+    def write(self, data):
+        if not data:
+            return 0
+        self._buffer += data
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if not any(s in line for s in _SUPPRESSED_LOAD_SUBSTRINGS):
+                self._wrapped.write(line + "\n")
+        return len(data)
+
+    def flush(self):
+        if self._buffer and not any(s in self._buffer for s in _SUPPRESSED_LOAD_SUBSTRINGS):
+            self._wrapped.write(self._buffer)
+        self._buffer = ""
+        self._wrapped.flush()
+
+    def isatty(self):
+        return getattr(self._wrapped, "isatty", lambda: False)()
+
+
+@contextmanager
+def _suppress_model_load_noise():
+    import os
+
+    warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    for logger_name in ("huggingface_hub", "sentence_transformers", "transformers", "safetensors"):
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    try:
+        sys.stdout = _FilteredStream(orig_stdout)
+        sys.stderr = _FilteredStream(orig_stderr)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
 
 
 @contextmanager
@@ -98,13 +157,14 @@ class SpeakerFingerprintDB:
             pass
 
         try:
-            from pyannote.audio import Inference, Model  # type: ignore
-            log.info("fingerprint", "Loading embedding model…")
-            model = Model.from_pretrained(
-                "pyannote/wespeaker-voxceleb-resnet34-LM",
-                use_auth_token=hf_token,
-            )
-            self._inference = Inference(model, window="whole")
+            with _suppress_model_load_noise():
+                from pyannote.audio import Inference, Model  # type: ignore
+                log.info("fingerprint", "Loading embedding model…")
+                model = Model.from_pretrained(
+                    "pyannote/wespeaker-voxceleb-resnet34-LM",
+                    use_auth_token=hf_token,
+                )
+                self._inference = Inference(model, window="whole")
             # Move to requested device
             if device and device != "cpu":
                 import torch

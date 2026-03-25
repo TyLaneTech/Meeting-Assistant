@@ -418,6 +418,32 @@ def main():
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
 
+    # ── FFmpeg ────────────────────────────────────────────────────────────────
+    _section("FFMPEG")
+
+    from screen_recorder import find_ffmpeg, download_ffmpeg, _LOCAL_FFMPEG
+
+    ffmpeg_path = find_ffmpeg()
+    if ffmpeg_path:
+        # Get version string
+        try:
+            fv = subprocess.run(
+                [ffmpeg_path, "-version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            ver_line = fv.stdout.split("\n")[0].strip() if fv.returncode == 0 else "ffmpeg"
+            _ok(f"{ver_line}  {GRY}({ffmpeg_path}){R}")
+        except Exception:
+            _ok(f"ffmpeg  {GRY}({ffmpeg_path}){R}")
+    else:
+        _info(f"ffmpeg not found — downloading...  {GRY}(needed for screen recording){R}")
+        try:
+            download_ffmpeg(progress_cb=lambda msg: _info(msg))
+            _ok(f"ffmpeg  {GRY}({_LOCAL_FFMPEG}){R}")
+        except Exception as e:
+            _warn(f"Could not download ffmpeg: {e}")
+            _warn("Screen recording will be unavailable. Install ffmpeg manually to enable it.")
+
     # ── Launch ────────────────────────────────────────────────────────────────
     print()
     print(SEP_HEAVY)

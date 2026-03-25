@@ -37,15 +37,29 @@
       <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()"><i class="fa-solid fa-trash"></i> Delete</button>
       <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()"><i class="fa-solid fa-xmark"></i></button>
     </div>
+    <div class="sidebar-search" id="sidebar-search">
+      <div class="sidebar-search-wrap">
+        <i class="fa-solid fa-magnifying-glass sidebar-search-icon"></i>
+        <input type="text" id="sidebar-search-input" placeholder="Search sessions…"
+               oninput="_onSidebarSearch(this.value)" autocomplete="off" spellcheck="false">
+        <button class="sidebar-search-clear hidden" id="sidebar-search-clear"
+                onclick="_clearSidebarSearch()"><i class="fa-solid fa-xmark"></i></button>
+        <span class="sidebar-search-ai" id="sidebar-search-ai" title="Search matches by title, transcript content, and AI-powered semantic meaning when available"><i class="fa-solid fa-brain"></i></span>
+      </div>
+    </div>
     <div class="sidebar-body" id="session-list">
       <p class="sidebar-empty">No past sessions yet.</p>
     </div>
-    <div class="model-config" id="model-config">
-      <button class="model-config-toggle" onclick="toggleModelConfig()">
-        <span class="model-config-label">Models</span>
-        <span class="model-config-arrow" id="model-config-arrow"><i class="fa-solid fa-chevron-right"></i></span>
+    <div class="sidebar-pane" id="model-config">
+      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('models')">
+        <div class="nav-menu-left">
+            <i class="fa-solid fa-microchip sidebar-pane-icon"></i>
+            <span class="sidebar-pane-label">Models</span>
+        </div>
+        <span class="sidebar-pane-arrow" id="pane-arrow-models">
+        <i class="fa-solid fa-chevron-right"></i></span>
       </button>
-      <div class="model-config-body hidden" id="model-config-body">
+      <div class="sidebar-pane-body hidden" id="pane-body-models">
         <div class="model-config-row">
           <label class="model-config-lbl">Whisper</label>
           <select id="whisper-preset-sel" class="model-config-sel" onchange="changeWhisperPreset(this.value)">
@@ -63,7 +77,15 @@
         </div>
       </div>
     </div>
-    <div class="audio-viz">
+    <div class="sidebar-pane" id="audio-viz-pane">
+      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('audio')">
+          <div class="nav-menu-left">
+            <i class="fa-solid fa-sliders sidebar-pane-icon"></i><span class="sidebar-pane-label">Input Devices</span>
+          </div>
+          <span class="sidebar-pane-arrow" id="pane-arrow-audio">
+          <i class="fa-solid fa-chevron-down"></i></span>
+      </button>
+      <div class="sidebar-pane-body" id="pane-body-audio">
       <!-- Desktop device + gain -->
       <div class="viz-device-row">
         <label class="viz-device-lbl viz-lbl-desktop">Desktop</label>
@@ -110,6 +132,28 @@
       <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
         <i class="fa-solid fa-play"></i> Test Audio
       </button>
+      </div><!-- /pane-body-audio -->
+    </div>
+    <div class="sidebar-pane" id="screen-capture-section">
+      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('screen')">
+      <div class="nav-menu-left">
+        <i class="fa-solid fa-display sidebar-pane-icon"></i>
+        <span class="sidebar-pane-label">Screen Recording</span>
+      </div>
+        <span class="sidebar-pane-actions">
+          <label class="toggle-switch toggle-switch-sm" onclick="event.stopPropagation()">
+            <input type="checkbox" id="screen-record-toggle" onchange="toggleScreenRecordEnabled(this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="sidebar-pane-arrow" id="pane-arrow-screen"><i class="fa-solid fa-chevron-right"></i></span>
+        </span>
+      </button>
+      <div class="sidebar-pane-body hidden" id="pane-body-screen">
+        <div class="screen-display-grid" id="screen-display-grid">
+          <!-- Populated by JS: clickable display thumbnails -->
+        </div>
+        <div class="screen-capture-status" id="screen-capture-status"></div>
+      </div>
     </div>
   </aside>
   <div class="sidebar-resize-handle" id="sidebar-resize-handle"></div>
@@ -160,6 +204,7 @@
           <div class="col-actions right">
             <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-filter"></i></button>
             <button class="icon-btn" id="analytics-btn" title="Session analytics" onclick="toggleAnalyticsPanel()"><i class="fa-solid fa-chart-pie"></i></button>
+            <hr style="height: -webkit-fill-available; border: 1px solid #ffffff1c; height: 13px; margin-inline: 3px;">
             <button class="icon-btn" title="Copy transcript" onclick="copyTranscript()"><i class="fa-solid fa-clipboard"></i></button>
             <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-solid fa-eraser"></i></button>
           </div>
@@ -237,6 +282,16 @@
             </div>-->
         </div>
 
+        <div id="video-viewer" class="video-viewer hidden">
+          <video id="playback-video" class="playback-video" muted playsinline></video>
+        </div>
+        <div id="screen-preview" class="screen-preview hidden">
+          <div class="screen-preview-header">
+            <span class="screen-preview-label"><i class="fa-solid fa-circle screen-preview-dot"></i> Live Preview</span>
+            <button class="icon-btn screen-preview-close" onclick="toggleScreenPreview()" title="Close preview"><i class="fa-solid fa-xmark"></i></button>
+          </div>
+          <img id="screen-preview-img" class="screen-preview-img" alt="Screen preview">
+        </div>
         <div id="playback-bar" class="playback-bar hidden">
           <button class="icon-btn playback-play-btn" id="playback-play" onclick="togglePlayback()" title="Play/Pause"><i class="fa-solid fa-play"></i></button>
           <span class="playback-time" id="playback-time">0:00</span>
@@ -251,6 +306,8 @@
             <option value="1.5">1.5×</option>
             <option value="2">2×</option>
           </select>
+          <button class="icon-btn playback-video-btn hidden" id="playback-video-toggle"
+                  onclick="toggleVideoViewer()" title="Toggle screen recording"><i class="fa-solid fa-display"></i></button>
         </div>
         <div id="transcript-selection-bar" class="transcript-selection-bar hidden">
           <span class="tsb-count" id="tsb-count">0 segments selected</span>
@@ -264,6 +321,8 @@
         <div id="transcript" class="col-body transcript-body">
           <p class="empty-hint">Transcript will appear here once recording starts.</p>
         </div>
+        <button class="screen-preview-fab hidden" id="screen-preview-toggle"
+                onclick="toggleScreenPreview()" title="Live screen preview"><i class="fa-solid fa-display"></i></button>
       </div>
 
       <div class="col-resize-handle" data-left="0" data-right="1"></div>
@@ -299,6 +358,22 @@
 
       <!-- ── Chat ───────────────────────────────────────────────────── -->
       <div class="col col-chat">
+
+        <!-- Full-pane drag-and-drop overlay -->
+        <div id="chat-drop-overlay" class="chat-drop-overlay" aria-hidden="true">
+          <div class="chat-drop-content">
+            <div class="chat-drop-rings">
+              <div class="chat-drop-ring"></div>
+              <div class="chat-drop-ring"></div>
+            </div>
+            <div class="chat-drop-icon-wrap">
+              <i class="fa-solid fa-cloud-arrow-up chat-drop-icon"></i>
+            </div>
+            <p class="chat-drop-title">Drop to attach</p>
+            <p class="chat-drop-hint" id="chat-drop-hint">Images · PDFs · text files</p>
+          </div>
+        </div>
+
         <div class="col-header">
           <div class="col-title-wrap">
             <span class="col-title">Chat</span>
@@ -312,13 +387,28 @@
           <p class="empty-hint">Ask questions about the meeting here.</p>
         </div>
         <div class="chat-input-area">
-          <textarea
-            id="chat-input"
-            placeholder="Ask about the meeting… (Enter to send, Shift+Enter for newline)"
-            rows="3"
-            onkeydown="handleChatKey(event)"
-          ></textarea>
-          <button id="send-btn" class="btn btn-send" onclick="sendMessage()">Send</button>
+          <div id="chat-attach-preview" class="chat-attach-preview hidden"></div>
+          <div class="chat-input-wrap">
+            <button class="chat-attach-btn" onclick="document.getElementById('chat-file-input').click()" title="Attach file">
+              <i class="fa-solid fa-paperclip"></i>
+            </button>
+            <input type="file" id="chat-file-input" multiple accept="image/*,.pdf,.txt,.csv,.md,.json" style="display:none"
+                   onchange="_handleFileSelect(this.files); this.value='';">
+            <textarea
+              id="chat-input"
+              placeholder="Ask about the meeting…"
+              rows="1"
+              onkeydown="handleChatKey(event)"
+              oninput="_autogrowChatInput()"
+              title="Press Enter to send, Shift+Enter for newline"
+            ></textarea>
+            <button id="send-btn" class="chat-send-btn" onclick="sendMessage()" title="Send message">
+              <i class="fa-solid fa-arrow-up"></i>
+            </button>
+            <button id="stop-btn" class="chat-stop-btn hidden" onclick="stopChatGeneration()" title="Stop generating">
+              <i class="fa-solid fa-stop"></i>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -461,6 +551,9 @@
         <button class="settings-nav-item" data-target="section-echo" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-tower-broadcast"></i><span>Echo Cancellation</span>
         </button>
+        <button class="settings-nav-item" data-target="section-screen" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-display"></i><span>Screen Recording</span>
+        </button>
         <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-microchip"></i><span>System</span>
         </button>
@@ -567,6 +660,34 @@
           </p>
           <div class="settings-group" id="ap-echo-params">
             <!-- Populated dynamically by JS -->
+          </div>
+        </div>
+
+        <!-- Screen Recording -->
+        <div class="settings-panel" id="section-screen">
+          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
+            Records your screen as an MP4 video during meetings using FFmpeg.
+            Enable below and select a display in the sidebar.
+          </p>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">FFmpeg</div>
+                <div class="settings-row-desc">Required for screen recording</div>
+              </div>
+              <span class="settings-info-val" id="settings-ffmpeg-status">checking...</span>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Preset</div>
+                <div class="settings-row-desc" id="screen-preset-desc">Performance profile for encoding</div>
+              </div>
+              <select id="screen-preset-sel" class="model-config-sel" onchange="setScreenPreset(this.value)">
+              </select>
+            </div>
+          </div>
+          <div class="settings-group" id="ap-screen-params">
+            <!-- Populated dynamically by JS (same system as audio params) -->
           </div>
         </div>
 

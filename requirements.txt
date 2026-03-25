@@ -43,6 +43,11 @@ matplotlib>=3.8.0
 python-dotenv>=1.0.0
 flask>=3.0.0
 
+# ── Semantic search ──────────────────────────────────────────────────────────
+# Uses all-MiniLM-L6-v2 (~80 MB) for meaning-based session search.
+# torch is already installed (needed by diart), so this adds minimal overhead.
+sentence-transformers>=2.2.0
+
 # ── System tray ───────────────────────────────────────────────────────────────
 pystray>=0.19.0
 Pillow>=10.0.0

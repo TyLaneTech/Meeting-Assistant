@@ -15,6 +15,7 @@ import sys
 import threading
 import traceback
 from typing import Callable
+from typing import Any
 
 import wave
 
@@ -37,7 +38,6 @@ if sys.platform == "win32":
 import log
 import numpy as np
 from scipy import signal as scipy_signal
-from faster_whisper import WhisperModel
 
 
 def detect_cuda_available() -> bool:
@@ -83,8 +83,30 @@ DIARIZER_OPTIONS = [
     {"id": "cpu",  "label": "CPU", "requires_cuda": False},
 ]
 
-CUDA_AVAILABLE = detect_cuda_available()
-DEVICE, COMPUTE_TYPE, MODEL_SIZE = detect_device()
+_RUNTIME_LOCK = threading.Lock()
+_CUDA_AVAILABLE: bool | None = None
+_DEFAULT_DEVICE = "cpu"
+_DEFAULT_COMPUTE_TYPE = "int8"
+_DEFAULT_MODEL_SIZE = "small"
+
+
+def get_cuda_available() -> bool:
+    """Return whether CUDA is usable for Whisper, probing once lazily."""
+    global _CUDA_AVAILABLE
+    if _CUDA_AVAILABLE is None:
+        with _RUNTIME_LOCK:
+            if _CUDA_AVAILABLE is None:
+                _CUDA_AVAILABLE = detect_cuda_available()
+    return _CUDA_AVAILABLE
+
+
+def get_default_model_config() -> tuple[str, str, str]:
+    """Return the preferred default Whisper config, probing once lazily."""
+    if get_cuda_available():
+        log.info("whisper", "CUDA OK — using large-v3 (float16).")
+        return "cuda", "float16", "large-v3"
+    log.info("whisper", "CUDA unavailable — using CPU.")
+    return _DEFAULT_DEVICE, _DEFAULT_COMPUTE_TYPE, _DEFAULT_MODEL_SIZE
 
 # Minimum samples to pass to Whisper — very short clips produce garbage output.
 _MIN_WHISPER_SAMPLES = 3_200   # 0.2 s at 16 kHz
@@ -117,16 +139,17 @@ class Transcriber:
     ):
         self.audio_queue = audio_queue
         self.on_text_callback = on_text_callback
-        self.model: WhisperModel | None = None
+        self.model: Any | None = None
         self.diarizer = None   # StreamingDiarizer | None, set via load_diarizer()
         self.is_running = False
         self._thread: threading.Thread | None = None
         self.sample_rate: int | None = None
         self.channels: int | None = None
         self._context = ""
-        self.device = DEVICE
-        self.compute_type = COMPUTE_TYPE
-        self.model_size = MODEL_SIZE
+        self.device = _DEFAULT_DEVICE
+        self.compute_type = _DEFAULT_COMPUTE_TYPE
+        self.model_size = _DEFAULT_MODEL_SIZE
+        self._auto_model_config = True
         self.diarization_enabled = True  # Can be toggled via the UI
         self.fingerprint_callback: Callable | None = None
         # (speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None
@@ -166,7 +189,10 @@ class Transcriber:
 
     def load_model(self) -> None:
         """Download (first run) and load Whisper. Blocking — run in a thread."""
+        if self._auto_model_config:
+            self.device, self.compute_type, self.model_size = get_default_model_config()
         log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
+        from faster_whisper import WhisperModel
         self.model = WhisperModel(
             self.model_size,
             device=self.device,
@@ -186,6 +212,7 @@ class Transcriber:
         self.device = device
         self.compute_type = compute_type
         self.model_size = model_size
+        self._auto_model_config = False
         self.model = None
         self.load_model()
 

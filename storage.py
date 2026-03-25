@@ -99,11 +99,191 @@ def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN folder_id TEXT DEFAULT NULL",
             "ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE folders ADD COLUMN parent_id TEXT DEFAULT NULL",
+            "ALTER TABLE chat_messages ADD COLUMN attachments TEXT DEFAULT NULL",
+            # Full-text search on session titles and transcript segments
+            """CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                session_id UNINDEXED,
+                kind UNINDEXED,
+                text,
+                tokenize='porter unicode61'
+            )""",
+            # v2: recreate FTS with source_id column for segment-level linking
+            "DROP TABLE IF EXISTS search_fts",
+            """CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                session_id UNINDEXED,
+                source_id UNINDEXED,
+                kind UNINDEXED,
+                text,
+                tokenize='porter unicode61'
+            )""",
+            # Semantic search embeddings per session
+            """CREATE TABLE IF NOT EXISTS session_embeddings (
+                session_id TEXT PRIMARY KEY,
+                embedding  BLOB NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
         ]:
             try:
                 conn.execute(migration)
             except Exception:
                 pass  # already exists
+
+        # Populate FTS index if it's empty (first migration or rebuild)
+        fts_count = conn.execute("SELECT COUNT(*) FROM search_fts").fetchone()[0]
+        if fts_count == 0:
+            _rebuild_fts(conn)
+
+
+def _rebuild_fts(conn) -> None:
+    """Populate the FTS index from existing sessions and transcript segments."""
+    conn.execute("DELETE FROM search_fts")
+    # Index session titles
+    conn.execute(
+        "INSERT INTO search_fts (session_id, source_id, kind, text) "
+        "SELECT id, NULL, 'title', title FROM sessions WHERE title IS NOT NULL AND title != ''"
+    )
+    # Index transcript segments (source_id = segment rowid)
+    conn.execute(
+        "INSERT INTO search_fts (session_id, source_id, kind, text) "
+        "SELECT session_id, id, 'segment', text FROM transcript_segments WHERE text IS NOT NULL AND text != ''"
+    )
+
+
+def fts_index_session_title(session_id: str, title: str) -> None:
+    """Add or update a session title in the FTS index."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM search_fts WHERE session_id = ? AND kind = 'title'",
+                     (session_id,))
+        if title and title.strip():
+            conn.execute("INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, NULL, 'title', ?)",
+                         (session_id, title))
+
+
+def fts_index_segment(session_id: str, text: str, segment_id: int | None = None) -> None:
+    """Add a transcript segment to the FTS index."""
+    if not text or not text.strip():
+        return
+    with _conn() as conn:
+        conn.execute("INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, ?, 'segment', ?)",
+                     (session_id, segment_id, text))
+
+
+def fts_remove_session(session_id: str) -> None:
+    """Remove all FTS entries for a session."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
+
+
+def search_sessions(query: str, limit: int = 50) -> list[dict]:
+    """Search sessions by title and transcript content using FTS5.
+
+    Returns a list of {session_id, title, matches: [{kind, snippet}]} dicts,
+    ordered by relevance.
+    """
+    if not query or not query.strip():
+        return []
+    # Escape FTS5 special characters and build a prefix query
+    terms = query.strip().split()
+    fts_query = " ".join(f'"{t}"*' for t in terms if t)
+    if not fts_query:
+        return []
+
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT f.session_id, f.source_id, f.kind,"
+            "       snippet(search_fts, 3, '<mark>', '</mark>', '…', 40) AS snippet,"
+            "       rank"
+            " FROM search_fts f"
+            " WHERE search_fts MATCH ?"
+            " ORDER BY rank"
+            " LIMIT ?",
+            (fts_query, limit * 3),  # over-fetch so we can group
+        ).fetchall()
+
+        # Group by session, collect match snippets
+        from collections import OrderedDict
+        sessions: OrderedDict[str, dict] = OrderedDict()
+        for r in rows:
+            sid = r["session_id"]
+            if sid not in sessions:
+                # Look up session title
+                title_row = conn.execute("SELECT title FROM sessions WHERE id = ?", (sid,)).fetchone()
+                sessions[sid] = {
+                    "session_id": sid,
+                    "title": title_row["title"] if title_row else "",
+                    "matches": [],
+                    "best_rank": r["rank"],
+                }
+            if len(sessions[sid]["matches"]) < 3:  # max 3 snippets per session
+                match = {
+                    "kind": r["kind"],
+                    "snippet": r["snippet"],
+                }
+                if r["source_id"] is not None:
+                    match["segment_id"] = r["source_id"]
+                sessions[sid]["matches"].append(match)
+
+    results = list(sessions.values())[:limit]
+    return results
+
+
+# ── Semantic embeddings ──────────────────────────────────────────────────────
+
+def save_session_embedding(session_id: str, embedding_bytes: bytes) -> None:
+    """Store (or update) the semantic embedding for a session."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO session_embeddings (session_id, embedding, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET embedding=excluded.embedding, updated_at=excluded.updated_at",
+            (session_id, embedding_bytes, datetime.utcnow().isoformat()),
+        )
+
+
+def get_all_session_embeddings() -> list[dict]:
+    """Return all session embeddings: [{session_id, title, embedding_bytes}]."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT e.session_id, s.title, e.embedding "
+            "FROM session_embeddings e "
+            "JOIN sessions s ON s.id = e.session_id"
+        ).fetchall()
+    return [{"session_id": r["session_id"], "title": r["title"],
+             "embedding_bytes": bytes(r["embedding"])} for r in rows]
+
+
+def get_session_text_for_embedding(session_id: str) -> str | None:
+    """Get concatenated title + transcript text for computing an embedding."""
+    with _conn() as conn:
+        session = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if not session:
+            return None
+        segments = conn.execute(
+            "SELECT text FROM transcript_segments WHERE session_id = ? ORDER BY start_time",
+            (session_id,),
+        ).fetchall()
+    title = session["title"] or ""
+    transcript = " ".join(r["text"] for r in segments if r["text"])
+    if not transcript and not title:
+        return None
+    return f"{title}. {transcript}" if transcript else title
+
+
+def delete_session_embedding(session_id: str) -> None:
+    """Remove the embedding for a session."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM session_embeddings WHERE session_id = ?", (session_id,))
+
+
+def get_unembedded_session_ids() -> list[str]:
+    """Return session IDs that have transcript segments but no embedding yet."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT s.id FROM sessions s "
+            "JOIN transcript_segments ts ON ts.session_id = s.id "
+            "WHERE s.id NOT IN (SELECT session_id FROM session_embeddings)"
+        ).fetchall()
+    return [r["id"] for r in rows]
 
 
 def _now() -> str:
@@ -146,10 +326,13 @@ def update_session_title(session_id: str, title: str) -> None:
             "UPDATE sessions SET title = ? WHERE id = ?",
             (title, session_id),
         )
+    fts_index_session_title(session_id, title)
 
 
 def delete_session(session_id: str) -> None:
     with _conn() as conn:
+        conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM session_embeddings WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM transcript_segments WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
@@ -168,8 +351,11 @@ def list_sessions() -> list[dict]:
     audio_dir = DB_PATH.parent / "audio"
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT id, title, started_at, ended_at, folder_id, sort_order"
-            " FROM sessions ORDER BY started_at DESC"
+            "SELECT s.id, s.title, s.started_at, s.ended_at,"
+            "       s.folder_id, s.sort_order,"
+            "       (SELECT MAX(ts.end_time) FROM transcript_segments ts"
+            "        WHERE ts.session_id = s.id) AS last_segment_time"
+            " FROM sessions s ORDER BY s.started_at DESC"
         ).fetchall()
     return [
         {**dict(r), "has_audio": (audio_dir / f"{r['id']}.wav").exists()}
@@ -357,7 +543,7 @@ def get_session(session_id: str) -> dict | None:
         ).fetchone()
 
         messages = conn.execute(
-            "SELECT role, content, created_at FROM chat_messages WHERE session_id = ? ORDER BY id",
+            "SELECT role, content, created_at, attachments FROM chat_messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
 
@@ -424,7 +610,17 @@ def save_segment(
             "VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, text, source, start_time, end_time, _now()),
         )
-        return cur.lastrowid
+        seg_id = cur.lastrowid
+        # Index in FTS for cross-session search
+        if text and text.strip():
+            try:
+                conn.execute(
+                    "INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, ?, 'segment', ?)",
+                    (session_id, seg_id, text),
+                )
+            except Exception:
+                pass
+        return seg_id
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -516,9 +712,11 @@ def save_speaker_label(
     }
 
 
-def save_chat_message(session_id: str, role: str, content: str) -> None:
+def save_chat_message(session_id: str, role: str, content: str,
+                      attachments: str | None = None) -> None:
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, _now()),
+            "INSERT INTO chat_messages (session_id, role, content, created_at, attachments)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, _now(), attachments),
         )

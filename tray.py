@@ -151,7 +151,7 @@ class MeetingTray:
             return "setup"
         if st.get("is_recording"):
             return "recording"
-        if st.get("model_ready"):
+        if st.get("recording_ready"):
             return "ready"
         return "loading"
 
@@ -197,7 +197,7 @@ class MeetingTray:
             S(
                 lambda _: "Stop Recording" if self._get_state().get("is_recording") else "Start Recording",
                 self._toggle_recording,
-                enabled=lambda _: self._get_state().get("model_ready", False),
+                enabled=lambda _: self._get_state().get("recording_ready", False),
             ),
             SEP,
             # ── Keys ─────────────────────────────────────────────────────
@@ -217,9 +217,9 @@ class MeetingTray:
             return "Setup required"
         if st.get("is_recording"):
             return "Recording..."
-        if st.get("model_ready"):
+        if st.get("recording_ready"):
             return "Ready"
-        return "Loading models..."
+        return st.get("recording_ready_reason", "Loading models...")
 
     def _diarizer_text(self) -> str:
         st = self._get_state()

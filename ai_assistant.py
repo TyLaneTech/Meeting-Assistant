@@ -3,6 +3,7 @@
 Supports Anthropic (Claude) and OpenAI (GPT) as interchangeable providers.
 Provider and model are runtime-configurable via reload_client().
 """
+import base64
 import json
 import re
 from typing import Callable
@@ -10,6 +11,7 @@ from typing import Callable
 import log
 
 Callback = Callable[[str], None]
+FrameExtractor = Callable[[float], bytes | None]  # timestamp → JPEG bytes or None
 
 # Tool definition used for Anthropic structured patch output.
 # Array-of-sections format so the model can create, rename, or restructure
@@ -62,6 +64,40 @@ _PATCH_TOOL = {
         },
         "required": ["sections"],
         "additionalProperties": False,
+    },
+}
+
+_SCREENSHOT_TOOL = {
+    "name": "get_screenshot",
+    "description": (
+        "Capture a screenshot from the meeting's screen recording at a specific "
+        "timestamp. Use this to see what was on screen at a given moment — "
+        "useful for reading slides, shared documents, UI content, code, diagrams, "
+        "or anything visual that the transcript alone cannot convey. "
+        "You may call this multiple times with different timestamps."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "timestamp": {
+                "type": "number",
+                "description": (
+                    "Time in seconds from the start of the recording. "
+                    "Use timestamps from the transcript to target specific moments."
+                ),
+            },
+        },
+        "required": ["timestamp"],
+    },
+}
+
+# OpenAI-compatible function definition for the same tool
+_SCREENSHOT_FUNC_OAI = {
+    "type": "function",
+    "function": {
+        "name": "get_screenshot",
+        "description": _SCREENSHOT_TOOL["description"],
+        "parameters": _SCREENSHOT_TOOL["input_schema"],
     },
 }
 
@@ -221,8 +257,15 @@ class AIAssistant:
         on_token: Callback,
         on_done: Callable[[], None] | None = None,
         meta: dict | None = None,
+        cancel: "threading.Event | None" = None,
+        frame_extractor: FrameExtractor | None = None,
     ) -> None:
-        """Stream an answer to the latest question in chat_history."""
+        """Stream an answer to the latest question in chat_history.
+
+        If ``frame_extractor`` is provided, the model can call the
+        ``get_screenshot`` tool to view what was on screen at a given
+        timestamp.  The tool loop runs up to 5 iterations.
+        """
         meta_block = _format_meta_block(meta)
         summary_block = ""
         if meta and meta.get("current_summary"):
@@ -231,7 +274,19 @@ class AIAssistant:
                 f"{meta['current_summary']}\n---"
             )
 
-        system = self._SYSTEM_QA + "\n\n"
+        system = self._SYSTEM_QA
+        if frame_extractor:
+            system += (
+                "\n\n## Screen recording\n"
+                "A screen recording is available for this session. You can call the "
+                "`get_screenshot` tool with a timestamp (in seconds) to see what was "
+                "on screen at that moment. Use this whenever the user asks about visual "
+                "content (slides, code, UI, diagrams, shared screens, etc.) or when "
+                "the transcript references something being shown on screen. You may "
+                "call the tool multiple times with different timestamps to examine "
+                "different moments."
+            )
+        system += "\n\n"
         if meta_block:
             system += meta_block + "\n\n"
         system += (
@@ -240,7 +295,14 @@ class AIAssistant:
             f"\n---"
             f"{summary_block}"
         )
-        self._stream(system, chat_history, on_token, on_done)
+
+        if frame_extractor:
+            self._stream_with_tools(
+                system, chat_history, on_token, on_done,
+                cancel=cancel, frame_extractor=frame_extractor,
+            )
+        else:
+            self._stream(system, chat_history, on_token, on_done, cancel=cancel)
 
     def summarize(
         self,
@@ -397,6 +459,7 @@ class AIAssistant:
         messages: list[dict],
         on_token: Callback,
         on_done: Callable[[], None] | None,
+        cancel: "threading.Event | None" = None,
     ) -> None:
         """Stream tokens from the active provider."""
         try:
@@ -407,16 +470,17 @@ class AIAssistant:
                 )
                 return
             if self.provider == "openai":
-                self._stream_openai(system, messages, on_token)
+                self._stream_openai(system, messages, on_token, cancel)
             else:
-                self._stream_anthropic(system, messages, on_token)
+                self._stream_anthropic(system, messages, on_token, cancel)
         except Exception as e:
             on_token(f"\n\n*Error: {e}*")
         finally:
             if on_done:
                 on_done()
 
-    def _stream_anthropic(self, system: str, messages: list[dict], on_token: Callback) -> None:
+    def _stream_anthropic(self, system: str, messages: list[dict], on_token: Callback,
+                           cancel: "threading.Event | None" = None) -> None:
         import anthropic
         kwargs: dict = {}
         if self.model in _ANTHROPIC_THINKING_MODELS:
@@ -430,15 +494,46 @@ class AIAssistant:
                 **kwargs,
             ) as stream:
                 for text in stream.text_stream:
+                    if cancel and cancel.is_set():
+                        stream.close()
+                        break
                     on_token(text)
         except anthropic.AuthenticationError:
             on_token("\n\n*Error: Invalid Anthropic API key. Check Settings.*")
         except anthropic.RateLimitError:
             on_token("\n\n*Error: Anthropic rate limit reached. Please wait and retry.*")
 
-    def _stream_openai(self, system: str, messages: list[dict], on_token: Callback) -> None:
+    @staticmethod
+    def _to_openai_messages(messages: list[dict]) -> list[dict]:
+        """Convert Anthropic-style content blocks to OpenAI vision format."""
+        out = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                out.append(m)
+                continue
+            # content is a list of blocks — convert to OpenAI format
+            parts: list[dict] = []
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "text":
+                    parts.append({"type": "text", "text": block["text"]})
+                elif btype == "image":
+                    src = block.get("source", {})
+                    mime = src.get("media_type", "image/png")
+                    b64 = src.get("data", "")
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    })
+            out.append({"role": m["role"], "content": parts or content})
+        return out
+
+    def _stream_openai(self, system: str, messages: list[dict], on_token: Callback,
+                        cancel: "threading.Event | None" = None) -> None:
         import openai
-        full_messages = [{"role": "system", "content": system}] + messages
+        converted = self._to_openai_messages(messages)
+        full_messages = [{"role": "system", "content": system}] + converted
         try:
             stream = self.client.chat.completions.create(
                 model=self.model,
@@ -447,6 +542,9 @@ class AIAssistant:
                 stream=True,
             )
             for chunk in stream:
+                if cancel and cancel.is_set():
+                    stream.close()
+                    break
                 content = chunk.choices[0].delta.content
                 if content:
                     on_token(content)
@@ -520,6 +618,241 @@ class AIAssistant:
                 if block.type == "tool_use":
                     return block.input or {}
             return {}
+
+    # ── Tool-use streaming ──────────────────────────────────────────────────────
+
+    def _stream_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        on_token: Callback,
+        on_done: Callable[[], None] | None,
+        cancel: "threading.Event | None" = None,
+        frame_extractor: FrameExtractor | None = None,
+    ) -> None:
+        """Stream with tool-use loop (up to 5 iterations).
+
+        When the model calls ``get_screenshot``, we extract a frame via
+        *frame_extractor* and feed the image back, then continue streaming.
+        """
+        try:
+            if self.client is None:
+                on_token(
+                    f"\n\n*Error: No {self.provider.title()} API key configured. "
+                    f"Add it in Settings.*"
+                )
+                return
+            if self.provider == "openai":
+                self._tool_loop_openai(
+                    system, messages, on_token, cancel, frame_extractor
+                )
+            else:
+                self._tool_loop_anthropic(
+                    system, messages, on_token, cancel, frame_extractor
+                )
+        except Exception as e:
+            on_token(f"\n\n*Error: {e}*")
+        finally:
+            if on_done:
+                on_done()
+
+    def _tool_loop_anthropic(
+        self,
+        system: str,
+        messages: list[dict],
+        on_token: Callback,
+        cancel: "threading.Event | None",
+        frame_extractor: FrameExtractor | None,
+    ) -> None:
+        import anthropic
+
+        msgs = list(messages)  # working copy
+        max_rounds = 5
+
+        for _ in range(max_rounds):
+            if cancel and cancel.is_set():
+                return
+
+            kwargs: dict = {}
+            if self.model in _ANTHROPIC_THINKING_MODELS:
+                kwargs["thinking"] = {"type": "adaptive"}
+
+            # Stream this turn so tokens appear incrementally in the UI.
+            with self.client.messages.stream(
+                model=self.model,
+                max_tokens=4096,
+                system=system,
+                messages=msgs,
+                tools=[_SCREENSHOT_TOOL],
+                **kwargs,
+            ) as stream:
+                for text in stream.text_stream:
+                    if cancel and cancel.is_set():
+                        stream.close()
+                        return
+                    on_token(text)
+                response = stream.get_final_message()
+
+            # Collect any tool_use blocks from the completed response.
+            tool_uses: list[dict] = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_uses.append({
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+
+            # If no tool calls, we're done
+            if not tool_uses or response.stop_reason != "tool_use":
+                return
+
+            # Build assistant message with all content blocks
+            msgs.append({"role": "assistant", "content": response.content})
+
+            # Process each tool call and build tool results
+            tool_results = []
+            for tu in tool_uses:
+                if tu["name"] == "get_screenshot" and frame_extractor:
+                    ts = tu["input"].get("timestamp", 0)
+                    jpeg = frame_extractor(float(ts))
+                    if jpeg:
+                        b64 = base64.b64encode(jpeg).decode()
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tu["id"],
+                            "content": [
+                                {"type": "text", "text": f"Screenshot at {ts:.1f}s:"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": b64,
+                                    },
+                                },
+                            ],
+                        })
+                    else:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tu["id"],
+                            "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
+                            "is_error": True,
+                        })
+                else:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": f"Unknown tool: {tu['name']}",
+                        "is_error": True,
+                    })
+
+            msgs.append({"role": "user", "content": tool_results})
+
+    def _tool_loop_openai(
+        self,
+        system: str,
+        messages: list[dict],
+        on_token: Callback,
+        cancel: "threading.Event | None",
+        frame_extractor: FrameExtractor | None,
+    ) -> None:
+        import openai
+
+        converted = self._to_openai_messages(messages)
+        msgs = [{"role": "system", "content": system}] + converted
+        max_rounds = 5
+
+        for _ in range(max_rounds):
+            if cancel and cancel.is_set():
+                return
+
+            # Stream this turn so tokens appear incrementally in the UI.
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=msgs,
+                tools=[_SCREENSHOT_FUNC_OAI],
+                stream=True,
+            )
+
+            # Accumulate streamed content and tool-call deltas.
+            full_content = ""
+            tool_calls_acc: dict[int, dict] = {}
+            finish_reason = None
+            for chunk in stream:
+                if cancel and cancel.is_set():
+                    break
+                choice = chunk.choices[0]
+                finish_reason = choice.finish_reason or finish_reason
+                delta = choice.delta
+                if delta.content:
+                    full_content += delta.content
+                    on_token(delta.content)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        entry = tool_calls_acc.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                        if tc.id:
+                            entry["id"] = tc.id
+                        if tc.function.name:
+                            entry["name"] += tc.function.name
+                        if tc.function.arguments:
+                            entry["arguments"] += tc.function.arguments
+
+            # If no tool calls, we're done
+            if not tool_calls_acc or finish_reason != "tool_calls":
+                return
+
+            # Reconstruct the assistant message for history
+            tc_list = [
+                {"id": v["id"], "type": "function",
+                 "function": {"name": v["name"], "arguments": v["arguments"]}}
+                for v in tool_calls_acc.values()
+            ]
+            msgs.append({"role": "assistant", "content": full_content or None, "tool_calls": tc_list})
+
+            # Process each accumulated tool call
+            for v in tool_calls_acc.values():
+                tc_id   = v["id"]
+                tc_name = v["name"]
+                if tc_name == "get_screenshot" and frame_extractor:
+                    args = json.loads(v["arguments"])
+                    ts = float(args.get("timestamp", 0))
+                    jpeg = frame_extractor(ts)
+                    if jpeg:
+                        b64 = base64.b64encode(jpeg).decode()
+                        # Tool result as text, then follow up with a user
+                        # message containing the image (OpenAI tool messages
+                        # don't support image content directly)
+                        msgs.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": f"Screenshot at {ts:.1f}s captured. The image follows.",
+                        })
+                        msgs.append({
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": f"[Screenshot at {ts:.1f}s from the screen recording:]"},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{b64}",
+                                    },
+                                },
+                            ],
+                        })
+                    else:
+                        msgs.append({
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
+                        })
+                else:
+                    msgs.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": f"Unknown tool: {tc_name}",
+                    })
 
     # ── Summary helpers ────────────────────────────────────────────────────────
 

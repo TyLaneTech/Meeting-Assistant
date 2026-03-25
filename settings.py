@@ -38,7 +38,11 @@ DEFAULTS: dict = {
 
     # AI provider and model
     "ai_provider": "openai",
-    "ai_model": "gpt-5.3",
+    "ai_model": "gpt-5.4",
+
+    # Screen recording
+    "screen_display": 0,
+    "screen_preset": "performance",
 }
 
 

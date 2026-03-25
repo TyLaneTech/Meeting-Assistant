@@ -6,6 +6,7 @@ Opens http://127.0.0.1:5000 automatically.
 import json
 import logging
 import os
+import signal
 import warnings
 warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"pyannote\.")
 import queue
@@ -37,12 +38,14 @@ import settings
 import storage
 from ai_assistant import AIAssistant
 from audio_capture import AudioCapture, enumerate_audio_devices
+from screen_recorder import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
 from speaker_db import SpeakerFingerprintDB
+import text_embeddings
 from transcriber import (
-    CUDA_AVAILABLE,
     DIARIZER_OPTIONS,
     WHISPER_PRESETS,
     Transcriber,
+    get_cuda_available,
 )
 
 config.ensure_env()
@@ -78,16 +81,9 @@ _transcriber = Transcriber(
 )
 
 # Apply saved model preferences
-_saved_whisper = _saved_prefs.get("whisper_preset", "")
-if _saved_whisper:
-    _wp = next((p for p in WHISPER_PRESETS if p["id"] == _saved_whisper), None)
-    if _wp and (not _wp["requires_cuda"] or CUDA_AVAILABLE):
-        _transcriber.device = _wp["device"]
-        _transcriber.compute_type = _wp["compute_type"]
-        _transcriber.model_size = _wp["model_size"]
-        log.info("settings", f"Restored whisper preset: {_saved_whisper}")
+_saved_whisper_preset = _saved_prefs.get("whisper_preset", "")
 _transcriber.diarization_enabled = _saved_prefs.get("diarization_enabled", True)
-del _saved_prefs, _saved_whisper
+del _saved_prefs
 
 # SSE: one queue per connected browser tab
 _client_queues: dict[str, queue.Queue] = {}
@@ -120,8 +116,12 @@ _state: dict = {
 }
 _state_lock = threading.Lock()
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
+_screen_recorder = ScreenRecorder()
+_chat_cancel: dict[str, threading.Event] = {}  # request_id → cancel event
 _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
 _tray = None  # MeetingTray instance (set in main(), None if no tray)
+_startup_init_lock = threading.Lock()
+_startup_init_started = False
 
 AUTO_SUMMARY_EVERY = 6  # trigger summary after this many new segments
 _CUSTOM_SPEAKER_PREFIX = "custom:"
@@ -182,6 +182,39 @@ def _push(event: str, data: dict) -> None:
     # Keep tray icon in sync with status changes
     if event == "status":
         _refresh_tray()
+
+
+def _recording_prereqs_locked() -> tuple[bool, str]:
+    """Return whether recording can start and, if not, why not."""
+    if not _state["model_ready"]:
+        info = (_state.get("model_info") or "").strip()
+        return False, info or "Loading transcription model..."
+    needs_diarizer = _transcriber.diarization_enabled and bool(os.getenv("HUGGING_FACE_KEY"))
+    if needs_diarizer and not _state["diarizer_ready"]:
+        return False, "Loading speaker diarization..."
+    return True, _state.get("model_info") or "Ready"
+
+
+def _status_payload(extra: dict | None = None) -> dict:
+    with _state_lock:
+        payload = {
+            "recording": _state["is_recording"],
+            "session_id": _state["session_id"],
+            "model_ready": _state["model_ready"],
+            "model_info": _state["model_info"],
+            "diarizer_ready": _state["diarizer_ready"],
+            "screen_recording": _screen_recorder.is_recording,
+        }
+        recording_ready, recording_ready_reason = _recording_prereqs_locked()
+    payload["recording_ready"] = recording_ready
+    payload["recording_ready_reason"] = recording_ready_reason
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _push_status(extra: dict | None = None) -> None:
+    _push("status", _status_payload(extra))
 
 
 # ── Transcript helpers ────────────────────────────────────────────────────────
@@ -562,6 +595,8 @@ def _run_summary(
             with _state_lock:
                 _state["summary_generating"] = False
             _push("summary_busy", {"busy": False, "session_id": session_id})
+            # Refresh semantic embedding after summary (content is most complete now)
+            update_session_embedding(session_id)
 
 
 def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None:
@@ -625,15 +660,26 @@ def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None
 
 def _load_model() -> None:
     try:
+        if _saved_whisper_preset:
+            preset = next((p for p in WHISPER_PRESETS if p["id"] == _saved_whisper_preset), None)
+            if preset and (not preset["requires_cuda"] or get_cuda_available()):
+                _transcriber.device = preset["device"]
+                _transcriber.compute_type = preset["compute_type"]
+                _transcriber.model_size = preset["model_size"]
+                _transcriber._auto_model_config = False
+                log.info("settings", f"Restored whisper preset: {_saved_whisper_preset}")
         _transcriber.load_model()
         info = _transcriber.device_info
         with _state_lock:
             _state["model_ready"] = True
             _state["model_info"] = info
-        _push("status", {"model_ready": True, "model_info": info})
+        _push_status()
     except Exception as e:
         log.error("whisper", f"Error loading model: {e}")
-        _push("status", {"model_ready": False, "model_info": f"Error: {e}"})
+        with _state_lock:
+            _state["model_ready"] = False
+            _state["model_info"] = f"Error: {e}"
+        _push_status()
 
 
 def _load_diarizer() -> None:
@@ -643,21 +689,23 @@ def _load_diarizer() -> None:
         return
     try:
         saved_device = settings.get("diarizer_device", "")
-        if saved_device and (saved_device != "cuda" or CUDA_AVAILABLE):
+        if saved_device and (saved_device != "cuda" or get_cuda_available()):
             log.info("settings", f"Restored diarizer device: {saved_device}")
             _transcriber.load_diarizer(hf_token, device=saved_device)
         else:
             _transcriber.load_diarizer(hf_token)
         with _state_lock:
             _state["diarizer_ready"] = True
-        _push("status", {"diarizer_ready": True})
+        _push_status()
         log.info("diarizer", "Speaker diarization ready.")
         if fingerprint_db.ready:
             _transcriber.fingerprint_callback = _on_fingerprint_audio
     except Exception as e:
         log.error("diarizer", f"Error loading models: {e}")
         log.warn("diarizer", "Transcription will continue without speaker labels.")
-        _push("status", {"diarizer_ready": False})
+        with _state_lock:
+            _state["diarizer_ready"] = False
+        _push_status()
 
 
 def _load_fingerprint_db() -> None:
@@ -670,9 +718,55 @@ def _load_fingerprint_db() -> None:
         _transcriber.fingerprint_callback = _on_fingerprint_audio
 
 
-threading.Thread(target=_load_model, daemon=True).start()
-threading.Thread(target=_load_diarizer, daemon=True).start()
-threading.Thread(target=_load_fingerprint_db, daemon=True).start()
+def _load_text_embeddings() -> None:
+    """Load the sentence-transformers model and index any unembedded sessions."""
+    text_embeddings.ensure_loaded()
+    if not text_embeddings.is_ready():
+        return
+    # Background-index sessions that don't have embeddings yet
+    _reindex_embeddings()
+
+
+def _reindex_embeddings() -> None:
+    """Compute embeddings for any sessions missing them."""
+    if not text_embeddings.is_ready():
+        return
+    unembedded = storage.get_unembedded_session_ids()
+    if not unembedded:
+        return
+    log.info("embeddings", f"Indexing {len(unembedded)} sessions for semantic search…")
+    for sid in unembedded:
+        text = storage.get_session_text_for_embedding(sid)
+        if not text:
+            continue
+        vec = text_embeddings.encode(text)
+        if vec is not None:
+            storage.save_session_embedding(sid, text_embeddings.embedding_to_bytes(vec))
+    log.info("embeddings", f"Semantic indexing complete.")
+
+
+def update_session_embedding(session_id: str) -> None:
+    """Recompute the embedding for a single session (call after content changes)."""
+    if not text_embeddings.is_ready():
+        return
+    text = storage.get_session_text_for_embedding(session_id)
+    if not text:
+        return
+    vec = text_embeddings.encode(text)
+    if vec is not None:
+        storage.save_session_embedding(session_id, text_embeddings.embedding_to_bytes(vec))
+
+
+def _start_background_initializers() -> None:
+    global _startup_init_started
+    with _startup_init_lock:
+        if _startup_init_started:
+            return
+        _startup_init_started = True
+    threading.Thread(target=_load_model, daemon=True).start()
+    threading.Thread(target=_load_diarizer, daemon=True).start()
+    threading.Thread(target=_load_fingerprint_db, daemon=True).start()
+    threading.Thread(target=_load_text_embeddings, daemon=True).start()
 
 
 def _level_push_loop() -> None:
@@ -804,14 +898,8 @@ def events():
 
     # Send initial state so a freshly-loaded page knows what's happening
     with _state_lock:
-        init = {
-            "recording": _state["is_recording"],
-            "session_id": _state["session_id"],
-            "model_ready": _state["model_ready"],
-            "model_info": _state["model_info"],
-            "diarizer_ready": _state["diarizer_ready"],
-        }
         active_sid = _state["session_id"] if _state["is_recording"] else None
+    init = _status_payload()
     q.put(f"event: status\ndata: {json.dumps(init)}\n\n")
 
     # Replay active session so reconnecting clients catch up instantly
@@ -858,14 +946,7 @@ def events():
 
 @app.route("/api/status")
 def get_status():
-    with _state_lock:
-        return jsonify({
-            "recording": _state["is_recording"],
-            "session_id": _state["session_id"],
-            "model_ready": _state["model_ready"],
-            "model_info": _state["model_info"],
-            "diarizer_ready": _state["diarizer_ready"],
-        })
+    return jsonify(_status_payload())
 
 
 @app.route("/api/audio/devices")
@@ -896,13 +977,66 @@ def list_sessions():
     return jsonify(storage.list_sessions())
 
 
+@app.route("/api/search")
+def search():
+    """Full-text search across session titles and transcript content."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify([])
+    limit = request.args.get("limit", 30, type=int)
+    results = storage.search_sessions(q, limit=limit)
+    return jsonify(results)
+
+
+@app.route("/api/search/semantic")
+def search_semantic():
+    """Semantic similarity search using text embeddings."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify([])
+    if not text_embeddings.is_ready():
+        return jsonify({"error": "Semantic search model is still loading"}), 503
+    limit = request.args.get("limit", 20, type=int)
+    threshold = request.args.get("threshold", 0.25, type=float)
+
+    query_vec = text_embeddings.encode(q)
+    if query_vec is None:
+        return jsonify({"error": "Failed to encode query"}), 500
+
+    all_embs = storage.get_all_session_embeddings()
+    scored = []
+    for row in all_embs:
+        vec = text_embeddings.bytes_to_embedding(row["embedding_bytes"])
+        score = text_embeddings.cosine_similarity(query_vec, vec)
+        if score >= threshold:
+            scored.append({
+                "session_id": row["session_id"],
+                "title": row["title"],
+                "score": round(score, 4),
+                "matches": [{"kind": "semantic", "snippet": f"Similarity: {score:.0%}"}],
+            })
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return jsonify(scored[:limit])
+
+
+@app.route("/api/search/semantic/status")
+def search_semantic_status():
+    """Check if the semantic search model is ready."""
+    return jsonify({
+        "ready": text_embeddings.is_ready(),
+        "loading": text_embeddings.is_loading(),
+    })
+
+
 @app.route("/api/sessions/<session_id>")
 def get_session(session_id: str):
     data = storage.get_session(session_id)
     if not data:
         return jsonify({"error": "Not found"}), 404
     wav_path = Path(__file__).parent / "data" / "audio" / f"{session_id}.wav"
+    video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
     data["has_audio"] = wav_path.exists()
+    data["has_video"] = video_path.exists()
     return jsonify(data)
 
 
@@ -975,8 +1109,9 @@ def start_recording():
     with _state_lock:
         if _state["is_recording"]:
             return jsonify({"error": "Already recording"}), 400
-        if not _state["model_ready"]:
-            return jsonify({"error": "Transcription model not loaded yet"}), 503
+        can_record, reason = _recording_prereqs_locked()
+        if not can_record:
+            return jsonify({"error": reason}), 503
         # Stop any active audio test so it doesn't conflict with the real capture
         test_cap = _state["test_capture"]
         _state["test_capture"] = None
@@ -1066,11 +1201,43 @@ def start_recording():
             "_confirmed_speakers":    set(),
         })
 
+    # ── Screen recording (optional) ────────────────────────────────────────
+    screen_recording_active = False
+    all_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
+    if int(all_params.get("screen_record_enabled", 0)) and find_ffmpeg():
+        try:
+            display_idx = int(settings.get("screen_display", 0))
+            # Resolve H.264 preset name from numeric index
+            h264_idx = int(all_params.get("screen_h264_preset", 2))
+            h264_name = H264_PRESETS[min(h264_idx, len(H264_PRESETS) - 1)]
+            framerate = int(all_params.get("screen_framerate", 10))
+            crf = int(all_params.get("screen_crf", 32))
+            scale_w = int(all_params.get("screen_scale_width", 0))
+            scale = f"{scale_w}:-2" if scale_w > 0 else ""
+
+            video_dir = Path(__file__).parent / "data" / "video"
+            video_path = str(video_dir / f"{session_id}.mp4")
+            _screen_recorder.start(
+                output_path=video_path,
+                display_index=display_idx,
+                framerate=framerate,
+                crf=crf,
+                preset=h264_name,
+                scale=scale,
+            )
+            screen_recording_active = True
+        except Exception as e:
+            log.warn("screen", f"Could not start screen recording: {e}")
+
     verb = "Resumed" if resume_session_id else "Started"
     log.info("recording", f"{verb} — session {session_id}")
-    _push("status", {"recording": True, "session_id": session_id,
-                     "resumed": bool(resume_session_id)})
-    return jsonify({"session_id": session_id})
+    _push_status({
+        "recording": True,
+        "session_id": session_id,
+        "resumed": bool(resume_session_id),
+        "screen_recording": screen_recording_active,
+    })
+    return jsonify({"session_id": session_id, "screen_recording": screen_recording_active})
 
 
 @app.route("/api/recording/stop", methods=["POST"])
@@ -1094,11 +1261,14 @@ def stop_recording():
             capture.stop_wav()   # finalize WAV header before stopping streams
             capture.stop()
         _transcriber.stop()
+        # Stop screen recording if active
+        if _screen_recorder.is_recording:
+            _screen_recorder.stop()
         if sid:
             storage.end_session(sid)
             seg_count = len(_state.get("segments", []))
             log.info("recording", f"Stopped — session {sid} ({seg_count} segments)")
-        _push("status", {"recording": False, "session_id": sid})
+        _push_status({"recording": False, "session_id": sid})
         # Auto-title: use full formatted transcript (with speaker labels) for better context
         if sid and (transcript_snapshot or plain_snapshot).strip():
             title = ai.generate_title(transcript_snapshot or plain_snapshot)
@@ -1107,6 +1277,9 @@ def stop_recording():
                 _push("session_title", {"session_id": sid, "title": title})
 
     threading.Thread(target=_cleanup, daemon=True).start()
+    # Update semantic embedding in background after session ends
+    if sid:
+        threading.Thread(target=update_session_embedding, args=(sid,), daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -1208,6 +1381,7 @@ def set_keys():
             threading.Thread(target=_load_diarizer, daemon=True).start()
 
     # Refresh tray icon if present
+    _push_status()
     _refresh_tray()
 
     return jsonify({"ok": True, "keys": config.get_key_status()})
@@ -1270,7 +1444,7 @@ def settings_status():
     provider = settings.get("ai_provider", "openai")
     return jsonify({
         "needs_setup": config.needs_setup(provider),
-        "cuda_available": CUDA_AVAILABLE,
+        "cuda_available": get_cuda_available(),
         "keys": config.get_key_status(),
     })
 
@@ -1430,7 +1604,8 @@ def get_audio_params():
     """Return current audio parameter values, defaults, and metadata."""
     from default_audio_params import (
         TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
-        ECHO_CANCELLATION_DEFAULTS, get_all_defaults,
+        ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
+        get_all_defaults,
     )
     saved = settings.load().get("audio_params", {})
     defaults = get_all_defaults()
@@ -1440,6 +1615,7 @@ def get_audio_params():
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
         "echo_cancellation": ECHO_CANCELLATION_DEFAULTS,
+        "screen_recording": SCREEN_RECORDING_DEFAULTS,
     })
 
 
@@ -1502,9 +1678,128 @@ def _apply_audio_params(params: dict) -> None:
         capture.echo_cancel_enabled = bool(int(params.get("echo_cancel_enabled", 0)))
 
 
+@app.route("/api/screen/displays", methods=["GET"])
+def get_displays():
+    """Return available displays for screen recording."""
+    displays = enumerate_displays()
+    selected = int(settings.get("screen_display", 0))
+    return jsonify({
+        "displays": displays,
+        "selected": selected,
+        "ffmpeg_available": find_ffmpeg() is not None,
+    })
+
+
+@app.route("/api/screen/displays", methods=["PUT"])
+def set_display():
+    """Set the selected display for screen recording."""
+    data = request.get_json(silent=True) or {}
+    idx = data.get("display", 0)
+    settings.put("screen_display", int(idx))
+    return jsonify({"ok": True, "selected": int(idx)})
+
+
+@app.route("/api/screen/identify", methods=["POST"])
+def identify_display():
+    """Flash a border around the given display."""
+    data = request.get_json(silent=True) or {}
+    idx = int(data.get("display", 0))
+    flash_display_border(idx)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/screen/presets", methods=["GET"])
+def get_screen_presets():
+    """Return screen recording preset definitions."""
+    return jsonify({
+        "presets": SCREEN_PRESETS,
+        "default": SCREEN_DEFAULT_PRESET,
+        "h264_presets": H264_PRESETS,
+        "selected": settings.get("screen_preset", SCREEN_DEFAULT_PRESET),
+    })
+
+
+@app.route("/api/screen/presets", methods=["PUT"])
+def set_screen_preset():
+    """Apply a screen recording preset (updates individual params)."""
+    data = request.get_json(silent=True) or {}
+    preset_id = data.get("preset", SCREEN_DEFAULT_PRESET)
+    if preset_id not in SCREEN_PRESETS or preset_id == "custom":
+        settings.put("screen_preset", preset_id)
+        return jsonify({"ok": True, "preset": preset_id})
+
+    p = SCREEN_PRESETS[preset_id]
+    h264_idx = H264_PRESETS.index(p["preset"]) if p["preset"] in H264_PRESETS else 2
+    scale_w = int(p["scale"].split(":")[0]) if p["scale"] else 0
+
+    param_updates = {
+        "screen_framerate": p["framerate"],
+        "screen_crf": p["crf"],
+        "screen_h264_preset": h264_idx,
+        "screen_scale_width": scale_w,
+    }
+
+    all_settings = settings.load()
+    params = all_settings.get("audio_params", {})
+    params.update(param_updates)
+    settings.put("audio_params", params)
+    settings.put("screen_preset", preset_id)
+
+    from default_audio_params import get_all_defaults
+    current = {**get_all_defaults(), **params}
+    return jsonify({"ok": True, "preset": preset_id, "audio_params": current})
+
+
+@app.route("/api/screen/status", methods=["GET"])
+def screen_status():
+    """Return current screen recording state."""
+    return jsonify({
+        "recording": _screen_recorder.is_recording,
+        "ffmpeg_available": find_ffmpeg() is not None,
+    })
+
+
+@app.route("/api/screen/preview", methods=["GET"])
+def screen_preview():
+    """Capture a live screenshot from the selected display as JPEG."""
+    display_idx = int(settings.get("screen_display", 0))
+    frame = capture_live_frame(display_index=display_idx)
+    if frame is None:
+        return jsonify({"error": "Could not capture frame"}), 500
+    return Response(frame, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/api/sessions/<session_id>/video", methods=["GET"])
+def get_session_video(session_id):
+    """Serve the recorded video file for a session."""
+    video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+    if not video_path.exists():
+        return jsonify({"error": "No video recording for this session"}), 404
+    return send_file(str(video_path), mimetype="video/mp4")
+
+
+@app.route("/api/sessions/<session_id>/frame", methods=["GET"])
+def get_session_frame(session_id):
+    """Extract a single JPEG frame from the session's screen recording.
+
+    Query params:
+        t: timestamp in seconds (float)
+    """
+    video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+    if not video_path.exists():
+        return jsonify({"error": "No video recording for this session"}), 404
+    t = request.args.get("t", 0, type=float)
+    jpeg_bytes = extract_frame(str(video_path), t)
+    if not jpeg_bytes:
+        return jsonify({"error": "Could not extract frame"}), 500
+    return Response(jpeg_bytes, mimetype="image/jpeg")
+
+
 @app.route("/api/models", methods=["GET"])
 def get_models():
     """Return current model config and available presets."""
+    cuda_available = get_cuda_available()
     has_hf_key = bool(os.getenv("HUGGING_FACE_KEY"))
     diarizer_device = _transcriber.diarizer_device
     with _state_lock:
@@ -1514,14 +1809,14 @@ def get_models():
     # device from CUDA availability so the dropdown shows the right value
     # instead of "Disabled".
     if diarizer_device is None and has_hf_key:
-        diarizer_device = "cuda" if CUDA_AVAILABLE else "cpu"
+        diarizer_device = "cuda" if cuda_available else "cpu"
 
     return jsonify({
-        "cuda_available": CUDA_AVAILABLE,
+        "cuda_available": cuda_available,
         "whisper": {
             "current": _transcriber.whisper_preset_id,
             "presets": [
-                {**p, "available": not p["requires_cuda"] or CUDA_AVAILABLE}
+                {**p, "available": not p["requires_cuda"] or cuda_available}
                 for p in WHISPER_PRESETS
             ],
         },
@@ -1531,7 +1826,7 @@ def get_models():
             "ready": diarizer_ready,
             "enabled": _transcriber.diarization_enabled,
             "options": [
-                {**o, "available": not o["requires_cuda"] or CUDA_AVAILABLE}
+                {**o, "available": not o["requires_cuda"] or cuda_available}
                 for o in DIARIZER_OPTIONS
             ],
         },
@@ -1550,17 +1845,17 @@ def set_whisper_model():
     preset = next((p for p in WHISPER_PRESETS if p["id"] == preset_id), None)
     if not preset:
         return jsonify({"error": "Unknown preset"}), 400
-    if preset["requires_cuda"] and not CUDA_AVAILABLE:
+    if preset["requires_cuda"] and not get_cuda_available():
         return jsonify({"error": "CUDA not available"}), 400
 
     # Already on this preset?
     if preset_id == _transcriber.whisper_preset_id:
         return jsonify({"ok": True, "info": _transcriber.device_info})
 
-    _push("status", {"model_ready": False, "model_info": f"Loading {preset['label']}…"})
     with _state_lock:
         _state["model_ready"] = False
         _state["model_info"] = f"Loading {preset['label']}…"
+    _push_status()
 
     def _reload():
         try:
@@ -1570,13 +1865,13 @@ def set_whisper_model():
             with _state_lock:
                 _state["model_ready"] = True
                 _state["model_info"] = info
-            _push("status", {"model_ready": True, "model_info": info})
+            _push_status()
         except Exception as e:
             log.error("whisper", f"Error reloading model: {e}")
             with _state_lock:
                 _state["model_ready"] = False
                 _state["model_info"] = f"Error: {e}"
-            _push("status", {"model_ready": False, "model_info": f"Error: {e}"})
+            _push_status()
 
     threading.Thread(target=_reload, daemon=True).start()
     return jsonify({"ok": True})
@@ -1589,6 +1884,7 @@ def set_diarizer_enabled():
     enabled = bool(data.get("enabled", True))
     _transcriber.diarization_enabled = enabled
     settings.put("diarization_enabled", enabled)
+    _push_status()
     return jsonify({"ok": True, "enabled": enabled})
 
 
@@ -1604,7 +1900,7 @@ def set_diarizer_model():
     option = next((o for o in DIARIZER_OPTIONS if o["id"] == device), None)
     if not option:
         return jsonify({"error": "Unknown device option"}), 400
-    if option["requires_cuda"] and not CUDA_AVAILABLE:
+    if option["requires_cuda"] and not get_cuda_available():
         return jsonify({"error": "CUDA not available"}), 400
 
     if device == _transcriber.diarizer_device:
@@ -1614,9 +1910,9 @@ def set_diarizer_model():
     if not hf_token:
         return jsonify({"error": "HUGGING_FACE_KEY not set"}), 400
 
-    _push("status", {"diarizer_ready": False})
     with _state_lock:
         _state["diarizer_ready"] = False
+    _push_status()
 
     def _reload():
         try:
@@ -1624,13 +1920,112 @@ def set_diarizer_model():
             settings.put("diarizer_device", device)
             with _state_lock:
                 _state["diarizer_ready"] = True
-            _push("status", {"diarizer_ready": True})
+            _push_status()
         except Exception as e:
             log.error("diarizer", f"Error reloading: {e}")
-            _push("status", {"diarizer_ready": False})
+            with _state_lock:
+                _state["diarizer_ready"] = False
+            _push_status()
 
     threading.Thread(target=_reload, daemon=True).start()
     return jsonify({"ok": True})
+
+
+_ATTACH_DIR = Path(__file__).parent / "data" / "attachments"
+_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_ALLOWED_TYPES = _IMAGE_TYPES | {"application/pdf", "text/plain", "text/csv",
+                                  "text/markdown", "application/json"}
+_MAX_ATTACH_SIZE = 20 * 1024 * 1024  # 20 MB
+
+
+@app.route("/api/chat/upload", methods=["POST"])
+def chat_upload():
+    """Upload a file for use as a chat attachment. Returns attachment metadata."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    data = f.read()
+    if len(data) > _MAX_ATTACH_SIZE:
+        return jsonify({"error": "File too large (max 20 MB)"}), 413
+
+    mime = f.content_type or "application/octet-stream"
+    # Accept any image or explicitly allowed type
+    if mime not in _ALLOWED_TYPES and not mime.startswith("image/"):
+        return jsonify({"error": f"Unsupported file type: {mime}"}), 415
+
+    fid = str(uuid.uuid4())
+    ext = Path(f.filename).suffix or ""
+    stored_name = fid + ext
+    (_ATTACH_DIR / stored_name).write_bytes(data)
+
+    meta = {
+        "id": fid,
+        "filename": f.filename,
+        "mime": mime,
+        "size": len(data),
+        "stored": stored_name,
+    }
+    return jsonify(meta)
+
+
+@app.route("/api/chat/attachment/<filename>")
+def chat_attachment(filename: str):
+    """Serve an uploaded attachment file."""
+    path = _ATTACH_DIR / filename
+    if not path.exists():
+        return jsonify({"error": "Not found"}), 404
+    return send_file(path)
+
+
+def _build_chat_history_from_messages(messages: list[dict]) -> list[dict]:
+    """Convert stored chat messages (with optional attachments) to AI-ready history."""
+    history = []
+    for m in messages:
+        att_json = m.get("attachments")
+        attachments = json.loads(att_json) if att_json else None
+        entry = _build_chat_entry(m["role"], m["content"], attachments)
+        history.append(entry)
+    return history
+
+
+def _build_chat_entry(role: str, text: str, attachments: list[dict] | None = None) -> dict:
+    """Build a single chat history entry, optionally with multimodal content."""
+    if not attachments:
+        return {"role": role, "content": text}
+    # Build multimodal content blocks
+    import base64
+    blocks: list[dict] = []
+    for att in attachments:
+        mime = att.get("mime", "")
+        stored = att.get("stored", "")
+        fpath = _ATTACH_DIR / stored
+        if not fpath.exists():
+            continue
+        if mime in _IMAGE_TYPES or mime.startswith("image/"):
+            raw = fpath.read_bytes()
+            b64 = base64.standard_b64encode(raw).decode("ascii")
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64},
+            })
+        else:
+            # Text-based files: inline as text
+            try:
+                file_text = fpath.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                file_text = "(Could not read file)"
+            blocks.append({
+                "type": "text",
+                "text": f"[Attached file: {att.get('filename', stored)}]\n{file_text}",
+            })
+    if text:
+        blocks.append({"type": "text", "text": text})
+    return {"role": role, "content": blocks}
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -1639,7 +2034,8 @@ def chat():
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
     question = (data.get("question") or "").strip()
-    if not question:
+    attachments = data.get("attachments") or []  # list of attachment metadata dicts
+    if not question and not attachments:
         return jsonify({"error": "No question provided"}), 400
 
     request_id = str(uuid.uuid4())
@@ -1669,10 +2065,7 @@ def chat():
             return jsonify({"error": "Session not found"}), 404
         labels = sess.get("speaker_labels") or {}
         transcript = _build_transcript(sess["segments"], labels)
-        chat_history = [
-            {"role": m["role"], "content": m["content"]}
-            for m in sess["chat_messages"]
-        ]
+        chat_history = _build_chat_history_from_messages(sess["chat_messages"])
         meta = _build_session_meta(
             sess["segments"], labels,
             session_title=sess.get("title", ""),
@@ -1682,37 +2075,67 @@ def chat():
             current_summary=sess.get("summary", ""),
         )
 
-    # Append the new question
-    chat_history.append({"role": "user", "content": question})
+    # Build the new user message (possibly multimodal)
+    user_entry = _build_chat_entry("user", question, attachments or None)
+    chat_history.append(user_entry)
 
     # Persist user message
-    storage.save_chat_message(session_id, "user", question)
+    att_json = json.dumps(attachments) if attachments else None
+    storage.save_chat_message(session_id, "user", question, attachments=att_json)
 
     # Update in-memory history if this is the active session
     with _state_lock:
         if session_id == _state["session_id"]:
-            _state["chat_history"].append({"role": "user", "content": question})
+            _state["chat_history"].append(user_entry)
+
+    cancel_event = threading.Event()
+    _chat_cancel[request_id] = cancel_event
 
     def run_chat():
         _push("chat_start", {"request_id": request_id, "question": question})
         response_chunks: list[str] = []
 
         def on_token(t: str) -> None:
+            if cancel_event.is_set():
+                return
             response_chunks.append(t)
             _push("chat_chunk", {"request_id": request_id, "text": t})
 
         def on_done() -> None:
+            _chat_cancel.pop(request_id, None)
             full = "".join(response_chunks)
-            storage.save_chat_message(session_id, "assistant", full)
-            with _state_lock:
-                if session_id == _state["session_id"]:
-                    _state["chat_history"].append({"role": "assistant", "content": full})
+            if full.strip():
+                storage.save_chat_message(session_id, "assistant", full)
+                with _state_lock:
+                    if session_id == _state["session_id"]:
+                        _state["chat_history"].append({"role": "assistant", "content": full})
             _push("chat_done", {"request_id": request_id})
 
-        ai.ask(transcript, chat_history, on_token, on_done, meta=meta)
+        # Build frame extractor if session has a screen recording
+        fe = None
+        video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+        if video_path.exists():
+            fe = lambda ts, vp=str(video_path): extract_frame(vp, ts)
+
+        ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
+               cancel=cancel_event, frame_extractor=fe)
 
     threading.Thread(target=run_chat, daemon=True).start()
     return jsonify({"request_id": request_id})
+
+
+@app.route("/api/chat/stop", methods=["POST"])
+def chat_stop():
+    """Cancel an in-flight chat response."""
+    data = request.get_json(silent=True) or {}
+    rid = data.get("request_id")
+    if rid and rid in _chat_cancel:
+        _chat_cancel[rid].set()
+        return jsonify({"ok": True})
+    # No specific request_id — cancel all active chat streams
+    for ev in _chat_cancel.values():
+        ev.set()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/sessions/<session_id>", methods=["DELETE"])
@@ -2393,35 +2816,60 @@ def fp_unlink_session_speaker(session_id: str, speaker_key: str):
     return jsonify({"ok": True})
 
 
+def _force_quit(delay: float = 0) -> None:
+    """Stop any active recording/test, clean up resources, and exit immediately.
+
+    Safe to call from a signal handler: uses a non-blocking lock acquire so it
+    cannot deadlock if the lock is already held on the interrupted thread.
+    """
+    global _tray
+    if delay:
+        time.sleep(delay)
+    got_lock = _state_lock.acquire(timeout=2)
+    try:
+        sid      = _state.get("session_id")
+        capture  = _state.get("audio_capture")
+        test_cap = _state.get("test_capture")
+        _state["is_recording"]  = False
+        _state["is_testing"]    = False
+        _state["audio_capture"] = None
+        _state["test_capture"]  = None
+    finally:
+        if got_lock:
+            _state_lock.release()
+    try:
+        if test_cap:
+            test_cap.stop()
+    except Exception:
+        pass
+    try:
+        if capture:
+            capture.stop()
+    except Exception:
+        pass
+    try:
+        _transcriber.stop()
+    except Exception:
+        pass
+    if sid:
+        try:
+            storage.end_session(sid)
+        except Exception:
+            pass
+    if _tray is not None:
+        try:
+            _tray.stop()
+        except Exception:
+            pass
+        _tray = None
+    os._exit(0)
+
+
 @app.route("/api/shutdown", methods=["POST"])
 def shutdown():
     """Gracefully stop recording (if active), remove tray, then exit."""
-    def _do_shutdown() -> None:
-        global _tray
-        # Stop any active recording / test first
-        with _state_lock:
-            sid         = _state["session_id"]
-            capture     = _state["audio_capture"]
-            test_cap    = _state["test_capture"]
-            _state["is_recording"] = False
-            _state["is_testing"]   = False
-            _state["audio_capture"] = None
-            _state["test_capture"]  = None
-        if test_cap:
-            test_cap.stop()
-        if capture:
-            capture.stop()
-        _transcriber.stop()
-        if sid:
-            storage.end_session(sid)
-        time.sleep(0.4)   # give the HTTP response time to reach the browser
-        # Stop tray cleanly before exiting
-        if _tray is not None:
-            _tray.stop()
-            _tray = None
-        os._exit(0)
-
-    threading.Thread(target=_do_shutdown, daemon=True).start()
+    # Small delay so the HTTP response reaches the browser before we exit.
+    threading.Thread(target=_force_quit, args=(0.4,), daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -2533,6 +2981,39 @@ def main() -> None:
     )
     flask_thread.start()
 
+    # Try to start system tray immediately so it becomes available during the
+    # same startup window as the webserver, rather than after the bind wait.
+    try:
+        from tray import TRAY_AVAILABLE, MeetingTray
+        if not TRAY_AVAILABLE:
+            raise ImportError("pystray or Pillow not installed")
+
+        def _state_snapshot() -> dict:
+            snap = _status_payload()
+            with _state_lock:
+                snap.update({**_state})
+            snap["ai_provider"] = settings.get("ai_provider", "openai")
+            return snap
+
+        def _on_tray_quit(icon) -> None:
+            if icon:
+                try:
+                    icon.stop()
+                except Exception:
+                    pass
+            _force_quit()
+
+        _tray = MeetingTray(url, _state_snapshot, _on_tray_quit)
+        log.info("tray", "System tray active — right-click for menu.")
+        # Run tray in a daemon thread so the main thread stays in Python code
+        # where it can receive signals (Ctrl+C).  pystray's Win32 message loop
+        # blocks in native C, which prevents Python signal handlers from firing.
+        threading.Thread(target=_tray.run, daemon=True).start()
+
+    except ImportError:
+        log.warn("tray", "pystray/Pillow not installed — running without system tray.")
+        log.warn("tray", "Install with: pip install pystray Pillow")
+
     # Wait for Flask to bind
     import urllib.request
     for _ in range(40):
@@ -2542,58 +3023,28 @@ def main() -> None:
         except Exception:
             time.sleep(0.15)
 
+    # Defer heavy model and embedding loads until after the server is accepting
+    # requests so the UI can render immediately and show startup progress.
+    _start_background_initializers()
+
     # Open browser — go to settings page if keys are missing
     if config.needs_setup(_active_provider):
         webbrowser.open(f"{url}?settings=1")
     #else: webbrowser.open(url)
 
-    # Try to start system tray on the main thread
+    # Register SIGINT after Flask starts (werkzeug would override an earlier handler).
+    # This ensures Ctrl+C in the console immediately stops recording and exits.
+    signal.signal(signal.SIGINT, lambda *_: _force_quit())
+
+    # Keep the main thread alive in a Python-level loop so signal handlers
+    # (Ctrl+C) can fire.  threading.Event.wait() with a timeout releases the
+    # GIL and lets the interpreter check for pending signals each iteration.
     try:
-        from tray import TRAY_AVAILABLE, MeetingTray
-        if not TRAY_AVAILABLE:
-            raise ImportError("pystray or Pillow not installed")
-
-        def _state_snapshot() -> dict:
-            with _state_lock:
-                snap = {**_state}
-            snap["ai_provider"] = settings.get("ai_provider", "openai")
-            return snap
-
-        def _on_tray_quit(icon) -> None:
-            # Same as /api/shutdown but called from the tray
-            if icon:
-                try:
-                    icon.stop()
-                except Exception:
-                    pass
-            with _state_lock:
-                capture = _state["audio_capture"]
-                test_cap = _state["test_capture"]
-                sid = _state["session_id"]
-                _state["is_recording"] = False
-                _state["is_testing"] = False
-                _state["audio_capture"] = None
-                _state["test_capture"] = None
-            if test_cap:
-                test_cap.stop()
-            if capture:
-                capture.stop()
-            _transcriber.stop()
-            if sid:
-                storage.end_session(sid)
-            os._exit(0)
-
-        _tray = MeetingTray(url, _state_snapshot, _on_tray_quit)
-        log.info("tray", "System tray active — right-click for menu.")
-        _tray.run()  # blocks until quit
-
-    except ImportError:
-        log.warn("tray", "pystray/Pillow not installed — running without system tray.")
-        log.warn("tray", "Install with: pip install pystray Pillow")
-        try:
-            flask_thread.join()
-        except KeyboardInterrupt:
-            os._exit(0)
+        _shutdown_event = threading.Event()
+        while not _shutdown_event.wait(timeout=1):
+            pass
+    except KeyboardInterrupt:
+        _force_quit()
 
 
 if __name__ == "__main__":

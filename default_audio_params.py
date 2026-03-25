@@ -325,11 +325,110 @@ ECHO_CANCELLATION_DEFAULTS = {
 }
 
 
+SCREEN_RECORDING_DEFAULTS = {
+    "screen_record_enabled": {
+        "value": 0,
+        "label": "Enable Screen Recording",
+        "description": "Record the selected display during meetings.",
+        "tooltip": (
+            "Captures your screen using FFmpeg and saves it as an MP4 file "
+            "alongside the audio recording. The video is encoded with H.264 "
+            "for broad compatibility.<br><br>"
+            "<b>Enable</b> to record your screen during meetings.<br>"
+            "<b>Leave disabled</b> to save system resources when video isn't needed."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+    },
+    "screen_framerate": {
+        "value": 10,
+        "label": "Framerate",
+        "unit": "fps",
+        "description": "Capture frames per second.",
+        "tooltip": (
+            "How many frames per second to capture from the display. Screen "
+            "content is mostly static, so low framerates work well.<br><br>"
+            "<b>5–10 fps</b> is ideal for presentations and documents — minimal "
+            "CPU usage and small files.<br>"
+            "<b>15–24 fps</b> is smooth enough for video playback and demos.<br>"
+            "<b>30 fps</b> produces very smooth video but significantly larger files."
+        ),
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "type": "int",
+    },
+    "screen_crf": {
+        "value": 32,
+        "label": "Quality (CRF)",
+        "description": "Constant Rate Factor — lower is better quality.",
+        "tooltip": (
+            "Controls the quality-vs-size tradeoff for H.264 encoding. CRF "
+            "uses a perceptual quality model — the encoder adjusts bitrate "
+            "automatically to maintain constant visual quality.<br><br>"
+            "<b>18–22</b>: Visually lossless — excellent quality, large files.<br>"
+            "<b>23–28</b>: Good quality — text is sharp, moderate file size.<br>"
+            "<b>29–35</b>: Acceptable quality — some softness, small files.<br>"
+            "<b>36+</b>: Low quality — blurry details, very small files.<br><br>"
+            "Each +6 roughly halves the file size."
+        ),
+        "min": 0,
+        "max": 51,
+        "step": 1,
+        "type": "int",
+    },
+    "screen_h264_preset": {
+        "value": 2,
+        "label": "Encoder Speed",
+        "description": "H.264 preset — faster encoding uses more disk, less CPU.",
+        "tooltip": (
+            "The H.264 preset controls the trade-off between encoding speed "
+            "and compression efficiency. All presets produce the same visual "
+            "quality at a given CRF — faster presets just use more bits.<br><br>"
+            "<b>0 (ultrafast)</b>: Minimal CPU, ~2× file size vs medium.<br>"
+            "<b>2 (veryfast)</b>: Low CPU, good compression. Recommended.<br>"
+            "<b>4 (fast)</b>: Moderate CPU, efficient compression.<br>"
+            "<b>5 (medium)</b>: FFmpeg default — balanced but heavier.<br>"
+            "<b>7+ (slow–veryslow)</b>: Maximum compression, high CPU."
+        ),
+        "min": 0,
+        "max": 8,
+        "step": 1,
+        "type": "int",
+    },
+    "screen_scale_width": {
+        "value": 0,
+        "label": "Downscale Width",
+        "unit": "px",
+        "description": "Scale video width (0 = native resolution).",
+        "tooltip": (
+            "Downscale the captured video to this width (height adjusts "
+            "automatically to maintain aspect ratio). Useful on high-DPI "
+            "displays to reduce file size.<br><br>"
+            "<b>0</b>: Native resolution (no scaling).<br>"
+            "<b>1920</b>: Full HD — good for 4K displays.<br>"
+            "<b>1280</b>: 720p — small files, still readable text.<br><br>"
+            "Values below 960 may make small text difficult to read."
+        ),
+        "min": 0,
+        "max": 7680,
+        "step": 160,
+        "type": "int",
+    },
+}
+
+_ALL_DEFAULTS_DICTS = (
+    TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
+    ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
+)
+
+
 def get_all_defaults() -> dict:
     """Return a flat dict of param_name -> default_value for all parameters."""
     flat = {}
-    for d in (TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
-              ECHO_CANCELLATION_DEFAULTS):
+    for d in _ALL_DEFAULTS_DICTS:
         for key, spec in d.items():
             flat[key] = spec["value"]
     return flat
@@ -337,8 +436,7 @@ def get_all_defaults() -> dict:
 
 def get_default(key: str):
     """Return the default value for a single parameter, or None."""
-    for d in (TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
-              ECHO_CANCELLATION_DEFAULTS):
+    for d in _ALL_DEFAULTS_DICTS:
         if key in d:
             return d[key]["value"]
     return None

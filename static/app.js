@@ -277,6 +277,10 @@ const state = {
   isReanalyzing:  false,
   sessionHasAudio: false,
   aiChatBusy:     false,
+  modelReady:     false,
+  diarizerReady:  false,
+  recordingReady: false,
+  recordingReadyReason: 'Loading transcription model...',
   modelInfo:      '',
   chatCursor:     null,
   chatBuffer:     '',
@@ -324,19 +328,20 @@ async function loadPreferences() {
     const sb = document.getElementById('sidebar');
     if (sb && state.sidebarOpen) sb.style.width = _prefs.sidebar_width + 'px';
   }
-  // Apply column proportions, then reflow
+  // Apply column proportions
   if (Array.isArray(_prefs.col_proportions) && _prefs.col_proportions.length === 3) {
     _colProportions = _prefs.col_proportions;
   }
-  recalcColWidths();
-  // Apply sidebar collapsed state — only toggle if it disagrees with what cache already set
+  // Apply sidebar collapsed state on load.
+  const sidebar = document.getElementById('sidebar');
   if (_prefs.sidebar_open === false && state.sidebarOpen) {
-    state.sidebarOpen = true;   // toggleSidebar flips it
+    state.sidebarOpen = true;
     toggleSidebar();
   } else if (_prefs.sidebar_open !== false && !state.sidebarOpen) {
-    state.sidebarOpen = false;  // toggleSidebar flips it
+    state.sidebarOpen = false;
     toggleSidebar();
   }
+  recalcColWidths();
   // Apply auto-summary toggle
   const autoBtn = document.getElementById('auto-summary-btn');
   if (autoBtn) {
@@ -376,8 +381,7 @@ function toggleSidebar() {
   }
   savePref('sidebar_open', state.sidebarOpen);
   _saveLayoutCache({ sidebar_open: state.sidebarOpen });
-  // Reflow workspace columns after the sidebar transition completes
-  sidebar.addEventListener('transitionend', recalcColWidths, { once: true });
+  recalcColWidths();
 }
 
 // ── Sidebar state ─────────────────────────────────────────────────────────────
@@ -393,6 +397,13 @@ let _sidebarDragIds     = [];             // IDs being dragged
 let _sidebarDragType    = 'session';      // 'session' | 'folder'
 let _dragIndicator      = null;           // reusable drop indicator element
 let _dragDescendants    = new Set();      // descendants of dragged folder (cycle prevention)
+let _sidebarSearchQuery = '';             // current search text
+let _sidebarSearchResults = null;         // null = not searching, Map<sessionId, {matches}>
+let _sidebarSearchTimer = null;           // debounce timer
+let _semanticSearchReady = false;         // true once backend model is loaded
+let _semanticSearchPending = false;       // true while a semantic request is in flight
+let _ftsSearchPending = false;            // true while FTS request is in flight
+let _pendingSearchHighlight = null;       // {segmentId, query} — scroll+highlight after session load
 
 async function refreshSidebar() {
   const [sessions, folders] = await Promise.all([
@@ -402,6 +413,186 @@ async function refreshSidebar() {
   _sidebarAllSessions = sessions;
   _sidebarFolders = folders;
   _renderSidebar();
+}
+
+/* ── Sidebar search ───────────────────────────────────────────────────────── */
+function _pulseSearchGlow() {
+  const body = document.getElementById('session-list');
+  if (!body) return;
+  body.classList.remove('search-glow');
+  void body.offsetWidth;          // force reflow — restarts animation instantly
+  body.classList.add('search-glow');
+}
+
+function _onSidebarSearch(value) {
+  _sidebarSearchQuery = value.trim();
+  const clearBtn = document.getElementById('sidebar-search-clear');
+  if (clearBtn) clearBtn.classList.toggle('hidden', !_sidebarSearchQuery);
+
+  if (!_sidebarSearchQuery) {
+    _sidebarSearchResults = null;
+    _semanticSearchPending = false;
+    _ftsSearchPending = false;
+    _renderSidebar();
+    return;
+  }
+
+  // Fire a subtle glow at the top of the results pane for keystroke feedback
+  _pulseSearchGlow();
+
+  // Instant client-side title filter
+  const q = _sidebarSearchQuery.toLowerCase();
+  const titleMatches = new Map();
+  for (const s of _sidebarAllSessions) {
+    if (s.title && s.title.toLowerCase().includes(q)) {
+      titleMatches.set(s.id, { matches: [{ kind: 'title', snippet: _highlightSnippet(s.title, q) }] });
+    }
+  }
+
+  const prevSize = _sidebarSearchResults ? _sidebarSearchResults.size : -1;
+  _sidebarSearchResults = titleMatches;
+  _ftsSearchPending = true;
+  if (_semanticSearchReady) _semanticSearchPending = true;
+
+  // Skip full re-render if we're already showing "Searching…" with no results
+  // — avoids restarting the dots animation on every keystroke
+  const stillEmpty = prevSize === 0 && titleMatches.size === 0;
+  if (!stillEmpty) _renderSidebar();
+
+  // Debounced backend FTS + semantic search
+  clearTimeout(_sidebarSearchTimer);
+  _sidebarSearchTimer = setTimeout(() => {
+    _runBackendSearch(_sidebarSearchQuery);
+    if (_semanticSearchReady) _runSemanticSearch(_sidebarSearchQuery);
+  }, 250);
+}
+
+async function _runBackendSearch(query) {
+  if (query !== _sidebarSearchQuery) return;  // stale
+  try {
+    const results = await fetch(`/api/search?q=${encodeURIComponent(query)}`).then(r => r.json());
+    if (query !== _sidebarSearchQuery) return;  // stale
+    // Merge with existing title matches
+    const merged = new Map(_sidebarSearchResults || []);
+    for (const r of results) {
+      if (merged.has(r.session_id)) {
+        const existing = merged.get(r.session_id);
+        const contentMatches = r.matches.filter(m => m.kind !== 'title');
+        existing.matches = [...existing.matches, ...contentMatches].slice(0, 3);
+      } else {
+        merged.set(r.session_id, { matches: r.matches });
+      }
+    }
+    _ftsSearchPending = false;
+    _sidebarSearchResults = merged;
+    _renderSidebar();
+  } catch {
+    _ftsSearchPending = false;
+  }
+}
+
+async function _runSemanticSearch(query) {
+  if (query !== _sidebarSearchQuery) return;
+  try {
+    const resp = await fetch(`/api/search/semantic?q=${encodeURIComponent(query)}`);
+    if (query !== _sidebarSearchQuery) return;
+    if (!resp.ok) {
+      _semanticSearchPending = false;
+      _renderSidebar();
+      return;
+    }
+    const results = await resp.json();
+    if (query !== _sidebarSearchQuery) return;
+    // Merge semantic results into existing results
+    const merged = new Map(_sidebarSearchResults || []);
+    for (const r of results) {
+      if (merged.has(r.session_id)) {
+        const existing = merged.get(r.session_id);
+        // Add semantic matches + score, avoid duplicates
+        const semMatches = (r.matches || []).filter(m => m.kind === 'semantic');
+        existing.matches = [...existing.matches, ...semMatches].slice(0, 3);
+        existing.score = Math.max(existing.score || 0, r.score || 0);
+      } else {
+        merged.set(r.session_id, {
+          matches: r.matches || [],
+          score: r.score,
+        });
+      }
+    }
+    _semanticSearchPending = false;
+    _sidebarSearchResults = merged;
+    _renderSidebar();
+  } catch {
+    _semanticSearchPending = false;
+  }
+}
+
+function _clearSidebarSearch() {
+  const input = document.getElementById('sidebar-search-input');
+  if (input) input.value = '';
+  _onSidebarSearch('');
+}
+
+function _checkSemanticSearchReady() {
+  fetch('/api/search/semantic/status').then(r => r.json()).then(data => {
+    _semanticSearchReady = data.ready;
+    const badge = document.getElementById('sidebar-search-ai');
+    if (badge) {
+      if (data.ready) {
+        badge.classList.add('ready');
+        badge.classList.remove('loading', 'unavailable');
+        badge.title = 'AI-powered semantic search active';
+      } else if (data.loading) {
+        badge.classList.add('loading');
+        badge.classList.remove('ready', 'unavailable');
+        badge.title = 'AI search model loading…';
+      } else {
+        badge.classList.add('unavailable');
+        badge.classList.remove('ready', 'loading');
+        badge.title = 'AI search unavailable';
+      }
+    }
+    if (data.loading) setTimeout(_checkSemanticSearchReady, 5000);
+  }).catch(() => {});
+}
+
+function _highlightSnippet(text, query) {
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx < 0) return escapeHtml(text);
+  const before = text.slice(0, idx);
+  const match = text.slice(idx, idx + query.length);
+  const after = text.slice(idx + query.length);
+  return escapeHtml(before) + '<mark>' + escapeHtml(match) + '</mark>' + escapeHtml(after);
+}
+
+function _executeSearchHighlight(hl) {
+  const transcriptEl = document.getElementById('transcript');
+  if (!transcriptEl) return;
+  let target = null;
+
+  // Strategy 1: find by segment ID
+  if (hl.segmentId != null) {
+    target = transcriptEl.querySelector(`.transcript-segment[data-seg-id="${hl.segmentId}"]`);
+  }
+
+  // Strategy 2: text search fallback — find segments containing the query
+  if (!target && hl.query) {
+    const q = hl.query.toLowerCase();
+    const segs = transcriptEl.querySelectorAll('.transcript-segment');
+    for (const seg of segs) {
+      if (seg.textContent.toLowerCase().includes(q)) {
+        target = seg;
+        break;
+      }
+    }
+  }
+
+  if (!target) return;
+
+  // Scroll into view and flash highlight
+  _doProgrammaticScroll(target, { behavior: 'smooth', block: 'center' });
+  target.classList.add('search-flash');
+  setTimeout(() => target.classList.remove('search-flash'), 2200);
 }
 
 // ── Folder tree helpers ───────────────────────────────────────────────────────
@@ -558,6 +749,100 @@ function _renderSidebar() {
   const list     = document.getElementById('session-list');
   const hasAny   = sessions.length > 0 || folders.length > 0;
 
+  // ── Search mode: flat filtered list with snippets ──
+  if (_sidebarSearchResults !== null) {
+    list.innerHTML = '';
+    const anyPending = _ftsSearchPending || _semanticSearchPending;
+    if (_sidebarSearchResults.size === 0 && _sidebarSearchQuery) {
+      if (anyPending) {
+        list.innerHTML =
+          '<div class="search-empty-state">' +
+            '<div class="search-dots"><span></span><span></span><span></span></div>' +
+            '<p>Searching…</p>' +
+          '</div>';
+      } else {
+        list.innerHTML =
+          '<div class="search-empty-state">' +
+            '<div class="search-empty-icon">' +
+              '<i class="fa-solid fa-magnifying-glass"></i>' +
+            '</div>' +
+            '<p>No matching sessions</p>' +
+          '</div>';
+      }
+      return;
+    }
+    const sessionMap = new Map(sessions.map(s => [s.id, s]));
+    const fragment = document.createDocumentFragment();
+    for (const [sid, data] of _sidebarSearchResults) {
+      const s = sessionMap.get(sid);
+      if (!s) continue;
+      const el = _makeSessionEl(s);
+      const info = el.querySelector('.session-info');
+      if (info) {
+        // Show semantic similarity score bar
+        if (data.score != null) {
+          const scoreEl = document.createElement('div');
+          scoreEl.className = 'session-search-score';
+          const pct = Math.round(data.score * 100);
+          scoreEl.innerHTML = `<span class="score-bar"><span class="score-fill" style="width:${pct}%"></span></span><span class="score-label">${pct}%</span>`;
+          info.appendChild(scoreEl);
+        }
+        // Append match snippets as clickable elements
+        if (data.matches?.length) {
+          const matchesEl = document.createElement('div');
+          matchesEl.className = 'session-search-matches';
+          for (const m of data.matches.slice(0, 2)) {
+            const snip = document.createElement('div');
+            snip.className = 'session-search-snippet';
+            if (m.segment_id != null || m.kind === 'segment') snip.classList.add('clickable');
+            const kindLabel = m.kind === 'title' ? ''
+              : m.kind === 'semantic' ? ''
+              : `<span class="search-match-kind">${escapeHtml(m.kind)}</span>`;
+            snip.innerHTML = kindLabel + m.snippet;
+            // Click snippet → load session and jump to matching segment
+            if (m.segment_id != null) {
+              snip.addEventListener('click', e => {
+                e.stopPropagation();
+                _pendingSearchHighlight = { segmentId: m.segment_id, query: _sidebarSearchQuery };
+                loadSession(sid);
+              });
+            } else if (m.kind === 'segment') {
+              // FTS match without segment_id — fall back to text search
+              snip.addEventListener('click', e => {
+                e.stopPropagation();
+                _pendingSearchHighlight = { query: _sidebarSearchQuery };
+                loadSession(sid);
+              });
+            }
+            matchesEl.appendChild(snip);
+          }
+          info.appendChild(matchesEl);
+        }
+      }
+      // Default click (no specific snippet) — still set query for text highlight
+      const origClick = el.onclick;
+      el.addEventListener('click', () => {
+        if (data.matches?.some(m => m.segment_id != null || m.kind === 'segment')) {
+          const first = data.matches.find(m => m.segment_id != null);
+          _pendingSearchHighlight = first
+            ? { segmentId: first.segment_id, query: _sidebarSearchQuery }
+            : { query: _sidebarSearchQuery };
+        }
+      }, true);  // capture phase — runs before the loadSession click
+      fragment.appendChild(el);
+    }
+    list.appendChild(fragment);
+    // Show refining indicator when semantic search is still running
+    if (_semanticSearchPending && _sidebarSearchResults.size > 0) {
+      const refining = document.createElement('div');
+      refining.className = 'search-refining';
+      refining.innerHTML = '<div class="search-dots sm"><span></span><span></span><span></span></div> Refining with AI…';
+      list.appendChild(refining);
+    }
+    return;
+  }
+
+  // ── Normal mode: folder hierarchy + date groups ──
   if (!hasAny) {
     list.innerHTML = '<p class="sidebar-empty">No past sessions yet.</p>';
     _updateBulkBar();
@@ -667,15 +952,16 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     });
 
     header.innerHTML = `
-      <button class="folder-toggle" onclick="event.stopPropagation(); _toggleFolder('${folder.id}')"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
+      <button class="folder-toggle"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
       <span class="folder-icon"><i class="fa-solid fa-folder${collapsed ? '' : '-open'}"></i></span>
-      <span class="folder-name" onclick="_toggleFolder('${folder.id}')">${escapeHtml(folder.name)}</span>
+      <span class="folder-name">${escapeHtml(folder.name)}</span>
       <span class="folder-count">${totalCount}</span>`;
 
     const folderMenuBtn = document.createElement('button');
     folderMenuBtn.className = 'folder-menu-btn';
     folderMenuBtn.title = 'More options';
     folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+    header.addEventListener('click', e => { _toggleFolder(`${folder.id}`); });
     folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
     header.appendChild(folderMenuBtn);
     folderEl.appendChild(header);
@@ -1248,9 +1534,16 @@ function formatSessionMeta(s) {
   const start = new Date(s.started_at + 'Z');
   const time  = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   if (!s.ended_at) return `${time} · In progress`;
-  const end  = new Date(s.ended_at + 'Z');
-  const mins = Math.round((end - start) / 60000);
-  return `${time} · ${mins < 1 ? '<1' : mins} min`;
+  // Use actual transcript duration (last segment end_time) when available,
+  // falling back to wall-clock duration between start/end timestamps.
+  let secs = s.last_segment_time;
+  if (secs == null || secs <= 0) {
+    const end = new Date(s.ended_at + 'Z');
+    secs = (end - start) / 1000;
+  }
+  const m = Math.floor(secs / 60);
+  const ss = Math.floor(secs % 60).toString().padStart(2, '0');
+  return `${time} · ${m}:${ss}`;
 }
 
 async function deleteSession(e, sessionId) {
@@ -1310,11 +1603,6 @@ function newSession() {
   history.pushState({}, '', '/');
   _applyPromptText('');
   updateRecordBtn();
-  const btn = document.getElementById('record-btn');
-  // Only re-enable if model is ready (status-dot will be 'ready')
-  if (!document.getElementById('status-dot').classList.contains('ready')) {
-    btn.disabled = true;
-  }
   refreshSidebar();
 }
 
@@ -1525,7 +1813,7 @@ function connectSSE(afterSegId = 0) {
     state.summaryBuffer += JSON.parse(e.data).text;
     if (state.summaryCursor) {
       state.summaryCursor.innerHTML = renderMd(state.summaryBuffer);
-      state.summaryCursor.scrollTop = state.summaryCursor.scrollHeight;
+      if (_summaryAtBottom) state.summaryCursor.scrollTop = state.summaryCursor.scrollHeight;
     }
   });
 
@@ -1564,12 +1852,13 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('chat_done', () => {
     if (state.chatCursor) {
       linkifyTimestamps(state.chatCursor);
+      highlightCode('#chat-messages');
+      _addCodeCopyButtons(state.chatCursor);
       state.chatCursor.classList.remove('typing-cursor');
       state.chatCursor = null;
     }
-    highlightCode('#chat-messages');
     state.aiChatBusy = false;
-    setSendBusy(false);
+    _setChatBusy(false);
   });
 
   src.addEventListener('audio_level', e => {
@@ -1636,6 +1925,7 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('transcript_reset', e => {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
+    _clearSegmentRegistry();
     document.getElementById('transcript').innerHTML =
       '<p class="empty-hint">Reanalyzing audio…</p>';
     document.getElementById('summary').innerHTML =
@@ -1655,6 +1945,7 @@ function connectSSE(afterSegId = 0) {
     text.textContent = 'Reanalyzing…';
     // Ensure playback is available during reanalysis
     if (!_playbackActive && state.sessionId) initPlayback(state.sessionId);
+    _syncRecordBtnDisabled();
     refreshSidebar();
   });
 
@@ -1668,6 +1959,7 @@ function connectSSE(afterSegId = 0) {
     dot.className    = 'status-dot ready';
     text.textContent = state.modelInfo || 'Ready';
     initPlayback(state.sessionId);
+    _syncRecordBtnDisabled();
     refreshSidebar();
   });
 
@@ -1680,6 +1972,7 @@ function connectSSE(afterSegId = 0) {
     dot.className    = 'status-dot ready';
     text.textContent = state.modelInfo || 'Ready';
     alert('Reanalysis failed: ' + (d.error || 'unknown error'));
+    _syncRecordBtnDisabled();
     refreshSidebar();
   });
 
@@ -1705,26 +1998,21 @@ function _updateBrandIcons(recording) {
 }
 
 /* ── Status ──────────────────────────────────────────────────────────────── */
+function _syncRecordBtnDisabled() {
+  const btn = document.getElementById('record-btn');
+  if (!btn) return;
+  btn.disabled = !state.isRecording && (state.isReanalyzing || !state.recordingReady);
+}
+
 function onStatus(d) {
   const dot  = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
-  const btn  = document.getElementById('record-btn');
-
-  if (d.model_ready === false || (!d.model_ready && !state.modelInfo)) {
-    dot.className   = 'status-dot loading';
-    text.textContent = 'Loading model…';
-    btn.disabled    = true;
-    return;
-  }
-
-  if (d.model_info) state.modelInfo = d.model_info;
-
-  if (d.model_ready === true) {
-    if (!state.isRecording) {
-      dot.className    = 'status-dot ready';
-      text.textContent = state.modelInfo;
-    }
-    btn.disabled = false;
+  if (d.model_ready !== undefined) state.modelReady = !!d.model_ready;
+  if (d.diarizer_ready !== undefined) state.diarizerReady = !!d.diarizer_ready;
+  if (d.model_info !== undefined) state.modelInfo = d.model_info || '';
+  if (d.recording_ready !== undefined) state.recordingReady = !!d.recording_ready;
+  if (d.recording_ready_reason !== undefined) {
+    state.recordingReadyReason = d.recording_ready_reason || 'Loading transcription model...';
   }
 
   if (d.recording !== undefined) {
@@ -1746,7 +2034,6 @@ function onStatus(d) {
       state.isViewingPast = false;
       dot.className       = 'status-dot recording';
       text.textContent    = 'Recording…';
-      btn.disabled        = false;
       destroyPlayback();
       if (!_durationInterval) {
         startDurationCounter();
@@ -1754,20 +2041,40 @@ function onStatus(d) {
         initGainSliders();
       }
       _updateBrandIcons(true);
+      if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
       if (_pendingSpeakerProfiles.length) _flushPendingSpeakers(d.session_id);
     } else if (!d.recording) {
       stopDurationCounter();
-      dot.className    = 'status-dot ready';
-      text.textContent = state.modelInfo || 'Ready';
       _updateBrandIcons(false);
+      _updateScreenRecordingStatus(false);
+      _stopScreenPreview();
       refreshSidebar();
       // The WAV is finalized before this event fires, so playback is available
       // immediately - no need to reload the page or click the session.
       if (!state.isViewingPast && state.sessionId) {
         initPlayback(state.sessionId);
+        // Check if a screen recording was saved for this session
+        fetch(`/api/sessions/${state.sessionId}`).then(r => r.json()).then(s => {
+          if (s.has_video) initVideo(state.sessionId);
+        }).catch(() => {});
       }
     }
   }
+
+  if (!state.isRecording) {
+    if (state.isReanalyzing) {
+      dot.className = 'status-dot recording';
+      text.textContent = 'Reanalyzing…';
+    } else if (!state.recordingReady) {
+      dot.className = 'status-dot loading';
+      text.textContent = state.recordingReadyReason || 'Loading transcription model…';
+    } else {
+      dot.className = 'status-dot ready';
+      text.textContent = state.modelInfo || 'Ready';
+    }
+  }
+
+  _syncRecordBtnDisabled();
 }
 
 function updateRecordBtn() {
@@ -1794,6 +2101,10 @@ function updateRecordBtn() {
   if (micSel) micSel.disabled = state.isRecording;
   if (wSel)   wSel.disabled   = state.isRecording;
   if (dSel)   dSel.disabled   = state.isRecording;
+  // Disable screen recording toggle during recording
+  const scrToggle = document.getElementById('screen-record-toggle');
+  if (scrToggle) scrToggle.disabled = state.isRecording;
+  _syncRecordBtnDisabled();
   updateTestBtn();
   syncBrowserMic();
 }
@@ -1861,6 +2172,24 @@ let _navState = { matches: [], currentIdx: -1 };
 // Set while the speaker picker dropdown is open - suppresses auto-scroll
 // so the transcript doesn't jump away while the user is typing a name.
 let _pickerOpen = false;
+
+// Set during bulk session loading to skip expensive per-segment operations.
+// Deferred work (filters, highlights, speaker manager) runs once after the load.
+let _bulkLoading = false;
+let _loadGeneration = 0;  // increments on each loadSession call to cancel stale renders
+
+// ── Performance: in-memory transcript index ──────────────────────────────────
+// Maintained in appendTranscript / _clearSegmentRegistry.  Avoids repeated
+// document.querySelectorAll calls in hot paths (playback, filter, highlights).
+let _segmentRegistry  = [];     // every .transcript-segment element, in insertion order
+let _segmentTimes     = [];     // {start, end, el} for timed segs — sorted by start
+let _visibleRangesCache = null; // cached _getVisibleTimeRanges(); null means stale
+
+function _clearSegmentRegistry() {
+  _segmentRegistry  = [];
+  _segmentTimes     = [];
+  _visibleRangesCache = null;
+}
 
 // speaker_key → display name for the session currently in view
 let _speakerLabels = {};
@@ -1976,9 +2305,10 @@ function _ensureSpeakerProfile(speakerKey, data = {}) {
 
 function _speakerBadgeCount(speakerKey) {
   let count = 0;
-  document.querySelectorAll('.src-speaker').forEach(badge => {
-    if (badge.dataset.speakerKey === speakerKey) count++;
-  });
+  for (const seg of _segmentRegistry) {
+    const badge = seg.querySelector('.src-badge.src-speaker');
+    if (badge && badge.dataset.speakerKey === speakerKey) count++;
+  }
   return count;
 }
 
@@ -2005,7 +2335,10 @@ function speakerColor(speakerKey) {
 
 function _getSortedSpeakerProfiles() {
   const keys = new Set([...Object.keys(_speakerProfiles), ...Object.keys(_speakerLabels)]);
-  document.querySelectorAll('.src-speaker').forEach(badge => keys.add(badge.dataset.speakerKey));
+  for (const seg of _segmentRegistry) {
+    const badge = seg.querySelector('.src-badge.src-speaker');
+    if (badge) keys.add(badge.dataset.speakerKey);
+  }
 
   return [...keys]
     .map(key => _ensureSpeakerProfile(key))
@@ -2036,9 +2369,10 @@ function _speakerOptionNames(currentName = '', excludeKey = '') {
 
 function _highlightSelectedSpeakerBadges() {
   const selected = new Set(_selectedSpeakerKeys);
-  document.querySelectorAll('.src-speaker').forEach(badge => {
-    badge.classList.toggle('speaker-selected', selected.has(badge.dataset.speakerKey));
-  });
+  for (const seg of _segmentRegistry) {
+    const badge = seg.querySelector('.src-badge.src-speaker');
+    if (badge) badge.classList.toggle('speaker-selected', selected.has(badge.dataset.speakerKey));
+  }
 }
 
 function _syncSpeakerDraftFromSelection() {
@@ -2628,7 +2962,7 @@ function clearSpeakerSelection() {
 
 function _toggleTranscriptSegSelection(segEl, { range = false } = {}) {
   if (range && _transcriptSelectionAnchor) {
-    const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+    const allSegs = _segmentRegistry;
     const fromIdx = allSegs.indexOf(_transcriptSelectionAnchor);
     const toIdx   = allSegs.indexOf(segEl);
     if (fromIdx !== -1 && toIdx !== -1) {
@@ -2647,7 +2981,7 @@ function _toggleTranscriptSegSelection(segEl, { range = false } = {}) {
 }
 
 function _updateTranscriptSelectionUI() {
-  document.querySelectorAll('#transcript .transcript-segment').forEach(seg => {
+  _segmentRegistry.forEach(seg => {
     seg.classList.toggle('transcript-seg-selected', _transcriptSelectedSegs.has(seg));
   });
   const bar = document.getElementById('transcript-selection-bar');
@@ -3151,6 +3485,17 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   }
 
   el.appendChild(seg);
+
+  // Register in the in-memory index used by playback and filter hot paths.
+  _segmentRegistry.push(seg);
+  if (startTime != null && startTime > 0) {
+    _segmentTimes.push({ start: startTime, end: endTime ?? startTime, el: seg });
+  }
+  _visibleRangesCache = null;  // new segment may change visible ranges
+
+  // During bulk load, skip expensive per-segment work — it runs once after the load.
+  if (_bulkLoading) return;
+
   // Extend time range slider if navigator is open (before filtering, so pinned max stays Infinity)
   _tnExtendTimeRange();
   _applyFilterToSeg(seg);
@@ -3158,7 +3503,11 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   if (_transcriptFilter.search.trim() && seg.style.display !== 'none') {
     _tnHighlightInSeg(seg);
   }
-  _highlightSelectedSpeakerBadges();
+  // Only check this new segment's badge — no need to re-scan all segments.
+  if (_selectedSpeakerKeys.length) {
+    const badge = seg.querySelector('.src-badge.src-speaker');
+    if (badge) badge.classList.toggle('speaker-selected', _selectedSpeakerKeys.includes(badge.dataset.speakerKey));
+  }
   if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
     renderSpeakerManager();
   }
@@ -3706,7 +4055,7 @@ async function persistSpeakerLabel(speakerKey, name, color = null) {
 }
 
 function copyTranscript() {
-  const segs = document.querySelectorAll('#transcript .transcript-segment');
+  const segs = _segmentRegistry;
   const lines = [];
   segs.forEach(seg => {
     if (seg.style.display === 'none') return; // respect active filter
@@ -3777,7 +4126,8 @@ function _applyFilterToSeg(seg) {
 }
 
 function applyTranscriptFilter() {
-  document.querySelectorAll('#transcript .transcript-segment').forEach(_applyFilterToSeg);
+  _segmentRegistry.forEach(_applyFilterToSeg);
+  _visibleRangesCache = null;  // filter changed — invalidate cached ranges
   _tnHighlightMatches();
 }
 
@@ -3789,13 +4139,16 @@ function _updateFilterBtnState() {
 // ── Panel toggle ──────────────────────────────────────────────────────────────
 
 function openTranscriptFilter() {
+  const filter_btn = document.getElementById('transcript-filter-btn');
   const panel = document.getElementById('transcript-navigator');
   if (!panel) return;
   const isOpen = !panel.classList.contains('collapsed');
   if (isOpen) {
+    filter_btn?.classList.remove('open');
     panel.classList.add('collapsed');
     return;
   }
+  filter_btn?.classList.add('open');
   panel.classList.remove('collapsed');
   _tnRefreshSpeakerPills();
   _tnRefreshReassignDropdowns();
@@ -3859,7 +4212,7 @@ function _tnHighlightMatches() {
   const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(escaped, 'gi');
 
-  document.querySelectorAll('#transcript .transcript-segment').forEach(seg => {
+  _segmentRegistry.forEach(seg => {
     if (seg.style.display === 'none') return;
     // Only highlight in text nodes that are NOT inside a badge
     const textNodes = [];
@@ -3995,7 +4348,7 @@ function tnToggleKeyLabels() {
 // Update all transcript segment badges to show either original speaker keys
 // or display names, depending on _showOriginalKeys state.
 function _tnRefreshTranscriptBadges() {
-  document.querySelectorAll('#transcript .transcript-segment').forEach(seg => {
+  _segmentRegistry.forEach(seg => {
     const badge = seg.querySelector('.src-badge.src-speaker');
     if (!badge) return;
     const speakerKey = badge.dataset.speakerKey;
@@ -4212,7 +4565,7 @@ function tnToggleAllSpeakers(showAll) {
 
 function _tnJumpToNextSpeaker(speakerKeys, direction) {
   const keysSet = new Set(speakerKeys);
-  const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+  const allSegs = _segmentRegistry;
   const transcriptEl = document.getElementById('transcript');
   const scrollTop = transcriptEl.scrollTop;
   const containerTop = transcriptEl.getBoundingClientRect().top;
@@ -4290,7 +4643,7 @@ async function tnApplyReassign() {
   if (!fromName || !toName || fromName === toName) return;
 
   const visibleOnly = document.getElementById('tn-reassign-visible-only')?.checked;
-  const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+  const allSegs = _segmentRegistry;
   const targets = allSegs.filter(seg => {
     if (visibleOnly && seg.style.display === 'none') return false;
     const badge = seg.querySelector('.src-speaker');
@@ -4454,7 +4807,7 @@ function _refreshAnalytics() {
   if (!panel || panel.classList.contains('collapsed')) return;
 
   const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
-  const allSegs = [...document.querySelectorAll('#transcript .transcript-segment')];
+  const allSegs = _segmentRegistry;
 
   // Gather per-speaker data
   const speakerData = [];
@@ -4854,6 +5207,7 @@ function destroyPlayback() {
   document.getElementById('playback-duration').textContent = '0:00';
   document.getElementById('playback-seek').value = 0;
   clearPlayingHighlight();
+  destroyVideo();
 }
 
 function togglePlayback() {
@@ -4896,21 +5250,21 @@ function setPlaybackSpeed(val) {
 
 // Build a sorted list of visible time ranges from transcript segments
 function _getVisibleTimeRanges() {
+  if (_visibleRangesCache) return _visibleRangesCache;
   const ranges = [];
-  document.querySelectorAll('#transcript .transcript-segment[data-start]').forEach(seg => {
-    if (seg.style.display === 'none') {
+  for (const { start, end, el } of _segmentTimes) {
+    if (el.style.display === 'none') {
       // Noise segments are hidden by default but their audio should still play.
       // Only skip segments hidden by an active speaker/search filter.
-      const source = seg.dataset.transcriptSource || '';
+      const source = el.dataset.transcriptSource || '';
       const isNoise = source === _NOISE_LABEL || _manualNoiseKeys.has(source);
-      if (!isNoise) return;
+      if (!isNoise) continue;
     }
-    ranges.push({
-      start: parseFloat(seg.dataset.start),
-      end:   parseFloat(seg.dataset.end),
-    });
-  });
+    ranges.push({ start, end });
+  }
+  // _segmentTimes is insertion-ordered (chronological), but sort defensively.
   ranges.sort((a, b) => a.start - b.start);
+  _visibleRangesCache = ranges;
   return ranges;
 }
 
@@ -4950,13 +5304,14 @@ function _doProgrammaticScroll(el, opts) {
 }
 
 function highlightPlayingSegment(t) {
-  const segs = document.querySelectorAll('.transcript-segment[data-start]');
-  let found = null;
-  for (const seg of segs) {
-    const start = parseFloat(seg.dataset.start);
-    const end   = parseFloat(seg.dataset.end);
-    if (t >= start && t < end) { found = seg; break; }
+  // Binary search on _segmentTimes (sorted by start) — O(log n) vs O(n) querySelectorAll.
+  let lo = 0, hi = _segmentTimes.length - 1, idx = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (_segmentTimes[mid].start <= t) { idx = mid; lo = mid + 1; }
+    else hi = mid - 1;
   }
+  const found = (idx >= 0 && _segmentTimes[idx].end > t) ? _segmentTimes[idx].el : null;
   if (found === _currentPlayingSeg) return;
   if (_currentPlayingSeg) _currentPlayingSeg.classList.remove('playing');
   _currentPlayingSeg = found;
@@ -4975,7 +5330,192 @@ function clearPlayingHighlight() {
   }
 }
 
+/* ── Video viewer ────────────────────────────────────────────────────────── */
+let _videoAvailable = false;
+let _videoVisible   = false;
+const _playbackVideo = document.getElementById('playback-video');
+
+function initVideo(sessionId) {
+  const video = _playbackVideo;
+  video.src = `/api/sessions/${sessionId}/video`;
+  video.load();
+  _videoAvailable = true;
+
+  // Show the toggle button in the playback bar
+  document.getElementById('playback-video-toggle').classList.remove('hidden');
+
+  // Sync playback rate with audio
+  video.playbackRate = _playbackAudio.playbackRate;
+
+  // When video metadata loads, ensure time is synced
+  video.onloadedmetadata = () => {
+    video.currentTime = _playbackAudio.currentTime;
+  };
+}
+
+function destroyVideo() {
+  _playbackVideo.pause();
+  _playbackVideo.removeAttribute('src');
+  _playbackVideo.load();
+  _videoAvailable = false;
+  _videoVisible = false;
+  document.getElementById('video-viewer').classList.add('hidden');
+  document.getElementById('playback-video-toggle').classList.add('hidden');
+  const btn = document.getElementById('playback-video-toggle');
+  btn.classList.remove('active');
+}
+
+function toggleVideoViewer() {
+  if (!_videoAvailable) return;
+  _videoVisible = !_videoVisible;
+  document.getElementById('video-viewer').classList.toggle('hidden', !_videoVisible);
+  document.getElementById('playback-video-toggle').classList.toggle('active', _videoVisible);
+  if (_videoVisible) {
+    // Sync video to current audio position
+    _syncVideoToAudio();
+    if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
+  } else {
+    _playbackVideo.pause();
+  }
+}
+
+function _syncVideoToAudio() {
+  if (!_videoAvailable || !_videoVisible) return;
+  const drift = Math.abs(_playbackVideo.currentTime - _playbackAudio.currentTime);
+  if (drift > 0.3) {
+    _playbackVideo.currentTime = _playbackAudio.currentTime;
+  }
+}
+
+// Patch existing playback functions to keep video in sync
+const _origTogglePlayback = togglePlayback;
+togglePlayback = function() {
+  _origTogglePlayback();
+  if (!_videoAvailable || !_videoVisible) return;
+  if (_playbackAudio.paused) {
+    _playbackVideo.pause();
+  } else {
+    _syncVideoToAudio();
+    _playbackVideo.play().catch(() => {});
+  }
+};
+
+const _origSeekPlayback = seekPlayback;
+seekPlayback = function(val) {
+  _origSeekPlayback(val);
+  if (_videoAvailable) {
+    _playbackVideo.currentTime = parseFloat(val);
+  }
+};
+
+const _origSeekToTime = seekToTime;
+seekToTime = function(t) {
+  _origSeekToTime(t);
+  if (_videoAvailable) {
+    _playbackVideo.currentTime = t;
+    if (_videoVisible && !_playbackVideo.paused !== !_playbackAudio.paused) {
+      if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
+      else _playbackVideo.pause();
+    }
+  }
+};
+
+const _origSetPlaybackSpeed = setPlaybackSpeed;
+setPlaybackSpeed = function(val) {
+  _origSetPlaybackSpeed(val);
+  if (_videoAvailable) _playbackVideo.playbackRate = parseFloat(val);
+};
+
+// Periodic drift correction — runs on audio's timeupdate
+_playbackAudio.addEventListener('timeupdate', () => {
+  if (_videoAvailable && _videoVisible && !_playbackAudio.paused) {
+    _syncVideoToAudio();
+    // Keep play state in sync (filter skipping can pause/seek audio)
+    if (_playbackVideo.paused) _playbackVideo.play().catch(() => {});
+  }
+});
+
+// When audio ends, stop video too
+_playbackAudio.addEventListener('ended', () => {
+  if (_videoAvailable) _playbackVideo.pause();
+});
+
+// When audio is paused externally, pause video
+_playbackAudio.addEventListener('pause', () => {
+  if (_videoAvailable && _videoVisible) _playbackVideo.pause();
+});
+
+// When audio plays, play video
+_playbackAudio.addEventListener('play', () => {
+  if (_videoAvailable && _videoVisible) {
+    _syncVideoToAudio();
+    _playbackVideo.play().catch(() => {});
+  }
+});
+
+/* ── Live screen preview ─────────────────────────────────────────────────── */
+let _screenPreviewVisible = false;
+let _screenPreviewTimer   = null;
+const _SCREEN_PREVIEW_INTERVAL = 1500; // ms between frame refreshes
+
+function toggleScreenPreview() {
+  _screenPreviewVisible = !_screenPreviewVisible;
+  const panel = document.getElementById('screen-preview');
+  const btn   = document.getElementById('screen-preview-toggle');
+  if (panel) panel.classList.toggle('hidden', !_screenPreviewVisible);
+  if (btn)   btn.classList.toggle('active', _screenPreviewVisible);
+  if (_screenPreviewVisible) {
+    // Load first frame immediately, then refresh on interval
+    _refreshScreenPreview();
+    _screenPreviewTimer = setInterval(_refreshScreenPreview, _SCREEN_PREVIEW_INTERVAL);
+  } else {
+    clearInterval(_screenPreviewTimer);
+    _screenPreviewTimer = null;
+  }
+}
+
+
+function _refreshScreenPreview() {
+  const img = document.getElementById('screen-preview-img');
+  if (!img || !_screenPreviewVisible) return;
+  // Append timestamp to bust cache
+  img.src = '/api/screen/preview?_=' + Date.now();
+}
+
+function _showScreenPreviewToggle(show) {
+  const btn = document.getElementById('screen-preview-toggle');
+  if (btn) btn.classList.toggle('hidden', !show);
+}
+
+function _stopScreenPreview() {
+  _screenPreviewVisible = false;
+  clearInterval(_screenPreviewTimer);
+  _screenPreviewTimer = null;
+  const panel = document.getElementById('screen-preview');
+  const btn   = document.getElementById('screen-preview-toggle');
+  if (panel) panel.classList.add('hidden');
+  if (btn)   { btn.classList.add('hidden'); btn.classList.remove('active'); }
+}
+
 /* ── Chat ────────────────────────────────────────────────────────────────── */
+// Whether each pane is scrolled to (or near) the bottom.
+// Auto-scroll is suppressed when the user has scrolled up; resumes on scroll-to-bottom.
+let _chatAtBottom    = true;
+let _summaryAtBottom = true;
+const _SCROLL_BOTTOM_THRESHOLD = 60; // px tolerance
+
+function _paneIsAtBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < _SCROLL_BOTTOM_THRESHOLD;
+}
+
+// Wire up scroll listeners once the DOM is ready.
+(function _initPaneScrollTracking() {
+  const chat    = document.getElementById('chat-messages');
+  const summary = document.getElementById('summary');
+  if (chat)    chat.addEventListener('scroll',    () => { _chatAtBottom    = _paneIsAtBottom(chat);    }, { passive: true });
+  if (summary) summary.addEventListener('scroll', () => { _summaryAtBottom = _paneIsAtBottom(summary); }, { passive: true });
+})();
+
 function createAssistantBubble() {
   const el = document.getElementById('chat-messages');
   el.querySelector('.empty-hint')?.remove();
@@ -4986,13 +5526,18 @@ function createAssistantBubble() {
       <div class="chat-avatar assistant">AI</div>
       <span class="chat-role">Assistant</span>
     </div>
-    <div class="chat-msg-body markdown-body"></div>`;
+    <div class="chat-msg-body markdown-body"></div>
+    <div class="chat-msg-actions">
+      <button class="chat-msg-action-btn" title="Copy response" onclick="_copyChatMsg(this)">
+        <i class="fa-regular fa-copy"></i> Copy
+      </button>
+    </div>`;
   el.appendChild(wrap);
-  scrollChatToBottom();
+  scrollChatToBottom();  // response is starting — always scroll
   return wrap.querySelector('.chat-msg-body');
 }
 
-function appendUserBubble(text) {
+function appendUserBubble(text, attachments) {
   const el = document.getElementById('chat-messages');
   el.querySelector('.empty-hint')?.remove();
   const wrap = document.createElement('div');
@@ -5004,10 +5549,16 @@ function appendUserBubble(text) {
     </div>
     <div class="chat-msg-body">${escapeHtml(text)}</div>`;
   el.appendChild(wrap);
+  if (attachments?.length) {
+    _renderBubbleAttachments(wrap.querySelector('.chat-msg-body'), attachments);
+  }
+  // User sent a message — reset flag and force-scroll so the response is visible.
+  _chatAtBottom = true;
   scrollChatToBottom();
 }
 
-function scrollChatToBottom() {
+function scrollChatToBottom(force = false) {
+  if (!force && !_chatAtBottom) return;
   const el = document.getElementById('chat-messages');
   el.scrollTop = el.scrollHeight;
 }
@@ -5017,40 +5568,288 @@ function clearChat() {
     '<p class="empty-hint">Chat cleared.</p>';
 }
 
+let _chatRequestId = null;  // tracks the active chat request for cancellation
+
 async function sendMessage() {
   if (state.aiChatBusy || !state.sessionId) return;
   const input    = document.getElementById('chat-input');
   const question = input.value.trim();
-  if (!question) return;
+  const attachments = [..._pendingAttachments];
+  if (!question && !attachments.length) return;
 
   input.value = '';
-  appendUserBubble(question);
+  _autogrowChatInput();
+  appendUserBubble(question, attachments);
+  _clearAttachments();
   state.aiChatBusy = true;
-  setSendBusy(true);
+  _setChatBusy(true);
 
   const resp = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: state.sessionId, question }),
+    body: JSON.stringify({
+      session_id: state.sessionId,
+      question,
+      attachments: attachments.map(a => ({id: a.id, filename: a.filename, mime: a.mime, size: a.size, stored: a.stored})),
+    }),
   });
-  if (!resp.ok) {
+  if (resp.ok) {
+    const data = await resp.json();
+    _chatRequestId = data.request_id;
+  } else {
     const err = await resp.json().catch(() => ({}));
     const bubble = createAssistantBubble();
     bubble.textContent = `Error: ${err.error || 'Unknown error'}`;
     state.aiChatBusy = false;
-    setSendBusy(false);
+    _setChatBusy(false);
   }
+}
+
+async function stopChatGeneration() {
+  await fetch('/api/chat/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: _chatRequestId }),
+  }).catch(() => {});
 }
 
 function handleChatKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 }
 
-function setSendBusy(busy) {
-  const btn = document.getElementById('send-btn');
-  btn.disabled    = busy;
-  btn.textContent = busy ? '…' : 'Send';
+function _setChatBusy(busy) {
+  const sendBtn = document.getElementById('send-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  sendBtn.disabled = busy;
+  if (busy) {
+    sendBtn.classList.add('hidden');
+    stopBtn.classList.remove('hidden');
+  } else {
+    sendBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+    _chatRequestId = null;
+  }
 }
+
+/* ── Auto-grow textarea ───────────────────────────────────────────────────── */
+function _autogrowChatInput() {
+  const ta = document.getElementById('chat-input');
+  ta.style.height = 'auto';
+  ta.style.height = ta.scrollHeight + 'px';
+  // If content exceeds max-height, allow scrolling; otherwise hide overflow
+  ta.style.overflowY = ta.scrollHeight > ta.clientHeight ? 'auto' : 'hidden';
+}
+
+/* ── Copy helpers ─────────────────────────────────────────────────────────── */
+function _copyChatMsg(btn) {
+  const body = btn.closest('.chat-msg')?.querySelector('.chat-msg-body');
+  if (!body) return;
+  navigator.clipboard.writeText(body.innerText).then(() => {
+    btn.classList.add('copied');
+    btn.querySelector('i').className = 'fa-solid fa-check';
+    setTimeout(() => {
+      btn.classList.remove('copied');
+      btn.querySelector('i').className = 'fa-regular fa-copy';
+    }, 1500);
+  });
+}
+
+function _addCodeCopyButtons(container) {
+  container.querySelectorAll('pre').forEach(pre => {
+    if (pre.querySelector('.code-copy-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'code-copy-btn';
+    btn.innerHTML = '<i class="fa-regular fa-copy"></i> Copy';
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const code = pre.querySelector('code')?.innerText || pre.innerText;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.classList.add('copied');
+        btn.innerHTML = '<i class="fa-solid fa-check"></i> Copied';
+        setTimeout(() => {
+          btn.classList.remove('copied');
+          btn.innerHTML = '<i class="fa-regular fa-copy"></i> Copy';
+        }, 1500);
+      });
+    });
+    pre.appendChild(btn);
+  });
+}
+
+// Backward-compat alias used by older callers
+function setSendBusy(busy) { _setChatBusy(busy); }
+
+/* ── Attachments ──────────────────────────────────────────────────────────── */
+let _pendingAttachments = [];  // [{id, filename, mime, size, stored, localUrl?}]
+
+const _IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function _handleFileSelect(files) {
+  for (const f of files) _uploadAttachment(f);
+}
+
+async function _uploadAttachment(file) {
+  const preview = document.getElementById('chat-attach-preview');
+  preview.classList.remove('hidden');
+
+  // Create preview item
+  const item = document.createElement('div');
+  item.className = 'chat-attach-item uploading';
+  const isImage = file.type.startsWith('image/');
+  if (isImage) {
+    const img = document.createElement('img');
+    img.src = URL.createObjectURL(file);
+    item.appendChild(img);
+  } else {
+    const icon = document.createElement('i');
+    icon.className = 'fa-solid fa-file';
+    icon.style.fontSize = '14px';
+    item.appendChild(icon);
+  }
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'attach-name';
+  nameSpan.textContent = file.name;
+  item.appendChild(nameSpan);
+  preview.appendChild(item);
+
+  // Upload
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const resp = await fetch('/api/chat/upload', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      item.classList.add('upload-error');
+      item.title = err.error || 'Upload failed';
+      item.classList.remove('uploading');
+      setTimeout(() => { item.remove(); _refreshAttachPreview(); }, 3000);
+      return;
+    }
+    const meta = await resp.json();
+    meta.localUrl = isImage ? URL.createObjectURL(file) : null;
+    _pendingAttachments.push(meta);
+    item.classList.remove('uploading');
+    item.dataset.attachId = meta.id;
+
+    // Add remove button
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'attach-remove';
+    removeBtn.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+    removeBtn.addEventListener('click', () => {
+      _pendingAttachments = _pendingAttachments.filter(a => a.id !== meta.id);
+      item.remove();
+      _refreshAttachPreview();
+    });
+    item.appendChild(removeBtn);
+  } catch {
+    item.classList.add('upload-error');
+    item.classList.remove('uploading');
+    setTimeout(() => { item.remove(); _refreshAttachPreview(); }, 3000);
+  }
+}
+
+function _refreshAttachPreview() {
+  const preview = document.getElementById('chat-attach-preview');
+  if (!preview.children.length) preview.classList.add('hidden');
+}
+
+function _clearAttachments() {
+  _pendingAttachments = [];
+  const preview = document.getElementById('chat-attach-preview');
+  preview.innerHTML = '';
+  preview.classList.add('hidden');
+}
+
+/** Render attachment thumbnails/links inside a chat bubble body element. */
+function _renderBubbleAttachments(bodyEl, attachments) {
+  if (!attachments || !attachments.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-bubble-attachments';
+  for (const att of attachments) {
+    const url = `/api/chat/attachment/${att.stored}`;
+    if (_IMAGE_MIMES.has(att.mime) || (att.mime && att.mime.startsWith('image/'))) {
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = att.filename;
+      img.title = att.filename;
+      img.addEventListener('click', () => window.open(url, '_blank'));
+      wrap.appendChild(img);
+    } else {
+      const link = document.createElement('a');
+      link.className = 'chat-bubble-attachment-file';
+      link.href = url;
+      link.target = '_blank';
+      link.innerHTML = `<i class="fa-solid fa-file"></i> ${escapeHtml(att.filename)}`;
+      wrap.appendChild(link);
+    }
+  }
+  bodyEl.insertBefore(wrap, bodyEl.firstChild);
+}
+
+// ── Drag-and-drop overlay on the full chat pane ───────────────────────────────
+{
+  const chatCol = document.querySelector('.col-chat');
+  const overlay = document.getElementById('chat-drop-overlay');
+  const hint    = document.getElementById('chat-drop-hint');
+
+  if (chatCol && overlay) {
+    let dragCounter = 0;
+
+    const showOverlay = (e) => {
+      // Update hint with file count when the browser exposes it
+      const count = e.dataTransfer?.items?.length;
+      if (hint && count) {
+        hint.textContent = count === 1 ? '1 file ready to attach' : `${count} files ready to attach`;
+      } else if (hint) {
+        hint.textContent = 'Images · PDFs · text files';
+      }
+      overlay.setAttribute('aria-hidden', 'false');
+      overlay.classList.add('active');
+    };
+
+    const hideOverlay = () => {
+      overlay.classList.remove('active');
+      overlay.setAttribute('aria-hidden', 'true');
+    };
+
+    chatCol.addEventListener('dragenter', e => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+      if (++dragCounter === 1) showOverlay(e);
+    });
+
+    chatCol.addEventListener('dragleave', e => {
+      if (!chatCol.contains(e.relatedTarget)) {
+        dragCounter = 0;
+        hideOverlay();
+      }
+    });
+
+    chatCol.addEventListener('dragover', e => {
+      if (e.dataTransfer?.types?.includes('Files')) e.preventDefault();
+    });
+
+    chatCol.addEventListener('drop', e => {
+      e.preventDefault();
+      dragCounter = 0;
+      hideOverlay();
+      if (e.dataTransfer?.files?.length) _handleFileSelect(e.dataTransfer.files);
+    });
+  }
+}
+
+// ── Paste images from clipboard ──────────────────────────────────────────────
+document.getElementById('chat-input')?.addEventListener('paste', e => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === 'file' && item.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      if (file) _uploadAttachment(file);
+    }
+  }
+});
 
 /* ── Past sessions ───────────────────────────────────────────────────────── */
 async function loadSession(sessionId) {
@@ -5061,8 +5860,16 @@ async function loadSession(sessionId) {
     await fetch('/api/recording/stop', { method: 'POST' });
   }
 
+  const gen = ++_loadGeneration;  // cancel any in-flight chunked render
+
   const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json());
-  if (data.error) { alert(data.error); return; }
+  if (data.error) {
+    // Session not found — clean up URL and show a brief status message
+    history.replaceState(null, '', location.pathname);
+    flashStatus('Session not found');
+    return;
+  }
+  if (gen !== _loadGeneration) return;  // another load started while we were fetching
 
   clearAll();
   state.sessionId     = sessionId;
@@ -5085,10 +5892,38 @@ async function loadSession(sessionId) {
     .then(links => { _sessionLinks = links || {}; _updateLinkedBadges(); })
     .catch(() => {});
 
-  data.segments?.forEach(s =>
-    appendTranscript(s.text, s.source_override || s.source || 'loopback', s.start_time, s.end_time,
-                     s.id, s.label_override, s.source_override ? s.source : null)
-  );
+  // Render segments in chunks to keep the UI responsive on large transcripts.
+  const segments = data.segments || [];
+  const CHUNK = 150;  // segments per animation frame
+
+  if (segments.length > CHUNK) {
+    // Show loading hint and render in async chunks
+    const transcriptEl = document.getElementById('transcript');
+    transcriptEl.innerHTML = '';
+    const loadingHint = document.createElement('p');
+    loadingHint.className = 'empty-hint loading-hint';
+    loadingHint.textContent = `Loading ${segments.length} segments…`;
+    transcriptEl.appendChild(loadingHint);
+
+    _bulkLoading = true;
+    const completed = await _renderSegmentsChunked(segments, CHUNK, loadingHint, gen);
+    _bulkLoading = false;
+    if (!completed) return;  // load was cancelled by a newer loadSession call
+    _finishBulkLoad();
+  } else {
+    // Small transcript — render synchronously (fast enough)
+    segments.forEach(s =>
+      appendTranscript(s.text, s.source_override || s.source || 'loopback', s.start_time, s.end_time,
+                       s.id, s.label_override, s.source_override ? s.source : null)
+    );
+  }
+
+  // Handle pending search highlight — scroll to and flash the matching segment
+  if (_pendingSearchHighlight) {
+    const hl = _pendingSearchHighlight;
+    _pendingSearchHighlight = null;
+    requestAnimationFrame(() => _executeSearchHighlight(hl));
+  }
 
   // Restore summary prompt for this session
   const storedPrompt = localStorage.getItem('summary-prompt:' + sessionId) || '';
@@ -5101,6 +5936,7 @@ async function loadSession(sessionId) {
 
   // Show playback bar if audio is available
   if (data.has_audio) initPlayback(sessionId);
+  if (data.has_video) initVideo(sessionId);
 
   if (data.summary) {
     const sumEl = document.getElementById('summary');
@@ -5112,17 +5948,63 @@ async function loadSession(sessionId) {
   if (data.chat_messages?.length) {
     document.getElementById('chat-messages').innerHTML = '';
     for (const m of data.chat_messages) {
-      if (m.role === 'user') appendUserBubble(m.content);
-      else {
+      const atts = m.attachments ? (typeof m.attachments === 'string' ? JSON.parse(m.attachments) : m.attachments) : null;
+      if (m.role === 'user') {
+        appendUserBubble(m.content, atts);
+      } else {
         const b = createAssistantBubble();
         b.innerHTML = renderMd(m.content);
         linkifyTimestamps(b);
       }
     }
     highlightCode('#chat-messages');
+    _addCodeCopyButtons(document.getElementById('chat-messages'));
   }
 
   refreshSidebar();  // re-render to highlight active item
+}
+
+/**
+ * Render transcript segments in chunks, yielding to the browser between batches
+ * so the UI stays responsive. Returns a promise that resolves when all segments
+ * are rendered.
+ */
+function _renderSegmentsChunked(segments, chunkSize, loadingHint, gen) {
+  return new Promise(resolve => {
+    let i = 0;
+    function renderChunk() {
+      if (gen !== _loadGeneration) { resolve(false); return; }  // cancelled
+      const end = Math.min(i + chunkSize, segments.length);
+      for (; i < end; i++) {
+        const s = segments[i];
+        appendTranscript(s.text, s.source_override || s.source || 'loopback',
+                         s.start_time, s.end_time, s.id,
+                         s.label_override, s.source_override ? s.source : null);
+      }
+      if (loadingHint && loadingHint.parentNode) {
+        loadingHint.textContent = `Loading… ${i} / ${segments.length}`;
+      }
+      if (i < segments.length) {
+        requestAnimationFrame(renderChunk);
+      } else {
+        if (loadingHint && loadingHint.parentNode) loadingHint.remove();
+        resolve(true);
+      }
+    }
+    requestAnimationFrame(renderChunk);
+  });
+}
+
+/**
+ * Run deferred per-segment operations once after bulk loading finishes.
+ */
+function _finishBulkLoad() {
+  _tnExtendTimeRange();
+  applyTranscriptFilter();
+  _highlightSelectedSpeakerBadges();
+  if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
+    renderSpeakerManager();
+  }
 }
 
 /* ── Shutdown ────────────────────────────────────────────────────────────── */
@@ -5180,6 +6062,7 @@ function clearAll() {
   _navState = { matches: [], currentIdx: -1 };
   const tnSearch = document.getElementById('tn-search-input');
   if (tnSearch) tnSearch.value = '';
+  document.getElementById('transcript-filter-btn')?.classList.remove('open');
   document.getElementById('transcript-navigator')?.classList.add('collapsed');
   document.getElementById('analytics-panel')?.classList.add('collapsed');
   document.getElementById('analytics-btn')?.classList.remove('active');
@@ -5187,12 +6070,16 @@ function clearAll() {
   closeSpeakerManager();
   const bar = document.getElementById('transcript-selection-bar');
   if (bar) bar.classList.add('hidden');
+  _clearSegmentRegistry();
   document.getElementById('transcript').innerHTML =
     '<p class="empty-hint">Transcript will appear here once recording starts.</p>';
   document.getElementById('summary').innerHTML =
     '<p class="empty-hint">An auto-updating summary will appear here as the meeting progresses.</p>';
   document.getElementById('chat-messages').innerHTML =
     '<p class="empty-hint">Ask questions about the meeting here.</p>';
+  state.aiChatBusy = false;
+  _setChatBusy(false);
+  _clearAttachments();
   state.summaryBuffer    = '';
   state.summaryStreaming  = false;
   state.chatBuffer       = '';
@@ -5489,11 +6376,35 @@ function initGainSliders() {
 }
 
 /* ── Model config ────────────────────────────────────────────────────────── */
-function toggleModelConfig() {
-  const body  = document.getElementById('model-config-body');
-  const arrow = document.getElementById('model-config-arrow');
+function toggleSidebarPane(key) {
+  const body  = document.getElementById('pane-body-' + key);
+  const arrow = document.getElementById('pane-arrow-' + key);
+  if (!body) return;
   const hidden = body.classList.toggle('hidden');
-  arrow.innerHTML = hidden ? '<i class="fa-solid fa-chevron-right"></i>' : '<i class="fa-solid fa-chevron-down"></i>';
+  if (arrow) arrow.innerHTML = hidden
+    ? '<i class="fa-solid fa-chevron-right"></i>'
+    : '<i class="fa-solid fa-chevron-down"></i>';
+  // Persist collapsed state
+  try {
+    const collapsed = JSON.parse(localStorage.getItem('sidebar-panes') || '{}');
+    collapsed[key] = hidden;
+    localStorage.setItem('sidebar-panes', JSON.stringify(collapsed));
+  } catch (_) {}
+}
+
+function _restoreSidebarPanes() {
+  try {
+    const collapsed = JSON.parse(localStorage.getItem('sidebar-panes') || '{}');
+    for (const [key, isCollapsed] of Object.entries(collapsed)) {
+      const body  = document.getElementById('pane-body-' + key);
+      const arrow = document.getElementById('pane-arrow-' + key);
+      if (!body) continue;
+      body.classList.toggle('hidden', isCollapsed);
+      if (arrow) arrow.innerHTML = isCollapsed
+        ? '<i class="fa-solid fa-chevron-right"></i>'
+        : '<i class="fa-solid fa-chevron-down"></i>';
+    }
+  } catch (_) {}
 }
 
 async function loadModelConfig() {
@@ -5713,7 +6624,11 @@ async function openSettings() {
   } catch (_) {}
 
   // Audio params — load eagerly so panels are ready when clicked
-  _apRefresh();
+  _apRefresh().then(() => _syncScreenToggle());
+
+  // Screen recording presets + ffmpeg status
+  loadScreenPresets();
+  loadScreenDisplays();
 }
 
 /** Sync provider toggle buttons and model dropdown to the given values. */
@@ -6196,6 +7111,7 @@ async function _apRefresh() {
   _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
   _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
   _apRenderSection('ap-echo-params',          _apCache.echo_cancellation, _apCache.current);
+  _apRenderSection('ap-screen-params',        _apCache.screen_recording,  _apCache.current);
 }
 
 async function _apSave(key, value) {
@@ -6208,12 +7124,14 @@ async function _apSave(key, value) {
     if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
       // Update reset button visibility
-      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]));
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
       const resetBtn = document.getElementById(`ap-reset-${key}`);
       if (resetBtn && spec) {
         const isDefault = Math.abs(value - spec.value) < 1e-9;
         resetBtn.classList.toggle('ap-reset-hidden', isDefault);
       }
+      // Keep sidebar screen toggle in sync with settings panel
+      if (key === 'screen_record_enabled') _syncScreenToggle();
     }
   } catch (_) {}
 }
@@ -6227,7 +7145,7 @@ async function _apResetOne(key) {
     }).then(r => r.json());
     if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
-      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]));
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
       if (spec) {
         if (spec.type === 'toggle') {
           const cb = document.getElementById(`ap-toggle-${key}`);
@@ -6252,6 +7170,164 @@ async function _apResetOne(key) {
       if (resetBtn) resetBtn.classList.add('ap-reset-hidden');
     }
   } catch (_) {}
+}
+
+// ── Screen Recording ──────────────────────────────────────────────────────
+
+let _screenDisplays = [];
+let _screenPresetsData = null;
+
+async function loadScreenDisplays() {
+  try {
+    const data = await fetch('/api/screen/displays').then(r => r.json());
+    _screenDisplays = data.displays || [];
+    _renderDisplayGrid(data.selected);
+    // Update ffmpeg status in settings
+    const ffEl = document.getElementById('settings-ffmpeg-status');
+    if (ffEl) {
+      ffEl.textContent = data.ffmpeg_available ? 'Available' : 'Not installed';
+      ffEl.className = 'settings-info-val ' + (data.ffmpeg_available ? 'val-ok' : 'val-warn');
+    }
+  } catch (_) {}
+}
+
+function _renderDisplayGrid(selectedIdx) {
+  const grid = document.getElementById('screen-display-grid');
+  if (!grid) return;
+  grid.innerHTML = '';
+
+  if (_screenDisplays.length === 0) {
+    grid.innerHTML = '<div class="screen-display-empty">No displays detected</div>';
+    return;
+  }
+
+  // Calculate scale for thumbnails — fit all monitors into the grid
+  const allLeft   = Math.min(..._screenDisplays.map(d => d.x));
+  const allTop    = Math.min(..._screenDisplays.map(d => d.y));
+  const allRight  = Math.max(..._screenDisplays.map(d => d.x + d.width));
+  const allBottom = Math.max(..._screenDisplays.map(d => d.y + d.height));
+  const totalW = allRight - allLeft;
+  const totalH = allBottom - allTop;
+
+  // Grid is roughly 200px wide — scale to fit
+  const gridW = 200;
+  const scale = gridW / totalW;
+  const gridH = totalH * scale;
+
+  const container = document.createElement('div');
+  container.className = 'screen-display-map';
+  container.style.width = gridW + 'px';
+  container.style.height = Math.max(gridH, 30) + 'px';
+  container.style.position = 'relative';
+
+  _screenDisplays.forEach((disp, i) => {
+    const el = document.createElement('div');
+    el.className = 'screen-display-thumb' + (i === selectedIdx ? ' selected' : '');
+    el.style.left   = ((disp.x - allLeft) * scale) + 'px';
+    el.style.top    = ((disp.y - allTop) * scale) + 'px';
+    el.style.width  = (disp.width * scale) + 'px';
+    el.style.height = (disp.height * scale) + 'px';
+    el.title = disp.label;
+    el.innerHTML = `<span class="screen-display-num">${i + 1}</span>`;
+    el.onclick = () => selectScreenDisplay(i);
+    container.appendChild(el);
+  });
+
+  grid.appendChild(container);
+
+  // Label below
+  if (_screenDisplays[selectedIdx]) {
+    const label = document.createElement('div');
+    label.className = 'screen-display-label';
+    label.textContent = _screenDisplays[selectedIdx].label;
+    grid.appendChild(label);
+  }
+}
+
+async function selectScreenDisplay(idx) {
+  try {
+    await fetch('/api/screen/displays', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ display: idx }),
+    });
+    _renderDisplayGrid(idx);
+    // Flash a border on the physical display so the user can identify it
+    fetch('/api/screen/identify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ display: idx }),
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+async function toggleScreenRecordEnabled(enabled) {
+  // Save via audio params system
+  await _apSave('screen_record_enabled', enabled ? 1 : 0);
+  // Toggle visual is handled by the pane collapse — no need to hide body here
+}
+
+function _syncScreenToggle() {
+  if (!_apCache) return;
+  const enabled = parseInt(_apCache.current.screen_record_enabled || 0);
+  const toggle = document.getElementById('screen-record-toggle');
+  if (toggle) toggle.checked = !!enabled;
+  // Toggle visual is handled by the pane collapse — no need to hide body here
+}
+
+async function loadScreenPresets() {
+  try {
+    _screenPresetsData = await fetch('/api/screen/presets').then(r => r.json());
+    _renderScreenPresetDropdown(_screenPresetsData.selected);
+  } catch (_) {}
+}
+
+function _renderScreenPresetDropdown(selectedId) {
+  const sel = document.getElementById('screen-preset-sel');
+  if (!sel || !_screenPresetsData) return;
+  sel.innerHTML = '';
+  for (const [id, p] of Object.entries(_screenPresetsData.presets)) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = p.label;
+    if (id === selectedId) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  // Update description
+  const desc = document.getElementById('screen-preset-desc');
+  const preset = _screenPresetsData.presets[selectedId];
+  if (desc && preset) desc.textContent = preset.description;
+}
+
+async function setScreenPreset(presetId) {
+  try {
+    const res = await fetch('/api/screen/presets', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset: presetId }),
+    }).then(r => r.json());
+    if (res.ok && _apCache) {
+      _apCache.current = res.audio_params;
+      // Re-render the screen params sliders with new values
+      _apRenderSection('ap-screen-params', _apCache.screen_recording, _apCache.current);
+    }
+    // Update description
+    const desc = document.getElementById('screen-preset-desc');
+    if (desc && _screenPresetsData?.presets[presetId]) {
+      desc.textContent = _screenPresetsData.presets[presetId].description;
+    }
+  } catch (_) {}
+}
+
+// Update screen recording status indicator
+function _updateScreenRecordingStatus(isRecording) {
+  const statusEl = document.getElementById('screen-capture-status');
+  if (!statusEl) return;
+  if (isRecording) {
+    statusEl.innerHTML = '<span class="screen-rec-indicator"><i class="fa-solid fa-circle"></i> Recording</span>';
+  } else {
+    statusEl.textContent = '';
+  }
 }
 
 async function saveApiKeys() {
@@ -6329,6 +7405,7 @@ document.getElementById('transcript').addEventListener('scroll', () => {
 
 connectSSE();
 refreshSidebar();
+_checkSemanticSearchReady();
 fetch('/api/status').then(r => r.json()).then(onStatus);
 fetch('/api/ai_settings')
   .then(r => r.json())
@@ -6339,6 +7416,7 @@ fetch('/api/ai_settings')
   .catch(() => {});
 startVizLoop();
 initGainSliders();
+_restoreSidebarPanes();
 _tnInitSearch();
 _tsbInitAutocomplete();
 // Load preferences first, then init components that depend on saved values
@@ -6346,6 +7424,9 @@ loadPreferences().then(() => {
   loadAudioDevices();
   loadModelConfig();
 });
+// Screen recording: load displays + sync toggle
+_apLoad().then(() => { _syncScreenToggle(); });
+loadScreenDisplays();
 loadSummaryPrompt();
 _startPeriodicUpdateCheck();
 
