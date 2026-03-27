@@ -227,6 +227,12 @@ class Transcriber:
         self.load_diarizer(hf_token, device=device)
 
     def start(self, sample_rate: int, channels: int, next_speaker_label: int = 1) -> None:
+        # Stop any previous loop that's still running (e.g. if the cleanup
+        # thread from a prior stop_recording hasn't finished yet).
+        if self._thread is not None and self._thread.is_alive():
+            self.is_running = False
+            self._thread.join(timeout=5)
+            self._thread = None
         self.sample_rate = sample_rate
         self.channels = channels
         self._context = ""

@@ -166,7 +166,10 @@
         <button class="icon-btn sidebar-toggle-btn" id="sidebar-open-btn"
                 onclick="toggleSidebar()" title="Open sessions sidebar"
                 style="display:none"><i class="fa-solid fa-bars"></i></button>
-        <img id="brand-icon" class="brand-icon" src="/static/images/logo.png" alt="">
+        <div class="brand-icon-wrap" id="brand-icon-wrap">
+          <canvas id="brand-viz-canvas" class="brand-viz-canvas"></canvas>
+          <img id="brand-icon" class="brand-icon" src="/static/images/logo.png" alt="">
+        </div>
         <span class="brand-name">Meeting Assistant</span>
       </div>
       <div class="topbar-right">

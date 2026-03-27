@@ -59,11 +59,14 @@ class AudioCapture:
         self._mic_rate: int | None = None
         self._mic_channels: int = 1
         self._has_mic: bool = False
+        self._mic_buf_size: int = 512
         self._resample_up: int = 1
         self._resample_down: int = 1
 
         # WAV writer — set via start_wav() before start()
         self.wav_writer: WavWriter | None = None
+        self._wav_path: str | None = None
+        self._wav_append: bool = False
 
         # Live RMS levels — read by app.py to push to the visualizer
         self.loopback_level: float = 0.0
@@ -82,6 +85,26 @@ class AudioCapture:
         self._hann_window: np.ndarray | None = None   # precomputed; set on first use
 
     # ── Device discovery ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_mic_buffer_size(mic_info: dict) -> int:
+        """Compute a frames_per_buffer for the mic aligned with the WASAPI device period.
+
+        WASAPI shared mode delivers data in chunks tied to the device's period
+        (typically 10 ms).  A too-small buffer causes underruns/glitches because
+        PortAudio's internal ring buffer can't bridge the timing gap reliably.
+        We derive a safe size from the device's reported high-input latency and
+        round up to the next power of two (required by some drivers, and always
+        safe for FFT-friendly alignment).
+        """
+        rate = int(mic_info["defaultSampleRate"])
+        latency = mic_info.get("defaultHighInputLatency", 0.02)
+        frames = int(rate * latency)
+        frames = max(1024, min(frames, 8192))
+        power = 1
+        while power < frames:
+            power <<= 1
+        return power
 
     def _find_loopback_device(self) -> dict:
         """
@@ -170,13 +193,16 @@ class AudioCapture:
     # ── WAV recording ──────────────────────────────────────────────────────
 
     def start_wav(self, path: str, append: bool = False) -> None:
-        """Open a WAV file for recording.  Call before start()."""
-        # sample_rate isn't known yet — defer opening until start() sets it.
+        """Request WAV recording.  Call before start().
+
+        The actual WavWriter is created inside start() once the sample rate
+        is known from the loopback device.
+        """
         self._wav_path = path
         self._wav_append = append
 
     def stop_wav(self) -> None:
-        """Finalize and close the WAV file."""
+        """Finalize and close the WAV file.  Safe to call multiple times."""
         if self.wav_writer is not None:
             self.wav_writer.close()
             self.wav_writer = None
@@ -236,13 +262,14 @@ class AudioCapture:
             try:
                 self._mic_rate = int(mic_info["defaultSampleRate"])
                 self._mic_channels = max(1, mic_info["maxInputChannels"])
+                self._mic_buf_size = self._compute_mic_buffer_size(mic_info)
                 self._mic_stream = self._pa.open(
                     format=self.FORMAT,
                     channels=self._mic_channels,
                     rate=self._mic_rate,
                     input=True,
                     input_device_index=mic_info["index"],
-                    frames_per_buffer=self.CHUNK_SIZE,
+                    frames_per_buffer=self._mic_buf_size,
                 )
                 self._has_mic = True
                 if self._mic_rate != self.sample_rate:
@@ -250,18 +277,23 @@ class AudioCapture:
                     self._resample_up = self.sample_rate // g
                     self._resample_down = self._mic_rate // g
                 log.info("audio", f"Mic: '{mic_info['name']}' @ {self._mic_rate} Hz, "
-                                  f"{self._mic_channels} ch")
+                                  f"{self._mic_channels} ch, buf={self._mic_buf_size}")
             except Exception as e:
                 log.warn("audio", f"Mic unavailable: {e}")
                 self._mic_stream = None
                 self._has_mic = False
-        else:
-            log.info("audio", "No microphone device found — capturing loopback only.")
+        elif mic_index != -2:
+            # Neither -2 (browser) nor a valid WASAPI mic — loopback only
+            self._has_mic = False
+            if mic_index == -1:
+                log.info("audio", "Microphone explicitly disabled — capturing loopback only.")
+            else:
+                log.info("audio", "No microphone device found — capturing loopback only.")
 
         # Open WAV writer now that sample_rate is known
-        if hasattr(self, "_wav_path") and self._wav_path:
-            append = getattr(self, "_wav_append", False)
-            self.wav_writer = WavWriter(self._wav_path, self.sample_rate, append=append)
+        if self._wav_path:
+            self.wav_writer = WavWriter(self._wav_path, self.sample_rate,
+                                        append=self._wav_append)
             self._wav_path = None
 
         self.is_running = True
@@ -277,6 +309,12 @@ class AudioCapture:
             # Only start a capture thread when there's an actual WASAPI stream.
             # For browser mic (mic_index=-2) _mic_stream is None; data arrives
             # externally via inject_mic_data() which feeds _mic_q directly.
+            #
+            # NOTE: Do NOT pass _mic_buf_size here.  _mic_buf_size is the
+            # frames_per_buffer for the WASAPI stream's internal ring buffer
+            # (large = prevents underruns).  The *read* chunk size must stay
+            # at CHUNK_SIZE (512) so mic data flows at the same cadence as
+            # loopback and the mixer can interleave them without gaps.
             self._mic_thread = threading.Thread(
                 target=self._capture_loop,
                 args=(self._mic_stream, self._mic_q),
@@ -298,6 +336,10 @@ class AudioCapture:
         self._loopback_thread = None
         self._mic_thread = None
         self._mixer_thread = None
+        # Finalize WAV *after* the mixer thread has stopped — calling stop_wav()
+        # while the mixer is still running is a race condition that can corrupt
+        # the file or crash on a write to a closed handle.
+        self.stop_wav()
         # Park streams + PyAudio instance in the graveyard instead of closing them.
         # Pa_StopStream / Pa_CloseStream on a WASAPI loopback stream calls
         # ExitProcess() at the C level on Windows, killing the whole process.
@@ -361,10 +403,26 @@ class AudioCapture:
 
     # ── Capture threads ───────────────────────────────────────────────────────
 
-    def _capture_loop(self, stream, out_queue: queue.Queue) -> None:
+    def _capture_loop(self, stream, out_queue: queue.Queue,
+                      buf_size: int = 0) -> None:
+        chunk = buf_size or self.CHUNK_SIZE
         while self.is_running:
             try:
-                data = stream.read(self.CHUNK_SIZE, exception_on_overflow=False)
+                # Read however many frames WASAPI has ready, clamped to a
+                # reasonable range.  This adapts to the device's actual
+                # delivery cadence instead of demanding a fixed count that
+                # may not align with the WASAPI shared-mode period — the
+                # main cause of choppy mic input on Windows.
+                avail = stream.get_read_available()
+                if avail >= chunk:
+                    n = min(avail, chunk * 4)  # cap to avoid huge reads
+                else:
+                    # Not enough data yet — do a blocking read for one
+                    # buffer's worth.  The large frames_per_buffer we
+                    # requested when opening the stream means this aligns
+                    # with the device period and won't underrun.
+                    n = chunk
+                data = stream.read(n, exception_on_overflow=False)
                 try:
                     out_queue.put_nowait(data)
                 except queue.Full:

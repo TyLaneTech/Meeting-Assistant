@@ -79,8 +79,28 @@ function _saveLayoutCache(updates) {
   } catch (_) {}
 }
 
-/* ── Pane toggle ──────────────────────────────────────────────────────────── */
-let _paneVisible = [true, true, true]; // [transcript, summary, chat]
+/* ── Pane toggle & column ordering ────────────────────────────────────────── */
+let _paneVisible = [true, true, true]; // indexed by column: [transcript, summary, chat]
+const _COL_NAMES = ['Transcript', 'Summary', 'Chat'];
+
+// Visual column order — maps position (left→right) to column index.
+// Seeded from localStorage cache so the first paint uses the saved order.
+let _colOrder = (() => {
+  const lc = _getLayoutCache();
+  return (Array.isArray(lc.col_order) && lc.col_order.length === 3)
+    ? lc.col_order
+    : [0, 1, 2];
+})();
+
+function _syncToggleButtons() {
+  const btns = document.querySelectorAll('.pane-toggle-group .pane-toggle-btn');
+  _colOrder.forEach((colIdx, pos) => {
+    if (!btns[pos]) return;
+    btns[pos].onclick = () => togglePane(colIdx);
+    btns[pos].title = _COL_NAMES[colIdx];
+    btns[pos].classList.toggle('active', _paneVisible[colIdx]);
+  });
+}
 
 function togglePane(idx) {
   // Don't allow hiding the last visible pane
@@ -88,16 +108,7 @@ function togglePane(idx) {
   if (_paneVisible[idx] && visibleCount <= 1) return;
 
   _paneVisible[idx] = !_paneVisible[idx];
-
-  const btns = [
-    document.getElementById('pane-toggle-transcript'),
-    document.getElementById('pane-toggle-summary'),
-    document.getElementById('pane-toggle-chat'),
-  ];
-  _paneVisible.forEach((vis, i) => {
-    if (btns[i]) btns[i].classList.toggle('active', vis);
-  });
-
+  _syncToggleButtons();
   _applyPaneLayout();
 }
 
@@ -107,56 +118,45 @@ function _applyPaneLayout() {
   const workspace = document.querySelector('.workspace');
   if (!workspace) return;
 
-  const cols = workspace.querySelectorAll('.col');
-  const handles = workspace.querySelectorAll('.col-resize-handle');
+  // Stable column references (DOM order = column index, never changes)
+  const colEls = [
+    workspace.querySelector('.col-transcript'),
+    workspace.querySelector('.col-summary'),
+    workspace.querySelector('.col-chat'),
+  ];
+  const handles = Array.from(workspace.querySelectorAll('.col-resize-handle'));
 
-  // Determine which visible columns are adjacent in the rendered layout
-  // and need a handle between them
-  const visIndices = [];
-  _paneVisible.forEach((vis, i) => { if (vis) visIndices.push(i); });
+  // Visible columns in visual (left→right) order
+  const visOrder = _colOrder.filter(ci => _paneVisible[ci]);
 
-  // Hide all columns and handles first; reset handle data attrs to originals
-  cols.forEach((col, i) => { col.style.display = _paneVisible[i] ? '' : 'none'; });
-  handles.forEach((h, i) => {
-    h.style.display = 'none';
-    h.dataset.left = String(i);
-    h.dataset.right = String(i + 1);
-  });
+  // Show/hide columns
+  colEls.forEach((col, ci) => { col.style.display = _paneVisible[ci] ? '' : 'none'; });
 
-  // Show handles between consecutively-rendered visible columns.
-  // Re-purpose the first available hidden handle for non-adjacent pairs.
-  const neededHandles = Math.max(0, visIndices.length - 1);
-  let handleIdx = 0;
-  for (let i = 0; i < visIndices.length - 1; i++) {
-    const li = visIndices[i];
-    const ri = visIndices[i + 1];
-    // Prefer the handle that originally sits between li and ri
-    const natural = Array.from(handles).find(
-      h => parseInt(h.dataset.left) === li && parseInt(h.dataset.right) === ri
-    );
-    if (natural) {
-      natural.style.display = '';
-    } else {
-      // Non-adjacent pair (e.g. 0 & 2 with 1 hidden) — show whichever handle is free
-      for (; handleIdx < handles.length; handleIdx++) {
-        if (handles[handleIdx].style.display === 'none') {
-          handles[handleIdx].style.display = '';
-          // Update data attrs so resize dragging works correctly
-          handles[handleIdx].dataset.left = String(li);
-          handles[handleIdx].dataset.right = String(ri);
-          handleIdx++;
-          break;
-        }
-      }
-    }
+  // Hide all handles, then show the ones needed between visible columns
+  handles.forEach(h => { h.style.display = 'none'; });
+  const shownHandles = [];
+  for (let i = 0; i < visOrder.length - 1 && i < handles.length; i++) {
+    handles[i].style.display = '';
+    handles[i].dataset.left  = String(visOrder[i]);
+    handles[i].dataset.right = String(visOrder[i + 1]);
+    shownHandles.push(handles[i]);
   }
 
-  // Build grid template
-  const handleCount = neededHandles;
-  const total = workspace.offsetWidth - HANDLE_PX * handleCount;
-  const visFracs = _colProportions.filter((_, i) => _paneVisible[i]);
-  const fracSum = visFracs.reduce((a, b) => a + b, 0);
-  const widths = visFracs.map(f => Math.max(MIN_COL_PX, Math.round(total * f / fracSum)));
+  // Assign CSS order so grid items match visual positions
+  let ord = 0;
+  visOrder.forEach((ci, i) => {
+    colEls[ci].style.order = ord++;
+    if (i < shownHandles.length) shownHandles[i].style.order = ord++;
+  });
+  // Push hidden columns out of the way
+  colEls.forEach((col, ci) => { if (!_paneVisible[ci]) col.style.order = 99; });
+  handles.forEach(h => { if (h.style.display === 'none') h.style.order = 99; });
+
+  // Build grid template in visual order
+  const total = workspace.offsetWidth - HANDLE_PX * shownHandles.length;
+  const visFracs = visOrder.map(ci => _colProportions[ci]);
+  const fracSum  = visFracs.reduce((a, b) => a + b, 0);
+  const widths   = visFracs.map(f => Math.max(MIN_COL_PX, Math.round(total * f / fracSum)));
 
   const parts = [];
   for (let i = 0; i < widths.length; i++) {
@@ -177,23 +177,7 @@ let _colProportions = (() => {
 })();
 
 function recalcColWidths() {
-  // If any panes are hidden, use the pane-aware layout
-  if (_paneVisible.some(v => !v)) {
-    _applyPaneLayout();
-    return;
-  }
-  const HANDLE_PX = 4;
-  const MIN_COL_PX = 160;
-  const workspace = document.querySelector('.workspace');
-  if (!workspace) return;
-  const handles = workspace.querySelectorAll('.col-resize-handle').length;
-  const total = workspace.offsetWidth - HANDLE_PX * handles;
-  const fracSum = _colProportions.reduce((a, b) => a + b, 0);
-  const widths = _colProportions.map(f => Math.max(MIN_COL_PX, Math.round(total * f / fracSum)));
-  const template = widths.map((w, i) =>
-    i < widths.length - 1 ? `${w}px ${HANDLE_PX}px` : `${w}px`
-  ).join(' ');
-  workspace.style.gridTemplateColumns = template;
+  _applyPaneLayout();
 }
 
 (function initResizableCols() {
@@ -206,7 +190,7 @@ function recalcColWidths() {
   if (!numCols || !handles.length) return;
 
   function getVisibleIndices() {
-    return _paneVisible.map((v, i) => v ? i : -1).filter(i => i >= 0);
+    return _colOrder.filter(ci => _paneVisible[ci]);
   }
 
   function getPixelWidths() {
@@ -283,6 +267,112 @@ function recalcColWidths() {
   });
 
   window.addEventListener('resize', recalcColWidths);
+})();
+
+/* ── Column drag-to-reorder ──────────────────────────────────────────────── */
+(function initColumnDragReorder() {
+  const workspace = document.querySelector('.workspace');
+  if (!workspace) return;
+
+  const colEls = [
+    workspace.querySelector('.col-transcript'),
+    workspace.querySelector('.col-summary'),
+    workspace.querySelector('.col-chat'),
+  ];
+
+  // Reusable floating ghost element
+  const ghost = document.createElement('div');
+  ghost.className = 'col-drag-ghost';
+  document.body.appendChild(ghost);
+
+  function positionGhost(x, y) {
+    ghost.style.left = x + 12 + 'px';
+    ghost.style.top  = y - 14 + 'px';
+  }
+
+  colEls.forEach((col, colIdx) => {
+    const header = col.querySelector('.col-header');
+    if (!header) return;
+
+    header.addEventListener('mousedown', e => {
+      // Don't hijack clicks on interactive elements
+      if (e.target.closest('button, input, select, textarea, a, .badge')) return;
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let isDragging = false;
+
+      function onMove(ev) {
+        if (!isDragging && Math.abs(ev.clientX - startX) > 5) {
+          isDragging = true;
+          col.classList.add('col-dragging');
+          document.body.style.cursor     = 'grabbing';
+          document.body.style.userSelect = 'none';
+
+          // Show ghost with column name
+          ghost.textContent = _COL_NAMES[colIdx];
+          positionGhost(ev.clientX, ev.clientY);
+          // Force reflow before adding .visible so the transition plays
+          ghost.offsetHeight;
+          ghost.classList.add('visible');
+        }
+        if (!isDragging) return;
+
+        positionGhost(ev.clientX, ev.clientY);
+
+        // Highlight the column the cursor is over
+        colEls.forEach((c, ci) => {
+          if (ci === colIdx || !_paneVisible[ci]) {
+            c.classList.remove('col-drag-over');
+            return;
+          }
+          const r = c.getBoundingClientRect();
+          c.classList.toggle('col-drag-over', ev.clientX >= r.left && ev.clientX <= r.right);
+        });
+      }
+
+      function onUp(ev) {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup',   onUp);
+        if (!isDragging) return;
+
+        col.classList.remove('col-dragging');
+        ghost.classList.remove('visible');
+        document.body.style.cursor     = '';
+        document.body.style.userSelect = '';
+
+        // Find drop target
+        let dropIdx = -1;
+        colEls.forEach((c, ci) => {
+          c.classList.remove('col-drag-over');
+          if (ci !== colIdx && _paneVisible[ci]) {
+            const r = c.getBoundingClientRect();
+            if (ev.clientX >= r.left && ev.clientX <= r.right) dropIdx = ci;
+          }
+        });
+
+        if (dropIdx >= 0) {
+          // Swap positions in _colOrder
+          const fromPos = _colOrder.indexOf(colIdx);
+          const toPos   = _colOrder.indexOf(dropIdx);
+          _colOrder[fromPos] = dropIdx;
+          _colOrder[toPos]   = colIdx;
+
+          _syncToggleButtons();
+          _applyPaneLayout();
+          savePref('col_order', [..._colOrder]);
+          _saveLayoutCache({ col_order: [..._colOrder] });
+        }
+      }
+
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup',   onUp);
+    });
+  });
+
+  // Apply initial order (from cache/defaults)
+  _syncToggleButtons();
+  _applyPaneLayout();
 })();
 
 /* ── Sidebar resize handle ────────────────────────────────────────────────── */
@@ -430,6 +520,7 @@ async function loadPreferences() {
   // page loads can apply them synchronously (no flash).
   const cacheUpdate = {};
   if (Array.isArray(_prefs.col_proportions))    cacheUpdate.col_proportions = _prefs.col_proportions;
+  if (Array.isArray(_prefs.col_order))          cacheUpdate.col_order       = _prefs.col_order;
   if (_prefs.sidebar_width)                      cacheUpdate.sidebar_width   = _prefs.sidebar_width;
   if (typeof _prefs.sidebar_open === 'boolean')  cacheUpdate.sidebar_open    = _prefs.sidebar_open;
   if (Object.keys(cacheUpdate).length) _saveLayoutCache(cacheUpdate);
@@ -439,9 +530,13 @@ async function loadPreferences() {
     const sb = document.getElementById('sidebar');
     if (sb && state.sidebarOpen) sb.style.width = _prefs.sidebar_width + 'px';
   }
-  // Apply column proportions
+  // Apply column proportions and order
   if (Array.isArray(_prefs.col_proportions) && _prefs.col_proportions.length === 3) {
     _colProportions = _prefs.col_proportions;
+  }
+  if (Array.isArray(_prefs.col_order) && _prefs.col_order.length === 3) {
+    _colOrder = _prefs.col_order;
+    _syncToggleButtons();
   }
   // Apply sidebar collapsed state on load.
   const sidebar = document.getElementById('sidebar');
@@ -2214,6 +2309,10 @@ function updateTopbarSessionTitle() {
 
 function updateRecordBtn() {
   const btn = document.getElementById('record-btn');
+  // Clear any inline "Stopping Recording…" overrides
+  btn.style.background = '';
+  btn.style.color = '';
+  btn.disabled = false;
   updateTopbarSessionTitle();
   if (state.isRecording) {
     btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop Recording';
@@ -2261,6 +2360,12 @@ function updateTestBtn() {
 /* ── Recording ───────────────────────────────────────────────────────────── */
 async function toggleRecording() {
   if (state.isRecording) {
+    // Immediate visual feedback while the server tears down streams
+    const btn = document.getElementById('record-btn');
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-spinner fa-spin"></i></span> Stopping Recording\u2026';
+    btn.style.background = 'var(--yellow)';
+    btn.style.color = '#0d1117';
+    btn.disabled = true;
     await fetch('/api/recording/stop', { method: 'POST' });
   } else {
     // Read selected device indices from the dropdowns
@@ -6925,6 +7030,10 @@ function saveDeviceSelection() {
   const micSel = document.getElementById('viz-mic-sel');
   if (lbSel)  savePref('loopback_device', lbSel.value);
   if (micSel) savePref('mic_device',      micSel.value);
+  // Release or acquire the browser getUserMedia stream immediately when the
+  // mic selector changes — otherwise a stale getUserMedia lock on the physical
+  // mic device causes WASAPI shared-mode contention and garbled audio.
+  syncBrowserMic();
 }
 
 async function toggleAudioTest() {
@@ -7033,6 +7142,86 @@ function startVizLoop() {
     ctx.moveTo(0, midY);
     ctx.lineTo(w, midY);
     ctx.stroke();
+  });
+}
+
+/* ── Brand circular visualizer (wraps around topbar logo) ────────────────── */
+function startBrandVizLoop() {
+  const canvas = document.getElementById('brand-viz-canvas');
+  if (!canvas) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const resize = () => {
+    canvas.width  = canvas.offsetWidth  * dpr;
+    canvas.height = canvas.offsetHeight * dpr;
+  };
+  resize();
+  new ResizeObserver(resize).observe(canvas);
+
+  // Separate smoothed bars so brand viz can animate independently
+  const bvLbBars  = new Float32Array(N_BARS);
+  const bvMicBars = new Float32Array(N_BARS);
+
+  requestAnimationFrame(function loop() {
+    requestAnimationFrame(loop);
+
+    const ctx = canvas.getContext('2d');
+    const w   = canvas.width  / dpr;
+    const h   = canvas.height / dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const cx = w / 2;
+    const cy = h / 2;
+    const innerR  = 19;   // just outside the logo edge
+    const maxBarH = 16;   // max outward extension of a bar
+
+    // Smooth toward latest spectrum (same attack/decay as sidebar)
+    for (let i = 0; i < N_BARS; i++) {
+      const lt = vizLbSpec[i]  || 0;
+      const mt = vizMicSpec[i] || 0;
+      bvLbBars[i]  += (lt > bvLbBars[i]  ? 0.55 : 0.10) * (lt - bvLbBars[i]);
+      bvMicBars[i] += (mt > bvMicBars[i] ? 0.55 : 0.10) * (mt - bvMicBars[i]);
+    }
+
+    const lbActive  = vizLb  > 0.002;
+    const micActive = vizHasMic && vizMic > 0.002;
+
+    // Top half (desktop / loopback) — angles from PI to 2*PI (180° to 360°)
+    // Bottom half (mic)            — angles from 0 to PI     (0° to 180°)
+    // Each half gets N_BARS bars spread evenly with small end gaps.
+    const gap   = 0.06;           // radians of padding at each end
+    const sweep = Math.PI - gap * 2;
+    const step  = sweep / N_BARS;
+    const barArc = step * 0.65;   // each bar occupies 65% of its slot
+
+    // ── Desktop bars (top semicircle, drawn clockwise from left to right) ──
+    for (let i = 0; i < N_BARS; i++) {
+      const angle = Math.PI + gap + step * i + step / 2;
+      const barH  = Math.max(0.5, bvLbBars[i] * maxBarH);
+      const alpha = lbActive ? 0.15 + 0.45 * bvLbBars[i] : 0.06;
+      ctx.beginPath();
+      ctx.arc(cx, cy, innerR, angle - barArc / 2, angle + barArc / 2);
+      ctx.arc(cx, cy, innerR + barH, angle + barArc / 2, angle - barArc / 2, true);
+      ctx.closePath();
+      ctx.fillStyle = `rgba(88,166,255,${alpha.toFixed(2)})`;
+      ctx.fill();
+    }
+
+    // ── Mic bars (bottom semicircle) ──
+    if (vizHasMic) {
+      for (let i = 0; i < N_BARS; i++) {
+        const angle = gap + step * i + step / 2;
+        const barH  = Math.max(0.5, bvMicBars[i] * maxBarH);
+        const alpha = micActive ? 0.15 + 0.45 * bvMicBars[i] : 0.06;
+        ctx.beginPath();
+        ctx.arc(cx, cy, innerR, angle - barArc / 2, angle + barArc / 2);
+        ctx.arc(cx, cy, innerR + barH, angle + barArc / 2, angle - barArc / 2, true);
+        ctx.closePath();
+        ctx.fillStyle = `rgba(63,185,80,${alpha.toFixed(2)})`;
+        ctx.fill();
+      }
+    }
   });
 }
 
@@ -8274,6 +8463,7 @@ fetch('/api/ai_settings')
   })
   .catch(() => {});
 startVizLoop();
+startBrandVizLoop();
 initGainSliders();
 _restoreSidebarPanes();
 _tnInitSearch();

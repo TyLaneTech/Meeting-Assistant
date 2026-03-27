@@ -43,7 +43,7 @@ from default_audio_params import (
     TRANSCRIPTION_PRESETS, TRANSCRIPTION_DEFAULT_PRESET,
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
-from screen_recorder import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
+from screen_recorder import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, kill_stale_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
 from speaker_db import SpeakerFingerprintDB
 import text_embeddings
 from transcriber import (
@@ -1288,8 +1288,7 @@ def stop_recording():
     # must not do it on the Flask request handler thread or the server hangs.
     def _cleanup() -> None:
         if capture:
-            capture.stop_wav()   # finalize WAV header before stopping streams
-            capture.stop()
+            capture.stop()   # joins threads then finalizes WAV
         _transcriber.stop()
         # Stop screen recording if active
         if _screen_recorder.is_recording:
@@ -3095,6 +3094,8 @@ def update_apply():
 
 def main() -> None:
     global _tray
+
+    kill_stale_ffmpeg()
 
     port = int(os.getenv("PORT", 6969))
     url = f"http://127.0.0.1:{port}"

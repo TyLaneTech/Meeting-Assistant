@@ -19,7 +19,7 @@
   --yellow:      #d29922;
   --purple:      #bc8cff;
   --sidebar-w:   252px;
-  --topbar-h:    52px;
+  --topbar-h: 62px;
   --font-mono:   'Cascadia Code', 'Fira Code', 'Consolas', monospace;
   --font-ui:     'Segoe UI', system-ui, sans-serif;
   --radius:      8px;
@@ -694,7 +694,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 14px 0 16px;
+  padding: 0 14px 0 21px;
   gap: 10px;
   flex-shrink: 0;
 }
@@ -713,8 +713,20 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 }
 .topbar-session-title.hidden { display: none; }
 
-.brand-icon { width: 26px; height: 26px; object-fit: contain; display: block; }
-.brand-name { font-weight: 600; font-size: 15px; letter-spacing: -0.3px; }
+.brand-icon-wrap {
+  position: relative;
+  width: 36px; height: 36px;
+  flex-shrink: 0;
+}
+.brand-viz-canvas {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 72px; height: 72px;
+  pointer-events: none;
+}
+.brand-icon {width: 36px;height: 36px;object-fit: contain;display: block; position: relative; z-index: 1;}
+.brand-name {font-weight: 600;font-size: 17px;letter-spacing: -0.3px;margin-left: 7px;}
 
 /* ── Buttons ───────────────────────────────────────────────────────────────── */
 .btn {
@@ -855,10 +867,51 @@ button#sidebar-close-btn {
   align-items: center;
   justify-content: space-between;
   padding: 9px 12px 9px 16px;
-  /* margin-right: -6px; */
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   flex-shrink: 0;
+  cursor: grab;
+}
+.col-header button, .col-header select, .col-header input { cursor: pointer; }
+
+/* ── Column drag-to-reorder feedback ──────────────────────────────────────── */
+.col.col-dragging {
+  opacity: 0.3;
+  transition: opacity 0.2s ease;
+}
+.col.col-drag-over {
+  outline: 1.5px solid rgba(88, 166, 255, 0.35);
+  outline-offset: -1.5px;
+  transition: outline-color 0.15s ease;
+}
+.col.col-drag-over .col-header {
+  background: rgba(88, 166, 255, 0.08);
+  transition: background 0.15s ease;
+}
+
+/* Floating ghost label that follows the cursor */
+.col-drag-ghost {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  padding: 5px 14px;
+  background: var(--surface3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transform: scale(0.85);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.col-drag-ghost.visible {
+  opacity: 1;
+  transform: scale(1);
 }
 
 .col-title {

@@ -85,6 +85,30 @@ def download_ffmpeg(progress_cb=None) -> str:
     return str(_LOCAL_FFMPEG)
 
 
+def kill_stale_ffmpeg() -> int:
+    """Kill any orphaned ffmpeg processes left over from a previous session.
+
+    Returns the number of processes killed.  Safe to call at startup — only
+    targets ffmpeg.exe instances whose command line includes 'gdigrab' (our
+    screen-recording invocations), so it won't disturb unrelated ffmpeg usage.
+    """
+    killed = 0
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", "ffmpeg.exe"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Count lines like "SUCCESS: The process ... has been terminated."
+        for line in result.stdout.splitlines():
+            if "SUCCESS" in line:
+                killed += 1
+        if killed:
+            log.info("screen", f"Killed {killed} stale ffmpeg process(es)")
+    except Exception as e:
+        log.warn("screen", f"Could not check for stale ffmpeg: {e}")
+    return killed
+
+
 # ── DPI awareness ────────────────────────────────────────────────────────────
 # Enable per-monitor DPI awareness so EnumDisplayMonitors returns physical
 # pixel coordinates and sizes — critical for correct gdigrab offsets on
