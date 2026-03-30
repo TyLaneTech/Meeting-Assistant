@@ -14,12 +14,12 @@
   --fg-subtle:   #484f58;
   --accent:      #58a6ff;
   --accent-dim:  #1f6feb;
-  --green:       #3fb950;
-  --red:         #f85149;
+  --green: #00b464;
+  --red: #f05541;
   --yellow:      #d29922;
   --purple:      #bc8cff;
   --sidebar-w:   252px;
-  --topbar-h: 62px;
+  --topbar-h: 78px;
   --font-mono:   'Cascadia Code', 'Fira Code', 'Consolas', monospace;
   --font-ui:     'Segoe UI', system-ui, sans-serif;
   --radius:      8px;
@@ -674,12 +674,12 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   color: var(--fg);
 }
 .viz-test-btn.testing {
-  background: rgba(63,185,80,0.12);
+  background: rgba(0,180,100,0.12);
   border-color: var(--green);
   color: var(--green);
 }
 .viz-test-btn.testing:hover:not(:disabled) {
-  background: rgba(63,185,80,0.22);
+  background: rgba(0,180,100,0.22);
 }
 .viz-test-btn:disabled {
   opacity: 0.4;
@@ -699,7 +699,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   flex-shrink: 0;
 }
 
-.topbar-left  { display: flex; align-items: center; gap: 8px; }
+.topbar-left  {display: flex;align-items: center;padding-top: 10px;align-self: flex-start;gap: 8px;}
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 .topbar-sep   { width: 1px; height: 22px; background: var(--border); margin: 0 2px; }
 .topbar-session-title {
@@ -715,18 +715,19 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 
 .brand-icon-wrap {
   position: relative;
-  width: 36px; height: 36px;
+  /* width: 36px; */
+  /* height: 36px; */
   flex-shrink: 0;
 }
 .brand-viz-canvas {
   position: absolute;
   top: 50%; left: 50%;
   transform: translate(-50%, -50%);
-  width: 72px; height: 72px;
+  width: 340px; height: 64px;
   pointer-events: none;
 }
-.brand-icon {width: 36px;height: 36px;object-fit: contain;display: block; position: relative; z-index: 1;}
-.brand-name {font-weight: 600;font-size: 17px;letter-spacing: -0.3px;margin-left: 7px;}
+.brand-icon {width: 56px;height: auto;object-fit: contain;display: block;position: relative;z-index: 1;}
+.brand-name {font-size: 1.3em;font-family: 'FontAwesome';letter-spacing: -0.3px;color: var(--fg-muted);/* margin-left: 7px; */line-height: 1;}
 
 /* ── Buttons ───────────────────────────────────────────────────────────────── */
 .btn {
@@ -1244,7 +1245,7 @@ button#sidebar-close-btn {
   padding: 6px 12px;
   background: var(--surface2);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--seg-color, var(--accent-dim));
+  border: 1px solid transparent;
   border-left: 3px solid var(--seg-color, var(--accent-dim));
   cursor: pointer;
   user-select: none;
@@ -1279,6 +1280,19 @@ button#sidebar-close-btn {
   font-size: 11px;
   opacity: 0.5;
   white-space: nowrap;
+}
+
+/* Indent segments inside an expanded group */
+.transcript-segment.in-group {
+  margin-left: 14px;
+  border-left: 2px solid var(--seg-color, var(--accent-dim));
+}
+
+/* Playing state on group summary (propagated from playing segment within) */
+.transcript-group-summary.playing {
+  border-color: var(--seg-color, var(--accent));
+  /* background: linear-gradient(90deg, var(--seg-color, var(--accent-dim))20 0%, transparent 40%); */
+  filter: brightness(1.15);
 }
 
 /* ── Playback bar ──────────────────────────────────────────────────────────── */
@@ -1385,7 +1399,7 @@ button#sidebar-close-btn {
   line-height: 1.6;
 }
 .src-loopback { background: rgba(88,166,255,0.15);  color: var(--accent);  border: 1px solid rgba(88,166,255,0.3); }
-.src-mic      { background: rgba(63,185,80,0.15);   color: var(--green);   border: 1px solid rgba(63,185,80,0.3);  }
+.src-mic      { background: rgba(0,180,100,0.15);   color: var(--green);   border: 1px solid rgba(0,180,100,0.3);  }
 .src-both     { background: rgba(188,140,255,0.15); color: var(--purple);  border: 1px solid rgba(188,140,255,0.3); }
 .src-speaker  { cursor: pointer; }
 .src-speaker:hover { filter: brightness(1.25); }
@@ -1758,7 +1772,7 @@ button#sidebar-close-btn {
 }
 #speaker-manager-overlay .speaker-row-linked {
   font-size: 10px;
-  color: var(--green, #3fb950);
+  color: var(--green, #00b464);
   opacity: 0.8;
   flex-shrink: 0;
   margin-right: 6px;
@@ -2005,7 +2019,7 @@ button#sidebar-close-btn {
   transition: color .12s, border-color .12s;
 }
 .chat-msg-action-btn:hover { color: var(--fg-muted); border-color: var(--border); }
-.chat-msg-action-btn.copied { color: var(--green, #3fb950); }
+.chat-msg-action-btn.copied { color: var(--green, #00b464); }
 
 /* ── Code block copy button ───────────────────────────────────────────────── */
 .chat-msg-body pre { position: relative; }
@@ -2018,7 +2032,7 @@ button#sidebar-close-btn {
 }
 .chat-msg-body pre:hover .code-copy-btn { opacity: 1; }
 .code-copy-btn:hover { color: var(--fg); }
-.code-copy-btn.copied { color: var(--green, #3fb950); }
+.code-copy-btn.copied { color: var(--green, #00b464); }
 
 .typing-cursor::after { content: '▋'; color: var(--accent); animation: blink .7s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -2556,6 +2570,220 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
 img#shutdown-icon.brand-icon {
     width: 80px;
     height: auto;
+}
+
+/* ── Fingerprint notification bell ─────────────────────────────────────────── */
+.fp-bell-btn {
+  position: relative;
+}
+.fp-bell-btn.has-notifications {
+  color: var(--green);
+}
+.fp-bell-btn.has-notifications i {
+  animation: fp-bell-ring 0.6s ease;
+}
+.fp-bell-badge {
+  position: absolute;
+  top: -2px; right: -2px;
+  background: var(--green);
+  color: #0d1117;
+  font-size: 9px;
+  font-weight: 700;
+  min-width: 14px;
+  height: 14px;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 7px;
+  padding: 0 3px;
+  display: none;
+}
+.fp-bell-btn.has-notifications .fp-bell-badge { display: block; }
+@keyframes fp-bell-ring {
+  0%   { transform: rotate(0); }
+  20%  { transform: rotate(14deg); }
+  40%  { transform: rotate(-12deg); }
+  60%  { transform: rotate(8deg); }
+  80%  { transform: rotate(-4deg); }
+  100% { transform: rotate(0); }
+}
+
+/* ── Fingerprint notification panel ───────────────────────────────────────── */
+.fp-notif-panel {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+  transition: max-height 0.25s ease, padding 0.25s ease;
+  max-height: 300px;
+  padding: 8px 12px;
+}
+.fp-notif-panel.collapsed {
+  max-height: 0;
+  padding: 0 12px;
+  border-bottom: none;
+}
+.fp-notif-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.fp-notif-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.fp-notif-dismiss-all {
+  font-size: 11px;
+  color: var(--fg-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.fp-notif-dismiss-all:hover { background: var(--surface2); color: var(--fg); }
+.fp-notif-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.fp-notif-empty {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.fp-notif-empty i { color: var(--green); }
+.fp-notif-panel:not(.collapsed) .fp-notif-list:empty + .fp-notif-empty { display: flex; }
+
+/* Individual notification card */
+.fp-notif-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  animation: fadeIn 0.2s ease;
+}
+.fp-notif-speaker {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.fp-notif-arrow {
+  color: var(--fg-muted);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+.fp-notif-match {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--green);
+  white-space: nowrap;
+}
+.fp-notif-sim {
+  font-size: 10px;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+.fp-notif-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.fp-notif-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  background: var(--surface3);
+  color: var(--fg);
+}
+.fp-notif-btn:hover { filter: brightness(1.15); }
+.fp-notif-btn.fp-notif-apply {
+  background: var(--green);
+  color: #0d1117;
+  border-color: transparent;
+  font-weight: 600;
+}
+.fp-notif-btn.fp-notif-skip {
+  color: var(--fg-muted);
+  background: transparent;
+}
+.fp-notif-other-wrap {
+  position: relative;
+}
+.fp-notif-other-list {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  right: 0;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px;
+  min-width: 140px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  z-index: 10;
+}
+.fp-notif-other-list.hidden { display: none; }
+.fp-notif-other-opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 8px;
+  font-size: 11px;
+  border: none;
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.fp-notif-other-opt:hover { background: var(--surface3); }
+
+/* ── Inline speaker identify icon ─────────────────────────────────────────── */
+.src-speaker:not(.speaker-linked) .speaker-identify-icon {
+  display: none;
+}
+.speaker-identify-icon {
+  display: none;
+  font-size: 0.65em;
+  margin-left: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  vertical-align: middle;
+  color: var(--fg-muted);
+}
+.src-speaker:not(.speaker-linked):hover .speaker-identify-icon {
+  opacity: 0.7;
+}
+.src-speaker:not(.speaker-linked) .speaker-identify-icon.has-suggestion {
+  opacity: 0.8;
+  color: var(--green);
+}
+.src-speaker:not(.speaker-linked):hover .speaker-identify-icon.has-suggestion {
+  opacity: 1;
+}
+
+/* ── Auto-apply flash animation ───────────────────────────────────────────── */
+@keyframes fp-auto-flash {
+  0%   { box-shadow: 0 0 0 0 var(--green); }
+  30%  { box-shadow: 0 0 8px 3px var(--green); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.src-speaker.fp-auto-applied {
+  animation: fp-auto-flash 1.2s ease-out;
 }
 
 /* ── Fingerprint match toast ──────────────────────────────────────────────── */

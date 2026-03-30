@@ -492,6 +492,182 @@ TRANSCRIPTION_PRESETS = {
 TRANSCRIPTION_DEFAULT_PRESET = "balanced"
 
 
+# ── Reanalysis Defaults ──────────────────────────────────────────────────────
+# These are used by the batch reanalysis pipeline (batch_transcriber.py) and
+# are stored under a separate "reanalysis_params" key in settings.json.
+
+REANALYSIS_DEFAULTS = {
+    "reanalysis_whisper_model": {
+        "value": "openai/whisper-large-v3-turbo",
+        "label": "Whisper Model",
+        "description": "HuggingFace model for batch transcription.",
+        "tooltip": (
+            "The Whisper model used for batch reanalysis. Unlike the real-time "
+            "pipeline (faster-whisper / CTranslate2), this uses the HuggingFace "
+            "transformers backend with batched inference for maximum throughput.<br><br>"
+            "<b>large-v3</b>: Best accuracy, highest VRAM usage.<br>"
+            "<b>large-v3-turbo</b>: Near large-v3 accuracy, significantly faster.<br>"
+            "<b>medium / small</b>: Lower accuracy, less VRAM."
+        ),
+        "type": "select",
+        "options": [
+            {"id": "openai/whisper-large-v3-turbo", "label": "large-v3-turbo (recommended)"},
+            {"id": "openai/whisper-large-v3", "label": "large-v3 (best accuracy, slow)"},
+            {"id": "openai/whisper-medium", "label": "medium"},
+            {"id": "openai/whisper-small", "label": "small (fastest)"},
+        ],
+    },
+    "reanalysis_batch_size": {
+        "value": 8,
+        "label": "Batch Size",
+        "description": "Segments transcribed in parallel per batch.",
+        "tooltip": (
+            "Controls how many diarized audio segments are sent to Whisper "
+            "simultaneously. Higher values process faster but use more VRAM.<br><br>"
+            "<b>4\u20138</b>: Safe for most GPUs (8\u201312 GB VRAM).<br>"
+            "<b>12\u201316</b>: Good for 16+ GB VRAM.<br>"
+            "<b>24+</b>: High-end GPUs (24+ GB).<br><br>"
+            "Reduce if you encounter out-of-memory errors."
+        ),
+        "min": 1,
+        "max": 64,
+        "step": 1,
+        "type": "int",
+    },
+    "reanalysis_device": {
+        "value": "auto",
+        "label": "Device",
+        "description": "Processing device for batch reanalysis.",
+        "tooltip": (
+            "Which device to use for diarization and transcription.<br><br>"
+            "<b>Auto</b>: Uses GPU if available, falls back to CPU.<br>"
+            "<b>GPU</b>: Forces CUDA (fails if no compatible GPU).<br>"
+            "<b>CPU</b>: Slower but always available."
+        ),
+        "type": "select",
+        "options": [
+            {"id": "auto", "label": "Auto (GPU if available)"},
+            {"id": "cuda", "label": "GPU (CUDA)"},
+            {"id": "cpu", "label": "CPU"},
+        ],
+    },
+    "reanalysis_num_speakers": {
+        "value": 0,
+        "label": "Number of Speakers",
+        "description": "Expected speaker count (0 = auto-detect).",
+        "tooltip": (
+            "Set the exact number of speakers if known. This significantly "
+            "improves diarization accuracy.<br><br>"
+            "<b>0</b>: Auto-detect (pyannote estimates from the audio).<br>"
+            "<b>1\u201320</b>: Force exact speaker count."
+        ),
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "type": "int",
+    },
+    "reanalysis_min_speakers": {
+        "value": 0,
+        "label": "Min Speakers",
+        "description": "Minimum expected speakers (0 = no minimum).",
+        "tooltip": (
+            "Lower bound for auto-detection. Only used when Number of Speakers "
+            "is set to 0 (auto-detect)."
+        ),
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "type": "int",
+    },
+    "reanalysis_max_speakers": {
+        "value": 0,
+        "label": "Max Speakers",
+        "description": "Maximum expected speakers (0 = no maximum).",
+        "tooltip": (
+            "Upper bound for auto-detection. Only used when Number of Speakers "
+            "is set to 0 (auto-detect)."
+        ),
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "type": "int",
+    },
+    "reanalysis_merge_gap": {
+        "value": 0.5,
+        "label": "Merge Gap",
+        "unit": "s",
+        "description": "Merge same-speaker segments closer than this.",
+        "tooltip": (
+            "After diarization, consecutive segments from the same speaker "
+            "with a gap shorter than this are merged into one.<br><br>"
+            "<b>Lower values</b>: More granular segments.<br>"
+            "<b>Higher values</b>: Fewer, longer segments."
+        ),
+        "min": 0.0,
+        "max": 3.0,
+        "step": 0.1,
+        "type": "number",
+    },
+    "reanalysis_use_live_diarization": {
+        "value": 0,
+        "label": "Use Live Diarization Settings",
+        "description": "Copy diarization thresholds from the live settings.",
+        "tooltip": (
+            "When enabled, the reanalysis pipeline uses the same diarization "
+            "thresholds (activity, centroid update, new speaker) as the live "
+            "pipeline instead of the reanalysis-specific values below.<br><br>"
+            "Enable this for consistent behavior between live and reanalysis."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+        "inverts_siblings": True,
+    },
+    "reanalysis_clustering_threshold": {
+        "value": 0.45,
+        "label": "Clustering Threshold",
+        "description": "Speaker clustering sensitivity.",
+        "tooltip": (
+            "Controls how different voices must be to be assigned separate "
+            "speaker labels. This is the agglomerative clustering distance "
+            "threshold.<br><br>"
+            "<b>Lower values</b>: Create more speakers (more sensitive to "
+            "voice differences).<br>"
+            "<b>Higher values</b>: Merge similar voices into fewer speakers."
+        ),
+        "min": 0.1,
+        "max": 0.95,
+        "step": 0.05,
+        "type": "number",
+    },
+    "reanalysis_min_duration_off": {
+        "value": 0.0,
+        "label": "Min Silence Duration",
+        "unit": "s",
+        "description": "Minimum silence before a speaker turn can end.",
+        "tooltip": (
+            "After the segmentation model detects a speaker stops talking, "
+            "it must stay silent for at least this long before the turn is "
+            "considered over.<br><br>"
+            "<b>0</b>: Turns end immediately when speech stops.<br>"
+            "<b>Higher values</b>: Require longer silence before closing "
+            "a turn, reducing fragmentation but potentially merging distinct "
+            "utterances."
+        ),
+        "min": 0.0,
+        "max": 2.0,
+        "step": 0.1,
+        "type": "number",
+    },
+}
+
+
+def get_reanalysis_defaults() -> dict:
+    """Return a flat dict of param_name -> default_value for reanalysis parameters."""
+    return {k: v["value"] for k, v in REANALYSIS_DEFAULTS.items()}
+
+
 # ── Diarization Presets ──────────────────────────────────────────────────────
 
 DIARIZATION_PRESETS = {

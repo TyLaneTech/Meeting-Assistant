@@ -230,11 +230,32 @@
             <button class="icon-btn active" id="auto-scroll-btn" title="Auto-scroll to latest" onclick="toggleAutoScroll()">Auto</button>
           </div>
           <div class="col-actions right">
+            <button class="icon-btn fp-bell-btn hidden" id="fp-bell-btn" title="Speaker suggestions" onclick="toggleFpNotifPanel()">
+              <i class="fa-solid fa-bell"></i>
+              <span class="fp-bell-badge" id="fp-bell-badge">0</span>
+            </button>
             <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-filter"></i></button>
             <button class="icon-btn" id="analytics-btn" title="Session analytics" onclick="toggleAnalyticsPanel()"><i class="fa-solid fa-chart-pie"></i></button>
             <hr style="height: -webkit-fill-available; border: 1px solid #ffffff1c; height: 13px; margin-inline: 3px;">
             <button class="icon-btn" id="btn-copy-transcript" title="Copy transcript" onclick="copyTranscript()"><i class="fa-solid fa-clipboard"></i></button>
             <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-solid fa-eraser"></i></button>
+          </div>
+        </div>
+
+        <!-- ── Speaker Notification Panel ────────────────────────────────── -->
+        <div id="fp-notif-panel" class="fp-notif-panel collapsed">
+          <div class="fp-notif-header">
+            <span class="fp-notif-title">Speaker Suggestions</span>
+            <button class="fp-notif-dismiss-all" id="fp-notif-dismiss-all" onclick="fpNotifDismissAll()" title="Dismiss all">
+              Clear all
+            </button>
+          </div>
+          <div class="fp-notif-list" id="fp-notif-list">
+            <!-- Populated dynamically by JS -->
+          </div>
+          <div class="fp-notif-empty" id="fp-notif-empty">
+            <i class="fa-solid fa-check-circle"></i>
+            <span>No pending suggestions</span>
           </div>
         </div>
 
@@ -590,6 +611,9 @@
         <button class="settings-nav-item" data-target="section-diarization" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-users"></i><span>Diarization</span>
         </button>
+        <button class="settings-nav-item" data-target="section-reanalysis" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-arrows-rotate"></i><span>Reanalysis</span>
+        </button>
         <button class="settings-nav-item" data-target="section-echo" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-tower-broadcast"></i><span>Echo Cancellation</span>
         </button>
@@ -719,6 +743,23 @@
           </div>
           <div class="ap-reset-all-wrap">
             <button class="ap-reset-all-btn" onclick="resetSection('diarization')">
+              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
+            </button>
+          </div>
+        </div>
+
+        <!-- Reanalysis (Batch Pipeline) -->
+        <div class="settings-panel" id="section-reanalysis">
+          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
+            Batch processing settings for reanalysis. Uses HuggingFace transformers
+            + pyannote for higher accuracy than real-time processing. These settings
+            are independent of the live transcription and diarization settings.
+          </p>
+          <div class="settings-group" id="ap-reanalysis-params">
+            <!-- Populated dynamically by JS -->
+          </div>
+          <div class="ap-reset-all-wrap">
+            <button class="ap-reset-all-btn" onclick="resetReanalysisParams()">
               <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
             </button>
           </div>

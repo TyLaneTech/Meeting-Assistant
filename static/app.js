@@ -110,6 +110,40 @@ function togglePane(idx) {
   _paneVisible[idx] = !_paneVisible[idx];
   _syncToggleButtons();
   _applyPaneLayout();
+  _savePaneVisible();
+}
+
+function _savePaneVisible() {
+  const sid = state.sessionId;
+  if (sid) {
+    try { localStorage.setItem(`ma-panes:${sid}`, JSON.stringify(_paneVisible)); } catch (_) {}
+  }
+  // Also save as global default for new sessions
+  try { localStorage.setItem('ma-panes:default', JSON.stringify(_paneVisible)); } catch (_) {}
+}
+
+function _loadPaneVisible(sessionId) {
+  // Try session-specific first, then global default
+  try {
+    const raw = localStorage.getItem(`ma-panes:${sessionId}`)
+             || localStorage.getItem('ma-panes:default');
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr) && arr.length === 3) {
+        // Ensure at least one pane is visible
+        if (arr.some(Boolean)) {
+          _paneVisible = arr;
+          _syncToggleButtons();
+          _applyPaneLayout();
+          return;
+        }
+      }
+    }
+  } catch (_) {}
+  // Fallback: show all
+  _paneVisible = [true, true, true];
+  _syncToggleButtons();
+  _applyPaneLayout();
 }
 
 function _applyPaneLayout() {
@@ -2118,6 +2152,9 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id === state.sessionId) {
       console.info(`[fingerprint] Auto-applied "${d.name}" → ${d.speaker_key} (${d.similarity})`);
+      _fpFlashAutoApply(d.speaker_key, d.name);
+      // Remove from notification queue if it was pending
+      _fpRemoveFromQueue(d.speaker_key);
     }
   });
 
@@ -2126,6 +2163,9 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id === state.sessionId) {
       _sessionLinks[d.speaker_key] = { global_id: d.global_id, name: d.name };
       _updateLinkedBadges();
+      // Clean up notification queue — this speaker is now identified
+      _fpRemoveFromQueue(d.speaker_key);
+      _fpUpdateInlineIcons();
     }
   });
 
@@ -2133,6 +2173,12 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     _clearSegmentRegistry();
+    // Clear notification queue on transcript reset (reanalysis)
+    _fpNotifQueue = [];
+    _fpToastActive = null;
+    if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
+    _fpUpdateBell();
+    _fpRenderNotifPanel();
     document.getElementById('transcript').innerHTML =
       '<p class="empty-hint">Reanalyzing audio…</p>';
     document.getElementById('summary').innerHTML =
@@ -2146,6 +2192,7 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing = true;
+    state.isViewingPast = false;  // Allow live transcript updates during reanalysis
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
     dot.className    = 'status-dot recording';
@@ -2156,10 +2203,19 @@ function connectSSE(afterSegId = 0) {
     refreshSidebar();
   });
 
+  src.addEventListener('reanalysis_progress', e => {
+    const d = JSON.parse(e.data);
+    if (d.session_id !== state.sessionId) return;
+    const pct = Math.round((d.progress || 0) * 100);
+    const text = document.getElementById('status-text');
+    if (text) text.textContent = `Reanalyzing… ${pct}%`;
+  });
+
   src.addEventListener('reanalysis_done', e => {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
-    state.isReanalyzing  = false;
+    state.isReanalyzing   = false;
+    state.isViewingPast   = true;  // Back to viewing past session
     state.sessionHasAudio = true;
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
@@ -2174,6 +2230,7 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing = false;
+    state.isViewingPast = true;
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
     dot.className    = 'status-dot ready';
@@ -2241,6 +2298,7 @@ function onStatus(d) {
       state.isViewingPast = false;
       dot.className       = 'status-dot recording';
       text.textContent    = 'Recording…';
+      _loadPaneVisible(d.session_id);
       destroyPlayback();
       if (!_durationInterval) {
         startDurationCounter();
@@ -2469,7 +2527,7 @@ const _NOISE_COLOR = '#6e7681';   // muted gray
 const _SPEAKER_PALETTE = [
   '#58a6ff', // blue
   '#f47067', // red
-  '#3fb950', // green
+  '#00b464', // green
   '#d2a8ff', // lavender
   '#f0883e', // orange
   '#db61a2', // pink
@@ -2761,43 +2819,271 @@ function closeSpeakerManagerOnOverlay(event) {
 
 // ── Fingerprint match toast ───────────────────────────────────────────────────
 
-let _fpToastQueue = [];          // pending {session_id, speaker_key, current_name, matches}
-let _fpToastActive = null;       // currently displayed toast data
+/* ── Fingerprint notification queue ─────────────────────────────────────────
+ * Replaces the old one-shot toast with a persistent notification queue.
+ * Suggestions accumulate in _fpNotifQueue and are shown in both:
+ *   1. The bell panel (always available for review)
+ *   2. A brief toast (fires once for attention, then auto-hides)
+ * ────────────────────────────────────────────────────────────────────────── */
+let _fpNotifQueue = [];          // persistent queue: [{session_id, speaker_key, current_name, matches}, ...]
+let _fpToastActive = null;
 let _fpToastTimer  = null;
 
 function _fpEnqueueToast(data) {
-  // Skip if the top match is the speaker's current name (already applied)
   const top = data.matches && data.matches[0];
   if (top && data.current_name && top.name === data.current_name) return;
-  // Replace any existing entry for the same speaker_key in the queue
-  _fpToastQueue = _fpToastQueue.filter(d => d.speaker_key !== data.speaker_key);
-  _fpToastQueue.push(data);
+  // Replace any existing entry for the same speaker_key
+  _fpNotifQueue = _fpNotifQueue.filter(d => d.speaker_key !== data.speaker_key);
+  _fpNotifQueue.push(data);
+  _fpUpdateBell();
+  _fpRenderNotifPanel();
+  _fpUpdateInlineIcons();
+  // Show a brief toast for the new item
   if (!_fpToastActive) _fpShowNextToast();
 }
 
+function _fpRemoveFromQueue(speakerKey) {
+  _fpNotifQueue = _fpNotifQueue.filter(d => d.speaker_key !== speakerKey);
+  _fpUpdateBell();
+  _fpRenderNotifPanel();
+  _fpUpdateInlineIcons();
+}
+
+function _fpGetSuggestion(speakerKey) {
+  return _fpNotifQueue.find(d => d.speaker_key === speakerKey) || null;
+}
+
+// ── Bell badge ────────────────────────────────────────────────────────────
+function _fpUpdateBell() {
+  const btn = document.getElementById('fp-bell-btn');
+  const badge = document.getElementById('fp-bell-badge');
+  if (!btn || !badge) return;
+  const count = _fpNotifQueue.length;
+  if (count > 0) {
+    btn.classList.remove('hidden');
+    btn.classList.add('has-notifications');
+    badge.textContent = count;
+  } else {
+    btn.classList.remove('has-notifications');
+    // Keep visible briefly so user sees it go to 0, then hide
+    setTimeout(() => {
+      if (_fpNotifQueue.length === 0) btn.classList.add('hidden');
+    }, 2000);
+  }
+}
+
+// ── Notification panel ────────────────────────────────────────────────────
+function toggleFpNotifPanel() {
+  const panel = document.getElementById('fp-notif-panel');
+  if (!panel) return;
+  panel.classList.toggle('collapsed');
+}
+
+function _fpRenderNotifPanel() {
+  const list = document.getElementById('fp-notif-list');
+  if (!list) return;
+  list.innerHTML = '';
+
+  for (const item of _fpNotifQueue) {
+    const top = item.matches[0];
+    if (!top) continue;
+
+    const card = document.createElement('div');
+    card.className = 'fp-notif-card';
+    card.dataset.speakerKey = item.speaker_key;
+
+    const speaker = document.createElement('span');
+    speaker.className = 'fp-notif-speaker';
+    speaker.textContent = item.current_name || item.speaker_key;
+
+    const arrow = document.createElement('i');
+    arrow.className = 'fa-solid fa-arrow-right fp-notif-arrow';
+
+    const match = document.createElement('span');
+    match.className = 'fp-notif-match';
+    match.textContent = top.name;
+
+    const sim = document.createElement('span');
+    sim.className = 'fp-notif-sim';
+    sim.textContent = `${Math.round(top.similarity * 100)}%`;
+
+    const actions = document.createElement('div');
+    actions.className = 'fp-notif-actions';
+
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'fp-notif-btn fp-notif-apply';
+    applyBtn.textContent = 'Apply';
+    applyBtn.addEventListener('click', () => _fpNotifConfirm(item, top.global_id));
+
+    const skipBtn = document.createElement('button');
+    skipBtn.className = 'fp-notif-btn fp-notif-skip';
+    skipBtn.textContent = 'Skip';
+    skipBtn.addEventListener('click', () => _fpNotifDismiss(item));
+
+    actions.appendChild(applyBtn);
+
+    // "Other" dropdown if multiple matches
+    if (item.matches.length > 1) {
+      const otherWrap = document.createElement('div');
+      otherWrap.className = 'fp-notif-other-wrap';
+      const otherBtn = document.createElement('button');
+      otherBtn.className = 'fp-notif-btn';
+      otherBtn.innerHTML = '<i class="fa-solid fa-chevron-down" style="font-size:9px"></i>';
+      otherBtn.title = 'Other matches';
+      const otherList = document.createElement('div');
+      otherList.className = 'fp-notif-other-list hidden';
+      item.matches.slice(1).forEach(m => {
+        const opt = document.createElement('button');
+        opt.className = 'fp-notif-other-opt';
+        opt.textContent = `${m.name} (${Math.round(m.similarity * 100)}%)`;
+        opt.addEventListener('click', () => _fpNotifConfirm(item, m.global_id));
+        otherList.appendChild(opt);
+      });
+      otherBtn.addEventListener('click', () => otherList.classList.toggle('hidden'));
+      otherWrap.appendChild(otherBtn);
+      otherWrap.appendChild(otherList);
+      actions.appendChild(otherWrap);
+    }
+
+    actions.appendChild(skipBtn);
+
+    card.appendChild(speaker);
+    card.appendChild(arrow);
+    card.appendChild(match);
+    card.appendChild(sim);
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+}
+
+async function _fpNotifConfirm(item, globalId) {
+  _fpRemoveFromQueue(item.speaker_key);
+  try {
+    await fetch('/api/fingerprint/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id:  item.session_id,
+        speaker_key: item.speaker_key,
+        global_id:   globalId,
+      }),
+    });
+  } catch (e) { console.warn('fp confirm failed', e); }
+  // If this was the active toast, advance
+  if (_fpToastActive?.speaker_key === item.speaker_key) _fpHideToast();
+}
+
+async function _fpNotifDismiss(item) {
+  _fpRemoveFromQueue(item.speaker_key);
+  try {
+    await fetch('/api/fingerprint/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id:  item.session_id,
+        speaker_key: item.speaker_key,
+        global_id:   item.matches[0]?.global_id || '',
+      }),
+    });
+  } catch (e) { console.warn('fp dismiss failed', e); }
+  if (_fpToastActive?.speaker_key === item.speaker_key) _fpHideToast();
+}
+
+function fpNotifDismissAll() {
+  const items = [..._fpNotifQueue];
+  _fpNotifQueue = [];
+  _fpUpdateBell();
+  _fpRenderNotifPanel();
+  _fpUpdateInlineIcons();
+  if (_fpToastActive) _fpHideToast();
+  for (const item of items) {
+    fetch('/api/fingerprint/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id:  item.session_id,
+        speaker_key: item.speaker_key,
+        global_id:   item.matches[0]?.global_id || '',
+      }),
+    }).catch(() => {});
+  }
+}
+
+// ── Load suggestions from server (for page refresh persistence) ───────────
+async function _fpLoadSuggestions() {
+  try {
+    const res = await fetch('/api/fingerprint/suggestions').then(r => r.json());
+    if (!res.suggestions?.length) return;
+    if (res.session_id !== state.sessionId) return;
+    for (const s of res.suggestions) {
+      // Only add if not already in queue
+      if (!_fpNotifQueue.some(q => q.speaker_key === s.speaker_key)) {
+        _fpNotifQueue.push(s);
+      }
+    }
+    _fpUpdateBell();
+    _fpRenderNotifPanel();
+    _fpUpdateInlineIcons();
+  } catch (_) {}
+}
+
+// ── Inline identify icons on speaker badges ───────────────────────────────
+function _fpUpdateInlineIcons() {
+  document.querySelectorAll('.speaker-identify-icon').forEach(icon => {
+    const key = icon.closest('.src-speaker')?.dataset.speakerKey;
+    if (!key) return;
+    const suggestion = _fpGetSuggestion(key);
+    if (suggestion) {
+      icon.classList.add('has-suggestion');
+      icon.title = `Sounds like ${suggestion.matches[0].name} (${Math.round(suggestion.matches[0].similarity * 100)}%)`;
+    } else {
+      icon.classList.remove('has-suggestion');
+      icon.title = 'Identify speaker';
+    }
+  });
+}
+
+// ── Auto-apply flash feedback ─────────────────────────────────────────────
+function _fpFlashAutoApply(speakerKey, name) {
+  document.querySelectorAll(`.src-speaker[data-speaker-key="${speakerKey}"]`).forEach(badge => {
+    badge.classList.add('fp-auto-applied');
+    badge.addEventListener('animationend', () => badge.classList.remove('fp-auto-applied'), { once: true });
+  });
+  // Brief status-bar message
+  const text = document.getElementById('status-text');
+  const prev = text?.textContent;
+  if (text) {
+    text.textContent = `Identified ${speakerKey} as ${name}`;
+    setTimeout(() => { if (text.textContent.startsWith('Identified')) text.textContent = prev; }, 3000);
+  }
+}
+
+// ── Toast (brief attention-getter, backed by notification queue) ──────────
 function _fpShowNextToast() {
-  if (!_fpToastQueue.length) return;
-  _fpToastActive = _fpToastQueue.shift();
-  const toast    = document.getElementById('fp-match-toast');
-  const top      = _fpToastActive.matches[0];
+  // Find next item in queue that hasn't been toasted yet
+  if (!_fpNotifQueue.length) return;
+  // Show the most recent item
+  _fpToastActive = _fpNotifQueue[_fpNotifQueue.length - 1];
+  const toast = document.getElementById('fp-match-toast');
+  const top   = _fpToastActive.matches[0];
 
   document.getElementById('fp-toast-label').innerHTML =
     `${_fpToastActive.current_name || _fpToastActive.speaker_key} sounds like <strong id="fp-toast-name">${top.name}</strong>`;
   document.getElementById('fp-toast-sim').textContent = `${Math.round(top.similarity * 100)}%`;
 
-  // Populate "Not this" list
   const otherList = document.getElementById('fp-toast-other-list');
   otherList.innerHTML = '';
   otherList.classList.add('hidden');
   const others = _fpToastActive.matches.slice(1);
   if (others.length) {
+    document.getElementById('fp-toast-other').style.display = '';
     others.forEach(m => {
       const btn = document.createElement('button');
       btn.className = 'fp-toast-opt';
       btn.textContent = `${m.name} (${Math.round(m.similarity * 100)}%)`;
       btn.addEventListener('mousedown', e => {
         e.preventDefault();
-        _fpConfirm(_fpToastActive, m.global_id);
+        _fpNotifConfirm(_fpToastActive, m.global_id);
       });
       otherList.appendChild(btn);
     });
@@ -2806,19 +3092,18 @@ function _fpShowNextToast() {
   }
 
   toast.classList.remove('hidden');
-  // Re-trigger entrance animation
   toast.style.animation = 'none';
-  toast.offsetHeight; // force reflow
+  toast.offsetHeight;
   toast.style.animation = '';
 
   if (_fpToastTimer) clearTimeout(_fpToastTimer);
-  _fpToastTimer = setTimeout(() => fpToastSkip(), 12000);
+  _fpToastTimer = setTimeout(() => fpToastSkip(), 8000);
 }
 
 function fpToastApply() {
   if (!_fpToastActive) return;
   const top = _fpToastActive.matches[0];
-  _fpConfirm(_fpToastActive, top.global_id);
+  _fpNotifConfirm(_fpToastActive, top.global_id);
 }
 
 function fpToastToggleOther() {
@@ -2827,7 +3112,7 @@ function fpToastToggleOther() {
 
 function _fpAnimateOut(cb) {
   const toast = document.getElementById('fp-match-toast');
-  document.getElementById('fp-toast-other-list').classList.add('hidden');
+  document.getElementById('fp-toast-other-list')?.classList.add('hidden');
   toast.classList.add('fp-toast-out');
   toast.addEventListener('animationend', function handler() {
     toast.removeEventListener('animationend', handler);
@@ -2839,45 +3124,24 @@ function _fpAnimateOut(cb) {
 
 function fpToastSkip() {
   if (!_fpToastActive) return;
-  _fpDismiss(_fpToastActive);
   _fpToastActive = null;
   if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
-  _fpAnimateOut(() => setTimeout(_fpShowNextToast, 300));
+  _fpAnimateOut();
+  // Don't dismiss from queue — it stays in the bell panel for later review
 }
 
 function _fpHideToast() {
   _fpToastActive = null;
   if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
-  _fpAnimateOut(() => setTimeout(_fpShowNextToast, 300));
+  _fpAnimateOut();
 }
 
 async function _fpConfirm(toastData, globalId) {
-  _fpHideToast();
-  try {
-    await fetch('/api/fingerprint/confirm', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id:  toastData.session_id,
-        speaker_key: toastData.speaker_key,
-        global_id:   globalId,
-      }),
-    });
-  } catch (e) { console.warn('fp confirm failed', e); }
+  _fpNotifConfirm(toastData, globalId);
 }
 
 async function _fpDismiss(toastData) {
-  try {
-    await fetch('/api/fingerprint/dismiss', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id:  toastData.session_id,
-        speaker_key: toastData.speaker_key,
-        global_id:   toastData.matches[0]?.global_id || '',
-      }),
-    });
-  } catch (e) { console.warn('fp dismiss failed', e); }
+  _fpNotifDismiss(toastData);
 }
 
 // ── Voice Library panel ───────────────────────────────────────────────────────
@@ -3724,11 +3988,30 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     badge.style.backgroundColor = color + '26'; // ~15% opacity tint
     badge.style.color = color;
     badge.style.borderColor = color + '60';
+
+    // Inline identify icon for unlinked speakers
+    const idIcon = document.createElement('i');
+    idIcon.className = 'fa-solid fa-fingerprint speaker-identify-icon';
+    const suggestion = _fpGetSuggestion(source);
+    if (suggestion) {
+      idIcon.classList.add('has-suggestion');
+      idIcon.title = `Sounds like ${suggestion.matches[0].name} (${Math.round(suggestion.matches[0].similarity * 100)}%)`;
+    } else {
+      idIcon.title = 'Identify speaker';
+    }
+    badge.appendChild(idIcon);
+
     badge.addEventListener('click', e => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) {
         e.preventDefault();
         e.stopPropagation();
         _toggleTranscriptSegSelection(seg, { range: e.shiftKey });
+        return;
+      }
+      // If clicking the identify icon and there's a suggestion, open the panel
+      if (e.target.closest('.speaker-identify-icon') && _fpGetSuggestion(source)) {
+        const panel = document.getElementById('fp-notif-panel');
+        if (panel?.classList.contains('collapsed')) toggleFpNotifPanel();
         return;
       }
       editSpeakerLabel(badge, source);
@@ -4340,7 +4623,7 @@ function copyTranscript() {
       const icon = btn.querySelector('i');
       if (icon) {
         icon.className = 'fa-solid fa-check';
-        icon.style.color = '#3fb950';
+        icon.style.color = '#00b464';
         clearTimeout(btn._copyTimer);
         btn._copyTimer = setTimeout(() => {
           icon.className = 'fa-solid fa-clipboard';
@@ -5618,12 +5901,25 @@ function highlightPlayingSegment(t) {
   }
   const found = (idx >= 0 && _segmentTimes[idx].end > t) ? _segmentTimes[idx].el : null;
   if (found === _currentPlayingSeg) return;
-  if (_currentPlayingSeg) _currentPlayingSeg.classList.remove('playing');
+  // Remove playing from previous segment and its group
+  if (_currentPlayingSeg) {
+    _currentPlayingSeg.classList.remove('playing');
+    if (_currentPlayingSeg._groupSummary) {
+      _currentPlayingSeg._groupSummary.classList.remove('playing');
+    }
+  }
   _currentPlayingSeg = found;
   if (found) {
     found.classList.add('playing');
+    // Propagate playing state to the parent group summary
+    if (found._groupSummary) {
+      found._groupSummary.classList.add('playing');
+    }
     if (_autoScroll) {
-      _doProgrammaticScroll(found, { behavior: 'smooth', block: 'center' });
+      // If segment is hidden inside a collapsed group, scroll to the group summary instead
+      const scrollTarget = (found.style.display === 'none' && found._groupSummary)
+        ? found._groupSummary : found;
+      _doProgrammaticScroll(scrollTarget, { behavior: 'smooth', block: 'center' });
     }
   }
 }
@@ -5631,6 +5927,9 @@ function highlightPlayingSegment(t) {
 function clearPlayingHighlight() {
   if (_currentPlayingSeg) {
     _currentPlayingSeg.classList.remove('playing');
+    if (_currentPlayingSeg._groupSummary) {
+      _currentPlayingSeg._groupSummary.classList.remove('playing');
+    }
     _currentPlayingSeg = null;
   }
 }
@@ -5923,9 +6222,9 @@ function toggleTranscriptCollapse() {
 }
 
 /** Build consecutive same-speaker runs and collapse them.
- *  After building strict runs, merges adjacent runs from the same speaker
- *  when they are separated by short (≤2 segment) runs from other speakers,
- *  producing larger, more uniform groups.
+ *  Groups by the resolved display name (final label), NOT the raw speaker key,
+ *  so renamed/linked speakers are grouped correctly even if they have different
+ *  underlying keys (e.g. "Speaker 1" and "Speaker 3" both renamed to "Joe Rogan").
  */
 function _applyCollapse() {
   const el = document.getElementById('transcript');
@@ -5933,7 +6232,18 @@ function _applyCollapse() {
   // Remove any existing group summaries first
   _removeCollapse();
 
-  // Build strict runs of consecutive segments by the same speaker
+  // Resolve the display label for a segment's speaker
+  function _resolveLabel(seg) {
+    const badge = seg.querySelector('.src-badge');
+    if (!badge) return seg.dataset.transcriptSource || '';
+    // Use the visible text content (which reflects renames/links)
+    // but strip any inline icon text (fingerprint icon etc.)
+    const clone = badge.cloneNode(true);
+    clone.querySelectorAll('i, .badge-alias, .speaker-identify-icon').forEach(el => el.remove());
+    return clone.textContent.trim() || badge.dataset.speakerKey || '';
+  }
+
+  // Build strict runs of consecutive segments by the same display label
   const segs = Array.from(el.querySelectorAll('.transcript-segment'));
   if (!segs.length) return;
 
@@ -5942,29 +6252,22 @@ function _applyCollapse() {
 
   for (const seg of segs) {
     if (seg.style.display === 'none') continue; // filtered out
-    const badge = seg.querySelector('.src-badge');
-    const key = badge?.dataset.speakerKey || seg.dataset.transcriptSource || '';
-    if (currentRun && currentRun.key === key) {
+    const label = _resolveLabel(seg);
+    if (currentRun && currentRun.key === label) {
       currentRun.segs.push(seg);
     } else {
       if (currentRun) strictRuns.push(currentRun);
-      currentRun = { key, segs: [seg] };
+      currentRun = { key: label, segs: [seg] };
     }
   }
   if (currentRun) strictRuns.push(currentRun);
 
-  // Merge pass: absorb short interstitial runs (≤2 segs) between same-speaker groups
+  // Merge pass: merge adjacent runs from the same speaker (no interstitial absorption)
   const merged = [strictRuns[0]];
   for (let i = 1; i < strictRuns.length; i++) {
     const prev = merged[merged.length - 1];
     const curr = strictRuns[i];
-    // Look ahead: is there a same-speaker group after a short gap?
-    if (curr.segs.length <= 2 && i + 1 < strictRuns.length && strictRuns[i + 1].key === prev.key) {
-      // Absorb the short gap and the next same-speaker run into prev
-      prev.segs.push(...curr.segs, ...strictRuns[i + 1].segs);
-      i++; // skip the next run (already absorbed)
-    } else if (curr.key === prev.key) {
-      // Same speaker, just merge directly
+    if (curr.key === prev.key) {
       prev.segs.push(...curr.segs);
     } else {
       merged.push(curr);
@@ -6021,14 +6324,17 @@ function _applyCollapse() {
       for (const seg of summary._groupSegs) {
         seg.style.display = expanded ? '' : 'none';
         seg.dataset.collapsedHidden = expanded ? '' : '1';
+        seg.classList.toggle('in-group', expanded);
       }
     });
 
     // Insert summary before first segment, hide all segments
+    // Link each segment back to its parent group for playback highlighting
     first.parentNode.insertBefore(summary, first);
     for (const seg of run.segs) {
       seg.style.display = 'none';
       seg.dataset.collapsedHidden = '1';
+      seg._groupSummary = summary;
     }
   }
 }
@@ -6041,6 +6347,8 @@ function _removeCollapse() {
   el.querySelectorAll('[data-collapsed-hidden]').forEach(seg => {
     delete seg.dataset.collapsedHidden;
     seg.style.display = '';
+    seg.classList.remove('in-group');
+    delete seg._groupSummary;
   });
   el.querySelectorAll('.transcript-group-summary').forEach(s => s.remove());
   // Re-apply transcript filter in case some segments should still be hidden
@@ -6074,9 +6382,24 @@ function toggleTranscriptMinimap() {
   const wrap = document.getElementById('transcript-minimap');
   if (btn)  btn.classList.toggle('active', _minimapActive);
   if (wrap) wrap.classList.toggle('hidden', !_minimapActive);
-  if (_minimapActive) {
-    _renderMinimap();
-    _updateMinimapViewport();
+  if (_minimapActive && wrap) {
+    // The minimap container transitions from width:0 via CSS. Wait for the
+    // transition to finish so clientWidth/clientHeight are final before rendering.
+    let rendered = false;
+    const onReady = () => {
+      if (rendered) return;
+      rendered = true;
+      _renderMinimap();
+      _updateMinimapViewport();
+    };
+    wrap.addEventListener('transitionend', function handler(e) {
+      if (e.propertyName === 'width') {
+        wrap.removeEventListener('transitionend', handler);
+        onReady();
+      }
+    });
+    // Fallback if transition doesn't fire (e.g., reduced motion or instant)
+    setTimeout(onReady, 250);
   }
 }
 
@@ -6687,6 +7010,7 @@ async function loadSession(sessionId) {
   state.isViewingPast = true;
   history.pushState({}, '', '?session=' + sessionId);
   updateRecordBtn();
+  _loadPaneVisible(sessionId);
 
   if (data.speaker_profiles?.length) {
     data.speaker_profiles.forEach(profile => applySpeakerProfileUpdate(profile));
@@ -6702,6 +7026,9 @@ async function loadSession(sessionId) {
     .then(r => r.json())
     .then(links => { _sessionLinks = links || {}; _updateLinkedBadges(); })
     .catch(() => {});
+
+  // Load pending speaker suggestions
+  _fpLoadSuggestions();
 
   // Render segments in chunks to keep the UI responsive on large transcripts.
   const segments = data.segments || [];
@@ -6964,6 +7291,9 @@ function stopBrowserMic() {
   if (_bmStream)    { _bmStream.getTracks().forEach(t => t.stop()); _bmStream = null; }
 }
 
+// Ensure browser mic is released when the page is closed or refreshed
+window.addEventListener('beforeunload', () => stopBrowserMic());
+
 function syncBrowserMic() {
   const micVal   = document.getElementById('viz-mic-sel')?.value;
   const needsMic = (state.isRecording || state.isTesting) && micVal === '-2';
@@ -7038,7 +7368,14 @@ function saveDeviceSelection() {
 
 async function toggleAudioTest() {
   if (state.isTesting) {
-    await fetch('/api/audio/test/stop', { method: 'POST' });
+    try {
+      await fetch('/api/audio/test/stop', { method: 'POST' });
+    } catch (_) { /* network error */ }
+    // Eagerly release browser mic regardless of server response —
+    // don't wait for SSE event which may be delayed or lost.
+    state.isTesting = false;
+    updateTestBtn();
+    stopBrowserMic();
   } else {
     const lbVal  = document.getElementById('viz-loopback-sel')?.value;
     const micVal = document.getElementById('viz-mic-sel')?.value;
@@ -7130,7 +7467,7 @@ function startVizLoop() {
       if (vizHasMic) {
         const micH = Math.max(1, vizMicBars[i] * (midY - 3));
         const micAlpha = micActive ? 0.25 + 0.75 * vizMicBars[i] : 0.12;
-        ctx.fillStyle = `rgba(63,185,80,${micAlpha.toFixed(2)})`;
+        ctx.fillStyle = `rgba(0,180,100,${micAlpha.toFixed(2)})`;
         ctx.fillRect(x, midY + 2, bw, micH);
       }
     }
@@ -7145,7 +7482,7 @@ function startVizLoop() {
   });
 }
 
-/* ── Brand circular visualizer (wraps around topbar logo) ────────────────── */
+/* ── Brand horizontal visualizer (bars extend left/right from logo) ──────── */
 function startBrandVizLoop() {
   const canvas = document.getElementById('brand-viz-canvas');
   if (!canvas) return;
@@ -7173,10 +7510,16 @@ function startBrandVizLoop() {
 
     const cx = w / 2;
     const cy = h / 2;
-    const innerR  = 19;   // just outside the logo edge
-    const maxBarH = 16;   // max outward extension of a bar
+    const logoHalfW = 20;  // tuck bars closer to logo center
+    const nBars     = 16;  // bars stacked vertically along logo edge
+    const barGap    = 1.0;
+    const maxBarW   = cx - logoHalfW - 125; // shorter max so left bars stay on screen
+    const barRegionH = h * 0.75;          // vertical region bars span
+    const barH      = barRegionH / nBars; // height of each bar
+    const topY      = cy - barRegionH / 2; // top of bar stack
 
-    // Smooth toward latest spectrum (same attack/decay as sidebar)
+    // Smooth toward latest spectrum
+    const binsPerBar = N_BARS / nBars;
     for (let i = 0; i < N_BARS; i++) {
       const lt = vizLbSpec[i]  || 0;
       const mt = vizMicSpec[i] || 0;
@@ -7187,39 +7530,38 @@ function startBrandVizLoop() {
     const lbActive  = vizLb  > 0.002;
     const micActive = vizHasMic && vizMic > 0.002;
 
-    // Top half (desktop / loopback) — angles from PI to 2*PI (180° to 360°)
-    // Bottom half (mic)            — angles from 0 to PI     (0° to 180°)
-    // Each half gets N_BARS bars spread evenly with small end gaps.
-    const gap   = 0.06;           // radians of padding at each end
-    const sweep = Math.PI - gap * 2;
-    const step  = sweep / N_BARS;
-    const barArc = step * 0.65;   // each bar occupies 65% of its slot
-
-    // ── Desktop bars (top semicircle, drawn clockwise from left to right) ──
-    for (let i = 0; i < N_BARS; i++) {
-      const angle = Math.PI + gap + step * i + step / 2;
-      const barH  = Math.max(0.5, bvLbBars[i] * maxBarH);
-      const alpha = lbActive ? 0.15 + 0.45 * bvLbBars[i] : 0.06;
-      ctx.beginPath();
-      ctx.arc(cx, cy, innerR, angle - barArc / 2, angle + barArc / 2);
-      ctx.arc(cx, cy, innerR + barH, angle + barArc / 2, angle - barArc / 2, true);
-      ctx.closePath();
-      ctx.fillStyle = `rgba(88,166,255,${alpha.toFixed(2)})`;
-      ctx.fill();
+    // Helper: average a range of smoothed bars into one value
+    function avgBand(bars, bandIdx) {
+      let sum = 0;
+      const s = Math.floor(bandIdx * binsPerBar);
+      const e = Math.floor((bandIdx + 1) * binsPerBar);
+      for (let j = s; j < e; j++) sum += bars[j];
+      return sum / (e - s);
     }
 
-    // ── Mic bars (bottom semicircle) ──
+    // ── Desktop bars (left side) ──
+    // Vertical bars stacked top-to-bottom, each extends horizontally LEFT
+    for (let i = 0; i < nBars; i++) {
+      const val   = avgBand(bvLbBars, i);
+      const y     = topY + i * barH + barGap;
+      const bh    = barH - barGap * 2;
+      const bw    = Math.max(1.5, val * maxBarW);
+      const alpha = lbActive ? 0.18 + 0.60 * val : 0.06;
+      ctx.fillStyle = `rgba(88,166,255,${alpha.toFixed(2)})`;
+      ctx.fillRect(cx - logoHalfW - bw, y, bw, bh);
+    }
+
+    // ── Mic bars (right side) ──
+    // Vertical bars stacked top-to-bottom, each extends horizontally RIGHT
     if (vizHasMic) {
-      for (let i = 0; i < N_BARS; i++) {
-        const angle = gap + step * i + step / 2;
-        const barH  = Math.max(0.5, bvMicBars[i] * maxBarH);
-        const alpha = micActive ? 0.15 + 0.45 * bvMicBars[i] : 0.06;
-        ctx.beginPath();
-        ctx.arc(cx, cy, innerR, angle - barArc / 2, angle + barArc / 2);
-        ctx.arc(cx, cy, innerR + barH, angle + barArc / 2, angle - barArc / 2, true);
-        ctx.closePath();
-        ctx.fillStyle = `rgba(63,185,80,${alpha.toFixed(2)})`;
-        ctx.fill();
+      for (let i = 0; i < nBars; i++) {
+        const val   = avgBand(bvMicBars, i);
+        const y     = topY + i * barH + barGap;
+        const bh    = barH - barGap * 2;
+        const bw    = Math.max(1.5, val * maxBarW);
+        const alpha = micActive ? 0.18 + 0.60 * val : 0.06;
+        ctx.fillStyle = `rgba(0,180,100,${alpha.toFixed(2)})`;
+        ctx.fillRect(cx + logoHalfW, y, bw, bh);
       }
     }
   });
@@ -7818,9 +8160,14 @@ function toggleKeyVis(inputId) {
 // ── Audio Parameters ──────────────────────────────────────────────────────
 let _apCache = null;  // cached audio params response
 
+let _raCache = null; // reanalysis params cache (separate from audio params)
+
 async function _apLoad() {
   try {
     _apCache = await fetch('/api/audio_params').then(r => r.json());
+  } catch (_) {}
+  try {
+    _raCache = await fetch('/api/reanalysis_params').then(r => r.json());
   } catch (_) {}
 }
 
@@ -7831,8 +8178,9 @@ function _apRenderSection(containerId, paramDefs, current) {
 
   // Find any toggle master key in this section (controls enabled state of siblings)
   let toggleMasterKey = null;
+  let toggleInverted = false; // when true, ON disables siblings instead of enabling them
   for (const [k, s] of Object.entries(paramDefs)) {
-    if (s.type === 'toggle') { toggleMasterKey = k; break; }
+    if (s.type === 'toggle') { toggleMasterKey = k; toggleInverted = !!s.inverts_siblings; break; }
   }
 
   for (const [key, spec] of Object.entries(paramDefs)) {
@@ -7876,16 +8224,60 @@ function _apRenderSection(containerId, paramDefs, current) {
       cb.addEventListener('change', () => {
         const v = cb.checked ? 1 : 0;
         lbl.textContent = cb.checked ? 'Enabled' : 'Disabled';
-        _apSave(key, v);
+        const saveFn = containerId === 'ap-reanalysis-params' ? _raSave : _apSave;
+        saveFn(key, v);
         // Enable/disable sibling params in this section
-        _apSetSectionEnabled(containerId, key, cb.checked);
+        const siblingsEnabled = toggleInverted ? !cb.checked : cb.checked;
+        _apSetSectionEnabled(containerId, key, siblingsEnabled);
+      });
+      continue;
+    }
+
+    if (spec.type === 'select') {
+      // Render as a dropdown select
+      const optionsHtml = spec.options.map(o =>
+        `<option value="${o.id}"${val === o.id ? ' selected' : ''}>${o.label}</option>`
+      ).join('');
+      const isDefault = val === spec.value;
+      param.innerHTML = `
+        <div class="ap-header">
+          <span class="ap-label">${spec.label}</span>
+          <span class="ap-desc">${spec.description}</span>
+          <div class="ap-info-wrap">
+            <button class="ap-info-btn" tabindex="-1"><i class="fa-solid fa-circle-info"></i></button>
+            <div class="ap-tooltip">
+              <div class="ap-tooltip-title"><i class="fa-solid fa-circle-info"></i> ${spec.label}</div>
+              <div class="ap-tooltip-body">${tooltip}</div>
+              <div class="ap-tooltip-default">Default: <span>${spec.options.find(o => o.id === spec.value)?.label || spec.value}</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="ap-slider-row" style="gap:8px">
+          <select class="model-config-sel" id="ap-select-${key}" style="flex:1">${optionsHtml}</select>
+          <button class="ap-reset${isDefault ? ' ap-reset-hidden' : ''}" id="ap-reset-${key}"
+                  title="Reset to default"
+                  onclick="_apResetOne('${key}')"
+                  style="flex-shrink:0">
+            <i class="fa-solid fa-rotate-right"></i>
+          </button>
+        </div>`;
+      container.appendChild(param);
+      _apBindTooltip(param);
+
+      const sel = param.querySelector(`#ap-select-${key}`);
+      sel.addEventListener('change', () => {
+        const saveFn = containerId === 'ap-reanalysis-params' ? _raSave : _apSave;
+        saveFn(key, sel.value);
+        const resetBtn = document.getElementById(`ap-reset-${key}`);
+        if (resetBtn) resetBtn.classList.toggle('ap-reset-hidden', sel.value === spec.value);
       });
       continue;
     }
 
     // Standard slider param
     const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
-    const isDisabled = (toggleMasterKey && key !== toggleMasterKey && !parseInt(current[toggleMasterKey] ?? 0));
+    const toggleOn = !!parseInt(current[toggleMasterKey] ?? 0);
+    const isDisabled = (toggleMasterKey && key !== toggleMasterKey && (toggleInverted ? toggleOn : !toggleOn));
 
     param.innerHTML = `
       <div class="ap-header">
@@ -7925,12 +8317,13 @@ function _apRenderSection(containerId, paramDefs, current) {
     const slider = param.querySelector('.ap-slider');
     const input  = param.querySelector('.ap-val-input');
 
+    const saveFn = containerId === 'ap-reanalysis-params' ? _raSave : _apSave;
     slider.addEventListener('input', () => {
       input.value = slider.value;
       _apUpdateSliderFill(slider, spec);
     });
     slider.addEventListener('change', () => {
-      _apSave(key, parseFloat(slider.value));
+      saveFn(key, parseFloat(slider.value));
       _apToggleReset(key, parseFloat(slider.value), spec.value);
     });
     input.addEventListener('change', () => {
@@ -7939,7 +8332,7 @@ function _apRenderSection(containerId, paramDefs, current) {
       input.value = v;
       slider.value = v;
       _apUpdateSliderFill(slider, spec);
-      _apSave(key, v);
+      saveFn(key, v);
       _apToggleReset(key, v, spec.value);
     });
   }
@@ -8007,11 +8400,15 @@ function _apToggleReset(key, val, defaultVal) {
 
 async function _apRefresh() {
   await _apLoad();
-  if (!_apCache) return;
-  _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
-  _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
-  _apRenderSection('ap-echo-params',          _apCache.echo_cancellation, _apCache.current);
-  _apRenderSection('ap-screen-params',        _apCache.screen_recording,  _apCache.current);
+  if (_apCache) {
+    _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
+    _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
+    _apRenderSection('ap-echo-params',          _apCache.echo_cancellation, _apCache.current);
+    _apRenderSection('ap-screen-params',        _apCache.screen_recording,  _apCache.current);
+  }
+  if (_raCache) {
+    _apRenderSection('ap-reanalysis-params', _raCache.reanalysis, _raCache.current);
+  }
 }
 
 async function _apSave(key, value) {
@@ -8034,6 +8431,33 @@ async function _apSave(key, value) {
       if (key === 'screen_record_enabled') _syncScreenToggle();
       // Switch preset to "Custom" when a parameter is manually changed
       _switchToCustomPreset(key);
+    }
+  } catch (_) {}
+}
+
+async function _raSave(key, value) {
+  try {
+    const res = await fetch('/api/reanalysis_params', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [key]: value }),
+    }).then(r => r.json());
+    if (res.ok && _raCache) {
+      _raCache.current = res.reanalysis_params;
+    }
+  } catch (_) {}
+}
+
+async function resetReanalysisParams() {
+  try {
+    const res = await fetch('/api/reanalysis_params/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(r => r.json());
+    if (res.ok && _raCache) {
+      _raCache.current = res.reanalysis_params;
+      _apRenderSection('ap-reanalysis-params', _raCache.reanalysis, _raCache.current);
     }
   } catch (_) {}
 }
@@ -8075,13 +8499,34 @@ function _switchToCustomPreset(key) {
 }
 
 async function _apResetOne(key) {
+  // Detect whether this is a reanalysis param or an audio param
+  const isReanalysis = _raCache?.reanalysis?.[key];
+  const endpoint = isReanalysis ? '/api/reanalysis_params/reset' : '/api/audio_params/reset';
+
   try {
-    const res = await fetch('/api/audio_params/reset', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ key }),
     }).then(r => r.json());
-    if (res.ok && _apCache) {
+
+    if (res.ok && isReanalysis && _raCache) {
+      _raCache.current = res.reanalysis_params;
+      const spec = _raCache.reanalysis[key];
+      if (spec) {
+        if (spec.type === 'select') {
+          const sel = document.getElementById(`ap-select-${key}`);
+          if (sel) sel.value = spec.value;
+        } else {
+          const input  = document.getElementById(`ap-${key}`);
+          const slider = document.getElementById(`ap-slider-${key}`);
+          if (input)  input.value  = spec.value;
+          if (slider) { slider.value = spec.value; _apUpdateSliderFill(slider, spec); }
+        }
+      }
+      const resetBtn = document.getElementById(`ap-reset-${key}`);
+      if (resetBtn) resetBtn.classList.add('ap-reset-hidden');
+    } else if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
       const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
       if (spec) {
@@ -8090,7 +8535,6 @@ async function _apResetOne(key) {
           const lbl = document.getElementById(`ap-toggle-label-${key}`);
           if (cb) { cb.checked = !!spec.value; }
           if (lbl) { lbl.textContent = spec.value ? 'Enabled' : 'Disabled'; }
-          // Find which container this toggle belongs to and update siblings
           const paramEl = cb?.closest('.ap-param');
           const container = paramEl?.parentElement;
           if (container) _apSetSectionEnabled(container.id, key, !!spec.value);

@@ -498,6 +498,21 @@ class SpeakerFingerprintDB:
                 (_emb_to_blob(centroid), len(rows), _now(), global_id),
             )
 
+    def remove_session_embeddings(self, session_id: str) -> list[str]:
+        """Delete all embeddings from a session. Returns affected global_ids for centroid recomputation."""
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                "SELECT DISTINCT global_id FROM speaker_embeddings WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            affected = [r["global_id"] for r in rows]
+            if affected:
+                c.execute(
+                    "DELETE FROM speaker_embeddings WHERE session_id = ?",
+                    (session_id,),
+                )
+        return affected
+
     def prune_embeddings(self, global_id: str, keep_newest: int = 30) -> None:
         """Delete oldest embeddings beyond keep_newest, then recompute centroid."""
         with _conn(self._db_path) as c:

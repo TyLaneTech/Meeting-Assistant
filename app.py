@@ -117,6 +117,7 @@ _state: dict = {
     "speaker_audio_accum":    {},  # speaker_key → {"audio": np.ndarray, "total_sec": float}
     "speaker_emb_counts":     {},  # speaker_key → int (embeddings extracted this session)
     "fingerprint_dismissals": {},  # speaker_key → set[global_id]
+    "fingerprint_suggestions": {},  # speaker_key → {session_id, speaker_key, current_name, matches}
     "speaker_offer_counts":   {},  # speaker_key → int (audio offers for diminishing returns)
 }
 _state_lock = threading.Lock()
@@ -871,6 +872,12 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
             fingerprint_db.add_embedding(existing_link, sid, speaker_key, emb, duration)
             return
         excluded = dismissals.get(speaker_key, set())
+        # Also exclude global profiles already linked to OTHER speakers in this session
+        # to prevent "Rogan sounds like Dave Smith" when Dave is already identified
+        session_links = fingerprint_db.get_session_links(sid)
+        for k, gid in session_links.items():
+            if k != speaker_key and gid:
+                excluded.add(gid)
         matches = fingerprint_db.find_matches(emb, exclude_global_ids=excluded)
         if not matches:
             return
@@ -880,8 +887,10 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         else:
             with _state_lock:
                 current_name = _state["speaker_labels"].get(speaker_key, speaker_key)
-            _push("fingerprint_match", {"session_id": sid, "speaker_key": speaker_key,
-                                        "current_name": current_name, "matches": matches})
+                suggestion = {"session_id": sid, "speaker_key": speaker_key,
+                              "current_name": current_name, "matches": matches}
+                _state["fingerprint_suggestions"][speaker_key] = suggestion
+            _push("fingerprint_match", suggestion)
 
     threading.Thread(target=_extract_and_match, daemon=True).start()
 
@@ -1220,6 +1229,7 @@ def start_recording():
             "speaker_audio_accum":    {},
             "speaker_emb_counts":     {},
             "fingerprint_dismissals": {},
+            "fingerprint_suggestions": {},
             "_confirmed_speakers":    set(),
         })
 
@@ -1719,6 +1729,54 @@ def reset_audio_section():
     current = {**defaults, **params}
     _apply_audio_params(current)
     return jsonify({"ok": True, "audio_params": current})
+
+
+# ── Reanalysis parameter endpoints ───────────────────────────────────────────
+
+@app.route("/api/reanalysis_params", methods=["GET"])
+def get_reanalysis_params():
+    """Return current reanalysis parameter values, defaults, and metadata."""
+    from default_audio_params import REANALYSIS_DEFAULTS, get_reanalysis_defaults
+    saved = settings.load().get("reanalysis_params", {})
+    defaults = get_reanalysis_defaults()
+    current = {**defaults, **saved}
+    return jsonify({
+        "current": current,
+        "reanalysis": REANALYSIS_DEFAULTS,
+    })
+
+
+@app.route("/api/reanalysis_params", methods=["PUT"])
+def set_reanalysis_params():
+    """Update one or more reanalysis parameters."""
+    from default_audio_params import get_reanalysis_defaults
+    data = request.get_json(silent=True) or {}
+    all_settings = settings.load()
+    params = all_settings.get("reanalysis_params", {})
+    defaults = get_reanalysis_defaults()
+    for key, val in data.items():
+        if key in defaults:
+            params[key] = val
+    settings.put("reanalysis_params", params)
+    return jsonify({"ok": True, "reanalysis_params": {**defaults, **params}})
+
+
+@app.route("/api/reanalysis_params/reset", methods=["POST"])
+def reset_reanalysis_param():
+    """Reset one or all reanalysis parameters to defaults."""
+    from default_audio_params import get_reanalysis_defaults
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    all_settings = settings.load()
+    params = all_settings.get("reanalysis_params", {})
+    if key:
+        params.pop(key, None)
+    else:
+        params = {}
+    settings.put("reanalysis_params", params)
+    defaults = get_reanalysis_defaults()
+    current = {**defaults, **params}
+    return jsonify({"ok": True, "reanalysis_params": current})
 
 
 @app.route("/api/transcription/presets", methods=["GET"])
@@ -2496,6 +2554,14 @@ def session_audio(session_id: str):
 def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
     """Worker: clear DB data, retranscribe the WAV, then regenerate summary."""
     try:
+        # Remove old session embeddings from Speaker Library and recompute centroids
+        if fingerprint_db.ready:
+            affected_ids = fingerprint_db.remove_session_embeddings(session_id)
+            for gid in affected_ids:
+                fingerprint_db.recompute_centroid(gid)
+            log.info("reanalysis", f"Cleared {len(affected_ids)} speaker profiles' "
+                     f"embeddings for session {session_id[:8]}")
+
         # Clear stored data (preserves session title/timestamps)
         storage.reset_session_transcript(session_id)
 
@@ -2508,12 +2574,46 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 _state["pending_segments"] = 0
                 _state["summarized_seg_count"] = 0
                 _state["speaker_labels"] = {}
+                # Reset fingerprint accumulators for fresh collection
+                _state["speaker_audio_accum"] = {}
+                _state["speaker_emb_counts"] = {}
+                _state["speaker_offer_counts"] = {}
+                _state["fingerprint_dismissals"] = {}
+                _state["fingerprint_suggestions"] = {}
+                _state["_confirmed_speakers"] = set()
 
         _push("reanalysis_start", {"session_id": session_id})
         _push("transcript_reset", {"session_id": session_id})
 
-        # Run transcription synchronously (blocks until complete)
-        _transcriber.process_wav_file(wav_path)
+        # Run batch pipeline (transformers + pyannote) if available,
+        # otherwise fall back to the real-time pipeline.
+        try:
+            from batch_transcriber import BatchTranscriber
+            from default_audio_params import get_reanalysis_defaults, get_all_defaults
+            saved = settings.load().get("reanalysis_params", {})
+            params = {**get_reanalysis_defaults(), **saved}
+
+            # If "Use Live Diarization Settings" is on, copy live thresholds
+            if params.get("reanalysis_use_live_diarization"):
+                live_saved = settings.load().get("audio_params", {})
+                live = {**get_all_defaults(), **live_saved}
+                # Map live diarization params to batch equivalents
+                params["reanalysis_clustering_threshold"] = live.get("delta_new", 0.5)
+
+            batch = BatchTranscriber(
+                on_text_callback=_on_segment,
+                fingerprint_callback=_on_fingerprint_audio if fingerprint_db.ready else None,
+                hf_token=os.getenv("HUGGING_FACE_KEY", ""),
+                on_progress_callback=lambda pct: _push(
+                    "reanalysis_progress",
+                    {"session_id": session_id, "progress": pct},
+                ),
+            )
+            batch.process_wav_file(wav_path, params)
+        except ImportError as ie:
+            log.warn("reanalysis", f"Batch pipeline unavailable ({ie}), "
+                     f"falling back to real-time pipeline")
+            _transcriber.process_wav_file(wav_path)
 
         # Trigger a fresh summary from the new transcript
         with _state_lock:
@@ -2531,7 +2631,9 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 segments = sess["segments"]
                 labels = sess.get("speaker_labels") or {}
 
-        if segments:
+        # Only auto-generate summary if the user has Auto enabled or provided a custom prompt
+        auto_summary_enabled = settings.get("auto_summary", True)
+        if segments and (auto_summary_enabled or custom_prompt):
             transcript = _build_transcript(segments, labels)
             meta = _build_session_meta(
                 segments, labels,
@@ -2564,7 +2666,14 @@ def reanalyze_session(session_id: str):
             return jsonify({"error": "Cannot reanalyze while recording"}), 400
         if _state.get("is_reanalyzing"):
             return jsonify({"error": "Reanalysis already in progress"}), 400
-        if not _state["model_ready"]:
+        # Batch reanalysis loads its own models; only require model_ready
+        # if the batch pipeline is unavailable (fallback to real-time).
+        try:
+            from batch_transcriber import BatchTranscriber  # noqa: F401
+            _batch_available = True
+        except ImportError:
+            _batch_available = False
+        if not _batch_available and not _state["model_ready"]:
             return jsonify({"error": "Transcription model not loaded yet"}), 503
         # Load the session into active state so _on_segment callbacks work
         sess = storage.get_session(session_id)
@@ -2880,8 +2989,22 @@ def fp_confirm():
                         log.info("fingerprint", f"Added {added} WAV embeddings on confirm for {name!r}")
                 _fp_executor.submit(_add_wav_embs)
 
+    # Remove from pending suggestions
+    with _state_lock:
+        for key in keys_to_link:
+            _state["fingerprint_suggestions"].pop(key, None)
+
     log.info("fingerprint", f"Confirmed {name!r} for {speaker_key} in session {session_id[:8]}")
     return jsonify({"ok": True})
+
+
+@app.route("/api/fingerprint/suggestions", methods=["GET"])
+def fp_suggestions():
+    """Return pending speaker suggestions for the active session."""
+    with _state_lock:
+        sid = _state.get("session_id")
+        suggestions = list(_state.get("fingerprint_suggestions", {}).values())
+    return jsonify({"session_id": sid, "suggestions": suggestions})
 
 
 @app.route("/api/fingerprint/dismiss", methods=["POST"])
@@ -2901,6 +3024,7 @@ def fp_dismiss():
                 dismissals[speaker_key] = set()
             if global_id:
                 dismissals[speaker_key].add(global_id)
+            _state["fingerprint_suggestions"].pop(speaker_key, None)
 
     return jsonify({"ok": True})
 
