@@ -539,9 +539,10 @@ def _run_summary(
     """
     with _summary_lock:
         with _state_lock:
-            if _state["session_id"] != session_id:
+            is_active = _state["session_id"] == session_id
+            if is_auto and not is_active:
                 return
-            if clears_pending:
+            if clears_pending and is_active:
                 _state["summary_manual_pending"] = False
             elif is_auto:
                 # Bail if a manual is queued — it will run as soon as we finish
@@ -549,7 +550,8 @@ def _run_summary(
                     return
                 # Re-read in case a prior run updated the summary while we waited
                 existing_summary = _state["summary"]
-            _state["summary_generating"] = True
+            if is_active:
+                _state["summary_generating"] = True
 
         mode = "generating" if not existing_summary else "updating"
         _push("summary_busy", {"busy": True, "mode": mode, "session_id": session_id})
@@ -599,7 +601,8 @@ def _run_summary(
                 ai.summarize(transcript, on_token, on_done, custom_prompt=custom_prompt, meta=meta)
         finally:
             with _state_lock:
-                _state["summary_generating"] = False
+                if _state["session_id"] == session_id:
+                    _state["summary_generating"] = False
             _push("summary_busy", {"busy": False, "session_id": session_id})
             # Refresh semantic embedding after summary (content is most complete now)
             update_session_embedding(session_id)
