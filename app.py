@@ -109,6 +109,7 @@ _state: dict = {
     "model_ready": False,
     "model_info": "",
     "diarizer_ready": False,
+    "diarizer_failed": False,
     "speaker_labels": {},   # speaker_key → display name for the active session
     "custom_prompt": "",    # user-supplied context appended to the summary system prompt
     "is_reanalyzing": False,
@@ -196,7 +197,7 @@ def _recording_prereqs_locked() -> tuple[bool, str]:
         info = (_state.get("model_info") or "").strip()
         return False, info or "Loading transcription model..."
     needs_diarizer = _transcriber.diarization_enabled and bool(os.getenv("HUGGING_FACE_KEY"))
-    if needs_diarizer and not _state["diarizer_ready"]:
+    if needs_diarizer and not _state["diarizer_ready"] and not _state["diarizer_failed"]:
         return False, "Loading speaker diarization..."
     return True, _state.get("model_info") or "Ready"
 
@@ -710,10 +711,13 @@ def _load_diarizer() -> None:
         if fingerprint_db.ready:
             _transcriber.fingerprint_callback = _on_fingerprint_audio
     except Exception as e:
+        import traceback
         log.error("diarizer", f"Error loading models: {e}")
+        log.error("diarizer", traceback.format_exc().rstrip())
         log.warn("diarizer", "Transcription will continue without speaker labels.")
         with _state_lock:
             _state["diarizer_ready"] = False
+            _state["diarizer_failed"] = True
         _push_status()
 
 
@@ -2119,6 +2123,7 @@ def set_diarizer_model():
 
     with _state_lock:
         _state["diarizer_ready"] = False
+        _state["diarizer_failed"] = False   # reset — we're retrying
     _push_status()
 
     def _reload():
@@ -2127,11 +2132,13 @@ def set_diarizer_model():
             settings.put("diarizer_device", device)
             with _state_lock:
                 _state["diarizer_ready"] = True
+                _state["diarizer_failed"] = False
             _push_status()
         except Exception as e:
             log.error("diarizer", f"Error reloading: {e}")
             with _state_lock:
                 _state["diarizer_ready"] = False
+                _state["diarizer_failed"] = True
             _push_status()
 
     threading.Thread(target=_reload, daemon=True).start()

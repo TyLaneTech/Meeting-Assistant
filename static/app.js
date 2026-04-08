@@ -7221,6 +7221,11 @@ document.getElementById('chat-input')?.addEventListener('paste', e => {
 
 /* ── Past sessions ───────────────────────────────────────────────────────── */
 async function loadSession(sessionId) {
+  // On the home page, navigate to the session page instead of loading inline
+  if (window._isHomePage) {
+    window.location.href = `/session?id=${sessionId}`;
+    return;
+  }
   if (sessionId === state.sessionId) return;
 
   if (state.isRecording) {
@@ -9196,9 +9201,10 @@ loadPreferences().then(() => {
 _apLoad().then(() => { try { _syncScreenToggle(); } catch {} });
 try { loadScreenDisplays(); } catch {}
 
+_startPeriodicUpdateCheck();
+
 if (!_isHomePage) {
   loadSummaryPrompt();
-  _startPeriodicUpdateCheck();
 
   // Auto-open settings if ?settings=1 or ?setup=1 is in the URL
   // Auto-load session if ?session=<id> is in the URL

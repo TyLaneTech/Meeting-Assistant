@@ -4531,17 +4531,7 @@ button.icon-btn.fingerprint-btn {
   gap: 10px;
 }
 
-.home-logo {
-  width: 28px;
-  height: 28px;
-}
-
-.home-brand {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--fg);
-  letter-spacing: -0.3px;
-}
+/* .home-logo and .home-brand removed — uses shared .brand-icon / .brand-name */
 
 .home-nav {
   display: flex;

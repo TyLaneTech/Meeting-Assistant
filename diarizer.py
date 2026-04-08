@@ -112,6 +112,24 @@ warnings.filterwarnings(
     module="pyannote",
 )
 
+# ── Speechbrain lazy-module resilience ───────────────────────────────────────
+# Newer speechbrain versions (>=1.1) use LazyModule for optional integrations
+# like k2_fsa, Kaldi, etc. If the optional dependency isn't installed the lazy
+# import raises an opaque error that kills the entire diarizer init.
+# Pre-emptively stub these modules so the lazy loader never fires.
+import sys as _sys
+import types as _types
+for _mod_name in (
+    "speechbrain.integrations",
+    "speechbrain.integrations.k2_fsa",
+    "speechbrain.k2_integration",
+):
+    if _mod_name not in _sys.modules:
+        _stub = _types.ModuleType(_mod_name)
+        _stub.__path__ = []          # mark as package so sub-imports don't crash
+        _stub.__package__ = _mod_name
+        _sys.modules[_mod_name] = _stub
+
 def _merge_turns(
     turns: list[tuple[str, float, float]],
     merge_gap: float = 0.1,
@@ -157,8 +175,14 @@ class DiartDiarizer:
         self._dev = torch.device(device)
         log.info("diarizer", f"Loading diart pipeline on {self._dev}…")
 
-        from diart import SpeakerDiarization, SpeakerDiarizationConfig
-        from diart.models import SegmentationModel, EmbeddingModel
+        try:
+            from diart import SpeakerDiarization, SpeakerDiarizationConfig
+            from diart.models import SegmentationModel, EmbeddingModel
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to import diart — check that diart, pyannote.audio, and "
+                f"speechbrain are installed and compatible: {e}"
+            ) from e
 
         # Load saved audio params
         from default_audio_params import DIARIZATION_DEFAULTS
@@ -173,12 +197,27 @@ class DiartDiarizer:
         self._merge_gap        = float(p["merge_gap_seconds"])
 
         # Load the same underlying models pyannote/speaker-diarization-3.1 uses.
-        seg = SegmentationModel.from_pretrained(
-            "pyannote/segmentation-3.0", use_hf_token=hf_token
-        )
-        emb = EmbeddingModel.from_pretrained(
-            "pyannote/wespeaker-voxceleb-resnet34-LM", use_hf_token=hf_token
-        )
+        log.info("diarizer", "Loading segmentation model…")
+        try:
+            seg = SegmentationModel.from_pretrained(
+                "pyannote/segmentation-3.0", use_hf_token=hf_token
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load segmentation model (pyannote/segmentation-3.0). "
+                f"Check your HuggingFace token and network: {e}"
+            ) from e
+
+        log.info("diarizer", "Loading embedding model…")
+        try:
+            emb = EmbeddingModel.from_pretrained(
+                "pyannote/wespeaker-voxceleb-resnet34-LM", use_hf_token=hf_token
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load embedding model (wespeaker-voxceleb-resnet34-LM). "
+                f"Check your HuggingFace token and network: {e}"
+            ) from e
 
         self._config = SpeakerDiarizationConfig(
             segmentation=seg,
