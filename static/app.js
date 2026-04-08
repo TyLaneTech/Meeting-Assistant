@@ -147,6 +147,7 @@ function _loadPaneVisible(sessionId) {
 }
 
 function _applyPaneLayout() {
+  if (window._isHomePage) return;
   const HANDLE_PX = 4;
   const MIN_COL_PX = 160;
   const workspace = document.querySelector('.workspace');
@@ -219,6 +220,7 @@ function recalcColWidths() {
   const MIN_COL_PX = 160;
 
   const workspace = document.querySelector('.workspace');
+  if (!workspace) return;
   const handles   = Array.from(workspace.querySelectorAll('.col-resize-handle'));
   const numCols   = workspace.querySelectorAll('.col').length;
   if (!numCols || !handles.length) return;
@@ -312,7 +314,8 @@ function recalcColWidths() {
     workspace.querySelector('.col-transcript'),
     workspace.querySelector('.col-summary'),
     workspace.querySelector('.col-chat'),
-  ];
+  ].filter(Boolean);
+  if (!colEls.length) return;
 
   // Reusable floating ghost element
   const ghost = document.createElement('div');
@@ -1847,7 +1850,7 @@ function newSession() {
   state.sessionId    = null;
   state.isViewingPast = false;
   clearAll();
-  history.pushState({}, '', '/');
+  history.pushState({}, '', '/session');
   _applyPromptText('');
   updateRecordBtn();
   refreshSidebar();
@@ -2326,7 +2329,7 @@ function onStatus(d) {
         }
       }
       // Update URL to reflect the active session
-      history.replaceState({}, '', '?session=' + d.session_id);
+      history.replaceState({}, '', '/session?id=' + d.session_id);
       state.sessionId     = d.session_id;
       state.isViewingPast = false;
       dot.className       = 'status-dot recording';
@@ -2545,7 +2548,7 @@ let _speakerLabels = {};
 const _speakerColors = {};
 let _speakerProfiles = {};
 let _lastLiveSegId   = 0;   // highest seg_id received from live transcript events
-let _sseSource       = null;
+var _sseSource       = null;  // var so home.js can access it
 let _selectedSpeakerKeys = [];
 let _speakerSelectionAnchor = null;
 let _speakerDraftName = '';
@@ -6866,7 +6869,13 @@ function _renderToolWidget(msgWrap, toolCalls) {
 }
 
 function _toolDisplayName(name) {
-  const map = { get_screenshot: 'Screenshot' };
+  const map = {
+    get_screenshot: 'Screenshot',
+    search_transcripts: 'Search Transcripts',
+    semantic_search: 'Semantic Search',
+    get_session_detail: 'Load Session',
+    list_speakers: 'List Speakers',
+  };
   return map[name] || name;
 }
 
@@ -6874,6 +6883,10 @@ function _toolInputSummary(name, input) {
   if (name === 'get_screenshot' && input?.timestamp != null) {
     return `at ${Number(input.timestamp).toFixed(1)}s`;
   }
+  if (name === 'search_transcripts' && input?.query) return `"${input.query}"`;
+  if (name === 'semantic_search' && input?.query) return `"${input.query}"`;
+  if (name === 'get_session_detail' && input?.session_id) return input.session_id.substring(0, 8) + '...';
+  if (name === 'list_speakers') return 'Voice Library';
   return JSON.stringify(input || {});
 }
 
@@ -7229,7 +7242,7 @@ async function loadSession(sessionId) {
   clearAll();
   state.sessionId     = sessionId;
   state.isViewingPast = true;
-  history.pushState({}, '', '?session=' + sessionId);
+  history.pushState({}, '', '/session?id=' + sessionId);
   updateRecordBtn();
   _loadPaneVisible(sessionId);
 
@@ -9111,91 +9124,117 @@ async function saveApiKeys() {
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 
-// Auto-scroll behavior:
-// - Live recording: disable when user scrolls up, re-enable at bottom
-// - Playback: disable on user-initiated scroll only, re-enable via button click
-document.getElementById('transcript').addEventListener('scroll', () => {
-  // Ignore programmatic scrolls (from playback tracking, seek, button clicks, etc.)
-  if (_programmaticScrollCount > 0) return;
+const _isHomePage = !!window._isHomePage;
 
-  if (_playbackActive && !_playbackAudio.paused) {
-    // During playback, only user-initiated scrolls disable auto-scroll
-    if (_autoScroll) {
-      _autoScroll = false;
-      updateAutoScrollBtn();
+// Session-page-specific init (transcript scroll, panels, etc.)
+if (!_isHomePage) {
+  // Auto-scroll behavior:
+  // - Live recording: disable when user scrolls up, re-enable at bottom
+  // - Playback: disable on user-initiated scroll only, re-enable via button click
+  document.getElementById('transcript').addEventListener('scroll', () => {
+    // Ignore programmatic scrolls (from playback tracking, seek, button clicks, etc.)
+    if (_programmaticScrollCount > 0) return;
+
+    if (_playbackActive && !_playbackAudio.paused) {
+      // During playback, only user-initiated scrolls disable auto-scroll
+      if (_autoScroll) {
+        _autoScroll = false;
+        updateAutoScrollBtn();
+      }
+    } else {
+      // Live mode: re-enable at bottom
+      const el = document.getElementById('transcript');
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      if (_autoScroll !== atBottom) {
+        _autoScroll = atBottom;
+        updateAutoScrollBtn();
+      }
     }
-  } else {
-    // Live mode: re-enable at bottom
-    const el = document.getElementById('transcript');
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    if (_autoScroll !== atBottom) {
-      _autoScroll = atBottom;
-      updateAutoScrollBtn();
-    }
-  }
+  });
+}
+
+// Shared init (sidebar, SSE, status, devices, models)
+connectSSE();
+
+// Close SSE on page unload to prevent connection leaks when navigating
+window.addEventListener('beforeunload', () => {
+  if (_sseSource) { _sseSource.close(); _sseSource = null; }
 });
 
-connectSSE();
 refreshSidebar();
 _checkSemanticSearchReady();
 fetch('/api/status').then(r => r.json()).then(onStatus);
-fetch('/api/ai_settings')
-  .then(r => r.json())
-  .then(aiCfg => {
-    currentAiModels = { ...AI_MODELS, ..._getAiModels(aiCfg.models) };
-    updateChatModelLabel(aiCfg.provider, aiCfg.model, currentAiModels);
-  })
-  .catch(() => {});
+
+if (!_isHomePage) {
+  fetch('/api/ai_settings')
+    .then(r => r.json())
+    .then(aiCfg => {
+      currentAiModels = { ...AI_MODELS, ..._getAiModels(aiCfg.models) };
+      updateChatModelLabel(aiCfg.provider, aiCfg.model, currentAiModels);
+    })
+    .catch(() => {});
+}
+
 startVizLoop();
-startBrandVizLoop();
+if (!_isHomePage) startBrandVizLoop();
 initGainSliders();
 _restoreSidebarPanes();
-_tnInitSearch();
-_tsbInitAutocomplete();
-_syncPanelBottomRadius();
-_syncSummaryBottomRadius();
+
+if (!_isHomePage) {
+  _tnInitSearch();
+  _tsbInitAutocomplete();
+  _syncPanelBottomRadius();
+  _syncSummaryBottomRadius();
+}
+
 // Load preferences first, then init components that depend on saved values
 loadPreferences().then(() => {
   loadAudioDevices();
   loadModelConfig();
 });
 // Screen recording: load displays + sync toggle
-_apLoad().then(() => { _syncScreenToggle(); });
-loadScreenDisplays();
-loadSummaryPrompt();
-_startPeriodicUpdateCheck();
+_apLoad().then(() => { try { _syncScreenToggle(); } catch {} });
+try { loadScreenDisplays(); } catch {}
 
-// Auto-open settings if ?settings=1 or ?setup=1 is in the URL
-// Auto-load session if ?session=<id> is in the URL
-{
-  const params = new URLSearchParams(location.search);
-  if (params.has('settings') || params.has('setup')) {
-    openSettings();
-    history.replaceState(null, '', location.pathname);
-  } else if (params.has('session')) {
-    // Defer until status has loaded — if the session is actively recording,
-    // the SSE status+replay events handle everything; only call loadSession
-    // for past (non-recording) sessions.
-    const _pendingSessionId = params.get('session');
-    fetch('/api/status').then(r => r.json()).then(st => {
-      if (st.recording && st.session_id === _pendingSessionId) {
-        // Active recording — SSE status event will set state; don't call loadSession
-        return;
-      }
-      loadSession(_pendingSessionId);
-    }).catch(() => loadSession(_pendingSessionId));
+if (!_isHomePage) {
+  loadSummaryPrompt();
+  _startPeriodicUpdateCheck();
+
+  // Auto-open settings if ?settings=1 or ?setup=1 is in the URL
+  // Auto-load session if ?session=<id> is in the URL
+  {
+    const params = new URLSearchParams(location.search);
+    if (params.has('settings') || params.has('setup')) {
+      openSettings();
+      history.replaceState(null, '', location.pathname);
+    } else if (params.has('fingerprint')) {
+      openFingerprintPanel();
+      history.replaceState(null, '', location.pathname);
+    } else if (params.has('id')) {
+      // Defer until status has loaded — if the session is actively recording,
+      // the SSE status+replay events handle everything; only call loadSession
+      // for past (non-recording) sessions.
+      const _pendingSessionId = params.get('id');
+      fetch('/api/status').then(r => r.json()).then(st => {
+        if (st.recording && st.session_id === _pendingSessionId) {
+          // Active recording — SSE status event will set state; don't call loadSession
+          return;
+        }
+        loadSession(_pendingSessionId);
+      }).catch(() => loadSession(_pendingSessionId));
+    }
   }
+
+  window.addEventListener('popstate', () => {
+    const params = new URLSearchParams(location.search);
+    const sid = params.get('id');
+    if (sid) {
+      loadSession(sid);
+    } else if (!state.isRecording) {
+      state.sessionId    = null;
+      state.isViewingPast = false;
+      clearAll();
+      updateRecordBtn();
+    }
+  });
 }
-
-window.addEventListener('popstate', () => {
-  const params = new URLSearchParams(location.search);
-  const sid = params.get('session');
-  if (sid) {
-    loadSession(sid);
-  } else if (!state.isRecording) {
-    state.sessionId    = null;
-    state.isViewingPast = false;
-    clearAll();
-    updateRecordBtn();
-  }
-});

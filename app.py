@@ -20,7 +20,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, stream_with_context
 import flask.cli
 
 # ── Suppress Flask / werkzeug console noise ────────────────────────────────────
@@ -901,7 +901,19 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def index():
+def home():
+    # Backwards compat: redirect /?session=xxx to /session?id=xxx
+    session_param = request.args.get("session")
+    if session_param:
+        return redirect(f"/session?id={session_param}")
+    # Redirect settings/setup to session page (which has the settings dialog)
+    if request.args.get("settings") or request.args.get("setup"):
+        return redirect("/session?settings=1")
+    return render_template("home.html")
+
+
+@app.route("/session")
+def session_view():
     return render_template("index.html")
 
 
@@ -2365,6 +2377,247 @@ def chat_clear():
         if _state["session_id"] == sid:
             _state["chat_history"] = []
     return jsonify({"ok": True})
+
+
+# ── Global Chat ──────────────────────────────────────────────────────────────
+
+# Cancel events for global chat requests (separate from session chat)
+_global_chat_cancel: dict[str, threading.Event] = {}
+
+
+@app.route("/api/global-chat/conversations", methods=["GET"])
+def list_global_conversations():
+    return jsonify(storage.list_global_conversations())
+
+
+@app.route("/api/global-chat/conversations", methods=["POST"])
+def create_global_conversation():
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "New Chat").strip()
+    cid = storage.create_global_conversation(title)
+    return jsonify({"id": cid, "title": title})
+
+
+@app.route("/api/global-chat/conversations/<conversation_id>", methods=["GET"])
+def get_global_conversation(conversation_id: str):
+    conv = storage.get_global_conversation(conversation_id)
+    if not conv:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(conv)
+
+
+@app.route("/api/global-chat/conversations/<conversation_id>", methods=["PATCH"])
+def rename_global_conversation(conversation_id: str):
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    storage.rename_global_conversation(conversation_id, title)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/global-chat/conversations/<conversation_id>", methods=["DELETE"])
+def delete_global_conversation(conversation_id: str):
+    storage.delete_global_conversation(conversation_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/global-chat/clear", methods=["POST"])
+def global_chat_clear():
+    data = request.get_json(silent=True) or {}
+    cid = data.get("conversation_id")
+    if not cid:
+        return jsonify({"error": "conversation_id required"}), 400
+    storage.clear_global_chat_messages(cid)
+    return jsonify({"ok": True})
+
+
+def _global_tool_executor(name: str, tool_input: dict) -> tuple:
+    """Execute a global chat tool call. Returns (content, is_error, summary, extra)."""
+    if name == "search_transcripts":
+        query = tool_input.get("query", "")
+        limit = tool_input.get("limit", 10)
+        results = storage.search_sessions(query, limit=limit)
+        if not results:
+            return "No matching sessions found.", False, f"Search: '{query}' — no results", None
+        text = json.dumps(results, indent=2)
+        return text, False, f"Search: '{query}' — {len(results)} results", None
+
+    if name == "semantic_search":
+        query = tool_input.get("query", "")
+        limit = tool_input.get("limit", 5)
+        if not text_embeddings.is_ready():
+            return "Semantic search model is still loading.", True, "Semantic search unavailable", None
+        query_vec = text_embeddings.encode(query)
+        if query_vec is None:
+            return "Failed to encode query.", True, "Encoding failed", None
+        all_embs = storage.get_all_session_embeddings()
+        scored = []
+        for row in all_embs:
+            vec = text_embeddings.bytes_to_embedding(row["embedding_bytes"])
+            score = text_embeddings.cosine_similarity(query_vec, vec)
+            if score >= 0.25:
+                scored.append({
+                    "session_id": row["session_id"],
+                    "title": row["title"],
+                    "score": round(score, 4),
+                })
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        results = scored[:limit]
+        if not results:
+            return "No semantically similar sessions found.", False, f"Semantic: '{query}' — no results", None
+        text = json.dumps(results, indent=2)
+        return text, False, f"Semantic: '{query}' — {len(results)} results", None
+
+    if name == "get_session_detail":
+        session_id = tool_input.get("session_id", "")
+        sess = storage.get_session(session_id)
+        if not sess:
+            return f"Session '{session_id}' not found.", True, "Session not found", None
+        labels = sess.get("speaker_labels") or {}
+        transcript = _build_transcript(sess["segments"], labels)
+        # Truncate very long transcripts
+        if len(transcript) > 50000:
+            transcript = transcript[:50000] + "\n\n... [transcript truncated — too long to show in full]"
+        summary = sess.get("summary", "")
+        result = f"Session: {sess.get('title', 'Untitled')}\n"
+        result += f"Started: {sess.get('started_at', 'unknown')}\n"
+        if sess.get("ended_at"):
+            result += f"Ended: {sess['ended_at']}\n"
+        result += f"Segments: {len(sess['segments'])}\n\n"
+        if summary:
+            result += f"Summary:\n---\n{summary}\n---\n\n"
+        result += f"Transcript:\n---\n{transcript}\n---"
+        return result, False, f"Loaded session: {sess.get('title', session_id)}", None
+
+    if name == "list_speakers":
+        speakers = fingerprint_db.list_global_speakers()
+        if not speakers:
+            return "No speakers in the Voice Library yet.", False, "No speakers found", None
+        # Enrich with session counts
+        enriched = []
+        for sp in speakers:
+            sessions = fingerprint_db.get_profile_sessions(sp["id"])
+            enriched.append({
+                "id": sp["id"],
+                "name": sp["name"],
+                "color": sp.get("color"),
+                "session_count": len(sessions),
+            })
+        text = json.dumps(enriched, indent=2)
+        return text, False, f"Found {len(enriched)} speakers", None
+
+    return f"Unknown tool: {name}", True, f"Unknown tool: {name}", None
+
+
+@app.route("/api/global-chat", methods=["POST"])
+def global_chat():
+    """Send a message to global chat. Response is streamed via SSE."""
+    data = request.get_json(silent=True) or {}
+    conversation_id = data.get("conversation_id")
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
+
+    # Auto-create conversation if needed
+    if not conversation_id:
+        conversation_id = storage.create_global_conversation()
+
+    request_id = str(uuid.uuid4())
+
+    # Load existing conversation history
+    conv = storage.get_global_conversation(conversation_id)
+    chat_history = []
+    if conv and conv.get("messages"):
+        chat_history = _build_chat_history_from_messages(conv["messages"])
+
+    # Add the new user message
+    user_entry = _build_chat_entry("user", question)
+    chat_history.append(user_entry)
+    storage.save_global_chat_message(conversation_id, "user", question)
+
+    cancel_event = threading.Event()
+    _global_chat_cancel[request_id] = cancel_event
+
+    def run_global_chat():
+        _push("global_chat_start", {
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "question": question,
+        })
+        response_chunks: list[str] = []
+        tool_calls_log: list[dict] = []
+
+        def on_token(t: str) -> None:
+            if cancel_event.is_set():
+                return
+            response_chunks.append(t)
+            _push("global_chat_chunk", {"request_id": request_id, "text": t})
+
+        def on_tool_event(event_type: str, payload: dict) -> None:
+            if cancel_event.is_set():
+                return
+            if event_type == "tool_call":
+                tool_calls_log.append({"name": payload["name"], "input": payload.get("input", {}), "result": None})
+            elif event_type == "tool_result" and tool_calls_log:
+                tool_calls_log[-1]["result"] = {
+                    "success": payload.get("success", False),
+                    "summary": payload.get("summary", ""),
+                }
+            _push("global_chat_tool_event", {
+                "request_id": request_id,
+                "type": event_type,
+                **payload,
+            })
+
+        def on_done() -> None:
+            _global_chat_cancel.pop(request_id, None)
+            full = "".join(response_chunks)
+            if full.strip():
+                tc_json = json.dumps(tool_calls_log) if tool_calls_log else None
+                storage.save_global_chat_message(conversation_id, "assistant", full, tool_calls=tc_json)
+
+            # Auto-title: if this is the first exchange and title is still default
+            if conv and conv.get("title") in ("New Chat", None, ""):
+                try:
+                    title = ai.generate_title(question)
+                    if title:
+                        storage.rename_global_conversation(conversation_id, title)
+                        _push("global_chat_title", {
+                            "conversation_id": conversation_id,
+                            "title": title,
+                        })
+                except Exception:
+                    pass
+
+            _push("global_chat_done", {"request_id": request_id})
+
+        ai.ask_global(
+            chat_history, on_token, on_done,
+            cancel=cancel_event,
+            on_tool_event=on_tool_event,
+            tool_executor=_global_tool_executor,
+        )
+
+    threading.Thread(target=run_global_chat, daemon=True).start()
+    return jsonify({"request_id": request_id, "conversation_id": conversation_id})
+
+
+@app.route("/api/global-chat/stop", methods=["POST"])
+def global_chat_stop():
+    data = request.get_json(silent=True) or {}
+    rid = data.get("request_id")
+    if rid and rid in _global_chat_cancel:
+        _global_chat_cancel[rid].set()
+        return jsonify({"ok": True})
+    for ev in _global_chat_cancel.values():
+        ev.set()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/analytics")
+def get_analytics():
+    return jsonify(storage.get_dashboard_analytics())
 
 
 @app.route("/api/sessions/<session_id>", methods=["DELETE"])

@@ -123,6 +123,22 @@ def init_db() -> None:
                 embedding  BLOB NOT NULL,
                 updated_at TEXT NOT NULL
             )""",
+            # Global chat (cross-session AI conversations)
+            """CREATE TABLE IF NOT EXISTS global_chat_conversations (
+                id         TEXT PRIMARY KEY,
+                title      TEXT NOT NULL DEFAULT 'New Chat',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS global_chat_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL REFERENCES global_chat_conversations(id) ON DELETE CASCADE,
+                role            TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                attachments     TEXT DEFAULT NULL,
+                tool_calls      TEXT DEFAULT NULL
+            )""",
         ]:
             try:
                 conn.execute(migration)
@@ -727,3 +743,192 @@ def save_chat_message(session_id: str, role: str, content: str,
             " VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, role, content, _now(), attachments, tool_calls),
         )
+
+
+# ── Global Chat Conversations ───────────────────────────────────────────────
+
+def create_global_conversation(title: str = "New Chat") -> str:
+    cid = str(uuid.uuid4())
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO global_chat_conversations (id, title, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            (cid, title, now, now),
+        )
+    return cid
+
+
+def list_global_conversations() -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT c.id, c.title, c.created_at, c.updated_at,"
+            "       (SELECT COUNT(*) FROM global_chat_messages m"
+            "        WHERE m.conversation_id = c.id) AS message_count"
+            " FROM global_chat_conversations c"
+            " ORDER BY c.updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_global_conversation(conversation_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, title, created_at, updated_at"
+            " FROM global_chat_conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if not row:
+            return None
+        msgs = conn.execute(
+            "SELECT id, role, content, created_at, attachments, tool_calls"
+            " FROM global_chat_messages"
+            " WHERE conversation_id = ?"
+            " ORDER BY id ASC",
+            (conversation_id,),
+        ).fetchall()
+    result = dict(row)
+    result["messages"] = [dict(m) for m in msgs]
+    return result
+
+
+def save_global_chat_message(conversation_id: str, role: str, content: str,
+                             attachments: str | None = None,
+                             tool_calls: str | None = None) -> None:
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO global_chat_messages"
+            " (conversation_id, role, content, created_at, attachments, tool_calls)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (conversation_id, role, content, now, attachments, tool_calls),
+        )
+        conn.execute(
+            "UPDATE global_chat_conversations SET updated_at = ? WHERE id = ?",
+            (now, conversation_id),
+        )
+
+
+def delete_global_conversation(conversation_id: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM global_chat_messages WHERE conversation_id = ?",
+                     (conversation_id,))
+        conn.execute("DELETE FROM global_chat_conversations WHERE id = ?",
+                     (conversation_id,))
+
+
+def rename_global_conversation(conversation_id: str, title: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE global_chat_conversations SET title = ?, updated_at = ? WHERE id = ?",
+            (title.strip(), _now(), conversation_id),
+        )
+
+
+def clear_global_chat_messages(conversation_id: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM global_chat_messages WHERE conversation_id = ?",
+                     (conversation_id,))
+        conn.execute(
+            "UPDATE global_chat_conversations SET updated_at = ? WHERE id = ?",
+            (_now(), conversation_id),
+        )
+
+
+def get_dashboard_analytics() -> dict:
+    from datetime import timedelta
+    with _conn() as conn:
+        total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+        # Total recording time (sum of max end_time per session, in seconds)
+        total_time_row = conn.execute(
+            "SELECT COALESCE(SUM(max_time), 0) FROM"
+            " (SELECT MAX(end_time) AS max_time FROM transcript_segments"
+            "  GROUP BY session_id)"
+        ).fetchone()
+        total_seconds = total_time_row[0] or 0
+
+        total_segments = conn.execute(
+            "SELECT COUNT(*) FROM transcript_segments"
+        ).fetchone()[0]
+
+        # Total word count across all transcripts
+        total_words_row = conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(text) - LENGTH(REPLACE(text, ' ', '')) + 1), 0)"
+            " FROM transcript_segments WHERE text != ''"
+        ).fetchone()
+        total_words = total_words_row[0] or 0
+
+        speaker_count = conn.execute(
+            "SELECT COUNT(*) FROM global_speakers"
+        ).fetchone()[0]
+
+        # Sessions this week (last 7 days)
+        week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        sessions_this_week = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE started_at >= ?",
+            (week_ago,),
+        ).fetchone()[0]
+
+        # Average session duration
+        avg_duration_row = conn.execute(
+            "SELECT AVG(max_time) FROM"
+            " (SELECT MAX(end_time) AS max_time FROM transcript_segments"
+            "  GROUP BY session_id)"
+        ).fetchone()
+        avg_duration_seconds = avg_duration_row[0] or 0
+
+        # Weekly activity (sessions per day for last 14 days)
+        two_weeks_ago = (datetime.utcnow() - timedelta(days=13)).strftime("%Y-%m-%d")
+        weekly_activity = conn.execute(
+            "SELECT DATE(started_at) AS day, COUNT(*) AS count"
+            " FROM sessions WHERE DATE(started_at) >= ?"
+            " GROUP BY DATE(started_at)"
+            " ORDER BY day ASC",
+            (two_weeks_ago,),
+        ).fetchall()
+
+        # Most active speakers (by number of sessions they appear in)
+        # Include total talk-time per speaker
+        top_speakers = conn.execute(
+            "SELECT gs.name, gs.color,"
+            "  COUNT(DISTINCT sl.session_id) AS session_count,"
+            "  COALESCE(SUM(ts.end_time - ts.start_time), 0) AS talk_seconds"
+            " FROM global_speakers gs"
+            " JOIN speaker_labels sl ON sl.global_id = gs.id"
+            " LEFT JOIN transcript_segments ts"
+            "   ON ts.session_id = sl.session_id AND ts.source = sl.speaker_key"
+            " GROUP BY gs.id"
+            " ORDER BY session_count DESC"
+            " LIMIT 8"
+        ).fetchall()
+
+        # Recent sessions with more detail (for the widget)
+        recent_sessions = conn.execute(
+            "SELECT s.id, s.title, s.started_at,"
+            "  (SELECT MAX(ts.end_time) FROM transcript_segments ts"
+            "   WHERE ts.session_id = s.id) AS duration_seconds,"
+            "  (SELECT COUNT(DISTINCT ts.source) FROM transcript_segments ts"
+            "   WHERE ts.session_id = s.id) AS speaker_count"
+            " FROM sessions s ORDER BY s.started_at DESC LIMIT 10"
+        ).fetchall()
+
+    # Build activity heatmap (fill in missing days)
+    activity_map = {r["day"]: r["count"] for r in weekly_activity}
+    activity_data = []
+    for i in range(14):
+        day = (datetime.utcnow() - timedelta(days=13 - i)).strftime("%Y-%m-%d")
+        activity_data.append({"day": day, "count": activity_map.get(day, 0)})
+
+    return {
+        "total_sessions": total_sessions,
+        "total_seconds": total_seconds,
+        "total_segments": total_segments,
+        "total_words": total_words,
+        "speaker_count": speaker_count,
+        "sessions_this_week": sessions_this_week,
+        "avg_duration_seconds": avg_duration_seconds,
+        "activity": activity_data,
+        "top_speakers": [dict(r) for r in top_speakers],
+        "recent_sessions": [dict(r) for r in recent_sessions],
+    }

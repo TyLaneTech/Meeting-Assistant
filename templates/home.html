@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meeting Assistant</title>
+  <link rel="icon" id="favicon" href="/static/images/logo.png" type="image/png">
+  <link rel="stylesheet" href="/static/fontAwesome/css/all.min.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+
+<div class="home-layout">
+
+  <!-- ── Full Sidebar (shared with session page) ───────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-header-pinned">
+        <button class="icon-btn new-session-btn" onclick="newSession()" title="New session"><i class="fa-solid fa-plus"></i></button>
+        <button class="icon-btn sidebar-toggle-btn" id="sidebar-close-btn" onclick="toggleSidebar()" title="Collapse sidebar"><i class="fa-solid fa-bars"></i></button>
+      </div>
+      <div class="sidebar-header-row">
+        <span class="sidebar-title">Sessions</span>
+        <div class="sidebar-header-tools">
+          <button class="icon-btn folder-btn" onclick="createFolder()" title="New folder"><i class="fa-solid fa-folder-plus"></i></button>
+          <button class="icon-btn fingerprint-btn" onclick="openFingerprintPanel()" title="Voice Library"><i class="fa-solid fa-waveform-lines"></i></button>
+          <button class="icon-btn multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions"><i class="fa-solid fa-list-check"></i></button>
+        </div>
+      </div>
+    </div>
+    <div class="sidebar-bulk-bar hidden" id="sidebar-bulk-bar">
+      <span class="sidebar-bulk-count" id="sidebar-bulk-count">0 selected</span>
+      <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI"><i class="fa-solid fa-arrows-rotate"></i> Titles</button>
+      <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()"><i class="fa-solid fa-trash"></i> Delete</button>
+      <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="sidebar-search" id="sidebar-search">
+      <div class="sidebar-search-wrap">
+        <i class="fa-solid fa-magnifying-glass sidebar-search-icon"></i>
+        <input type="text" id="sidebar-search-input" placeholder="Search sessions…"
+               oninput="_onSidebarSearch(this.value)" autocomplete="off" spellcheck="false">
+        <button class="sidebar-search-clear hidden" id="sidebar-search-clear"
+                onclick="_clearSidebarSearch()"><i class="fa-solid fa-xmark"></i></button>
+        <span class="sidebar-search-ai" id="sidebar-search-ai" title="Search matches by title, transcript content, and AI-powered semantic meaning when available"><i class="fa-solid fa-brain"></i></span>
+      </div>
+    </div>
+    <div class="sidebar-body" id="session-list">
+      <p class="sidebar-empty">No past sessions yet.</p>
+    </div>
+    <div class="sidebar-pane" id="model-config">
+      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('models')">
+        <div class="nav-menu-left">
+            <i class="fa-solid fa-microchip sidebar-pane-icon"></i>
+            <span class="sidebar-pane-label">Models</span>
+        </div>
+        <span class="sidebar-pane-arrow" id="pane-arrow-models">
+        <i class="fa-solid fa-chevron-right"></i></span>
+      </button>
+      <div class="sidebar-pane-body hidden" id="pane-body-models">
+        <div class="model-config-row">
+          <label class="model-config-lbl">Whisper</label>
+          <select id="whisper-preset-sel" class="model-config-sel" onchange="changeWhisperPreset(this.value)">
+          </select>
+        </div>
+        <div class="model-config-row">
+          <label class="model-config-lbl">Diarizer</label>
+          <select id="diarizer-device-sel" class="model-config-sel" onchange="changeDiarizerDevice(this.value)">
+          </select>
+        </div>
+        <div class="model-config-row hidden" id="diarization-enabled-row">
+          <label class="model-config-lbl">Speaker ID</label>
+          <button class="icon-btn active" id="diarization-toggle-btn"
+                  onclick="toggleDiarizationEnabled()" title="Enable/disable speaker diarization">On</button>
+        </div>
+      </div>
+    </div>
+    <div class="sidebar-pane" id="audio-viz-pane">
+      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('audio')">
+          <div class="nav-menu-left">
+            <i class="fa-solid fa-sliders sidebar-pane-icon"></i><span class="sidebar-pane-label">Input Devices</span>
+          </div>
+          <span class="sidebar-pane-arrow" id="pane-arrow-audio">
+          <i class="fa-solid fa-chevron-down"></i></span>
+      </button>
+      <div class="sidebar-pane-body" id="pane-body-audio">
+      <!-- Desktop device + gain -->
+      <div class="viz-device-row">
+        <label class="viz-device-lbl viz-lbl-desktop">Desktop</label>
+        <select id="viz-loopback-sel" class="viz-select" onchange="saveDeviceSelection()">
+          <option value="">— loading —</option>
+        </select>
+        <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list"><i class="fa-solid fa-rotate-right"></i></button>
+      </div>
+      <div class="viz-gain-row">
+        <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
+        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1"
+               oninput="onGainInput('lb', this.value)">
+        <span id="viz-lb-gain-val" class="viz-gain-val viz-lbl-desktop">1.0×</span>
+      </div>
+
+      <!-- Waveform canvas + level meter -->
+      <div class="viz-canvas-row">
+        <canvas id="viz-canvas"></canvas>
+        <div class="viz-level-meter" id="viz-level-meter">
+          <div class="viz-meter-track">
+            <div class="viz-meter-fill viz-meter-lb" id="viz-meter-lb"></div>
+          </div>
+          <div class="viz-meter-track">
+            <div class="viz-meter-fill viz-meter-mic" id="viz-meter-mic"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mic gain + device -->
+      <div class="viz-gain-row">
+        <label class="viz-gain-lbl viz-lbl-mic">Gain</label>
+        <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1"
+               oninput="onGainInput('mic', this.value)">
+        <span id="viz-mic-gain-val" class="viz-gain-val viz-lbl-mic">1.0×</span>
+      </div>
+      <div class="viz-device-row">
+        <label class="viz-device-lbl viz-lbl-mic">Mic</label>
+        <select id="viz-mic-sel" class="viz-select" onchange="saveDeviceSelection()">
+          <option value="-2">Browser Mic (this tab)</option>
+          <option value="-1">None</option>
+        </select>
+      </div>
+
+      <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
+        <i class="fa-solid fa-play"></i> Test Audio
+      </button>
+      </div><!-- /pane-body-audio -->
+    </div>
+    <div class="sidebar-pane" id="screen-capture-section">
+      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('screen')">
+      <div class="nav-menu-left">
+        <i class="fa-solid fa-display sidebar-pane-icon"></i>
+        <span class="sidebar-pane-label">Screen Recording</span>
+      </div>
+        <span class="sidebar-pane-actions">
+          <label class="toggle-switch toggle-switch-sm" onclick="event.stopPropagation()">
+            <input type="checkbox" id="screen-record-toggle" onchange="toggleScreenRecordEnabled(this.checked)">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="sidebar-pane-arrow" id="pane-arrow-screen"><i class="fa-solid fa-chevron-right"></i></span>
+        </span>
+      </button>
+      <div class="sidebar-pane-body hidden" id="pane-body-screen">
+        <div class="screen-display-grid" id="screen-display-grid">
+        </div>
+        <div class="screen-capture-status" id="screen-capture-status"></div>
+      </div>
+    </div>
+  </aside>
+  <div class="sidebar-resize-handle" id="sidebar-resize-handle"></div>
+
+  <!-- ── Home Main Area ──────────────────────────────────────────────────── -->
+  <div class="home-main">
+
+    <!-- Top Bar -->
+    <header class="home-topbar">
+      <div class="home-topbar-left">
+        <button class="icon-btn sidebar-toggle-btn" id="sidebar-open-btn"
+                onclick="toggleSidebar()" title="Open sessions sidebar"
+                style="display:none"><i class="fa-solid fa-bars"></i></button>
+        <img src="/static/images/logo.png" alt="" class="home-logo">
+        <span class="home-brand">Meeting Assistant</span>
+        <nav class="home-nav">
+          <a href="/" class="home-nav-item active"><i class="fa-solid fa-house"></i> Home</a>
+          <a href="/session" class="home-nav-item"><i class="fa-solid fa-list"></i> Sessions</a>
+        </nav>
+      </div>
+      <div class="home-topbar-right">
+        <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
+          <span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording
+        </button>
+        <div class="status-pill" id="status-pill">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Loading model…</span>
+          <span id="recording-duration" class="recording-duration hidden"></span>
+        </div>
+        <div class="home-search-wrap">
+          <i class="fa-solid fa-magnifying-glass home-search-icon"></i>
+          <input type="text" id="home-search-input" class="home-search-input"
+                 placeholder="Search all sessions..." autocomplete="off" spellcheck="false">
+          <button class="home-search-clear hidden" id="home-search-clear"
+                  onclick="clearHomeSearch()"><i class="fa-solid fa-xmark"></i></button>
+          <span class="home-search-ai" id="home-search-ai" title="Includes AI-powered semantic search when available"><i class="fa-solid fa-brain"></i></span>
+        </div>
+        <div id="home-search-results" class="home-search-results hidden"></div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="home-content">
+
+      <!-- Left: Global Chat -->
+      <div class="home-chat-area">
+        <div class="home-chat-panel">
+          <!-- Conversation sidebar -->
+          <div class="home-conv-sidebar" id="home-conv-sidebar">
+            <div class="home-conv-header">
+              <span class="home-conv-title">Chats</span>
+              <button class="icon-btn" onclick="newGlobalConversation()" title="New chat">
+                <i class="fa-solid fa-plus"></i>
+              </button>
+            </div>
+            <div class="home-conv-list" id="home-conv-list">
+              <p class="home-conv-empty">No conversations yet</p>
+            </div>
+          </div>
+
+          <!-- Chat area -->
+          <div class="home-chat-main">
+            <div class="home-chat-header">
+              <button class="icon-btn home-conv-toggle" id="home-conv-toggle"
+                      onclick="toggleConvSidebar()" title="Toggle chat list">
+                <i class="fa-solid fa-sidebar"></i>
+              </button>
+              <span class="home-chat-title" id="home-chat-title">Global Chat</span>
+              <div class="home-chat-actions">
+                <button class="icon-btn" title="Clear chat" onclick="clearGlobalChat()">
+                  <i class="fa-solid fa-xmark"></i>
+                </button>
+              </div>
+            </div>
+            <div id="global-chat-messages" class="col-body chat-body">
+              <div class="home-chat-welcome" id="home-chat-welcome">
+                <div class="home-welcome-icon">
+                  <i class="fa-solid fa-comments"></i>
+                </div>
+                <h2 class="home-welcome-title">Ask about your meetings</h2>
+                <p class="home-welcome-subtitle">Search transcripts, find discussions, and get insights across all your recorded sessions.</p>
+                <div class="home-welcome-suggestions" id="home-welcome-suggestions">
+                  <button class="home-suggestion-chip" onclick="useSuggestion(this)">What were the key decisions from recent meetings?</button>
+                  <button class="home-suggestion-chip" onclick="useSuggestion(this)">Summarize discussions about deadlines</button>
+                  <button class="home-suggestion-chip" onclick="useSuggestion(this)">Who are the most active speakers?</button>
+                </div>
+              </div>
+            </div>
+            <div class="chat-input-area">
+              <div class="chat-input-wrap">
+                <textarea
+                  id="global-chat-input"
+                  placeholder="Ask about all your meetings..."
+                  rows="1"
+                  onkeydown="handleGlobalChatKey(event)"
+                  oninput="autogrowGlobalInput()"
+                ></textarea>
+                <button id="global-send-btn" class="chat-send-btn" onclick="sendGlobalMessage()" title="Send message">
+                  <i class="fa-solid fa-arrow-up"></i>
+                </button>
+                <button id="global-stop-btn" class="chat-stop-btn hidden" onclick="stopGlobalChat()" title="Stop generating">
+                  <i class="fa-solid fa-stop"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Dashboard -->
+      <div class="home-widgets">
+
+        <!-- Hero Stats Row -->
+        <div class="home-widget home-hero-stats">
+          <div class="home-hero-stat">
+            <div class="home-hero-icon meetings"><i class="fa-solid fa-video"></i></div>
+            <div class="home-hero-data">
+              <div class="home-hero-value" id="stat-sessions">-</div>
+              <div class="home-hero-label">Meetings</div>
+            </div>
+          </div>
+          <div class="home-hero-divider"></div>
+          <div class="home-hero-stat">
+            <div class="home-hero-icon time"><i class="fa-solid fa-clock"></i></div>
+            <div class="home-hero-data">
+              <div class="home-hero-value" id="stat-time">-</div>
+              <div class="home-hero-label">Recorded</div>
+            </div>
+          </div>
+          <div class="home-hero-divider"></div>
+          <div class="home-hero-stat">
+            <div class="home-hero-icon speakers"><i class="fa-solid fa-users"></i></div>
+            <div class="home-hero-data">
+              <div class="home-hero-value" id="stat-speakers">-</div>
+              <div class="home-hero-label">Speakers</div>
+            </div>
+          </div>
+          <div class="home-hero-divider"></div>
+          <div class="home-hero-stat">
+            <div class="home-hero-icon words"><i class="fa-solid fa-font"></i></div>
+            <div class="home-hero-data">
+              <div class="home-hero-value" id="stat-words">-</div>
+              <div class="home-hero-label">Words</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Activity Heatmap -->
+        <div class="home-widget">
+          <div class="home-widget-header">
+            <span class="home-widget-title"><i class="fa-solid fa-calendar-days"></i> Activity</span>
+            <span class="home-widget-subtitle" id="home-activity-summary">-</span>
+          </div>
+          <div class="home-activity-chart" id="home-activity-chart"></div>
+        </div>
+
+        <!-- Two-column row: Recent Sessions + Top Speakers -->
+        <div class="home-widget-row">
+          <div class="home-widget home-widget-grow">
+            <div class="home-widget-header">
+              <span class="home-widget-title"><i class="fa-solid fa-clock-rotate-left"></i> Recent Sessions</span>
+              <a href="/session" class="home-widget-link">View all</a>
+            </div>
+            <div class="home-recent-list" id="home-recent-list">
+              <p class="home-recent-empty">No sessions yet. Start your first recording!</p>
+            </div>
+          </div>
+          <div class="home-widget home-widget-grow" id="home-speakers-widget">
+            <div class="home-widget-header">
+              <span class="home-widget-title"><i class="fa-solid fa-microphone-lines"></i> Top Speakers</span>
+            </div>
+            <div class="home-speakers-list" id="home-speakers-list">
+              <p class="home-speakers-empty">No speakers identified yet.</p>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Hidden stubs for app.js compatibility -->
+<div id="transcript" style="display:none"></div>
+<div id="summary" style="display:none"></div>
+<div id="chat-messages" style="display:none"></div>
+<canvas id="brand-viz-canvas" style="display:none"></canvas>
+<span id="topbar-session-title" style="display:none"></span>
+<div id="auto-summary-btn" style="display:none"></div>
+<audio id="playback-audio" style="display:none"></audio>
+
+<script>
+  // Flag so app.js knows this is the home page
+  window._isHomePage = true;
+</script>
+<script src="/static/app.js"></script>
+<script>
+  // Override session-page functions that don't work on the home page
+  function newSession() { window.location.href = '/session'; }
+  function openFingerprintPanel() { window.location.href = '/session?fingerprint=1'; }
+</script>
+<script src="/static/home.js"></script>
+</body>
+</html>
