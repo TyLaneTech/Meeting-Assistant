@@ -100,6 +100,7 @@ def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE folders ADD COLUMN parent_id TEXT DEFAULT NULL",
             "ALTER TABLE chat_messages ADD COLUMN attachments TEXT DEFAULT NULL",
+            "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
             # Full-text search on session titles and transcript segments
             """CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
                 session_id UNINDEXED,
@@ -543,7 +544,7 @@ def get_session(session_id: str) -> dict | None:
         ).fetchone()
 
         messages = conn.execute(
-            "SELECT role, content, created_at, attachments FROM chat_messages WHERE session_id = ? ORDER BY id",
+            "SELECT role, content, created_at, attachments, tool_calls FROM chat_messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
 
@@ -712,11 +713,17 @@ def save_speaker_label(
     }
 
 
+def clear_chat_messages(session_id: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+
+
 def save_chat_message(session_id: str, role: str, content: str,
-                      attachments: str | None = None) -> None:
+                      attachments: str | None = None,
+                      tool_calls: str | None = None) -> None:
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO chat_messages (session_id, role, content, created_at, attachments)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (session_id, role, content, _now(), attachments),
+            "INSERT INTO chat_messages (session_id, role, content, created_at, attachments, tool_calls)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, role, content, _now(), attachments, tool_calls),
         )

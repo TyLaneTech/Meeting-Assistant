@@ -519,6 +519,7 @@ const state = {
   modelInfo:      '',
   chatCursor:     null,
   chatBuffer:     '',
+  chatToolCalls:  [],
   summaryBuffer:    '',
   summaryCursor:    null,
   summaryStreaming: false,
@@ -1772,7 +1773,15 @@ function dateKey(d) {
 
 function formatSessionMeta(s) {
   const start = new Date(s.started_at + 'Z');
-  const time  = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const now   = new Date();
+  const isToday = start.toDateString() === now.toDateString();
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  const isYesterday = start.toDateString() === yesterday.toDateString();
+  const datePart = isToday ? 'Today'
+    : isYesterday ? 'Yesterday'
+    : start.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: start.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
+  const timePart = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const time = `${datePart}, ${timePart}`;
   if (!s.ended_at) return `${time} · In progress`;
   // Use actual transcript duration (last segment end_time) when available,
   // falling back to wall-clock duration between start/end timestamps.
@@ -1781,9 +1790,7 @@ function formatSessionMeta(s) {
     const end = new Date(s.ended_at + 'Z');
     secs = (end - start) / 1000;
   }
-  const m = Math.floor(secs / 60);
-  const ss = Math.floor(secs % 60).toString().padStart(2, '0');
-  return `${time} · ${m}:${ss}`;
+  return `${time} · ${fmtDuration(secs)}`;
 }
 
 async function deleteSession(e, sessionId) {
@@ -2077,12 +2084,35 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('chat_start', () => {
     state.chatBuffer  = '';
+    state.chatToolCalls = [];
     state.chatCursor  = createAssistantBubble();
+    // Show "Thinking" indicator until first text chunk arrives
+    const wrap = state.chatCursor?.closest('.chat-msg');
+    if (wrap) _setAssistantProcessing(wrap, true, 'Thinking');
+  });
+
+  src.addEventListener('chat_tool_event', e => {
+    const d = JSON.parse(e.data);
+    if (!state.chatCursor) return;
+    const wrap = state.chatCursor.closest('.chat-msg');
+    if (!wrap) return;
+    if (d.type === 'tool_call') {
+      state.chatToolCalls.push({ name: d.name, input: d.input, result: null });
+      _renderToolWidget(wrap, state.chatToolCalls);
+      _setAssistantProcessing(wrap, true, 'Using ' + _toolDisplayName(d.name) + '…');
+    } else if (d.type === 'tool_result') {
+      const last = state.chatToolCalls[state.chatToolCalls.length - 1];
+      if (last) last.result = { success: d.success, summary: d.summary, image: d.image || null };
+      _renderToolWidget(wrap, state.chatToolCalls);
+    }
+    scrollChatToBottom();
   });
 
   src.addEventListener('chat_chunk', e => {
     state.chatBuffer += JSON.parse(e.data).text;
     if (state.chatCursor) {
+      const wrap = state.chatCursor.closest('.chat-msg');
+      if (wrap) _setAssistantProcessing(wrap, false);
       state.chatCursor.innerHTML = renderMd(state.chatBuffer);
       state.chatCursor.classList.add('typing-cursor');
       scrollChatToBottom();
@@ -2091,12 +2121,15 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('chat_done', () => {
     if (state.chatCursor) {
+      const wrap = state.chatCursor.closest('.chat-msg');
+      if (wrap) _setAssistantProcessing(wrap, false);
       linkifyTimestamps(state.chatCursor);
       highlightCode('#chat-messages');
       _addCodeCopyButtons(state.chatCursor);
       state.chatCursor.classList.remove('typing-cursor');
       state.chatCursor = null;
     }
+    state.chatToolCalls = [];
     state.aiChatBusy = false;
     _setChatBusy(false);
   });
@@ -2495,6 +2528,9 @@ function _clearSegmentRegistry() {
   _removeCollapse();
   // Reset minimap state
   _minimapActive = false;
+  _minimapDataCache = null;
+  _minimapDirty = true;
+  if (_minimapDebounceTimer) { clearTimeout(_minimapDebounceTimer); _minimapDebounceTimer = 0; }
   const mmBtn = document.getElementById('transcript-minimap-toggle');
   if (mmBtn) { mmBtn.classList.add('hidden'); mmBtn.classList.remove('active'); }
   const mmEl = document.getElementById('transcript-minimap');
@@ -2872,11 +2908,63 @@ function _fpUpdateBell() {
   }
 }
 
+// ── Bottom-radius sync ───────────────────────────────────────────────────
+// The transcript column has a stack of collapsible/hideable panels above
+// the scroll area. Only the bottom-most visible element should carry the
+// bottom border-radius so it visually closes the header block.
+const _PANEL_BOTTOM_RADIUS_CLS = 'panel-bottom-radius';
+const _PANEL_STACK_IDS = [
+  'transcript-selection-bar',
+  'playback-bar',
+  'screen-preview',
+  'video-viewer',
+  'transcript-navigator',
+  'analytics-panel',
+  'fp-notif-panel',
+];
+function _syncPanelBottomRadius() {
+  const col = document.querySelector('.col-transcript');
+  if (!col) return;
+  // Remove from all candidates
+  const header = col.querySelector('.col-header');
+  if (header) header.classList.remove(_PANEL_BOTTOM_RADIUS_CLS);
+  for (const id of _PANEL_STACK_IDS) {
+    document.getElementById(id)?.classList.remove(_PANEL_BOTTOM_RADIUS_CLS);
+  }
+  // Find the bottom-most visible panel (first in our bottom-to-top list)
+  for (const id of _PANEL_STACK_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (el.classList.contains('hidden') || el.classList.contains('collapsed')) continue;
+    el.classList.add(_PANEL_BOTTOM_RADIUS_CLS);
+    return;
+  }
+  // No panels visible — col-header is the bottom element
+  if (header) header.classList.add(_PANEL_BOTTOM_RADIUS_CLS);
+}
+
+function _syncSummaryBottomRadius() {
+  const col = document.querySelector('.col-summary');
+  if (!col) return;
+  const header = col.querySelector('.col-header');
+  const area = document.getElementById('summary-prompt-area');
+  if (header) header.classList.remove(_PANEL_BOTTOM_RADIUS_CLS);
+  if (area)   area.classList.remove(_PANEL_BOTTOM_RADIUS_CLS);
+  if (area && !area.classList.contains('hidden')) {
+    area.classList.add(_PANEL_BOTTOM_RADIUS_CLS);
+  } else if (header) {
+    header.classList.add(_PANEL_BOTTOM_RADIUS_CLS);
+  }
+}
+
 // ── Notification panel ────────────────────────────────────────────────────
 function toggleFpNotifPanel() {
   const panel = document.getElementById('fp-notif-panel');
   if (!panel) return;
   panel.classList.toggle('collapsed');
+  const btn = document.getElementById('fp-bell-btn');
+  if (btn) btn.classList.toggle('open', !panel.classList.contains('collapsed'));
+  _syncPanelBottomRadius();
 }
 
 function _fpRenderNotifPanel() {
@@ -3514,6 +3602,7 @@ function _updateTranscriptSelectionUI() {
     bar.classList.add('hidden');
     document.getElementById('tsb-autocomplete')?.classList.add('hidden');
   }
+  _syncPanelBottomRadius();
 }
 
 function _tsbGetSpeakerNames() {
@@ -4560,7 +4649,7 @@ function applySpeakerProfileUpdate(update) {
     renderSpeakerManager();
   }
   _tnRefreshSpeakerPills();
-  _refreshMinimap();
+  _refreshMinimap(true);
 }
 
 function _applySpeakerColor(speakerKey, color) {
@@ -4684,7 +4773,7 @@ function applyTranscriptFilter() {
   _segmentRegistry.forEach(_applyFilterToSeg);
   _visibleRangesCache = null;  // filter changed — invalidate cached ranges
   _tnHighlightMatches();
-  _refreshMinimap();
+  _refreshMinimap(true);
 }
 
 function _updateFilterBtnState() {
@@ -4702,10 +4791,12 @@ function openTranscriptFilter() {
   if (isOpen) {
     filter_btn?.classList.remove('open');
     panel.classList.add('collapsed');
+    _syncPanelBottomRadius();
     return;
   }
   filter_btn?.classList.add('open');
   panel.classList.remove('collapsed');
+  _syncPanelBottomRadius();
   _tnRefreshSpeakerPills();
   _tnRefreshReassignDropdowns();
   _tnRefreshTimeRange();
@@ -5356,6 +5447,7 @@ function toggleAnalyticsPanel() {
   panel.classList.toggle('collapsed');
   if (btn) btn.classList.toggle('active', !isOpen);
   if (!isOpen) _refreshAnalytics();
+  _syncPanelBottomRadius();
 }
 
 function _refreshAnalytics() {
@@ -5662,7 +5754,9 @@ function toggleSummaryPrompt() {
   const btn  = document.getElementById('summary-prompt-toggle');
   const hidden = area.classList.toggle('hidden');
   btn.classList.toggle('active', !hidden);
+  localStorage.setItem('summary-prompt-open', hidden ? '' : '1');
   if (!hidden) document.getElementById('summary-custom-prompt').focus();
+  _syncSummaryBottomRadius();
 }
 
 let _promptSaveTimer = null;
@@ -5683,9 +5777,10 @@ function saveSummaryPrompt() {
 function _applyPromptText(text) {
   const ta = document.getElementById('summary-custom-prompt');
   ta.value = text || '';
-  const hasPrompt = !!ta.value.trim();
-  document.getElementById('summary-prompt-area').classList.toggle('hidden', !hasPrompt);
-  document.getElementById('summary-prompt-toggle').classList.toggle('active', hasPrompt);
+  const show = !!ta.value.trim() || localStorage.getItem('summary-prompt-open') === '1';
+  document.getElementById('summary-prompt-area').classList.toggle('hidden', !show);
+  document.getElementById('summary-prompt-toggle').classList.toggle('active', show);
+  _syncSummaryBottomRadius();
 }
 
 async function loadSummaryPrompt() {
@@ -5714,9 +5809,7 @@ let _playbackActive = false;
 
 function fmtTime(s) {
   if (!isFinite(s)) return '0:00';
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, '0')}`;
+  return fmtDuration(s);
 }
 
 function initPlayback(sessionId) {
@@ -5724,6 +5817,7 @@ function initPlayback(sessionId) {
   _playbackAudio.load();
   _playbackActive = true;
   document.getElementById('playback-bar').classList.remove('hidden');
+  _syncPanelBottomRadius();
 
   // Restore saved playback speed
   const savedSpeed = _prefs.playback_speed || '1';
@@ -5759,6 +5853,7 @@ function destroyPlayback() {
   _playbackAudio.removeAttribute('src');
   _playbackActive = false;
   document.getElementById('playback-bar').classList.add('hidden');
+  _syncPanelBottomRadius();
   document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-play"></i>';
   document.getElementById('playback-time').textContent = '0:00';
   document.getElementById('playback-duration').textContent = '0:00';
@@ -5962,6 +6057,7 @@ function initVideo(sessionId, offset) {
   if (_prefs.video_viewer_open) {
     _videoVisible = true;
     document.getElementById('video-viewer').classList.remove('hidden');
+    _syncPanelBottomRadius();
     document.getElementById('playback-video-toggle').classList.add('active');
     video.onloadedmetadata = () => {
       _syncVideoToAudio();
@@ -5981,6 +6077,7 @@ function destroyVideo() {
   document.getElementById('playback-video-toggle').classList.add('hidden');
   const btn = document.getElementById('playback-video-toggle');
   btn.classList.remove('active');
+  _syncPanelBottomRadius();
 }
 
 function toggleVideoViewer() {
@@ -5988,6 +6085,7 @@ function toggleVideoViewer() {
   _videoVisible = !_videoVisible;
   document.getElementById('video-viewer').classList.toggle('hidden', !_videoVisible);
   document.getElementById('playback-video-toggle').classList.toggle('active', _videoVisible);
+  _syncPanelBottomRadius();
   savePref('video_viewer_open', _videoVisible);
   if (_videoVisible) {
     // Sync video to current audio position
@@ -6162,6 +6260,7 @@ function toggleScreenPreview() {
   const btn   = document.getElementById('screen-preview-toggle');
   if (panel) panel.classList.toggle('hidden', !_screenPreviewVisible);
   if (btn)   btn.classList.toggle('active', _screenPreviewVisible);
+  _syncPanelBottomRadius();
   if (_screenPreviewVisible && !_screenPreviewRunning) {
     _screenPreviewLoop();
   }
@@ -6203,6 +6302,7 @@ function _stopScreenPreview() {
   if (panel) panel.classList.add('hidden');
   if (btn)   { btn.classList.add('hidden'); btn.classList.remove('active'); }
   if (img)   delete img.dataset.loaded;
+  _syncPanelBottomRadius();
 }
 
 /* ── Transcript collapse (consecutive speaker runs) ──────────────────────── */
@@ -6326,6 +6426,7 @@ function _applyCollapse() {
         seg.dataset.collapsedHidden = expanded ? '' : '1';
         seg.classList.toggle('in-group', expanded);
       }
+      _refreshMinimap(true);
     });
 
     // Insert summary before first segment, hide all segments
@@ -6376,6 +6477,14 @@ let _minimapDragging      = false;
 let _minimapRafPending    = false;
 let _minimapPlayheadEl    = null;    // lazily created playhead line
 
+// ── Minimap data cache ─────────────────────────────────────────────────────
+// Avoids re-querying every segment's offsetHeight on each redraw.
+// Invalidated explicitly when the segment list or visibility changes.
+let _minimapDataCache     = null;    // cached result of _minimapSegmentData()
+let _minimapDirty         = true;    // true → cache must be rebuilt before next render
+let _minimapDebounceTimer = 0;       // debounce timer for live-recording redraws
+const _MINIMAP_DEBOUNCE_MS = 300;    // coalesce rapid segment appends
+
 function toggleTranscriptMinimap() {
   _minimapActive = !_minimapActive;
   const btn  = document.getElementById('transcript-minimap-toggle');
@@ -6389,6 +6498,7 @@ function toggleTranscriptMinimap() {
     const onReady = () => {
       if (rendered) return;
       rendered = true;
+      _invalidateMinimapCache();
       _renderMinimap();
       _updateMinimapViewport();
     };
@@ -6403,8 +6513,10 @@ function toggleTranscriptMinimap() {
   }
 }
 
-/** Gather segment data for the minimap: color + proportional height. */
+/** Gather segment data for the minimap: color + proportional height.
+ *  Returns a cached array unless _minimapDirty is set. */
 function _minimapSegmentData() {
+  if (!_minimapDirty && _minimapDataCache) return _minimapDataCache;
   const transcript = document.getElementById('transcript');
   if (!transcript) return [];
   const segs = transcript.querySelectorAll('.transcript-segment');
@@ -6416,8 +6528,13 @@ function _minimapSegmentData() {
     const h = seg.offsetHeight || 40;
     data.push({ color, height: h, el: seg });
   }
+  _minimapDataCache = data;
+  _minimapDirty = false;
   return data;
 }
+
+/** Mark minimap data as stale — next render will rebuild. */
+function _invalidateMinimapCache() { _minimapDirty = true; }
 
 /** Render the minimap canvas with colored blocks per segment. */
 function _renderMinimap() {
@@ -6600,6 +6717,7 @@ function _minimapScrollTo(clientY) {
 // Re-render minimap on window resize
 window.addEventListener('resize', () => {
   if (_minimapActive) {
+    _invalidateMinimapCache();
     _renderMinimap();
     _updateMinimapViewport();
   }
@@ -6618,17 +6736,36 @@ function _updateMinimapFabVisibility() {
   }
 }
 
-/** Full minimap refresh — re-render canvas + viewport. */
+/** Full minimap refresh — re-render canvas + viewport.
+ *  Debounces during live recording to avoid per-segment redraws.
+ *  Immediate when called from bulk actions (filter, speaker rename, etc.). */
 let _minimapRefreshTimer = 0;
-/** Throttled minimap refresh — avoids re-rendering on every live segment. */
-function _refreshMinimap() {
+function _refreshMinimap(immediate = false) {
   if (!_minimapActive) return;
-  if (_minimapRefreshTimer) return;  // already scheduled
-  _minimapRefreshTimer = requestAnimationFrame(() => {
-    _minimapRefreshTimer = 0;
-    _renderMinimap();
-    _updateMinimapViewport();
-  });
+  _invalidateMinimapCache();
+
+  // Cancel any pending debounced refresh
+  if (_minimapDebounceTimer) { clearTimeout(_minimapDebounceTimer); _minimapDebounceTimer = 0; }
+  if (_minimapRefreshTimer)  { cancelAnimationFrame(_minimapRefreshTimer); _minimapRefreshTimer = 0; }
+
+  if (!immediate && state.isRecording) {
+    // During live recording, debounce — segments arrive every ~0.5 s
+    _minimapDebounceTimer = setTimeout(() => {
+      _minimapDebounceTimer = 0;
+      _minimapRefreshTimer = requestAnimationFrame(() => {
+        _minimapRefreshTimer = 0;
+        _renderMinimap();
+        _updateMinimapViewport();
+      });
+    }, _MINIMAP_DEBOUNCE_MS);
+  } else {
+    // Immediate (one rAF) for user-driven actions
+    _minimapRefreshTimer = requestAnimationFrame(() => {
+      _minimapRefreshTimer = 0;
+      _renderMinimap();
+      _updateMinimapViewport();
+    });
+  }
 }
 
 /* ── Chat ────────────────────────────────────────────────────────────────── */
@@ -6660,6 +6797,12 @@ function createAssistantBubble() {
       <div class="chat-avatar assistant">AI</div>
       <span class="chat-role">Assistant</span>
     </div>
+    <div class="chat-processing">
+      <div class="chat-processing-dots">
+        <span></span><span></span><span></span>
+      </div>
+      <span class="chat-processing-label">Thinking</span>
+    </div>
     <div class="chat-msg-body markdown-body"></div>
     <div class="chat-msg-actions">
       <button class="chat-msg-action-btn" title="Copy response" onclick="_copyChatMsg(this)">
@@ -6669,6 +6812,78 @@ function createAssistantBubble() {
   el.appendChild(wrap);
   scrollChatToBottom();  // response is starting — always scroll
   return wrap.querySelector('.chat-msg-body');
+}
+
+/* ── Tool-call collapsible widget ────────────────────────────────────────── */
+function _renderToolWidget(msgWrap, toolCalls) {
+  let widget = msgWrap.querySelector('.chat-tool-widget');
+  if (!widget) {
+    widget = document.createElement('div');
+    widget.className = 'chat-tool-widget';
+    const body = msgWrap.querySelector('.chat-msg-body');
+    body.parentNode.insertBefore(widget, body);
+  }
+  const count = toolCalls.length;
+  const doneCount = toolCalls.filter(tc => tc.result).length;
+  const allDone = doneCount === count;
+  const isOpen = widget.classList.contains('open');
+
+  let itemsHtml = '';
+  for (const tc of toolCalls) {
+    const icon = !tc.result ? '⏳' : tc.result.success ? '✓' : '✗';
+    const iconCls = !tc.result ? 'pending' : tc.result.success ? 'success' : 'error';
+    const label = _toolDisplayName(tc.name);
+    const detail = tc.result ? tc.result.summary : _toolInputSummary(tc.name, tc.input);
+    const thumb = tc.result?.image
+      ? `<img class="chat-tool-thumb" src="data:image/jpeg;base64,${tc.result.image}" alt="screenshot thumbnail">`
+      : '';
+    itemsHtml += `<div class="chat-tool-item">
+      <div class="chat-tool-left">
+        <div class="row1">
+          <span class="chat-tool-icon ${iconCls}">${icon}</span>
+          <span class="chat-tool-label">${escapeHtml(label)}</span>
+        </div>
+        <span class="chat-tool-detail">${escapeHtml(detail)}</span>
+      </div>
+      ${thumb}
+    </div>`;
+  }
+
+  const statusIcon = allDone ? '<i class="fa-solid fa-wrench"></i>' : '<span class="chat-tool-spinner"></span>';
+  const statusText = allDone
+    ? `${count} tool use${count > 1 ? 's' : ''}`
+    : `Using tools (${doneCount}/${count})`;
+
+  widget.innerHTML = `
+    <button class="chat-tool-toggle" onclick="this.closest('.chat-tool-widget').classList.toggle('open')">
+      ${statusIcon}
+      <span>${statusText}</span>
+      <i class="fa-solid fa-chevron-right chat-tool-chevron"></i>
+    </button>
+    <div class="chat-tool-details">${itemsHtml}</div>`;
+
+  if (isOpen) widget.classList.add('open');
+}
+
+function _toolDisplayName(name) {
+  const map = { get_screenshot: 'Screenshot' };
+  return map[name] || name;
+}
+
+function _toolInputSummary(name, input) {
+  if (name === 'get_screenshot' && input?.timestamp != null) {
+    return `at ${Number(input.timestamp).toFixed(1)}s`;
+  }
+  return JSON.stringify(input || {});
+}
+
+function _setAssistantProcessing(msgWrap, active, label) {
+  const proc = msgWrap.querySelector('.chat-processing');
+  if (!proc) return;
+  if (active && label) {
+    proc.querySelector('.chat-processing-label').textContent = label;
+  }
+  proc.classList.toggle('active', active);
 }
 
 function appendUserBubble(text, attachments) {
@@ -6697,9 +6912,15 @@ function scrollChatToBottom(force = false) {
   el.scrollTop = el.scrollHeight;
 }
 
-function clearChat() {
+async function clearChat() {
+  if (!state.sessionId) return;
   document.getElementById('chat-messages').innerHTML =
     '<p class="empty-hint">Chat cleared.</p>';
+  await fetch('/api/chat/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: state.sessionId }),
+  }).catch(() => {});
 }
 
 let _chatRequestId = null;  // tracks the active chat request for cancellation
@@ -7091,8 +7312,20 @@ async function loadSession(sessionId) {
         appendUserBubble(m.content, atts);
       } else {
         const b = createAssistantBubble();
+        // Hide the processing indicator for restored messages
+        const wrap = b.closest('.chat-msg');
+        if (wrap) {
+          const proc = wrap.querySelector('.chat-processing');
+          if (proc) proc.classList.remove('active');
+        }
         b.innerHTML = renderMd(m.content);
         linkifyTimestamps(b);
+        // Restore tool-call widget if present
+        const tcRaw = m.tool_calls;
+        if (tcRaw) {
+          const tcs = typeof tcRaw === 'string' ? JSON.parse(tcRaw) : tcRaw;
+          if (tcs?.length && wrap) _renderToolWidget(wrap, tcs);
+        }
       }
     }
     highlightCode('#chat-messages');
@@ -7145,7 +7378,7 @@ function _finishBulkLoad() {
   }
   _updateCollapseFabVisibility();
   _updateMinimapFabVisibility();
-  _refreshMinimap();
+  _refreshMinimap(true);
 }
 
 /* ── Shutdown ────────────────────────────────────────────────────────────── */
@@ -7204,6 +7437,8 @@ function clearAll() {
   const tnSearch = document.getElementById('tn-search-input');
   if (tnSearch) tnSearch.value = '';
   document.getElementById('transcript-filter-btn')?.classList.remove('open');
+  document.getElementById('fp-bell-btn')?.classList.remove('open');
+  document.getElementById('fp-notif-panel')?.classList.add('collapsed');
   document.getElementById('transcript-navigator')?.classList.add('collapsed');
   document.getElementById('analytics-panel')?.classList.add('collapsed');
   document.getElementById('analytics-btn')?.classList.remove('active');
@@ -7211,6 +7446,7 @@ function clearAll() {
   closeSpeakerManager();
   const bar = document.getElementById('transcript-selection-bar');
   if (bar) bar.classList.add('hidden');
+  _syncPanelBottomRadius();
   _clearSegmentRegistry();
   document.getElementById('transcript').innerHTML =
     '<p class="empty-hint">Transcript will appear here once recording starts.</p>';
@@ -7224,6 +7460,7 @@ function clearAll() {
   state.summaryBuffer    = '';
   state.summaryStreaming  = false;
   state.chatBuffer       = '';
+  state.chatToolCalls    = [];
   destroyPlayback();
 }
 
@@ -8673,7 +8910,8 @@ async function loadScreenDisplays() {
   try {
     const data = await fetch('/api/screen/displays').then(r => r.json());
     _screenDisplays = data.displays || [];
-    _renderDisplayGrid(data.selected);
+    const selected = (data.selected < _screenDisplays.length) ? data.selected : 0;
+    _renderDisplayGrid(selected);
     // Update ffmpeg status in settings
     const ffEl = document.getElementById('settings-ffmpeg-status');
     if (ffEl) {
@@ -8738,17 +8976,18 @@ function _renderDisplayGrid(selectedIdx) {
 
 async function selectScreenDisplay(idx) {
   try {
-    await fetch('/api/screen/displays', {
+    const res = await fetch('/api/screen/displays', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ display: idx }),
-    });
-    _renderDisplayGrid(idx);
+    }).then(r => r.json());
+    // Re-render with the server-confirmed selection
+    _renderDisplayGrid(res.selected ?? idx);
     // Flash a border on the physical display so the user can identify it
     fetch('/api/screen/identify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ display: idx }),
+      body: JSON.stringify({ display: res.selected ?? idx }),
     }).catch(() => {});
   } catch (_) {}
 }
@@ -8756,7 +8995,8 @@ async function selectScreenDisplay(idx) {
 async function toggleScreenRecordEnabled(enabled) {
   // Save via audio params system
   await _apSave('screen_record_enabled', enabled ? 1 : 0);
-  // Toggle visual is handled by the pane collapse — no need to hide body here
+  // Verify the save took effect — revert the checkbox if it didn't
+  _syncScreenToggle();
 }
 
 function _syncScreenToggle() {
@@ -8912,6 +9152,8 @@ initGainSliders();
 _restoreSidebarPanes();
 _tnInitSearch();
 _tsbInitAutocomplete();
+_syncPanelBottomRadius();
+_syncSummaryBottomRadius();
 // Load preferences first, then init components that depend on saved values
 loadPreferences().then(() => {
   loadAudioDevices();

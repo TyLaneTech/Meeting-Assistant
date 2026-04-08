@@ -111,12 +111,36 @@ def get_default_model_config() -> tuple[str, str, str]:
 # Minimum samples to pass to Whisper — very short clips produce garbage output.
 _MIN_WHISPER_SAMPLES = 3_200   # 0.2 s at 16 kHz
 
+# Short-fragment threshold: Whisper adds a trailing period to tiny audio clips
+# (e.g. a single word from diarization).  Outputs with this few words or fewer
+# are considered fragments and have their trailing period stripped.
+_FRAGMENT_MAX_WORDS = 4
+
 # Repetition / hallucination-loop detection.
 # Whisper can get stuck repeating a short phrase when conditioned on a
 # contaminated context (common with noisy mic input).  We measure the ratio of
 # unique N-grams to total N-grams; a low ratio means the text is a loop.
 _HALLUCINATION_NGRAM      = 4     # n-gram size for repetition check
 _HALLUCINATION_THRESHOLD  = 0.35  # unique-ratio below this → treat as loop
+
+
+def _strip_fragment_period(text: str) -> str:
+    """Strip a trailing period from short fragments.
+
+    Whisper treats every audio clip as a complete utterance and appends a period.
+    For very short clips (typically one diarized word) this produces output like
+    "word." which looks wrong when displayed.  This function removes the trailing
+    period only when the text is short enough to be a fragment, preserving real
+    sentence-ending punctuation on longer outputs.
+    """
+    if not text:
+        return text
+    words = text.split()
+    if len(words) <= _FRAGMENT_MAX_WORDS and text.endswith("."):
+        # Only strip a plain period — preserve "..." or "!." etc.
+        if not text.endswith(".."):
+            text = text[:-1].rstrip()
+    return text
 
 
 def _repetition_ratio(text: str, n: int = _HALLUCINATION_NGRAM) -> float:
@@ -355,6 +379,14 @@ class Transcriber:
                 # Timestamps from diart are relative to the start of `audio`.
                 # Reconstruct absolute recording-clock times from end_time.
                 chunk_start = end_time - len(audio) / self.TARGET_RATE
+
+                # ── Batch consecutive same-speaker segments ──────────────
+                # Diarization often produces many tiny per-speaker slices
+                # (0.3–0.5 s each).  Feeding each to Whisper individually
+                # yields one-word outputs with spurious trailing periods.
+                # Merge consecutive runs for the same speaker into a single
+                # audio buffer so Whisper receives sentence-level context.
+                batches: list[tuple[str, list[np.ndarray], float, float]] = []
                 for label, start, end in segments:
                     start_i   = int(start * self.TARGET_RATE)
                     end_i     = int(end   * self.TARGET_RATE)
@@ -368,9 +400,19 @@ class Transcriber:
                                                       chunk_start + end)
                         except Exception:
                             pass
-                    self._run_whisper(seg_audio, label, use_vad=False,
-                                     start_time=chunk_start + start,
-                                     end_time=chunk_start + end)
+                    if batches and batches[-1][0] == label:
+                        # Same speaker as previous — append audio to batch
+                        batches[-1][1].append(seg_audio)
+                        batches[-1] = (label, batches[-1][1],
+                                       batches[-1][2], chunk_start + end)
+                    else:
+                        batches.append((label, [seg_audio],
+                                        chunk_start + start, chunk_start + end))
+
+                for label, audio_parts, abs_start, abs_end in batches:
+                    merged_audio = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
+                    self._run_whisper(merged_audio, label, use_vad=False,
+                                     start_time=abs_start, end_time=abs_end)
             # Diarizer was active — don't also run plain Whisper on the same audio.
             return
 
@@ -418,7 +460,7 @@ class Transcriber:
             )
             parts = [seg.text.strip() for seg in segments if seg.text.strip()]
             if parts:
-                text = " ".join(parts)
+                text = _strip_fragment_period(" ".join(parts))
                 # Discard and clear context if output is a hallucination loop.
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:
                     log.warn("transcriber", f"[{label}] Hallucination loop detected — discarding")

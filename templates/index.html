@@ -26,7 +26,7 @@
         <span class="sidebar-title">Sessions</span>
         <div class="sidebar-header-tools">
           <button class="icon-btn folder-btn" onclick="createFolder()" title="New folder"><i class="fa-solid fa-folder-plus"></i></button>
-          <button class="icon-btn" onclick="openFingerprintPanel()" title="Voice Library"><i class="fa-solid fa-waveform-lines"></i></button>
+          <button class="icon-btn fingerprint-btn" onclick="openFingerprintPanel()" title="Voice Library"><i class="fa-solid fa-waveform-lines"></i></button>
           <button class="icon-btn multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions"><i class="fa-solid fa-list-check"></i></button>
         </div>
       </div>
@@ -358,6 +358,7 @@
           <button class="icon-btn playback-video-btn hidden" id="playback-video-toggle"
                   onclick="toggleVideoViewer()" title="Toggle screen recording"><i class="fa-solid fa-display"></i></button>
         </div>
+
         <div id="transcript-selection-bar" class="transcript-selection-bar hidden">
           <span class="tsb-count" id="tsb-count">0 segments selected</span>
           <div class="tsb-input-wrap" id="tsb-input-wrap">
@@ -378,7 +379,7 @@
         </div>
         <button class="transcript-minimap-fab hidden" id="transcript-minimap-toggle"
                 onclick="toggleTranscriptMinimap()" title="Speaker minimap">
-          <i class="fa-solid fa-bars-staggered"></i>
+          <i class="fa-solid fa-objects-column"></i>
         </button>
         <button class="transcript-collapse-fab hidden" id="transcript-collapse-toggle"
                 onclick="toggleTranscriptCollapse()" title="Collapse consecutive speaker segments">

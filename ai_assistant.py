@@ -11,6 +11,7 @@ from typing import Callable
 import log
 
 Callback = Callable[[str], None]
+ToolEventCallback = Callable[[str, dict], None]  # (event_type, payload) → None
 FrameExtractor = Callable[[float], bytes | None]  # timestamp → JPEG bytes or None
 
 # Tool definition used for Anthropic structured patch output.
@@ -187,6 +188,7 @@ class AIAssistant:
         "to indicate a span (e.g. the stretch of discussion on a topic). Place the timestamp "
         "after the referenced text, not before. Only timestamp moments worth jumping to — "
         "avoid tagging every sentence or obvious context\n"
+        "- For multiple timespans, group each range in it's own set of square brackets (e.g. [18:31–19:48] [27:17–27:26])\n"
         "- Always respond in English regardless of any foreign words or phrases in the transcript"
     )
 
@@ -217,6 +219,7 @@ class AIAssistant:
         "notable quotes or turning points, topic transitions, key disagreements resolved\n"
         "- Skip timestamps on: generic observations, filler content, bullets that are already "
         "obvious from context, or anywhere one per section is already enough\n"
+        "- For multiple seperate timespan moments, group each range in it's own set of square brackets (e.g. [18:31–19:48] [27:17–27:26])\n"
         "- Aim for 1–3 timestamps per section — enough to orient, not so many they lose meaning\n\n"
         "## Quality bar\n"
         "- Keep every section as concise as possible — rich but tight\n"
@@ -259,6 +262,7 @@ class AIAssistant:
         meta: dict | None = None,
         cancel: "threading.Event | None" = None,
         frame_extractor: FrameExtractor | None = None,
+        on_tool_event: ToolEventCallback | None = None,
     ) -> None:
         """Stream an answer to the latest question in chat_history.
 
@@ -300,6 +304,7 @@ class AIAssistant:
             self._stream_with_tools(
                 system, chat_history, on_token, on_done,
                 cancel=cancel, frame_extractor=frame_extractor,
+                on_tool_event=on_tool_event,
             )
         else:
             self._stream(system, chat_history, on_token, on_done, cancel=cancel)
@@ -629,6 +634,7 @@ class AIAssistant:
         on_done: Callable[[], None] | None,
         cancel: "threading.Event | None" = None,
         frame_extractor: FrameExtractor | None = None,
+        on_tool_event: ToolEventCallback | None = None,
     ) -> None:
         """Stream with tool-use loop (up to 5 iterations).
 
@@ -644,11 +650,13 @@ class AIAssistant:
                 return
             if self.provider == "openai":
                 self._tool_loop_openai(
-                    system, messages, on_token, cancel, frame_extractor
+                    system, messages, on_token, cancel, frame_extractor,
+                    on_tool_event=on_tool_event,
                 )
             else:
                 self._tool_loop_anthropic(
-                    system, messages, on_token, cancel, frame_extractor
+                    system, messages, on_token, cancel, frame_extractor,
+                    on_tool_event=on_tool_event,
                 )
         except Exception as e:
             on_token(f"\n\n*Error: {e}*")
@@ -663,6 +671,7 @@ class AIAssistant:
         on_token: Callback,
         cancel: "threading.Event | None",
         frame_extractor: FrameExtractor | None,
+        on_tool_event: ToolEventCallback | None = None,
     ) -> None:
         import anthropic
 
@@ -713,6 +722,13 @@ class AIAssistant:
             # Process each tool call and build tool results
             tool_results = []
             for tu in tool_uses:
+                # Notify frontend about the tool call
+                if on_tool_event:
+                    on_tool_event("tool_call", {
+                        "name": tu["name"],
+                        "input": tu["input"],
+                    })
+
                 if tu["name"] == "get_screenshot" and frame_extractor:
                     ts = tu["input"].get("timestamp", 0)
                     jpeg = frame_extractor(float(ts))
@@ -733,6 +749,13 @@ class AIAssistant:
                                 },
                             ],
                         })
+                        if on_tool_event:
+                            on_tool_event("tool_result", {
+                                "name": tu["name"],
+                                "success": True,
+                                "summary": f"Captured screenshot at {ts:.1f}s",
+                                "image": b64,
+                            })
                     else:
                         tool_results.append({
                             "type": "tool_result",
@@ -740,6 +763,12 @@ class AIAssistant:
                             "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
                             "is_error": True,
                         })
+                        if on_tool_event:
+                            on_tool_event("tool_result", {
+                                "name": tu["name"],
+                                "success": False,
+                                "summary": "Could not extract frame",
+                            })
                 else:
                     tool_results.append({
                         "type": "tool_result",
@@ -747,6 +776,12 @@ class AIAssistant:
                         "content": f"Unknown tool: {tu['name']}",
                         "is_error": True,
                     })
+                    if on_tool_event:
+                        on_tool_event("tool_result", {
+                            "name": tu["name"],
+                            "success": False,
+                            "summary": f"Unknown tool: {tu['name']}",
+                        })
 
             msgs.append({"role": "user", "content": tool_results})
 
@@ -757,6 +792,7 @@ class AIAssistant:
         on_token: Callback,
         cancel: "threading.Event | None",
         frame_extractor: FrameExtractor | None,
+        on_tool_event: ToolEventCallback | None = None,
     ) -> None:
         import openai
 
@@ -815,6 +851,17 @@ class AIAssistant:
             for v in tool_calls_acc.values():
                 tc_id   = v["id"]
                 tc_name = v["name"]
+
+                if on_tool_event:
+                    try:
+                        parsed_args = json.loads(v["arguments"])
+                    except Exception:
+                        parsed_args = {}
+                    on_tool_event("tool_call", {
+                        "name": tc_name,
+                        "input": parsed_args,
+                    })
+
                 if tc_name == "get_screenshot" and frame_extractor:
                     args = json.loads(v["arguments"])
                     ts = float(args.get("timestamp", 0))
@@ -841,18 +888,37 @@ class AIAssistant:
                                 },
                             ],
                         })
+                        if on_tool_event:
+                            on_tool_event("tool_result", {
+                                "name": tc_name,
+                                "success": True,
+                                "summary": f"Captured screenshot at {ts:.1f}s",
+                                "image": b64,
+                            })
                     else:
                         msgs.append({
                             "role": "tool",
                             "tool_call_id": tc_id,
                             "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
                         })
+                        if on_tool_event:
+                            on_tool_event("tool_result", {
+                                "name": tc_name,
+                                "success": False,
+                                "summary": "Could not extract frame",
+                            })
                 else:
                     msgs.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
                         "content": f"Unknown tool: {tc_name}",
                     })
+                    if on_tool_event:
+                        on_tool_event("tool_result", {
+                            "name": tc_name,
+                            "success": False,
+                            "summary": f"Unknown tool: {tc_name}",
+                        })
 
     # ── Summary helpers ────────────────────────────────────────────────────────
 

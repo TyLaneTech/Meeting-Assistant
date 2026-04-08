@@ -1871,6 +1871,10 @@ def get_displays():
     """Return available displays for screen recording."""
     displays = enumerate_displays()
     selected = int(settings.get("screen_display", 0))
+    # Clamp to valid range in case displays changed since the setting was saved
+    if selected >= len(displays):
+        selected = 0
+        settings.put("screen_display", 0)
     return jsonify({
         "displays": displays,
         "selected": selected,
@@ -2282,6 +2286,7 @@ def chat():
     def run_chat():
         _push("chat_start", {"request_id": request_id, "question": question})
         response_chunks: list[str] = []
+        tool_calls_log: list[dict] = []
 
         def on_token(t: str) -> None:
             if cancel_event.is_set():
@@ -2289,11 +2294,29 @@ def chat():
             response_chunks.append(t)
             _push("chat_chunk", {"request_id": request_id, "text": t})
 
+        def on_tool_event(event_type: str, payload: dict) -> None:
+            if cancel_event.is_set():
+                return
+            # Collect tool call data for persistence (omit large image data)
+            if event_type == "tool_call":
+                tool_calls_log.append({"name": payload["name"], "input": payload.get("input", {}), "result": None})
+            elif event_type == "tool_result" and tool_calls_log:
+                tool_calls_log[-1]["result"] = {
+                    "success": payload.get("success", False),
+                    "summary": payload.get("summary", ""),
+                }
+            _push("chat_tool_event", {
+                "request_id": request_id,
+                "type": event_type,
+                **payload,
+            })
+
         def on_done() -> None:
             _chat_cancel.pop(request_id, None)
             full = "".join(response_chunks)
             if full.strip():
-                storage.save_chat_message(session_id, "assistant", full)
+                tc_json = json.dumps(tool_calls_log) if tool_calls_log else None
+                storage.save_chat_message(session_id, "assistant", full, tool_calls=tc_json)
                 with _state_lock:
                     if session_id == _state["session_id"]:
                         _state["chat_history"].append({"role": "assistant", "content": full})
@@ -2306,7 +2329,8 @@ def chat():
             fe = lambda ts, vp=str(video_path): extract_frame(vp, ts)
 
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
-               cancel=cancel_event, frame_extractor=fe)
+               cancel=cancel_event, frame_extractor=fe,
+               on_tool_event=on_tool_event)
 
     threading.Thread(target=run_chat, daemon=True).start()
     return jsonify({"request_id": request_id})
@@ -2323,6 +2347,20 @@ def chat_stop():
     # No specific request_id — cancel all active chat streams
     for ev in _chat_cancel.values():
         ev.set()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/chat/clear", methods=["POST"])
+def chat_clear():
+    """Delete all chat messages for a session."""
+    data = request.get_json(silent=True) or {}
+    sid = data.get("session_id")
+    if not sid:
+        return jsonify({"error": "session_id required"}), 400
+    storage.clear_chat_messages(sid)
+    with _state_lock:
+        if _state["session_id"] == sid:
+            _state["chat_history"] = []
     return jsonify({"ok": True})
 
 
