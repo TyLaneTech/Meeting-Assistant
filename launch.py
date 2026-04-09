@@ -320,11 +320,37 @@ def _torch_build() -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _disconnect_cloudflare_warp():
+    """Disconnect Cloudflare WARP if installed — it blocks HuggingFace model downloads."""
+    warp_cli = shutil.which("warp-cli")
+    if not warp_cli:
+        return False
+    try:
+        status = subprocess.run(
+            [warp_cli, "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if status.returncode != 0 or "Disconnected" in status.stdout:
+            return False
+        subprocess.run(
+            [warp_cli, "disconnect"],
+            capture_output=True, timeout=10,
+        )
+        _info("Cloudflare WARP disconnected (blocks model downloads)")
+        return True
+    except Exception:
+        return False
+
+
 def main():
     global UV
 
     os.chdir(Path(__file__).parent)
     _ensure_venv()   # re-execs into .venv if not already running inside it
+
+    # Disconnect Cloudflare WARP before any network operations — its TLS
+    # inspection breaks HuggingFace model downloads and pip index requests.
+    _disconnect_cloudflare_warp()
 
     # Ensure uv can find the active venv
     os.environ["VIRTUAL_ENV"] = str(VENV_DIR)
@@ -443,6 +469,13 @@ def main():
         except Exception as e:
             _warn(f"Could not download ffmpeg: {e}")
             _warn("Screen recording will be unavailable. Install ffmpeg manually to enable it.")
+
+    # ── Offline mode for HuggingFace ─────────────────────────────────────────
+    # All models have been downloaded during first-run (or by the diarizer /
+    # whisper init above).  Switch HF Hub to offline mode so that reanalysis
+    # and other runtime code never makes network calls — avoids failures when
+    # Cloudflare WARP reconnects or the network drops mid-session.
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print()
