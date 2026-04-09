@@ -6976,6 +6976,15 @@ function scrollChatToBottom(force = false) {
 
 async function clearChat() {
   if (!state.sessionId) return;
+  // Cancel any in-flight response
+  if (state.aiChatBusy) {
+    await stopChatGeneration();
+    state.aiChatBusy = false;
+    _setChatBusy(false);
+  }
+  state.chatCursor = null;
+  state.chatBuffer = '';
+  state.chatToolCalls = [];
   document.getElementById('chat-messages').innerHTML =
     '<p class="empty-hint">Chat cleared.</p>';
   await fetch('/api/chat/clear', {

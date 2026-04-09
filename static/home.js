@@ -472,6 +472,15 @@ async function newGlobalConversation() {
 }
 
 async function clearGlobalChat() {
+  // Cancel any in-flight response
+  if (_homeState.busy) {
+    await stopGlobalChat();
+    _homeState.busy = false;
+    _homeState.currentMsgWrap = null;
+    _homeState.currentChunks = [];
+    _homeState.currentToolCalls = [];
+    _setChatBusy(false);
+  }
   if (!_homeState.conversationId) {
     const container = _chatContainer();
     container.querySelectorAll('.chat-msg').forEach(el => el.remove());
