@@ -6,6 +6,35 @@ function renderMd(text) {
 }
 
 /**
+ * Diff-update a chat body element using morphdom to avoid re-creating
+ * existing DOM nodes (which causes images to flash/reload).
+ * Also wires up image onload handlers to fix auto-scroll when images
+ * load asynchronously and change the scroll height.
+ */
+function _morphChatBody(el, mdText) {
+  const newHtml = renderMd(mdText);
+  // morphdom needs a single root - wrap in a div
+  const tmp = document.createElement('div');
+  tmp.innerHTML = newHtml;
+  morphdom(el, tmp, {
+    childrenOnly: true,
+    onBeforeElUpdated(fromEl, toEl) {
+      // Don't touch images that already have the same src (prevents reload flash)
+      if (fromEl.tagName === 'IMG' && toEl.tagName === 'IMG'
+          && fromEl.src === toEl.src) {
+        return false;
+      }
+      return true;
+    },
+  });
+  // Wire image load handlers for scroll correction
+  el.querySelectorAll('img:not([data-scroll-wired])').forEach(img => {
+    img.dataset.scrollWired = '1';
+    img.addEventListener('load', () => scrollChatToBottom(), { once: true });
+  });
+}
+
+/**
  * Post-process rendered summary HTML to make timestamps clickable pills.
  * Matches single timestamps [M:SS] and ranges [M:SS–M:SS] (en-dash, em-dash,
  * or plain hyphen as separator). Clicking seeks to the start of the range.
@@ -2125,7 +2154,8 @@ function connectSSE(afterSegId = 0) {
         const actions = wrap.querySelector('.chat-msg-actions');
         if (actions) actions.style.display = '';
       }
-      state.chatCursor.innerHTML = renderMd(state.chatBuffer);
+      // Use morphdom to diff-update instead of innerHTML to avoid image flashing
+      _morphChatBody(state.chatCursor, state.chatBuffer);
       state.chatCursor.classList.add('typing-cursor');
       scrollChatToBottom();
     }
@@ -6997,6 +7027,66 @@ function scrollChatToBottom(force = false) {
   if (!force && !_chatAtBottom) return;
   const el = document.getElementById('chat-messages');
   el.scrollTop = el.scrollHeight;
+}
+
+/* ── Image lightbox ────────────────────────────────────────────────────────── */
+document.addEventListener('click', e => {
+  const img = e.target.closest('.chat-msg-body img');
+  if (!img) return;
+  _openImageLightbox(img.src);
+});
+
+function _openImageLightbox(src) {
+  const overlay = document.createElement('div');
+  overlay.className = 'img-lightbox';
+  overlay.innerHTML = `
+    <button class="img-lightbox-close" title="Close">&times;</button>
+    <img src="${src}" alt="Screenshot preview">`;
+  document.body.appendChild(overlay);
+
+  const img = overlay.querySelector('img');
+  let zoomed = false;
+  let dragState = null;
+
+  // Click backdrop to close
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.remove();
+  });
+  overlay.querySelector('.img-lightbox-close').addEventListener('click', () => overlay.remove());
+
+  // Click image to toggle zoom
+  img.addEventListener('click', e => {
+    e.stopPropagation();
+    zoomed = !zoomed;
+    img.classList.toggle('zoomed', zoomed);
+    if (!zoomed) {
+      img.style.transform = '';
+      dragState = null;
+    }
+  });
+
+  // Drag to pan when zoomed
+  img.addEventListener('mousedown', e => {
+    if (!zoomed) return;
+    e.preventDefault();
+    dragState = { startX: e.clientX, startY: e.clientY,
+                  tx: parseFloat(img.dataset.tx || 0), ty: parseFloat(img.dataset.ty || 0) };
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragState) return;
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    const tx = dragState.tx + dx;
+    const ty = dragState.ty + dy;
+    img.style.transform = `translate(${tx}px, ${ty}px)`;
+    img.dataset.tx = tx;
+    img.dataset.ty = ty;
+  });
+  document.addEventListener('mouseup', () => { dragState = null; });
+
+  // Escape to close
+  const onKey = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', onKey); } };
+  document.addEventListener('keydown', onKey);
 }
 
 async function clearChat() {
