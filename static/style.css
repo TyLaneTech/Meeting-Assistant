@@ -2154,6 +2154,11 @@ button#sidebar-close-btn {
   background: var(--surface4);
   padding: 6px 20px 4px 10px;
 }
+/* While tools are still running, expand fully without scroll */
+.chat-tool-widget.open.streaming .chat-tool-details {
+  max-height: none;
+  overflow-y: visible;
+}
 .chat-tool-details::-webkit-scrollbar { width: 4px; }
 .chat-tool-details::-webkit-scrollbar-track { background: transparent; }
 .chat-tool-details::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
