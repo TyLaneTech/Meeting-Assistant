@@ -325,48 +325,57 @@ def _torch_build() -> str:
 # The download functions are defined inside _predownload_models to avoid
 # importing heavy libraries at module level.
 
-def _has_snapshot(base: Path, hf_model_id: str) -> bool:
-    """Check if a models--org--name/snapshots/ dir has content."""
-    snapshots = base / ("models--" + hf_model_id.replace("/", "--")) / "snapshots"
-    if snapshots.is_dir():
-        for snap in snapshots.iterdir():
-            if snap.is_dir() and any(snap.iterdir()):
-                return True
-    return False
+def _is_model_cached(hf_model_id: str) -> bool:
+    """Search common cache roots for a HuggingFace model directory.
 
-
-def _is_model_cached(hf_model_id: str, is_pyannote: bool = False) -> bool:
-    """Check all known cache locations for a HuggingFace model."""
-    project_hf = Path(__file__).parent / "models" / "hub"
-    home = Path.home()
-
-    # Locations where HF Hub models are stored
-    hf_dirs = [
-        project_hf,                                          # ./models/hub/ (HF_HOME)
-        home / ".cache" / "huggingface" / "hub",             # default HF cache
+    The target directory name is models--<org>--<name>.  We search
+    recursively (up to depth 4) under ~/.cache/ and the project-local
+    models/ dir so that models cached by any library (huggingface_hub,
+    pyannote, torch, etc.) are found regardless of the exact path.
+    """
+    target = "models--" + hf_model_id.replace("/", "--")
+    roots = [
+        Path(__file__).parent / "models",   # project-local HF_HOME
+        Path.home() / ".cache",             # covers huggingface/, torch/, etc.
     ]
-
-    for d in hf_dirs:
-        if _has_snapshot(d, hf_model_id):
+    for root in roots:
+        if not root.is_dir():
+            continue
+        if _find_model_dir(root, target, max_depth=4):
             return True
-
-    # Pyannote caches models separately under ~/.cache/torch/pyannote/
-    if is_pyannote:
-        torch_pyannote = home / ".cache" / "torch" / "pyannote"
-        if _has_snapshot(torch_pyannote, hf_model_id):
-            return True
-
     return False
 
 
-# Map task IDs → (HuggingFace model ID, is_pyannote)
+def _find_model_dir(base: Path, target: str, max_depth: int) -> bool:
+    """Recursively search for a directory named `target` under `base`."""
+    if max_depth <= 0:
+        return False
+    try:
+        for entry in base.iterdir():
+            if not entry.is_dir():
+                continue
+            if entry.name == target:
+                # Confirm it has actual content (snapshots or model files)
+                try:
+                    if any(entry.rglob("*")):
+                        return True
+                except (PermissionError, OSError):
+                    pass
+            if _find_model_dir(entry, target, max_depth - 1):
+                return True
+    except (PermissionError, OSError):
+        pass
+    return False
+
+
+# Map task IDs → HuggingFace model IDs for cache checking
 _MODEL_IDS = {
-    "faster-whisper":        ("Systran/faster-whisper-large-v3", False),
-    "pyannote-segmentation": ("pyannote/segmentation-3.0", True),
-    "pyannote-embedding":    ("pyannote/wespeaker-voxceleb-resnet34-LM", True),
-    "pyannote-pipeline":     ("pyannote/speaker-diarization-3.1", True),
-    "whisper-turbo":         ("openai/whisper-large-v3-turbo", False),
-    "sentence-transformers": ("sentence-transformers/all-MiniLM-L6-v2", False),
+    "faster-whisper":        "Systran/faster-whisper-large-v3",
+    "pyannote-segmentation": "pyannote/segmentation-3.0",
+    "pyannote-embedding":    "pyannote/wespeaker-voxceleb-resnet34-LM",
+    "pyannote-pipeline":     "pyannote/speaker-diarization-3.1",
+    "whisper-turbo":         "openai/whisper-large-v3-turbo",
+    "sentence-transformers": "sentence-transformers/all-MiniLM-L6-v2",
 }
 
 
@@ -429,13 +438,11 @@ elif task == "sentence-transformers":
     # Fast check: skip models already in the local cache
     need_download = []
     for task_id, display_name in models:
-        entry = _MODEL_IDS.get(task_id)
-        if entry:
-            hf_id, is_pyannote = entry
-            if _is_model_cached(hf_id, is_pyannote):
-                _ok(f"{display_name}")
-                continue
-        need_download.append((task_id, display_name))
+        hf_id = _MODEL_IDS.get(task_id)
+        if hf_id and _is_model_cached(hf_id):
+            _ok(f"{display_name}")
+        else:
+            need_download.append((task_id, display_name))
 
     if not need_download:
         _ok("All models cached")
