@@ -20,18 +20,12 @@ from scipy import signal as scipy_signal
 
 import log
 
-# ── Hallucination detection (mirrors transcriber.py) ──────────────────────────
-_HALLUCINATION_NGRAM     = 4
-_HALLUCINATION_THRESHOLD = 0.35  # unique-ratio below this → discard
-
-
-def _repetition_ratio(text: str, n: int = _HALLUCINATION_NGRAM) -> float:
-    """Return the fraction of unique n-grams (1.0 = no repetition)."""
-    words = text.lower().split()
-    if len(words) < n * 2:
-        return 1.0
-    ngrams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
-    return len(set(ngrams)) / len(ngrams)
+# ── Hallucination detection (shared with transcriber.py) ─────────────────────
+from transcriber import (
+    _HALLUCINATION_THRESHOLD,
+    _repetition_ratio,
+    _clean_hallucinations,
+)
 
 
 # ── Windows: register nvidia DLL directories ─────────────────────────────────
@@ -348,6 +342,9 @@ class BatchTranscriber:
             # Fire callbacks in chronological order, filtering hallucinations
             for result, (speaker, start, end) in zip(results, batch_meta):
                 text = result.get("text", "").strip()
+                if not text:
+                    continue
+                text = _clean_hallucinations(text)
                 if not text:
                     continue
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:

@@ -123,6 +123,54 @@ _FRAGMENT_MAX_WORDS = 4
 _HALLUCINATION_NGRAM      = 4     # n-gram size for repetition check
 _HALLUCINATION_THRESHOLD  = 0.35  # unique-ratio below this → treat as loop
 
+# Known Whisper hallucination phrases.  These are artifacts from the training
+# data (subtitles, YouTube outros, etc.) that Whisper hallucinates when the
+# audio is silent or contains only background noise.  Checked against the
+# lowercased text — if ANY phrase appears as a substring, the segment is
+# discarded.  Also applied as a strip: if the phrase appears at the start or
+# end, it's removed and the remainder is kept (if any real speech remains).
+import re as _re
+
+_HALLUCINATION_PHRASES = [
+    "subtitles by",
+    "subtitle workshop",
+    "amara.org",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "like and subscribe",
+    "subscribe to",
+    "click the bell",
+    "hit the notification",
+    "www.mooji.org",
+    "subs by",
+    "subtitling by",
+    "captions by",
+    "transcription by",
+    "translated by",
+    "captioned by",
+]
+
+# Pre-compile a single regex for efficiency
+_HALLUCINATION_RE = _re.compile(
+    "|".join(_re.escape(p) for p in _HALLUCINATION_PHRASES),
+    _re.IGNORECASE,
+)
+
+
+def _clean_hallucinations(text: str) -> str:
+    """Remove known Whisper hallucination phrases from text.
+
+    If the entire text is a hallucination, returns ''.
+    If real speech is mixed with hallucination artifacts, strips the artifacts.
+    """
+    cleaned = _HALLUCINATION_RE.sub("", text).strip()
+    # If stripping left only punctuation/whitespace or very short residue, discard
+    stripped = _re.sub(r"[^\w]", "", cleaned)
+    if len(stripped) < 3:
+        return ""
+    return cleaned
+
 
 def _strip_fragment_period(text: str) -> str:
     """Strip a trailing period from short fragments.
@@ -492,6 +540,10 @@ class Transcriber:
             parts = [seg.text.strip() for seg in segments if seg.text.strip()]
             if parts:
                 text = _strip_fragment_period(" ".join(parts))
+                # Strip known hallucination phrases (subtitle credits, etc.)
+                text = _clean_hallucinations(text)
+                if not text:
+                    return
                 # Discard and clear context if output is a hallucination loop.
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:
                     log.warn("transcriber", f"[{label}] Hallucination loop detected — discarding")
