@@ -54,6 +54,24 @@ except AttributeError:
 # or admin rights; caching still works fine without them).
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
+# torchaudio 2.x removed symbols that older pyannote.audio references at import
+# time.  Apply shims early (before any pyannote import) so both diarizer.py and
+# speaker_db.py see them regardless of load order.
+try:
+    import torchaudio as _ta
+    if not hasattr(_ta, "AudioMetaData"):
+        import collections as _collections
+        _ta.AudioMetaData = _collections.namedtuple(
+            "AudioMetaData",
+            ["sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding"],
+        )
+    if not hasattr(_ta, "list_audio_backends"):
+        _ta.list_audio_backends = lambda: ["soundfile"]
+    if not hasattr(_ta, "set_audio_backend"):
+        _ta.set_audio_backend = lambda backend: None
+except ImportError:
+    pass
+
 REQUIRED_KEYS = {
     "ANTHROPIC_API_KEY": {
         "label": "Anthropic API Key",
