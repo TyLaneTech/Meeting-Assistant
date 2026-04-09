@@ -386,22 +386,29 @@ elif task == "sentence-transformers":
     script_path = Path(__file__).parent / ".model_download.py"
     script_path.write_text(script_template)
 
+    max_attempts = 3
     all_ok = True
     for task_id, display_name in models:
-        r = subprocess.run(
-            [sys.executable, str(script_path), task_id],
-            capture_output=True, text=True, timeout=600,
-        )
-        if r.returncode == 0:
-            _ok(f"{display_name}")
-        else:
-            # Check if it's just a network issue vs real error
+        success = False
+        for attempt in range(1, max_attempts + 1):
+            r = subprocess.run(
+                [sys.executable, str(script_path), task_id],
+                capture_output=True, text=True, timeout=600,
+            )
+            if r.returncode == 0:
+                success = True
+                break
             stderr = r.stderr.strip()
             if "already" in stderr.lower() or not stderr:
-                _ok(f"{display_name}")
-            else:
-                _warn(f"{display_name} — download failed, will retry at runtime")
-                all_ok = False
+                success = True
+                break
+            if attempt < max_attempts:
+                _info(f"{display_name} — retrying ({attempt}/{max_attempts})...")
+        if success:
+            _ok(f"{display_name}")
+        else:
+            _warn(f"{display_name} — download failed after {max_attempts} attempts")
+            all_ok = False
 
     # Clean up
     try:
