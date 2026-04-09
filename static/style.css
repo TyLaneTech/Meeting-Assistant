@@ -2147,7 +2147,8 @@ button#sidebar-close-btn {
   padding: 0 0 0 10px;
 }
 .chat-tool-widget.open .chat-tool-details {
-  max-height: 400px;
+  max-height: 300px;
+  overflow-y: auto;
   transition: all 0.25s;
   background: var(--surface4);
   padding: 6px 20px 4px 10px;

@@ -1005,14 +1005,13 @@ class AIAssistant:
             jpeg = frame_extractor(ts)
             if jpeg:
                 b64 = base64.b64encode(jpeg).decode()
+                # Include image directly in the tool result — inserting a user
+                # message between tool results breaks OpenAI's protocol when
+                # multiple tool calls are processed in parallel.
                 msgs.append({
                     "role": "tool", "tool_call_id": tc_id,
-                    "content": f"Screenshot at {ts:.1f}s captured. The image follows.",
-                })
-                msgs.append({
-                    "role": "user",
                     "content": [
-                        {"type": "text", "text": f"[Screenshot at {ts:.1f}s from the screen recording:]"},
+                        {"type": "text", "text": f"Screenshot at {ts:.1f}s:"},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ],
                 })
