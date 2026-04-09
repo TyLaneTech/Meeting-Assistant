@@ -11,10 +11,12 @@ function renderMd(text) {
  * Also wires up image onload handlers to fix auto-scroll when images
  * load asynchronously and change the scroll height.
  */
-// Regex-based timestamp linkification on HTML strings (for use before morphdom).
-const _tsHtmlRe = /\[(\d{1,2}:\d{2})(?:[\u2013\u2014\-](\d{1,2}:\d{2}))?\]/g;
-function _linkifyTimestampsHtml(html) {
-  return html.replace(_tsHtmlRe, (full, start, end) => {
+// Replace [M:SS] timestamps in raw markdown text with HTML spans BEFORE
+// passing to marked.parse(). This prevents marked from interpreting the
+// brackets as link reference syntax and ensures pills render during streaming.
+const _tsMdRe = /\[(\d{1,2}:\d{2})(?:[\u2013\u2014\-](\d{1,2}:\d{2}))?\]/g;
+function _linkifyTimestampsInMd(md) {
+  return md.replace(_tsMdRe, (full, start, end) => {
     const [m, s] = start.split(':').map(Number);
     const sec = m * 60 + s;
     const label = end ? `${start} - ${end}` : start;
@@ -23,9 +25,8 @@ function _linkifyTimestampsHtml(html) {
 }
 
 function _morphChatBody(el, mdText) {
-  let newHtml = renderMd(mdText);
-  // Linkify timestamps in the HTML string so morphdom sees stable spans
-  newHtml = _linkifyTimestampsHtml(newHtml);
+  // Linkify timestamps in the raw markdown before marked parses it
+  let newHtml = renderMd(_linkifyTimestampsInMd(mdText));
 
   // Preserve existing loaded images - detach them before morphdom runs,
   // then restore them after. This prevents flashing when morphdom
@@ -2114,8 +2115,7 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('summary_chunk', e => {
     state.summaryBuffer += JSON.parse(e.data).text;
     if (state.summaryCursor) {
-      let html = renderMd(state.summaryBuffer);
-      html = _linkifyTimestampsHtml(html);
+      const html = renderMd(_linkifyTimestampsInMd(state.summaryBuffer));
       state.summaryCursor.innerHTML = html;
       if (_summaryAtBottom) state.summaryCursor.scrollTop = state.summaryCursor.scrollHeight;
     }
