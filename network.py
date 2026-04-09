@@ -75,26 +75,52 @@ def warp_reconnect() -> bool:
         return False
 
 
-def _load_hf_pipeline(model_id: str, hf_token: str):
-    """Load a pyannote Pipeline, trying local cache first.
+def _is_model_cached(model_id: str) -> bool:
+    """Check if a HuggingFace model/pipeline is already in the local cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        # Pipeline configs are stored as config.yaml
+        result = try_to_load_from_cache(model_id, "config.yaml")
+        if result is not None and isinstance(result, str):
+            return True
+        # Also check for pytorch_model.bin (model weights)
+        result = try_to_load_from_cache(model_id, "pytorch_model.bin")
+        return result is not None and isinstance(result, str)
+    except Exception:
+        return False
 
-    1. Try local_files_only (no network needed — WARP state irrelevant)
-    2. On cache miss, disconnect WARP and try a fresh download
-    3. If that also fails, reconnect WARP and try once more
+
+def _load_hf_pipeline(model_id: str, hf_token: str):
+    """Load a pyannote Pipeline, using cache when available.
+
+    pyannote's Pipeline.from_pretrained does NOT support local_files_only,
+    so we check the HF cache manually first.  If cached, we set
+    HF_HUB_OFFLINE=1 for the duration of the load to prevent any network
+    calls.  On cache miss, try downloading with WARP off then WARP on.
 
     Returns the Pipeline object or None on failure.
     """
+    import os
     from pyannote.audio import Pipeline as PyannotePipeline
 
-    # Attempt 1: local cache only — no network, no WARP issues
-    try:
-        return PyannotePipeline.from_pretrained(
-            model_id,
-            use_auth_token=hf_token,
-            local_files_only=True,
-        )
-    except Exception:
-        log.info("network", f"Model '{model_id}' not in cache, downloading...")
+    # Attempt 1: load from cache (no network)
+    if _is_model_cached(model_id):
+        old_val = os.environ.get("HF_HUB_OFFLINE")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            return PyannotePipeline.from_pretrained(
+                model_id,
+                use_auth_token=hf_token,
+            )
+        except Exception:
+            log.warn("network", f"Cache hit for '{model_id}' but load failed, re-downloading...")
+        finally:
+            if old_val is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = old_val
+
+    log.info("network", f"Model '{model_id}' not in cache, downloading...")
 
     # Attempt 2: download with WARP off
     warp_disconnect()
