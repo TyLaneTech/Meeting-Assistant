@@ -43,6 +43,9 @@ os.environ.setdefault("HF_HOME", _MODEL_CACHE)
 os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFY", "1")
 os.environ.setdefault("CURL_CA_BUNDLE", "")
 os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+os.environ.setdefault("SSL_CERT_FILE", "")
+# httpx (used by Anthropic/OpenAI SDKs) respects this env var
+os.environ.setdefault("SSL_VERIFY", "0")
 
 import ssl as _ssl
 try:

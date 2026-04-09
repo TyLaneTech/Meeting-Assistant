@@ -333,11 +333,15 @@ class AIAssistant:
     def _make_client(self, provider: str):
         """Create the API client.  Returns None gracefully if no key is set."""
         try:
+            import httpx
+            # Disable SSL verification - corporate Cloudflare WARP injects a
+            # self-signed CA that breaks httpx's default cert validation.
+            http_client = httpx.Client(verify=False)
             if provider == "openai":
                 from openai import OpenAI
-                return OpenAI()
+                return OpenAI(http_client=http_client)
             import anthropic
-            return anthropic.Anthropic()
+            return anthropic.Anthropic(http_client=http_client)
         except Exception as e:
             print(f"[ai] Could not initialise {provider} client: {e}")
             return None
