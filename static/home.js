@@ -543,6 +543,12 @@ function useSuggestion(btn) {
   sendGlobalMessage();
 }
 
+// Trim pasted text
+document.getElementById('global-chat-input')?.addEventListener('paste', e => {
+  const ta = e.target;
+  setTimeout(() => { ta.value = ta.value.trim(); }, 0);
+});
+
 /* ── Conversation Sidebar Toggle ──────────────────────────────────────────── */
 
 function toggleConvSidebar() {

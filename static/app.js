@@ -7260,12 +7260,19 @@ function _renderBubbleAttachments(bodyEl, attachments) {
 document.getElementById('chat-input')?.addEventListener('paste', e => {
   const items = e.clipboardData?.items;
   if (!items) return;
+  let hasFile = false;
   for (const item of items) {
     if (item.kind === 'file' && item.type.startsWith('image/')) {
       e.preventDefault();
+      hasFile = true;
       const file = item.getAsFile();
       if (file) _uploadAttachment(file);
     }
+  }
+  // Trim leading/trailing whitespace from pasted text
+  if (!hasFile) {
+    const ta = e.target;
+    setTimeout(() => { ta.value = ta.value.trim(); }, 0);
   }
 });
 
