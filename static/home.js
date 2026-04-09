@@ -231,8 +231,15 @@ function _renderToolWidget(msgWrap, toolCalls) {
 
 function _copyChatMsg(btn) {
   const body = btn.closest('.chat-msg').querySelector('.chat-msg-body');
-  const text = body?.innerText || '';
-  navigator.clipboard.writeText(text).then(() => {
+  if (!body) return;
+  const html = body.innerHTML;
+  const plain = body.innerText || '';
+  navigator.clipboard.write([
+    new ClipboardItem({
+      'text/html': new Blob([html], { type: 'text/html' }),
+      'text/plain': new Blob([plain], { type: 'text/plain' }),
+    }),
+  ]).catch(() => navigator.clipboard.writeText(plain)).then(() => {
     btn.classList.add('copied');
     btn.innerHTML = '<i class="fa-solid fa-check"></i>';
     setTimeout(() => {
