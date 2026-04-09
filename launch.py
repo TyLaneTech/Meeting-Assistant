@@ -325,10 +325,9 @@ def _torch_build() -> str:
 # The download functions are defined inside _predownload_models to avoid
 # importing heavy libraries at module level.
 
-def _is_model_cached(hf_model_id: str) -> bool:
-    """Quick filesystem check: is a HuggingFace model already in our local cache?"""
-    model_dir = Path(__file__).parent / "models" / "hub" / ("models--" + hf_model_id.replace("/", "--"))
-    snapshots = model_dir / "snapshots"
+def _has_snapshot(base: Path, hf_model_id: str) -> bool:
+    """Check if a models--org--name/snapshots/ dir has content."""
+    snapshots = base / ("models--" + hf_model_id.replace("/", "--")) / "snapshots"
     if snapshots.is_dir():
         for snap in snapshots.iterdir():
             if snap.is_dir() and any(snap.iterdir()):
@@ -336,14 +335,38 @@ def _is_model_cached(hf_model_id: str) -> bool:
     return False
 
 
-# Map task IDs → HuggingFace model IDs for cache checking
+def _is_model_cached(hf_model_id: str, is_pyannote: bool = False) -> bool:
+    """Check all known cache locations for a HuggingFace model."""
+    project_hf = Path(__file__).parent / "models" / "hub"
+    home = Path.home()
+
+    # Locations where HF Hub models are stored
+    hf_dirs = [
+        project_hf,                                          # ./models/hub/ (HF_HOME)
+        home / ".cache" / "huggingface" / "hub",             # default HF cache
+    ]
+
+    for d in hf_dirs:
+        if _has_snapshot(d, hf_model_id):
+            return True
+
+    # Pyannote caches models separately under ~/.cache/torch/pyannote/
+    if is_pyannote:
+        torch_pyannote = home / ".cache" / "torch" / "pyannote"
+        if _has_snapshot(torch_pyannote, hf_model_id):
+            return True
+
+    return False
+
+
+# Map task IDs → (HuggingFace model ID, is_pyannote)
 _MODEL_IDS = {
-    "faster-whisper":        "Systran/faster-whisper-large-v3",
-    "pyannote-segmentation": "pyannote/segmentation-3.0",
-    "pyannote-embedding":    "pyannote/wespeaker-voxceleb-resnet34-LM",
-    "pyannote-pipeline":     "pyannote/speaker-diarization-3.1",
-    "whisper-turbo":         "openai/whisper-large-v3-turbo",
-    "sentence-transformers": "sentence-transformers/all-MiniLM-L6-v2",
+    "faster-whisper":        ("Systran/faster-whisper-large-v3", False),
+    "pyannote-segmentation": ("pyannote/segmentation-3.0", True),
+    "pyannote-embedding":    ("pyannote/wespeaker-voxceleb-resnet34-LM", True),
+    "pyannote-pipeline":     ("pyannote/speaker-diarization-3.1", True),
+    "whisper-turbo":         ("openai/whisper-large-v3-turbo", False),
+    "sentence-transformers": ("sentence-transformers/all-MiniLM-L6-v2", False),
 }
 
 
@@ -406,11 +429,13 @@ elif task == "sentence-transformers":
     # Fast check: skip models already in the local cache
     need_download = []
     for task_id, display_name in models:
-        hf_id = _MODEL_IDS.get(task_id)
-        if hf_id and _is_model_cached(hf_id):
-            _ok(f"{display_name}")
-        else:
-            need_download.append((task_id, display_name))
+        entry = _MODEL_IDS.get(task_id)
+        if entry:
+            hf_id, is_pyannote = entry
+            if _is_model_cached(hf_id, is_pyannote):
+                _ok(f"{display_name}")
+                continue
+        need_download.append((task_id, display_name))
 
     if not need_download:
         _ok("All models cached")
