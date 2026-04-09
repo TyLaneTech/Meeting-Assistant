@@ -12,8 +12,8 @@ function renderMd(text) {
  */
 function linkifyTimestamps(container) {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  // Group 1: start time. Group 2 (optional): end time after –, -, or -
-  const timestampRe = /\[(\d{1,2}:\d{2})(?:[–--](\d{1,2}:\d{2}))?\]/g;
+  // Group 1: start time. Group 2 (optional): end time after - or –
+  const timestampRe = /\[(\d{1,2}:\d{2})(?:[\u2013\u2014\-](\d{1,2}:\d{2}))?\]/g;
   const nodesToReplace = [];
 
   let node;
