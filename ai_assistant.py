@@ -278,11 +278,13 @@ class AIAssistant:
         "## Timestamps\n"
         "Timestamps let users jump directly to moments in the recording - use them.\n"
         "- Include [M:SS] when citing a specific quote or moment\n"
-        "- Use [M:SS–M:SS] to indicate a span (e.g. stretch of discussion on a topic)\n"
+        "- Use [M:SS-M:SS] to indicate a span (e.g. stretch of discussion on a topic)\n"
         "- Place the timestamp after the referenced text, not before\n"
         "- For multiple timespans, group each range in its own brackets "
-        "(e.g. [18:31–19:48] [27:17–27:26])\n"
-        "- Only timestamp moments worth jumping to - avoid tagging every sentence\n\n"
+        "(e.g. [18:31-19:48] [27:17-27:26])\n"
+        "- Only timestamp moments worth jumping to - avoid tagging every sentence\n"
+        "- NEVER use approximate timestamps like [~17:30] - always use exact "
+        "timestamps from the transcript. No tildes or approximation symbols.\n\n"
         "- Always respond in English regardless of any foreign words or phrases in the transcript"
     )
 

@@ -11,22 +11,45 @@ function renderMd(text) {
  * Also wires up image onload handlers to fix auto-scroll when images
  * load asynchronously and change the scroll height.
  */
+// Regex-based timestamp linkification on HTML strings (for use before morphdom).
+const _tsHtmlRe = /\[(\d{1,2}:\d{2})(?:[\u2013\u2014\-](\d{1,2}:\d{2}))?\]/g;
+function _linkifyTimestampsHtml(html) {
+  return html.replace(_tsHtmlRe, (full, start, end) => {
+    const [m, s] = start.split(':').map(Number);
+    const sec = m * 60 + s;
+    const label = end ? `${start} - ${end}` : start;
+    return `<span class="ts-pill" data-ts="${sec}" onclick="seekPlayback(${sec})">${label}</span>`;
+  });
+}
+
 function _morphChatBody(el, mdText) {
-  const newHtml = renderMd(mdText);
-  // morphdom needs a single root - wrap in a div
+  let newHtml = renderMd(mdText);
+  // Linkify timestamps in the HTML string so morphdom sees stable spans
+  newHtml = _linkifyTimestampsHtml(newHtml);
+
+  // Preserve existing loaded images - detach them before morphdom runs,
+  // then restore them after. This prevents flashing when morphdom
+  // recreates parent <p> elements around unchanged images.
+  const existingImgs = new Map();
+  el.querySelectorAll('img[src]').forEach(img => {
+    existingImgs.set(img.getAttribute('src'), img);
+  });
+
   const tmp = document.createElement('div');
   tmp.innerHTML = newHtml;
-  morphdom(el, tmp, {
-    childrenOnly: true,
-    onBeforeElUpdated(fromEl, toEl) {
-      // Don't touch images that already have the same src (prevents reload flash)
-      if (fromEl.tagName === 'IMG' && toEl.tagName === 'IMG'
-          && fromEl.src === toEl.src) {
-        return false;
+  morphdom(el, tmp, { childrenOnly: true });
+
+  // Restore preserved images by replacing their fresh (unloaded) clones
+  if (existingImgs.size > 0) {
+    el.querySelectorAll('img[src]').forEach(freshImg => {
+      const src = freshImg.getAttribute('src');
+      const cached = existingImgs.get(src);
+      if (cached && cached !== freshImg && cached.complete) {
+        freshImg.replaceWith(cached);
       }
-      return true;
-    },
-  });
+    });
+  }
+
   // Wire image load handlers for scroll correction
   el.querySelectorAll('img:not([data-scroll-wired])').forEach(img => {
     img.dataset.scrollWired = '1';
