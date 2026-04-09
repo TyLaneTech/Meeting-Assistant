@@ -121,7 +121,7 @@ _FRAGMENT_MAX_WORDS = 4
 # contaminated context (common with noisy mic input).  We measure the ratio of
 # unique N-grams to total N-grams; a low ratio means the text is a loop.
 _HALLUCINATION_NGRAM      = 4     # n-gram size for repetition check
-_HALLUCINATION_THRESHOLD  = 0.35  # unique-ratio below this → treat as loop
+_HALLUCINATION_THRESHOLD  = 0.50  # unique-ratio below this → treat as loop
 
 # Known Whisper hallucination phrases.  These are artifacts from the training
 # data (subtitles, YouTube outros, etc.) that Whisper hallucinates when the
@@ -170,6 +170,39 @@ def _clean_hallucinations(text: str) -> str:
     if len(stripped) < 3:
         return ""
     return cleaned
+
+
+def _dedup_sentences(text: str) -> str:
+    """Remove repeated sentences/clauses from Whisper output.
+
+    Whisper sometimes loops a phrase like "SO I THINK THAT'S A GOOD QUESTION.
+    QUESTION. SO I THINK THAT'S A GOOD QUESTION." — the n-gram filter may not
+    catch this if there's enough variation.  This splits on sentence boundaries,
+    normalises each, and keeps only the first occurrence.
+    """
+    # Split on sentence-ending punctuation, keeping the delimiter
+    parts = _re.split(r'(?<=[.!?])\s+', text)
+    if len(parts) <= 1:
+        return text
+
+    seen: set[str] = set()
+    kept: list[str] = []
+    for part in parts:
+        # Normalise: lowercase, strip punctuation, collapse whitespace
+        key = _re.sub(r'[^\w\s]', '', part.lower()).strip()
+        key = _re.sub(r'\s+', ' ', key)
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(part)
+
+    result = " ".join(kept).strip()
+    # If we removed more than half the sentences, the whole thing is suspect
+    if len(kept) < len(parts) * 0.4:
+        return ""
+    return result
 
 
 def _strip_fragment_period(text: str) -> str:
@@ -543,6 +576,12 @@ class Transcriber:
                 # Strip known hallucination phrases (subtitle credits, etc.)
                 text = _clean_hallucinations(text)
                 if not text:
+                    return
+                # Remove repeated sentences (e.g. "QUESTION. SO I THINK...")
+                text = _dedup_sentences(text)
+                if not text:
+                    log.warn("transcriber", f"[{label}] Sentence-loop detected — discarding")
+                    self._context = ""
                     return
                 # Discard and clear context if output is a hallucination loop.
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:

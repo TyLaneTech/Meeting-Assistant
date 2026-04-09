@@ -25,6 +25,7 @@ from transcriber import (
     _HALLUCINATION_THRESHOLD,
     _repetition_ratio,
     _clean_hallucinations,
+    _dedup_sentences,
 )
 
 
@@ -345,6 +346,9 @@ class BatchTranscriber:
                 if not text:
                     continue
                 text = _clean_hallucinations(text)
+                if not text:
+                    continue
+                text = _dedup_sentences(text)
                 if not text:
                     continue
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:
