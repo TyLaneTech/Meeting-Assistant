@@ -7546,6 +7546,48 @@ function confirmRestart() {
   document.body.appendChild(overlay);
 }
 
+function confirmUpdateRestart() {
+  const overlay = document.createElement('div');
+  overlay.className = 'overlay';
+  overlay.innerHTML = `
+    <div class="dialog">
+      <h3>Update &amp; Restart?</h3>
+      <p>This will pull the latest update, stop recording (if active), and restart.</p>
+      <div class="dialog-btns">
+        <button class="btn" style="background:var(--accent);color:#fff" onclick="doUpdateRestart()">Update &amp; Restart</button>
+        <button class="btn" style="background:var(--surface2);color:var(--fg)"
+                onclick="this.closest('.overlay').remove()">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+}
+
+async function doUpdateRestart() {
+  document.querySelector('.overlay')?.remove();
+  document.body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:center;height:100vh;
+                flex-direction:column;gap:12px;color:#8b949e;font-family:system-ui">
+      <span style="font-size:40px"><img class="brand-icon shutdown-icon" src="/static/images/logo.png" alt=""></span>
+      <p style="font-size:16px;font-weight:600;color:#e6edf3">Updating &amp; Restarting...</p>
+      <p style="font-size:13px">The page will reload when the server is back.</p>
+    </div>`;
+  try {
+    const res = await fetch('/api/update/apply', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      document.body.querySelector('p:first-of-type').textContent = 'Update failed: ' + data.error;
+      return;
+    }
+  } catch {}
+  // Poll until the server is back, then reload
+  const poll = setInterval(async () => {
+    try {
+      const r = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
+      if (r.ok) { clearInterval(poll); location.reload(); }
+    } catch {}
+  }, 2000);
+}
+
 async function doRestart() {
   document.querySelector('.overlay')?.remove();
   await fetch('/api/restart', { method: 'POST' }).catch(() => {});
@@ -8462,6 +8504,9 @@ function _showTopbarUpdate(commitsBehind) {
   const s = commitsBehind !== 1 ? 's' : '';
   btn.title = `${commitsBehind} update${s} available`;
   btn.innerHTML = `<i class="fa-solid fa-download"></i> Update`;
+  // Show the "Update & Restart" option in the power menu
+  const pmUpdate = document.getElementById('power-menu-update');
+  if (pmUpdate) pmUpdate.classList.remove('hidden');
 }
 
 async function topbarApplyUpdate() {

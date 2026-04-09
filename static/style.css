@@ -796,6 +796,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 .power-menu button:hover { background: var(--surface3); }
 .power-menu button:first-child:hover { color: var(--red); }
 .power-menu.hidden { display: none; }
+.power-menu button .fa-download { color: var(--accent); }
 
 .icon-btn {
   background: none;
