@@ -3430,20 +3430,37 @@ def shutdown():
 
 # ── Update / self-update ──────────────────────────────────────────────────────
 
+_UPDATE_REMOTES = [
+    "origin",                                                  # Azure DevOps (primary)
+    "https://github.com/TyLaneTech/Meeting-Assistant.git",     # GitHub (fallback)
+]
+
+
+def _git_fetch(root: Path) -> tuple[bool, str, str]:
+    """Try fetching from each remote in _UPDATE_REMOTES; return (ok, remote_used, error)."""
+    last_err = ""
+    for remote in _UPDATE_REMOTES:
+        fetch = subprocess.run(
+            ["git", "fetch", remote, "main"],
+            cwd=str(root), capture_output=True, text=True, timeout=20,
+        )
+        if fetch.returncode == 0:
+            return True, remote, ""
+        last_err = fetch.stderr.strip() or "git fetch failed"
+    return False, "", last_err
+
+
 @app.route("/api/update/check")
 def update_check():
     """Fetch from origin and report whether the remote main branch is ahead."""
     root = Path(__file__).parent
     try:
-        fetch = subprocess.run(
-            ["git", "fetch", "origin"],
-            cwd=str(root), capture_output=True, text=True, timeout=20,
-        )
-        if fetch.returncode != 0:
-            return jsonify({"error": fetch.stderr.strip() or "git fetch failed"}), 500
+        ok, remote, err = _git_fetch(root)
+        if not ok:
+            return jsonify({"error": err}), 500
 
         count_r = subprocess.run(
-            ["git", "rev-list", "HEAD..origin/main", "--count"],
+            ["git", "rev-list", "HEAD..FETCH_HEAD", "--count"],
             cwd=str(root), capture_output=True, text=True, timeout=5,
         )
         if count_r.returncode != 0:
@@ -3461,8 +3478,14 @@ def update_check():
 def update_apply():
     """Pull latest changes then restart via the Start Menu shortcut."""
     root = Path(__file__).parent
+
+    # Fetch first so we know which remote is reachable
+    ok, remote, err = _git_fetch(root)
+    if not ok:
+        return jsonify({"error": err}), 500
+
     pull = subprocess.run(
-        ["git", "pull", "origin", "main"],
+        ["git", "pull", remote, "main"],
         cwd=str(root), capture_output=True, text=True, timeout=120,
     )
     if pull.returncode != 0:
