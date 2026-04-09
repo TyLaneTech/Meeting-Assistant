@@ -180,6 +180,16 @@
         <button class="btn btn-settings" onclick="openSettings()" title="Settings">
           <i class="fa-solid fa-gear"></i> Settings
         </button>
+        <div class="power-menu-wrap">
+          <button class="btn btn-danger btn-icon-only" onclick="togglePowerMenu()" title="Power options">
+            <i class="fa-solid fa-power-off"></i>
+          </button>
+          <div class="power-menu hidden" id="power-menu">
+            <button onclick="confirmShutdown(); closePowerMenu()"><i class="fa-solid fa-power-off"></i> Shut Down</button>
+            <button onclick="confirmRestart(); closePowerMenu()"><i class="fa-solid fa-rotate-right"></i> Restart</button>
+            <button class="hidden" id="power-menu-update" onclick="confirmUpdateRestart(); closePowerMenu()"><i class="fa-solid fa-download"></i> Update &amp; Restart</button>
+          </div>
+        </div>
         <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
           <span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording
         </button>
