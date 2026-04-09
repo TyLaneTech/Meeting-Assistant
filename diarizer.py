@@ -73,6 +73,11 @@ except Exception:
 
 # Suppress the long torchcodec warning — irrelevant since we always pass
 # pre-loaded waveform tensors, never file paths.
+warnings.filterwarnings(
+    "ignore",
+    message="torchaudio._backend.set_audio_backend has been deprecated",
+    category=UserWarning,
+)
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
     from pyannote.audio import Pipeline
@@ -102,7 +107,7 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings(
     "ignore",
-    message="Module 'speechbrain.pretrained' was deprecated",
+    message="Module 'speechbrain\\.",
     category=UserWarning,
 )
 warnings.filterwarnings(
