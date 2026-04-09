@@ -319,7 +319,7 @@ function _onGlobalChatChunk(data) {
   if (_homeState.currentMsgWrap) {
     _setAssistantProcessing(_homeState.currentMsgWrap, false);
     // Collapse tool widget when response starts streaming
-    const tw = _homeState.currentMsgWrap.querySelector('.chat-tool-widget');
+    const tw = _homeState.currentMsgWrap.querySelector('.chat-tool-widget.streaming');
     if (tw) tw.classList.remove('open', 'streaming');
     _updateAssistantBody(_homeState.currentMsgWrap, full);
     _scrollChatToBottom();

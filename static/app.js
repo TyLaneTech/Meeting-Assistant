@@ -2117,8 +2117,8 @@ function connectSSE(afterSegId = 0) {
       const wrap = state.chatCursor.closest('.chat-msg');
       if (wrap) {
         _setAssistantProcessing(wrap, false);
-        // Collapse tool widget when response starts streaming
-        const tw = wrap.querySelector('.chat-tool-widget');
+        // On first chunk: collapse the auto-expanded tool widget
+        const tw = wrap.querySelector('.chat-tool-widget.streaming');
         if (tw) tw.classList.remove('open', 'streaming');
         // Reveal body and actions on first content
         state.chatCursor.style.display = '';
