@@ -423,7 +423,7 @@ def main():
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
 
-    # Reconnect WARP — git pulls and HuggingFace model downloads need it.
+    # Reconnect WARP — git fetch for update checks needs it.
     warp_reconnect()
 
     # ── FFmpeg ────────────────────────────────────────────────────────────────

@@ -1,11 +1,12 @@
 """
 Network utilities — Cloudflare WARP management.
 
-Corporate WARP setups use TLS inspection which breaks pip/uv (untrusted CA),
-but git and HuggingFace downloads require WARP to be connected for routing.
+Corporate WARP setups use TLS inspection which breaks pip/uv and
+HuggingFace model downloads (untrusted CA).  Git operations require
+WARP connected for routing.
 
-- Call warp_disconnect() before pip/uv installs
-- Call warp_reconnect() after pip/uv, before git/HF operations
+- Call warp_disconnect() before pip/uv installs and HF model downloads
+- Call warp_reconnect() before git fetch/pull operations
 - Both are safe to call repeatedly and no-op when WARP isn't installed.
 """
 import shutil

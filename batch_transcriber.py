@@ -153,8 +153,8 @@ class BatchTranscriber:
 
         log.info("batch", "Loading diarization pipeline...")
         try:
-            from network import warp_reconnect
-            warp_reconnect()
+            from network import warp_disconnect
+            warp_disconnect()
             pipeline = PyannotePipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
                 use_auth_token=self.hf_token,
@@ -285,8 +285,8 @@ class BatchTranscriber:
         attn_impl = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
         log.info("batch", f"Loading Whisper model: {model_name} (attn: {attn_impl})")
 
-        from network import warp_reconnect
-        warp_reconnect()
+        from network import warp_disconnect
+        warp_disconnect()
 
         torch_dtype = torch.float16 if device == "cuda" else torch.float32
         whisper_pipe = hf_pipeline(
