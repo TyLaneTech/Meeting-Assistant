@@ -326,11 +326,6 @@ def main():
     os.chdir(Path(__file__).parent)
     _ensure_venv()   # re-execs into .venv if not already running inside it
 
-    # Disconnect Cloudflare WARP before any network operations — its TLS
-    # inspection breaks HuggingFace model downloads and pip index requests.
-    from network import ensure_warp_disconnected
-    ensure_warp_disconnected()
-
     # Ensure uv can find the active venv
     os.environ["VIRTUAL_ENV"] = str(VENV_DIR)
 
@@ -379,6 +374,11 @@ def main():
     # ── Packages ──────────────────────────────────────────────────────────────
     _section("PACKAGES")
 
+    # Cloudflare WARP's TLS inspection breaks pip/uv (untrusted CA).
+    # Disconnect before package installs, reconnect after (git/HF need it).
+    from network import warp_disconnect, warp_reconnect
+    warp_disconnect()
+
     # PyTorch — only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
 
@@ -422,6 +422,9 @@ def main():
         if not _uv("-r", "requirements.txt", show_output=True):
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
+
+    # Reconnect WARP — git pulls and HuggingFace model downloads need it.
+    warp_reconnect()
 
     # ── FFmpeg ────────────────────────────────────────────────────────────────
     _section("FFMPEG")

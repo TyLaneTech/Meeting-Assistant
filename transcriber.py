@@ -217,8 +217,8 @@ class Transcriber:
             self.device, self.compute_type, self.model_size = get_default_model_config()
         log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
         from faster_whisper import WhisperModel
-        from network import ensure_warp_disconnected
-        ensure_warp_disconnected()
+        from network import warp_reconnect
+        warp_reconnect()
         try:
             self.model = WhisperModel(
                 self.model_size,
@@ -518,8 +518,8 @@ class Transcriber:
 
     def _switch_to_cpu(self) -> None:
         """Reload the Whisper model in CPU/int8 mode after a CUDA failure."""
-        from network import ensure_warp_disconnected
-        ensure_warp_disconnected()
+        from network import warp_reconnect
+        warp_reconnect()
         self.device = "cpu"
         self.compute_type = "int8"
         self.model_size = "small"

@@ -3438,6 +3438,8 @@ _UPDATE_REMOTES = [
 
 def _git_fetch(root: Path) -> tuple[bool, str, str]:
     """Try fetching from each remote in _UPDATE_REMOTES; return (ok, remote_used, error)."""
+    from network import warp_reconnect
+    warp_reconnect()
     last_err = ""
     for remote in _UPDATE_REMOTES:
         fetch = subprocess.run(

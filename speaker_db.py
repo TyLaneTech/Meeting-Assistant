@@ -157,8 +157,8 @@ class SpeakerFingerprintDB:
             pass
 
         try:
-            from network import ensure_warp_disconnected
-            ensure_warp_disconnected()
+            from network import warp_reconnect
+            warp_reconnect()
             with _suppress_model_load_noise():
                 from pyannote.audio import Inference, Model  # type: ignore
                 log.info("fingerprint", "Loading embedding model…")

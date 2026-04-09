@@ -41,8 +41,8 @@ def _load_model():
                               "transformers", "safetensors"):
             logging.getLogger(_logger_name).setLevel(logging.ERROR)
 
-        from network import ensure_warp_disconnected
-        ensure_warp_disconnected()
+        from network import warp_reconnect
+        warp_reconnect()
         from sentence_transformers import SentenceTransformer
         log.info("Loading text embedding model %s …", MODEL_NAME)
         m = SentenceTransformer(MODEL_NAME)
