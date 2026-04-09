@@ -634,6 +634,8 @@ class AIAssistant:
     ) -> None:
         """Stream tokens from the active provider."""
         try:
+            from network import warp_disconnect
+            warp_disconnect()
             if self.client is None:
                 on_token(
                     f"\n\n*Error: No {self.provider.title()} API key configured. "
@@ -726,6 +728,8 @@ class AIAssistant:
 
     def _complete(self, system: str, prompt: str, max_tokens: int = 1024) -> str:
         """Non-streaming single completion from the active provider."""
+        from network import warp_disconnect
+        warp_disconnect()
         if self.client is None:
             raise RuntimeError(
                 f"No {self.provider.title()} API key configured. Add it in Settings."
@@ -756,6 +760,8 @@ class AIAssistant:
         OpenAI: uses json_object response format + prompt instructions.
         Returns {} on empty or unparseable responses.
         """
+        from network import warp_disconnect
+        warp_disconnect()
         if self.client is None:
             raise RuntimeError(
                 f"No {self.provider.title()} API key configured. Add it in Settings."
@@ -805,12 +811,14 @@ class AIAssistant:
         tools_openai: list | None = None,
         tool_executor: "ToolExecutor | None" = None,
     ) -> None:
-        """Stream with tool-use loop (up to 5 iterations).
+        """Stream with tool-use loop (up to 50 iterations).
 
         Accepts either a ``frame_extractor`` (legacy screenshot-only mode)
         or generic ``tool_executor`` + tool lists for arbitrary tool handling.
         """
         try:
+            from network import warp_disconnect
+            warp_disconnect()
             if self.client is None:
                 on_token(
                     f"\n\n*Error: No {self.provider.title()} API key configured. "
