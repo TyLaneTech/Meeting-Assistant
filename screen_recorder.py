@@ -449,6 +449,7 @@ class ScreenRecorder:
     def __init__(self):
         self._proc: subprocess.Popen | None = None
         self._output_path: str | None = None
+        self._frag_path: str | None = None
         self._lock = threading.Lock()
         self._monitor_thread: threading.Thread | None = None
 
@@ -460,6 +461,13 @@ class ScreenRecorder:
     @property
     def output_path(self) -> str | None:
         return self._output_path
+
+    @property
+    def live_video_path(self) -> str | None:
+        """Path to the fragmented MP4 being written during recording."""
+        if self.is_recording and self._frag_path and Path(self._frag_path).exists():
+            return self._frag_path
+        return None
 
     def start(
         self,
@@ -530,6 +538,11 @@ class ScreenRecorder:
         if vf_parts:
             cmd.extend(["-vf", ",".join(vf_parts)])
 
+        # Write as fragmented MP4 so the file is seekable mid-recording
+        # (the moov atom is at the start, data streams as fragments).
+        # On stop, we remux to a standard faststart MP4 for compatibility.
+        self._frag_path = output_path + ".frag.mp4"
+
         # Encoder settings
         cmd.extend([
             "-c:v", "libx264",
@@ -538,9 +551,9 @@ class ScreenRecorder:
             "-pix_fmt", "yuv420p",
             # No audio — audio is captured separately
             "-an",
-            # MP4-friendly settings
-            "-movflags", "+faststart",
-            output_path,
+            # Fragmented MP4 — seekable during recording
+            "-movflags", "frag_keyframe+empty_moov",
+            self._frag_path,
         ])
 
         log.info("screen", f"Starting: {' '.join(cmd)}")
@@ -599,14 +612,41 @@ class ScreenRecorder:
             proc.kill()
             proc.wait(timeout=5)
 
-        path = self._output_path
-        if path and Path(path).exists() and Path(path).stat().st_size > 0:
-            size_mb = Path(path).stat().st_size / (1024 * 1024)
-            log.info("screen", f"Saved: {path} ({size_mb:.1f} MB)")
-            return path
-        else:
+        final_path = self._output_path
+        frag_path = getattr(self, "_frag_path", None)
+
+        if not frag_path or not Path(frag_path).exists() or Path(frag_path).stat().st_size == 0:
             log.warn("screen", "Recording file is missing or empty")
             return None
+
+        # Remux fragmented MP4 → standard faststart MP4 for broad compatibility
+        ffmpeg = find_ffmpeg()
+        if ffmpeg and final_path:
+            try:
+                remux = subprocess.run(
+                    [ffmpeg, "-y", "-i", frag_path,
+                     "-c", "copy", "-movflags", "+faststart", final_path],
+                    capture_output=True, timeout=60,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if remux.returncode == 0 and Path(final_path).exists():
+                    Path(frag_path).unlink(missing_ok=True)
+                    size_mb = Path(final_path).stat().st_size / (1024 * 1024)
+                    log.info("screen", f"Saved: {final_path} ({size_mb:.1f} MB)")
+                    return final_path
+                else:
+                    log.warn("screen", "Remux failed — keeping fragmented file")
+            except Exception as e:
+                log.warn("screen", f"Remux error: {e} — keeping fragmented file")
+
+        # Fallback: rename the frag file as the final output
+        try:
+            Path(frag_path).rename(final_path)
+        except OSError:
+            final_path = frag_path
+        size_mb = Path(final_path).stat().st_size / (1024 * 1024)
+        log.info("screen", f"Saved: {final_path} ({size_mb:.1f} MB)")
+        return final_path
 
 
 def capture_live_frame(display_index: int = 0, max_width: int = 960) -> bytes | None:

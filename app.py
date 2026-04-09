@@ -2344,10 +2344,21 @@ def chat():
                         _state["chat_history"].append({"role": "assistant", "content": full})
             _push("chat_done", {"request_id": request_id})
 
-        # Build frame extractor if session has a screen recording
+        # Build frame extractor — works for both live and completed recordings.
+        # During live recording: seek into the fragmented MP4 being written,
+        # falling back to a live screen capture if seeking fails.
+        # After recording: seek into the finalized MP4.
         fe = None
         video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
-        if video_path.exists():
+        live_path = _screen_recorder.live_video_path
+        if live_path:
+            def _live_extractor(ts, lp=live_path):
+                frame = extract_frame(lp, ts)
+                if frame:
+                    return frame
+                return capture_live_frame()
+            fe = _live_extractor
+        elif video_path.exists():
             fe = lambda ts, vp=str(video_path): extract_frame(vp, ts)
 
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
