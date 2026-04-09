@@ -2267,6 +2267,10 @@ function connectSSE(afterSegId = 0) {
     dot.className    = 'status-dot ready';
     text.textContent = state.modelInfo || 'Ready';
     initPlayback(state.sessionId);
+    // Check if a screen recording exists and init video playback
+    fetch(`/api/sessions/${state.sessionId}`).then(r => r.json()).then(s => {
+      if (s.has_video) initVideo(state.sessionId, s.video_offset);
+    }).catch(() => {});
     _syncRecordBtnDisabled();
     refreshSidebar();
   });
