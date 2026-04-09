@@ -269,23 +269,24 @@ def _build_session_meta(
     current_summary: str = "",
 ) -> dict:
     """Gather rich metadata about the session for AI context."""
-    # Compute speaker roster
+    # Compute speaker roster - only show user-assigned display names.
+    # If multiple raw keys map to the same name, deduplicate.
     sources = set()
     for s in segments:
         src = s.get("source", "loopback")
         sources.add(src)
+    seen_names = set()
     speakers = []
     for src in sorted(sources):
         if speaker_labels and src in speaker_labels:
             display = speaker_labels[src]
-            if display != src:
-                speakers.append(f"{display} (raw key: {src})")
-            else:
-                speakers.append(src)
         elif src in _SOURCE_LABELS:
-            speakers.append(f"{_SOURCE_LABELS[src]} (audio: {src})")
+            display = _SOURCE_LABELS[src]
         else:
-            speakers.append(src)
+            display = src
+        if display not in seen_names:
+            seen_names.add(display)
+            speakers.append(display)
 
     # Duration
     times = [s.get("start_time", 0) or 0 for s in segments] + [s.get("end_time", 0) or 0 for s in segments]
