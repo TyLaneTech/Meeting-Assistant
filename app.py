@@ -327,7 +327,7 @@ _FILLER_WORDS = frozenset({
 # Patterns that are noise when they appear as the entire text
 _NOISE_PATTERNS = [
     re.compile(r"^(ha|he|heh|hah|ho)+[.!?…]*$", re.I),           # laughter
-    re.compile(r"^[.…!?\-–-\s]+$"),                                # pure punctuation
+    re.compile(r"^[.…!?\-\s]+$"),                                   # pure punctuation
     re.compile(r"^(um|uh|ah|oh|hm|mm|mhm|mmhmm)[\s,.…!?]*$", re.I),  # pure filler sounds
 ]
 
