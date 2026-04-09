@@ -695,16 +695,51 @@ def _load_model() -> None:
         _push_status()
 
 
+def _cuda_diarizer_safe() -> bool:
+    """Test if CUDA works for pyannote/speechbrain in a subprocess.
+
+    Some machines have cuDNN version mismatches that cause native crashes
+    (STATUS_STACK_BUFFER_OVERRUN) when loading speechbrain models on GPU.
+    A subprocess crash here is safe and tells us to fall back to CPU.
+    """
+    if not get_cuda_available():
+        return False
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import torch; t = torch.randn(2, 2, device='cuda'); "
+             "from speechbrain.inference.speaker import EncoderClassifier; "
+             "print('ok')"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.returncode == 0 and "ok" in r.stdout
+    except Exception:
+        return False
+
+
 def _load_diarizer() -> None:
     hf_token = os.getenv("HUGGING_FACE_KEY")
     if not hf_token:
         log.warn("diarizer", "HUGGING_FACE_KEY not set - speaker diarization disabled.")
         return
+
+    saved_device = settings.get("diarizer_device", "")
+    device = None  # auto-detect
+
+    if saved_device == "cuda" or (not saved_device and get_cuda_available()):
+        # Verify CUDA actually works for speechbrain before committing to it
+        if _cuda_diarizer_safe():
+            device = "cuda"
+        else:
+            log.warn("diarizer", "CUDA smoke test failed - falling back to CPU for diarization")
+            device = "cpu"
+    elif saved_device:
+        device = saved_device
+
     try:
-        saved_device = settings.get("diarizer_device", "")
-        if saved_device and (saved_device != "cuda" or get_cuda_available()):
-            log.info("settings", f"Restored diarizer device: {saved_device}")
-            _transcriber.load_diarizer(hf_token, device=saved_device)
+        if device:
+            log.info("settings", f"Diarizer device: {device}")
+            _transcriber.load_diarizer(hf_token, device=device)
         else:
             _transcriber.load_diarizer(hf_token)
         with _state_lock:
