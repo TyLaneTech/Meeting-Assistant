@@ -2114,7 +2114,9 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('summary_chunk', e => {
     state.summaryBuffer += JSON.parse(e.data).text;
     if (state.summaryCursor) {
-      state.summaryCursor.innerHTML = renderMd(state.summaryBuffer);
+      let html = renderMd(state.summaryBuffer);
+      html = _linkifyTimestampsHtml(html);
+      state.summaryCursor.innerHTML = html;
       if (_summaryAtBottom) state.summaryCursor.scrollTop = state.summaryCursor.scrollHeight;
     }
   });
