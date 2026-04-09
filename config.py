@@ -37,6 +37,19 @@ if not os.getenv("HF_TOKEN", "").strip():
 _MODEL_CACHE = str(Path(__file__).parent / "models")
 os.environ.setdefault("HF_HOME", _MODEL_CACHE)
 
+# Corporate Cloudflare WARP injects a self-signed CA for TLS inspection,
+# which breaks SSL verification for HuggingFace and other HTTPS requests.
+# Disable SSL verification so model downloads work regardless of WARP state.
+os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFY", "1")
+os.environ.setdefault("CURL_CA_BUNDLE", "")
+os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+
+import ssl as _ssl
+try:
+    _ssl._create_default_https_context = _ssl._create_unverified_context
+except AttributeError:
+    pass
+
 # Suppress HuggingFace symlinks warning on Windows (symlinks require Developer Mode
 # or admin rights; caching still works fine without them).
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
