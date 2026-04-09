@@ -7066,52 +7066,77 @@ function _openImageLightbox(src) {
   overlay.className = 'img-lightbox';
   overlay.innerHTML = `
     <button class="img-lightbox-close" title="Close">&times;</button>
-    <img src="${src}" alt="Screenshot preview">`;
+    <img src="${src}" alt="Screenshot preview" draggable="false">`;
   document.body.appendChild(overlay);
 
   const img = overlay.querySelector('img');
-  let zoomed = false;
+  let scale = 1, tx = 0, ty = 0;
   let dragState = null;
+
+  function _applyTransform() {
+    img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    img.classList.toggle('zoomed', scale > 1.05);
+  }
 
   // Click backdrop to close
   overlay.addEventListener('click', e => {
-    if (e.target === overlay) overlay.remove();
+    if (e.target === overlay) { _cleanup(); overlay.remove(); }
   });
-  overlay.querySelector('.img-lightbox-close').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('.img-lightbox-close').addEventListener('click', () => {
+    _cleanup(); overlay.remove();
+  });
 
-  // Click image to toggle zoom
-  img.addEventListener('click', e => {
+  // Double-click to toggle between fit and 1:1
+  img.addEventListener('dblclick', e => {
     e.stopPropagation();
-    zoomed = !zoomed;
-    img.classList.toggle('zoomed', zoomed);
-    if (!zoomed) {
-      img.style.transform = '';
-      dragState = null;
+    if (scale > 1.05) {
+      scale = 1; tx = 0; ty = 0;
+    } else {
+      scale = 2;
     }
+    _applyTransform();
   });
 
-  // Drag to pan when zoomed
-  img.addEventListener('mousedown', e => {
-    if (!zoomed) return;
+  // Mouse wheel to zoom in/out
+  overlay.addEventListener('wheel', e => {
     e.preventDefault();
-    dragState = { startX: e.clientX, startY: e.clientY,
-                  tx: parseFloat(img.dataset.tx || 0), ty: parseFloat(img.dataset.ty || 0) };
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newScale = Math.min(10, Math.max(0.5, scale * delta));
+    // Zoom toward cursor position
+    const rect = img.getBoundingClientRect();
+    const cx = e.clientX - rect.left - rect.width / 2;
+    const cy = e.clientY - rect.top - rect.height / 2;
+    tx += cx * (1 - delta);
+    ty += cy * (1 - delta);
+    scale = newScale;
+    _applyTransform();
+  }, { passive: false });
+
+  // Drag to pan
+  img.addEventListener('mousedown', e => {
+    if (scale <= 1.05) return;
+    e.preventDefault();
+    dragState = { startX: e.clientX, startY: e.clientY, tx, ty };
   });
-  document.addEventListener('mousemove', e => {
+  const _onMove = e => {
     if (!dragState) return;
-    const dx = e.clientX - dragState.startX;
-    const dy = e.clientY - dragState.startY;
-    const tx = dragState.tx + dx;
-    const ty = dragState.ty + dy;
-    img.style.transform = `translate(${tx}px, ${ty}px)`;
-    img.dataset.tx = tx;
-    img.dataset.ty = ty;
-  });
-  document.addEventListener('mouseup', () => { dragState = null; });
+    tx = dragState.tx + (e.clientX - dragState.startX);
+    ty = dragState.ty + (e.clientY - dragState.startY);
+    _applyTransform();
+  };
+  const _onUp = () => { dragState = null; };
+  document.addEventListener('mousemove', _onMove);
+  document.addEventListener('mouseup', _onUp);
 
   // Escape to close
-  const onKey = e => { if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', onKey); } };
-  document.addEventListener('keydown', onKey);
+  const _onKey = e => { if (e.key === 'Escape') { _cleanup(); overlay.remove(); } };
+  document.addEventListener('keydown', _onKey);
+
+  function _cleanup() {
+    document.removeEventListener('mousemove', _onMove);
+    document.removeEventListener('mouseup', _onUp);
+    document.removeEventListener('keydown', _onKey);
+  }
 }
 
 async function clearChat() {
