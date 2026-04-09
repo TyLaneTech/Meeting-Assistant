@@ -318,6 +318,101 @@ def _torch_build() -> str:
     except Exception:
         return ""
 
+# ── Model pre-download ───────────────────────────────────────────────────────
+
+# Models that need to be cached before the app starts.
+# Each entry: (display_name, download_function_name)
+# The download functions are defined inside _predownload_models to avoid
+# importing heavy libraries at module level.
+
+def _predownload_models():
+    """Ensure all HuggingFace models are cached locally.
+
+    Runs with WARP disconnected (same state as pip installs).  Each model is
+    downloaded via a subprocess so a failure in one doesn't block others.
+    Already-cached models return instantly.
+    """
+    script_template = '''
+import sys, os, warnings
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+warnings.filterwarnings("ignore")
+
+# Load config which sets HF_TOKEN from .env or bundled token
+import config
+hf_token = os.environ.get("HF_TOKEN", "")
+
+task = sys.argv[1]
+
+if task == "faster-whisper":
+    from faster_whisper import WhisperModel
+    WhisperModel("large-v3", device="cpu", compute_type="int8")
+
+elif task == "pyannote-segmentation":
+    # Import diarizer to get all the torchaudio/speechbrain shims
+    import diarizer  # noqa: F401
+    from diart.models import SegmentationModel
+    SegmentationModel.from_pretrained("pyannote/segmentation-3.0", use_hf_token=hf_token)
+
+elif task == "pyannote-embedding":
+    import diarizer  # noqa: F401
+    from pyannote.audio import Model
+    Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", use_auth_token=hf_token)
+
+elif task == "pyannote-pipeline":
+    import diarizer  # noqa: F401
+    from pyannote.audio import Pipeline
+    Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+
+elif task == "whisper-turbo":
+    from transformers import AutoFeatureExtractor, AutoModelForSpeechSeq2Seq
+    AutoFeatureExtractor.from_pretrained("openai/whisper-large-v3-turbo")
+    AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-large-v3-turbo")
+
+elif task == "sentence-transformers":
+    from sentence_transformers import SentenceTransformer
+    SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+'''
+
+    models = [
+        ("faster-whisper",        "Whisper large-v3 (streaming)"),
+        ("pyannote-segmentation", "Pyannote segmentation"),
+        ("pyannote-embedding",    "Pyannote speaker embedding"),
+        ("pyannote-pipeline",     "Pyannote diarization pipeline"),
+        ("whisper-turbo",         "Whisper large-v3-turbo (reanalysis)"),
+        ("sentence-transformers", "Sentence embeddings"),
+    ]
+
+    # Write the download script to a temp file
+    script_path = Path(__file__).parent / ".model_download.py"
+    script_path.write_text(script_template)
+
+    all_ok = True
+    for task_id, display_name in models:
+        r = subprocess.run(
+            [sys.executable, str(script_path), task_id],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode == 0:
+            _ok(f"{display_name}")
+        else:
+            # Check if it's just a network issue vs real error
+            stderr = r.stderr.strip()
+            if "already" in stderr.lower() or not stderr:
+                _ok(f"{display_name}")
+            else:
+                _warn(f"{display_name} — download failed, will retry at runtime")
+                all_ok = False
+
+    # Clean up
+    try:
+        script_path.unlink()
+    except OSError:
+        pass
+
+    if all_ok:
+        _ok("All models cached")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -422,6 +517,13 @@ def main():
         if not _uv("-r", "requirements.txt", show_output=True):
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
+
+    # ── Pre-download models ──────────────────────────────────────────────────
+    # Download all HuggingFace models now, while WARP is off and we control
+    # the network state.  At runtime the cache-first approach means no network
+    # calls are needed.  This step is fast when models are already cached.
+    _section("MODELS")
+    _predownload_models()
 
     # Reconnect WARP — git fetch for update checks needs it.
     warp_reconnect()
