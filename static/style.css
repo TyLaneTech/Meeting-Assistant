@@ -2036,8 +2036,8 @@ button#sidebar-close-btn {
 .markdown-body strong { font-weight: 600; }
 .markdown-body em    { color: var(--fg-muted); }
 .markdown-body code  { background: var(--surface2); border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; font-family: var(--font-mono); font-size: 12.5px; color: var(--purple); }
-.markdown-body pre   { background: #010409; border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; overflow-x: auto; margin-bottom: .7em; }
-.markdown-body pre code { background: none; border: none; padding: 0; color: var(--fg); font-size: 13px; }
+.markdown-body pre   {background: #010409;border: 1px solid var(--border);border-radius: var(--radius);padding: 17px 4px 0px 4px;overflow-x: auto;margin-bottom: .7em;}
+.markdown-body pre code {background: none;border: none;padding: 0;color: var(--fg);font-size: 13px;}
 .markdown-body blockquote { border-left: 3px solid var(--border); padding-left: 12px; color: var(--fg-muted); margin: .7em 0; }
 .markdown-body table { width: 100%; border-collapse: collapse; margin-bottom: .7em; font-size: 13px; }
 .markdown-body th { background: var(--surface2); font-weight: 600; }
@@ -2101,14 +2101,31 @@ button#sidebar-close-btn {
 
 /* ── Code block copy button ───────────────────────────────────────────────── */
 .chat-msg-body pre { position: relative; }
-.code-copy-btn {
-  position: absolute; top: 6px; right: 6px;
-  background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--fg-subtle); cursor: pointer; font-size: 11px; padding: 3px 8px;
-  opacity: 0; transition: opacity .15s, color .12s;
-  display: flex; align-items: center; gap: 4px;
+.chat-msg-body img {
+  max-width: 100%;
+  border-radius: var(--radius);
+  margin: 8px 0;
+  cursor: pointer;
 }
-.chat-msg-body pre:hover .code-copy-btn { opacity: 1; }
+.chat-msg-body img:hover { opacity: 0.9; }
+.code-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background-color: #161b2291;
+  border: 1px solid #161b2291;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 3px 8px;
+  opacity: 0;
+  transition: opacity .15s, color .12s;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.chat-msg-body pre:hover .code-copy-btn {opacity: 1;}
 .code-copy-btn:hover { color: var(--fg); }
 .code-copy-btn.copied { color: var(--green, #00b464); }
 

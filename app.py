@@ -1984,6 +1984,17 @@ def screen_preview():
                     headers={"Cache-Control": "no-store"})
 
 
+@app.route("/api/sessions/<session_id>/screenshots/<filename>", methods=["GET"])
+def get_session_screenshot(session_id, filename):
+    """Serve a saved screenshot image for a session."""
+    # Sanitize filename to prevent path traversal
+    safe_name = Path(filename).name
+    path = _SCREENSHOT_DIR / session_id / safe_name
+    if not path.exists():
+        return jsonify({"error": "Screenshot not found"}), 404
+    return send_file(str(path), mimetype="image/jpeg")
+
+
 @app.route("/api/sessions/<session_id>/video", methods=["GET"])
 def get_session_video(session_id):
     """Serve the recorded video file for a session."""
@@ -2150,6 +2161,18 @@ def set_diarizer_model():
 
 _ATTACH_DIR = Path(__file__).parent / "data" / "attachments"
 _ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+
+_SCREENSHOT_DIR = Path(__file__).parent / "data" / "screenshots"
+_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_screenshot(session_id: str, timestamp: float, jpeg_bytes: bytes) -> str:
+    """Save screenshot JPEG to disk and return the URL path for markdown embedding."""
+    session_dir = _SCREENSHOT_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{timestamp:.1f}s.jpg"
+    (session_dir / filename).write_bytes(jpeg_bytes)
+    return f"/api/sessions/{session_id}/screenshots/{filename}"
 
 _IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 _ALLOWED_TYPES = _IMAGE_TYPES | {"application/pdf", "text/plain", "text/csv",
@@ -2348,21 +2371,28 @@ def chat():
             _push("chat_done", {"request_id": request_id})
 
         # Build frame extractor - works for both live and completed recordings.
-        # During live recording: seek into the fragmented MP4 being written,
-        # falling back to a live screen capture if seeking fails.
-        # After recording: seek into the finalized MP4.
+        # Returns (jpeg_bytes, url) so ai_assistant can show the image to the
+        # model AND give it a markdown-embeddable URL for inline screenshots.
         fe = None
         video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
         live_path = _screen_recorder.live_video_path
-        if live_path:
-            def _live_extractor(ts, lp=live_path):
-                frame = extract_frame(lp, ts)
-                if frame:
-                    return frame
-                return capture_live_frame()
-            fe = _live_extractor
-        elif video_path.exists():
-            fe = lambda ts, vp=str(video_path): extract_frame(vp, ts)
+
+        def _saving_extractor(ts, sid=session_id):
+            """Extract frame, save to disk, return (jpeg_bytes, url)."""
+            jpeg = None
+            if live_path:
+                jpeg = extract_frame(live_path, ts)
+                if not jpeg:
+                    jpeg = capture_live_frame()
+            elif video_path.exists():
+                jpeg = extract_frame(str(video_path), ts)
+            if not jpeg:
+                return None
+            url = _save_screenshot(sid, ts, jpeg)
+            return (jpeg, url)
+
+        if live_path or video_path.exists():
+            fe = _saving_extractor
 
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
                cancel=cancel_event, frame_extractor=fe,

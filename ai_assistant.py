@@ -382,7 +382,14 @@ class AIAssistant:
                 "content (slides, code, UI, diagrams, shared screens, etc.) or when "
                 "the transcript references something being shown on screen. You may "
                 "call the tool multiple times with different timestamps to examine "
-                "different moments."
+                "different moments.\n\n"
+                "### Embedding screenshots in your response\n"
+                "Each screenshot tool result includes a markdown image URL. **Always embed "
+                "relevant screenshots inline in your response** using the provided markdown "
+                "syntax: `![description](url)`. This lets the user see what you're "
+                "describing without expanding the tool panel. Include screenshots at the "
+                "point in your response where they're most relevant - e.g. right after "
+                "describing what's shown on screen."
             )
         system += "\n\n"
         if meta_block:
@@ -859,19 +866,28 @@ class AIAssistant:
         # Built-in: get_screenshot
         if tu["name"] == "get_screenshot" and frame_extractor:
             ts = tu["input"].get("timestamp", 0)
-            jpeg = frame_extractor(float(ts))
-            if jpeg:
+            result = frame_extractor(float(ts))
+            # frame_extractor returns (jpeg_bytes, url) or just jpeg_bytes for compat
+            if result:
+                if isinstance(result, tuple):
+                    jpeg, url = result
+                else:
+                    jpeg, url = result, None
                 b64 = base64.b64encode(jpeg).decode()
                 if on_tool_event:
                     on_tool_event("tool_result", {
                         "name": tu["name"], "success": True,
                         "summary": f"Captured screenshot at {ts:.1f}s", "image": b64,
                     })
+                # Tell the model the image URL so it can embed it in markdown
+                text_msg = f"Screenshot at {ts:.1f}s captured."
+                if url:
+                    text_msg += f" Embed in your response with: ![Screenshot at {ts:.1f}s]({url})"
                 return {
                     "type": "tool_result",
                     "tool_use_id": tu["id"],
                     "content": [
-                        {"type": "text", "text": f"Screenshot at {ts:.1f}s:"},
+                        {"type": "text", "text": text_msg},
                         {"type": "image", "source": {
                             "type": "base64", "media_type": "image/jpeg", "data": b64,
                         }},
@@ -920,6 +936,7 @@ class AIAssistant:
         max_rounds = 50
         a_tools = tools or [_SCREENSHOT_TOOL]
 
+        had_text = False  # track if any text was emitted before tools
         for _ in range(max_rounds):
             if cancel and cancel.is_set():
                 return
@@ -928,6 +945,7 @@ class AIAssistant:
             if self.model in _ANTHROPIC_THINKING_MODELS:
                 kwargs["thinking"] = {"type": "adaptive"}
 
+            round_had_text = False
             with self.client.messages.stream(
                 model=self.model,
                 max_tokens=4096,
@@ -940,8 +958,14 @@ class AIAssistant:
                     if cancel and cancel.is_set():
                         stream.close()
                         return
+                    if not round_had_text and had_text:
+                        on_token("\n\n---\n\n")
+                    round_had_text = True
                     on_token(text)
                 response = stream.get_final_message()
+
+            if round_had_text:
+                had_text = True
 
             tool_uses: list[dict] = []
             for block in response.content:
@@ -1002,16 +1026,20 @@ class AIAssistant:
         # Built-in: get_screenshot
         if tc_name == "get_screenshot" and frame_extractor:
             ts = float(parsed_args.get("timestamp", 0))
-            jpeg = frame_extractor(ts)
-            if jpeg:
+            result = frame_extractor(ts)
+            if result:
+                if isinstance(result, tuple):
+                    jpeg, url = result
+                else:
+                    jpeg, url = result, None
                 b64 = base64.b64encode(jpeg).decode()
-                # Include image directly in the tool result - inserting a user
-                # message between tool results breaks OpenAI's protocol when
-                # multiple tool calls are processed in parallel.
+                text_msg = f"Screenshot at {ts:.1f}s captured."
+                if url:
+                    text_msg += f" Embed in your response with: ![Screenshot at {ts:.1f}s]({url})"
                 msgs.append({
                     "role": "tool", "tool_call_id": tc_id,
                     "content": [
-                        {"type": "text", "text": f"Screenshot at {ts:.1f}s:"},
+                        {"type": "text", "text": text_msg},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ],
                 })
@@ -1056,6 +1084,7 @@ class AIAssistant:
         max_rounds = 50
         o_tools = tools or [_SCREENSHOT_FUNC_OAI]
 
+        had_text = False
         for _ in range(max_rounds):
             if cancel and cancel.is_set():
                 return
@@ -1068,6 +1097,7 @@ class AIAssistant:
             )
 
             full_content = ""
+            round_had_text = False
             tool_calls_acc: dict[int, dict] = {}
             finish_reason = None
             for chunk in stream:
@@ -1077,6 +1107,10 @@ class AIAssistant:
                 finish_reason = choice.finish_reason or finish_reason
                 delta = choice.delta
                 if delta.content:
+                    if not round_had_text and had_text:
+                        on_token("\n\n---\n\n")
+                        full_content += "\n\n---\n\n"
+                    round_had_text = True
                     full_content += delta.content
                     on_token(delta.content)
                 if delta.tool_calls:
@@ -1088,6 +1122,9 @@ class AIAssistant:
                             entry["name"] += tc.function.name
                         if tc.function.arguments:
                             entry["arguments"] += tc.function.arguments
+
+            if round_had_text:
+                had_text = True
 
             if not tool_calls_acc or finish_reason != "tool_calls":
                 return
