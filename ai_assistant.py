@@ -167,6 +167,26 @@ _GLOBAL_TOOLS = [
             "properties": {},
         },
     },
+    {
+        "name": "get_speaker_history",
+        "description": (
+            "Get all meetings a specific speaker appeared in, with session titles, "
+            "dates, summaries, folder info, and how many segments they spoke. "
+            "Use this when the user asks about a specific person's involvement, "
+            "what someone has discussed across meetings, or to find meetings "
+            "featuring a particular participant."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "speaker_name": {
+                    "type": "string",
+                    "description": "The speaker's name to look up (case-insensitive, partial match supported)",
+                },
+            },
+            "required": ["speaker_name"],
+        },
+    },
 ]
 
 _GLOBAL_TOOLS_OAI = [
@@ -530,7 +550,15 @@ class AIAssistant:
         "- Use `semantic_search` for conceptual/thematic queries\n"
         "- Use `get_session_detail` to load full context after finding relevant sessions\n"
         "- Use `list_speakers` when the user asks about participants or people\n"
-        "- You may call tools multiple times to gather enough context"
+        "- Use `get_speaker_history` to find all meetings a specific person appeared in\n"
+        "- You may call tools multiple times to gather enough context\n\n"
+        "## Context in results\n"
+        "- Search results include session summaries (truncated) so you can often "
+        "answer without loading the full transcript\n"
+        "- Results include folder names when sessions are organized into folders — "
+        "use this to provide project/team context\n"
+        "- Speaker history shows segment counts per session to indicate how "
+        "active someone was in each meeting"
     )
 
     def ask_global(
@@ -884,7 +912,7 @@ class AIAssistant:
         import anthropic
 
         msgs = list(messages)  # working copy
-        max_rounds = 5
+        max_rounds = 50
         a_tools = tools or [_SCREENSHOT_TOOL]
 
         for _ in range(max_rounds):
@@ -1021,7 +1049,7 @@ class AIAssistant:
 
         converted = self._to_openai_messages(messages)
         msgs = [{"role": "system", "content": system}] + converted
-        max_rounds = 5
+        max_rounds = 50
         o_tools = tools or [_SCREENSHOT_FUNC_OAI]
 
         for _ in range(max_rounds):

@@ -2447,6 +2447,16 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         results = storage.search_sessions(query, limit=limit)
         if not results:
             return "No matching sessions found.", False, f"Search: '{query}' — no results", None
+        # Enrich results with folder names and summaries
+        folders = {f["id"]: f["name"] for f in storage.list_folders()}
+        for r in results:
+            sess = storage.get_session(r["session_id"])
+            if sess:
+                fid = sess.get("folder_id")
+                r["folder"] = folders.get(fid) if fid else None
+                summary = sess.get("summary", "")
+                if summary:
+                    r["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
         text = json.dumps(results, indent=2)
         return text, False, f"Search: '{query}' — {len(results)} results", None
 
@@ -2473,6 +2483,16 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         results = scored[:limit]
         if not results:
             return "No semantically similar sessions found.", False, f"Semantic: '{query}' — no results", None
+        # Enrich with folder names and summaries
+        folders = {f["id"]: f["name"] for f in storage.list_folders()}
+        for r in results:
+            sess = storage.get_session(r["session_id"])
+            if sess:
+                fid = sess.get("folder_id")
+                r["folder"] = folders.get(fid) if fid else None
+                summary = sess.get("summary", "")
+                if summary:
+                    r["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
         text = json.dumps(results, indent=2)
         return text, False, f"Semantic: '{query}' — {len(results)} results", None
 
@@ -2484,8 +2504,8 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         labels = sess.get("speaker_labels") or {}
         transcript = _build_transcript(sess["segments"], labels)
         # Truncate very long transcripts
-        if len(transcript) > 50000:
-            transcript = transcript[:50000] + "\n\n... [transcript truncated — too long to show in full]"
+        if len(transcript) > 200000:
+            transcript = transcript[:200000] + "\n\n... [transcript truncated — too long to show in full]"
         summary = sess.get("summary", "")
         result = f"Session: {sess.get('title', 'Untitled')}\n"
         result += f"Started: {sess.get('started_at', 'unknown')}\n"
@@ -2513,6 +2533,49 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
             })
         text = json.dumps(enriched, indent=2)
         return text, False, f"Found {len(enriched)} speakers", None
+
+    if name == "get_speaker_history":
+        speaker_name = tool_input.get("speaker_name", "").strip()
+        if not speaker_name:
+            return "Speaker name is required.", True, "Missing speaker name", None
+        # Find matching global speaker(s) by name (case-insensitive)
+        all_speakers = fingerprint_db.list_global_speakers()
+        matched = [s for s in all_speakers if s["name"].lower() == speaker_name.lower()]
+        if not matched:
+            # Try partial match
+            matched = [s for s in all_speakers if speaker_name.lower() in s["name"].lower()]
+        if not matched:
+            return f"No speaker named '{speaker_name}' found in the Voice Library.", False, f"Speaker '{speaker_name}' not found", None
+        results = []
+        for sp in matched:
+            sessions = fingerprint_db.get_profile_sessions(sp["id"])
+            # Enrich sessions with summaries and folder info
+            folders = {f["id"]: f["name"] for f in storage.list_folders()}
+            enriched_sessions = []
+            for sess_info in sessions:
+                sess = storage.get_session(sess_info["session_id"])
+                entry = {
+                    "session_id": sess_info["session_id"],
+                    "title": sess_info["title"],
+                    "started_at": sess_info["started_at"],
+                    "segments_by_speaker": sess_info["seg_count"],
+                }
+                if sess:
+                    fid = sess.get("folder_id")
+                    entry["folder"] = folders.get(fid) if fid else None
+                    summary = sess.get("summary", "")
+                    if summary:
+                        entry["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
+                enriched_sessions.append(entry)
+            results.append({
+                "speaker_id": sp["id"],
+                "speaker_name": sp["name"],
+                "total_sessions": len(sessions),
+                "sessions": enriched_sessions,
+            })
+        text = json.dumps(results, indent=2)
+        total = sum(r["total_sessions"] for r in results)
+        return text, False, f"Speaker '{speaker_name}': {total} sessions", None
 
     return f"Unknown tool: {name}", True, f"Unknown tool: {name}", None
 
