@@ -24,7 +24,7 @@ _PATCH_TOOL = {
     "name": "update_summary",
     "description": (
         "Update the meeting summary. Only return sections with genuinely new "
-        "high-level content — do not update for minor details or topics already "
+        "high-level content - do not update for minor details or topics already "
         "captured. Return an empty sections array if nothing significant changed."
     ),
     "input_schema": {
@@ -56,9 +56,9 @@ _PATCH_TOOL = {
                                 "For 'replace': the complete consolidated content. "
                                 "Nesting and sub-bullets are encouraged for clarity. "
                                 "Timestamps: append [M:SS] after a bullet when it anchors a specific "
-                                "decision, commitment, or notable moment — e.g. '- Agreed to delay launch [12:04]'. "
+                                "decision, commitment, or notable moment - e.g. '- Agreed to delay launch [12:04]'. "
                                 "Use [M:SS–M:SS] ranges to mark the span of a key topic or discussion block. "
-                                "Do NOT timestamp every bullet — only moments worth jumping to."
+                                "Do NOT timestamp every bullet - only moments worth jumping to."
                             ),
                         },
                     },
@@ -75,7 +75,7 @@ _SCREENSHOT_TOOL = {
     "name": "get_screenshot",
     "description": (
         "Capture a screenshot from the meeting's screen recording at a specific "
-        "timestamp. Use this to see what was on screen at a given moment — "
+        "timestamp. Use this to see what was on screen at a given moment - "
         "useful for reading slides, shared documents, UI content, code, diagrams, "
         "or anything visual that the transcript alone cannot convey. "
         "You may call this multiple times with different timestamps."
@@ -215,7 +215,7 @@ def _format_meta_block(meta: dict | None) -> str:
         lines.append(f"  Title: {meta['title']}")
 
     if meta.get("is_live"):
-        lines.append("  Status: LIVE — recording is in progress, transcript is growing in real time")
+        lines.append("  Status: LIVE - recording is in progress, transcript is growing in real time")
     else:
         lines.append("  Status: Completed recording")
 
@@ -251,7 +251,7 @@ class AIAssistant:
 
     _SYSTEM_QA = (
         "You are an intelligent meeting assistant. You are scoped to a SINGLE meeting "
-        "session — the transcript, metadata, and summary provided below are your only "
+        "session - the transcript, metadata, and summary provided below are your only "
         "source of truth. Do not reference or speculate about other meetings.\n\n"
         "## What you know\n"
         "- The full transcript of THIS session with speaker labels and timestamps\n"
@@ -264,25 +264,25 @@ class AIAssistant:
         "- Timestamps mark when each segment was spoken\n"
         "- Speaker labels may be auto-generated (\"Speaker 1\") or user-assigned names\n"
         "- The transcript is machine-generated from audio, so expect minor transcription "
-        "errors, missing punctuation, or misheard words — interpret charitably\n\n"
+        "errors, missing punctuation, or misheard words - interpret charitably\n\n"
         "## How to respond\n"
         "- Answer questions directly and concisely using markdown formatting\n"
         "- When quoting or referencing specific moments, include the timestamp as [M:SS] "
         "so the user can jump to that point in the recording\n"
         "- If the user asks about something not discussed in this meeting, say so clearly\n"
-        "- You can cross-reference the summary and transcript — e.g. if asked to elaborate "
+        "- You can cross-reference the summary and transcript - e.g. if asked to elaborate "
         "on a summary bullet point, find the relevant transcript section\n"
         "- If the recording is live, keep in mind more content may arrive after your answer\n"
         "- When speakers are identified by name, use their names naturally in your response\n"
         "- For questions about who said what, be precise about speaker attribution\n\n"
         "## Timestamps\n"
-        "Timestamps let users jump directly to moments in the recording — use them.\n"
+        "Timestamps let users jump directly to moments in the recording - use them.\n"
         "- Include [M:SS] when citing a specific quote or moment\n"
         "- Use [M:SS–M:SS] to indicate a span (e.g. stretch of discussion on a topic)\n"
         "- Place the timestamp after the referenced text, not before\n"
         "- For multiple timespans, group each range in its own brackets "
         "(e.g. [18:31–19:48] [27:17–27:26])\n"
-        "- Only timestamp moments worth jumping to — avoid tagging every sentence\n\n"
+        "- Only timestamp moments worth jumping to - avoid tagging every sentence\n\n"
         "- Always respond in English regardless of any foreign words or phrases in the transcript"
     )
 
@@ -290,7 +290,7 @@ class AIAssistant:
         "You are a meeting summarization assistant. You produce clear, well-structured "
         "summaries from audio transcripts.\n\n"
         "## Important context\n"
-        "- The transcript may be partial, incomplete, or still in progress — the recording "
+        "- The transcript may be partial, incomplete, or still in progress - the recording "
         "could be live and ongoing, or the audio may have been cut off mid-sentence\n"
         "- Work with whatever content is available; never refuse because the transcript "
         "seems short or incomplete\n\n"
@@ -298,14 +298,14 @@ class AIAssistant:
         "Each line follows: [M:SS] [Speaker Name] spoken text\n"
         "- Timestamps mark when each segment was spoken\n"
         "- Speaker labels may be auto-generated (\"Speaker 1\") or user-assigned names\n"
-        "- The transcript is machine-generated, so expect minor errors — interpret charitably\n\n"
+        "- The transcript is machine-generated, so expect minor errors - interpret charitably\n\n"
         "## Output format\n"
-        "- Choose section headings that fit the content and context — do not use a fixed "
+        "- Choose section headings that fit the content and context - do not use a fixed "
         "structure. Let the transcript and any user instructions guide what sections to create.\n"
         "- Use markdown (## headings, bullets, **bold**, nesting) for a scannable hierarchy\n"
         "- Attribute key points and decisions to speakers by name when identified\n\n"
         "## Timestamps\n"
-        "Timestamps let users jump directly to moments in the recording — use them surgically.\n"
+        "Timestamps let users jump directly to moments in the recording - use them surgically.\n"
         "- Format: `[M:SS]` for a moment, `[M:SS–M:SS]` for a span (e.g. a topic block)\n"
         "- Place AFTER the relevant bullet or phrase, not at the start: "
         "`- Team agreed to cut scope for v1 [8:14]`\n"
@@ -314,9 +314,9 @@ class AIAssistant:
         "- Skip timestamps on: generic observations, filler content, bullets that are already "
         "obvious from context, or anywhere one per section is already enough\n"
         "- For multiple seperate timespan moments, group each range in it's own set of square brackets (e.g. [18:31–19:48] [27:17–27:26])\n"
-        "- Aim for 1–3 timestamps per section — enough to orient, not so many they lose meaning\n\n"
+        "- Aim for 1–3 timestamps per section - enough to orient, not so many they lose meaning\n\n"
         "## Quality bar\n"
-        "- Keep every section as concise as possible — rich but tight\n"
+        "- Keep every section as concise as possible - rich but tight\n"
         "- Do not pad with obvious or low-value bullets; every line should earn its place\n"
         "- Prefer nested structure over long flat lists when topics have sub-points\n"
         "- Always write in English regardless of any foreign words or phrases in the transcript"
@@ -389,7 +389,7 @@ class AIAssistant:
             system += meta_block + "\n\n"
         system += (
             f"Meeting transcript:\n---\n"
-            f"{transcript or '(No transcript yet — meeting may just be starting)'}"
+            f"{transcript or '(No transcript yet - meeting may just be starting)'}"
             f"\n---"
             f"{summary_block}"
         )
@@ -413,7 +413,7 @@ class AIAssistant:
     ) -> None:
         """Stream a structured meeting summary from a full transcript."""
         if not transcript.strip():
-            on_token("*No transcript available yet — start recording first.*")
+            on_token("*No transcript available yet - start recording first.*")
             if on_done:
                 on_done()
             return
@@ -427,7 +427,7 @@ class AIAssistant:
 
         prompt = (
             "Summarize this transcript. Choose section headings that fit the content "
-            "and any instructions above — do not use a fixed structure.\n\n"
+            "and any instructions above - do not use a fixed structure.\n\n"
             f"Transcript:\n---\n{transcript}\n---"
         )
         self._stream(
@@ -477,10 +477,10 @@ class AIAssistant:
             "- 'append': add new content to an existing section\n"
             "- 'replace': rewrite a section entirely (consolidation, deduplication, or "
             "restructuring), or create a new section\n"
-            "- Section names are free-form — rename, merge, or create sections as the "
+            "- Section names are free-form - rename, merge, or create sections as the "
             "content warrants. Let the transcript and user instructions guide structure.\n\n"
             "## Quality bar\n"
-            "- Keep all sections as concise as possible — rich but tight\n"
+            "- Keep all sections as concise as possible - rich but tight\n"
             "- Do not arbitrarily append bullets; update existing ones when appropriate\n"
             "- Use markdown hierarchy and nesting to keep things organised\n"
             "- Timestamps: [M:SS] format (e.g. [4:32]) inline for key moments only\n"
@@ -500,7 +500,7 @@ class AIAssistant:
         try:
             raw = self._complete_structured(system_prompt, user_prompt)
         except Exception as e:
-            log.warn("summary", f"patch failed ({e}) — keeping existing summary")
+            log.warn("summary", f"patch failed ({e}) - keeping existing summary")
             return existing_summary
 
         section_updates = raw.get("sections", []) if isinstance(raw, dict) else []
@@ -532,15 +532,15 @@ class AIAssistant:
 
     _SYSTEM_GLOBAL_QA = (
         "You are an intelligent meeting assistant with access to a library of "
-        "recorded meetings. You search across ALL sessions to answer questions — "
+        "recorded meetings. You search across ALL sessions to answer questions - "
         "you are NOT scoped to any single meeting.\n\n"
         "## How to respond\n"
-        "- Use your tools to find relevant information before answering — "
+        "- Use your tools to find relevant information before answering - "
         "do not guess or make up content\n"
         "- Always cite which session(s) your information comes from by "
         "**meeting title** (e.g. \"In *Sprint Planning (Apr 7)*...\")\n"
         "- Reference speakers by name and note their involvement across sessions\n"
-        "- Do NOT include [M:SS] timestamps — this is a cross-session view, "
+        "- Do NOT include [M:SS] timestamps - this is a cross-session view, "
         "not a single-recording player\n"
         "- If the user asks about something you can't find, say so clearly\n"
         "- Answer directly and concisely using markdown formatting\n"
@@ -560,7 +560,7 @@ class AIAssistant:
         "## Context in results\n"
         "- Search results include session summaries (truncated) so you can often "
         "answer without loading the full transcript\n"
-        "- Results include folder names when sessions are organized into folders — "
+        "- Results include folder names when sessions are organized into folders - "
         "use this to provide project/team context\n"
         "- Speaker history shows segment counts per session to indicate how "
         "active someone was in each meeting"
@@ -669,7 +669,7 @@ class AIAssistant:
             if isinstance(content, str):
                 out.append(m)
                 continue
-            # content is a list of blocks — convert to OpenAI format
+            # content is a list of blocks - convert to OpenAI format
             parts: list[dict] = []
             for block in content:
                 btype = block.get("type", "")
@@ -886,7 +886,7 @@ class AIAssistant:
                 return {
                     "type": "tool_result",
                     "tool_use_id": tu["id"],
-                    "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
+                    "content": "Could not extract frame - the timestamp may be out of range or no video is available.",
                     "is_error": True,
                 }
 
@@ -1005,7 +1005,7 @@ class AIAssistant:
             jpeg = frame_extractor(ts)
             if jpeg:
                 b64 = base64.b64encode(jpeg).decode()
-                # Include image directly in the tool result — inserting a user
+                # Include image directly in the tool result - inserting a user
                 # message between tool results breaks OpenAI's protocol when
                 # multiple tool calls are processed in parallel.
                 msgs.append({
@@ -1023,7 +1023,7 @@ class AIAssistant:
             else:
                 msgs.append({
                     "role": "tool", "tool_call_id": tc_id,
-                    "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
+                    "content": "Could not extract frame - the timestamp may be out of range or no video is available.",
                 })
                 if on_tool_event:
                     on_tool_event("tool_result", {

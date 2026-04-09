@@ -136,7 +136,7 @@ class SpeakerFingerprintDB:
         self._inference = None
 
         if not hf_token:
-            log.warn("fingerprint", "No HF token — voice library disabled.")
+            log.warn("fingerprint", "No HF token - voice library disabled.")
             return
 
         try:
@@ -217,7 +217,7 @@ class SpeakerFingerprintDB:
     def delete_global_speaker(self, global_id: str) -> None:
         """Delete profile and all embeddings. Nulls speaker_labels.global_id via FK cascade."""
         # Manually null the FK since SQLite ON DELETE CASCADE on speaker_labels
-        # requires the FK to be set up on that table — we handle it explicitly.
+        # requires the FK to be set up on that table - we handle it explicitly.
         with _conn(self._db_path) as c:
             c.execute(
                 "UPDATE speaker_labels SET global_id = NULL WHERE global_id = ?",

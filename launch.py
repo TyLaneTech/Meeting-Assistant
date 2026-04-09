@@ -150,7 +150,7 @@ def _ensure_venv():
     re-exec this script using the venv Python.  Does not return on success.
     """
     if _running_in_venv():
-        return  # already inside the venv — nothing to do
+        return  # already inside the venv - nothing to do
 
     need_create = not _venv_python().exists()
 
@@ -170,7 +170,7 @@ def _ensure_venv():
                 shutil.rmtree(VENV_DIR, ignore_errors=True)
                 need_create = True
             else:
-                _warn("Skipping rebuild — things may not work correctly.")
+                _warn("Skipping rebuild - things may not work correctly.")
 
     if need_create:
         _info("Creating Python environment (one-time setup)...")
@@ -314,7 +314,7 @@ def _torch_build() -> str:
         ver = r.stdout.strip()          # e.g. "2.10.0+cu126" or "2.10.0+cpu"
         if "+" in ver:
             return ver.split("+", 1)[1] # "cu126" or "cpu"
-        return ""                       # plain version string — treat as unknown
+        return ""                       # plain version string - treat as unknown
     except Exception:
         return ""
 
@@ -469,11 +469,11 @@ elif task == "sentence-transformers":
                 success = True
                 break
             if attempt < max_attempts:
-                _info(f"{display_name} — retrying ({attempt}/{max_attempts})...")
+                _info(f"{display_name} - retrying ({attempt}/{max_attempts})...")
         if success:
             _ok(f"{display_name}")
         else:
-            _warn(f"{display_name} — download failed after {max_attempts} attempts")
+            _warn(f"{display_name} - download failed after {max_attempts} attempts")
             all_ok = False
 
     # Clean up
@@ -547,7 +547,7 @@ def main():
     from network import warp_disconnect, warp_reconnect
     warp_disconnect()
 
-    # PyTorch — only install/replace when the installed variant doesn't match
+    # PyTorch - only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
 
     if whl == "cpu":
@@ -598,7 +598,7 @@ def main():
     _section("MODELS")
     _predownload_models()
 
-    # Reconnect WARP — git fetch for update checks needs it.
+    # Reconnect WARP - git fetch for update checks needs it.
     warp_reconnect()
 
     # ── FFmpeg ────────────────────────────────────────────────────────────────
@@ -619,7 +619,7 @@ def main():
         except Exception:
             _ok(f"ffmpeg  {GRY}({ffmpeg_path}){R}")
     else:
-        _info(f"ffmpeg not found — downloading...  {GRY}(needed for screen recording){R}")
+        _info(f"ffmpeg not found - downloading...  {GRY}(needed for screen recording){R}")
         try:
             download_ffmpeg(progress_cb=lambda msg: _info(msg))
             _ok(f"ffmpeg  {GRY}({_LOCAL_FFMPEG}){R}")

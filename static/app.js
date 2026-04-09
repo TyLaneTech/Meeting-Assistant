@@ -12,8 +12,8 @@ function renderMd(text) {
  */
 function linkifyTimestamps(container) {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  // Group 1: start time. Group 2 (optional): end time after –, —, or -
-  const timestampRe = /\[(\d{1,2}:\d{2})(?:[–—-](\d{1,2}:\d{2}))?\]/g;
+  // Group 1: start time. Group 2 (optional): end time after –, -, or -
+  const timestampRe = /\[(\d{1,2}:\d{2})(?:[–--](\d{1,2}:\d{2}))?\]/g;
   const nodesToReplace = [];
 
   let node;
@@ -83,7 +83,7 @@ function _saveLayoutCache(updates) {
 let _paneVisible = [true, true, true]; // indexed by column: [transcript, summary, chat]
 const _COL_NAMES = ['Transcript', 'Summary', 'Chat'];
 
-// Visual column order — maps position (left→right) to column index.
+// Visual column order - maps position (left→right) to column index.
 // Seeded from localStorage cache so the first paint uses the saved order.
 let _colOrder = (() => {
   const lc = _getLayoutCache();
@@ -202,7 +202,7 @@ function _applyPaneLayout() {
 }
 
 /* ── Resizable columns ────────────────────────────────────────────────────── */
-// Relative column proportions — updated when user drags; loaded from settings on init.
+// Relative column proportions - updated when user drags; loaded from settings on init.
 // Seeded from localStorage cache immediately so the IIFE below uses the right values.
 let _colProportions = (() => {
   const lc = _getLayoutCache();
@@ -529,7 +529,7 @@ const state = {
   sidebarOpen:    true,
 };
 
-// Apply sidebar layout from cache synchronously — eliminates flash before async prefs load
+// Apply sidebar layout from cache synchronously - eliminates flash before async prefs load
 {
   const _lc = _getLayoutCache();
   const _sb = document.getElementById('sidebar');
@@ -631,7 +631,7 @@ function toggleSidebar() {
 // ── Sidebar state ─────────────────────────────────────────────────────────────
 let _sidebarSelected    = new Set();      // selected session IDs
 let _sidebarMultiselect = false;          // multiselect mode on/off
-let _sidebarCollapsed   = (() => {        // collapsed folder IDs — persisted in localStorage
+let _sidebarCollapsed   = (() => {        // collapsed folder IDs - persisted in localStorage
   try { return new Set(JSON.parse(localStorage.getItem(_FOLDER_STATE_KEY) || '[]')); }
   catch (_) { return new Set(); }
 })();
@@ -647,7 +647,7 @@ let _sidebarSearchTimer = null;           // debounce timer
 let _semanticSearchReady = false;         // true once backend model is loaded
 let _semanticSearchPending = false;       // true while a semantic request is in flight
 let _ftsSearchPending = false;            // true while FTS request is in flight
-let _pendingSearchHighlight = null;       // {segmentId, query} — scroll+highlight after session load
+let _pendingSearchHighlight = null;       // {segmentId, query} - scroll+highlight after session load
 
 async function refreshSidebar() {
   const [sessions, folders] = await Promise.all([
@@ -664,7 +664,7 @@ function _pulseSearchGlow() {
   const body = document.getElementById('session-list');
   if (!body) return;
   body.classList.remove('search-glow');
-  void body.offsetWidth;          // force reflow — restarts animation instantly
+  void body.offsetWidth;          // force reflow - restarts animation instantly
   body.classList.add('search-glow');
 }
 
@@ -699,7 +699,7 @@ function _onSidebarSearch(value) {
   if (_semanticSearchReady) _semanticSearchPending = true;
 
   // Skip full re-render if we're already showing "Searching…" with no results
-  // — avoids restarting the dots animation on every keystroke
+  // - avoids restarting the dots animation on every keystroke
   const stillEmpty = prevSize === 0 && titleMatches.size === 0;
   if (!stillEmpty) _renderSidebar();
 
@@ -819,7 +819,7 @@ function _executeSearchHighlight(hl) {
     target = transcriptEl.querySelector(`.transcript-segment[data-seg-id="${hl.segmentId}"]`);
   }
 
-  // Strategy 2: text search fallback — find segments containing the query
+  // Strategy 2: text search fallback - find segments containing the query
   if (!target && hl.query) {
     const q = hl.query.toLowerCase();
     const segs = transcriptEl.querySelectorAll('.transcript-segment');
@@ -950,7 +950,7 @@ function _isFolderDropBlocked(folderId) {
 /** Attach drag-over / drop handlers to a folder header for reorder + nest. */
 function _attachFolderDragHandlers(headerEl, folderEl, folder) {
   headerEl.addEventListener('dragover', e => {
-    // Block self/descendant drops — don't call preventDefault so browser rejects the drop
+    // Block self/descendant drops - don't call preventDefault so browser rejects the drop
     if (_isFolderDropBlocked(folder.id)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
@@ -1051,7 +1051,7 @@ function _renderSidebar() {
                 loadSession(sid);
               });
             } else if (m.kind === 'segment') {
-              // FTS match without segment_id — fall back to text search
+              // FTS match without segment_id - fall back to text search
               snip.addEventListener('click', e => {
                 e.stopPropagation();
                 _pendingSearchHighlight = { query: _sidebarSearchQuery };
@@ -1063,7 +1063,7 @@ function _renderSidebar() {
           info.appendChild(matchesEl);
         }
       }
-      // Default click (no specific snippet) — still set query for text highlight
+      // Default click (no specific snippet) - still set query for text highlight
       const origClick = el.onclick;
       el.addEventListener('click', () => {
         if (data.matches?.some(m => m.segment_id != null || m.kind === 'segment')) {
@@ -1072,7 +1072,7 @@ function _renderSidebar() {
             ? { segmentId: first.segment_id, query: _sidebarSearchQuery }
             : { query: _sidebarSearchQuery };
         }
-      }, true);  // capture phase — runs before the loadSession click
+      }, true);  // capture phase - runs before the loadSession click
       fragment.appendChild(el);
     }
     list.appendChild(fragment);
@@ -1112,7 +1112,7 @@ function _renderSidebar() {
   // Render folder tree recursively from top-level
   _renderFolderSubtree(null, 0, fragment, childMap, sessionsByFolder, folderIds);
 
-  // Ungrouped sessions (no folder or deleted folder) — also acts as a drop
+  // Ungrouped sessions (no folder or deleted folder) - also acts as a drop
   // target to remove sessions from folders.
   const ungroupedZone = document.createElement('div');
   ungroupedZone.className = 'sidebar-ungrouped-zone';
@@ -1627,10 +1627,10 @@ function _handleDrop(targetId, targetType, zone, parentContext) {
   } else if (_sidebarDragType === 'folder' && targetType === 'folder') {
     _reorderFolders(targetId, zone);
   } else if (_sidebarDragType === 'session' && targetType === 'folder') {
-    // Session dropped on edge of a folder — treat as drop into the folder
+    // Session dropped on edge of a folder - treat as drop into the folder
     _handleDropIntoFolder(targetId);
   } else if (_sidebarDragType === 'folder' && targetType === 'session') {
-    // Folder dropped on a session edge — ignore (doesn't make sense)
+    // Folder dropped on a session edge - ignore (doesn't make sense)
     return;
   }
 }
@@ -1824,13 +1824,13 @@ async function reanalyzeSession(e, sessionId) {
       data.speaker_profiles.forEach(p => applySpeakerProfileUpdate(p));
     }
   } else {
-    // Already viewing — just clear the display
+    // Already viewing - just clear the display
     clearAll();
     state.isViewingPast = false;
     document.getElementById('record-btn').disabled = true;
   }
 
-  // Keep playback available during reanalysis — the WAV file still exists
+  // Keep playback available during reanalysis - the WAV file still exists
   initPlayback(sessionId);
 
   const customPrompt = document.getElementById('summary-custom-prompt')?.value || '';
@@ -1937,7 +1937,7 @@ function connectSSE(afterSegId = 0) {
     if (!state.isViewingPast && d.seg_id) {
       const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
       if (seg) {
-        // Source changed (e.g. noise reclaimed as real speaker) — full re-render
+        // Source changed (e.g. noise reclaimed as real speaker) - full re-render
         if (d.source && d.source !== seg.dataset.transcriptSource) {
           seg.dataset.transcriptSource = d.source;
           seg.classList.remove('noise-segment');
@@ -1996,7 +1996,7 @@ function connectSSE(afterSegId = 0) {
           }
           _applyFilterToSeg(seg);
         } else {
-          // Text/time update only — preserve the badge
+          // Text/time update only - preserve the badge
           const badge = seg.querySelector('.src-badge');
           if (badge) {
             while (badge.nextSibling) badge.nextSibling.remove();
@@ -2208,7 +2208,7 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id === state.sessionId) {
       _sessionLinks[d.speaker_key] = { global_id: d.global_id, name: d.name };
       _updateLinkedBadges();
-      // Clean up notification queue — this speaker is now identified
+      // Clean up notification queue - this speaker is now identified
       _fpRemoveFromQueue(d.speaker_key);
       _fpUpdateInlineIcons();
     }
@@ -2230,7 +2230,7 @@ function connectSSE(afterSegId = 0) {
       '<p class="empty-hint">Summary will regenerate after reanalysis completes.</p>';
     document.getElementById('chat-messages').innerHTML =
       '<p class="empty-hint">Ask questions about the meeting here.</p>';
-    // Keep playback active — the WAV file still exists during reanalysis
+    // Keep playback active - the WAV file still exists during reanalysis
   });
 
   src.addEventListener('reanalysis_start', e => {
@@ -2347,7 +2347,7 @@ function onStatus(d) {
       destroyPlayback();
       if (!_durationInterval) {
         startDurationCounter();
-        // Push stored gain values now — AudioCapture is guaranteed to exist
+        // Push stored gain values now - AudioCapture is guaranteed to exist
         initGainSliders();
       }
       _updateBrandIcons(true);
@@ -2531,7 +2531,7 @@ let _loadGeneration = 0;  // increments on each loadSession call to cancel stale
 // Maintained in appendTranscript / _clearSegmentRegistry.  Avoids repeated
 // document.querySelectorAll calls in hot paths (playback, filter, highlights).
 let _segmentRegistry  = [];     // every .transcript-segment element, in insertion order
-let _segmentTimes     = [];     // {start, end, el} for timed segs — sorted by start
+let _segmentTimes     = [];     // {start, end, el} for timed segs - sorted by start
 let _visibleRangesCache = null; // cached _getVisibleTimeRanges(); null means stale
 
 function _clearSegmentRegistry() {
@@ -2956,7 +2956,7 @@ function _syncPanelBottomRadius() {
     el.classList.add(_PANEL_BOTTOM_RADIUS_CLS);
     return;
   }
-  // No panels visible — col-header is the bottom element
+  // No panels visible - col-header is the bottom element
   if (header) header.classList.add(_PANEL_BOTTOM_RADIUS_CLS);
 }
 
@@ -3232,7 +3232,7 @@ function fpToastSkip() {
   _fpToastActive = null;
   if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
   _fpAnimateOut();
-  // Don't dismiss from queue — it stays in the bell panel for later review
+  // Don't dismiss from queue - it stays in the bell panel for later review
 }
 
 function _fpHideToast() {
@@ -3879,7 +3879,7 @@ function renderSpeakerManager() {
       const k = group.speakerKeys[0];
       meta.textContent = `${k}${count ? ` · ${count} segment${count === 1 ? '' : 's'}` : ''}`;
     } else {
-      // Multiple diarizer fragments — show key list as muted subtext
+      // Multiple diarizer fragments - show key list as muted subtext
       const displayed = group.speakerKeys.slice(0, 3).join(', ');
       const extra = group.speakerKeys.length > 3 ? ` +${group.speakerKeys.length - 3}` : '';
       meta.textContent = `${displayed}${extra}${count ? ` · ${count} segments` : ''}`;
@@ -4037,7 +4037,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     const { label, cls } = SOURCE_META[source];
     seg.innerHTML = `<span class="src-badge ${cls}">${label}</span>${escapeHtml(text)}`;
   } else if (source === _NOISE_LABEL || labelOverride === _NOISE_LABEL) {
-    // Noise/filler segment — muted styling, click to reassign
+    // Noise/filler segment - muted styling, click to reassign
     if (labelOverride === _NOISE_LABEL) _manualNoiseKeys.add(source);
     seg.classList.add('noise-segment');
     seg.style.setProperty('--seg-color', _NOISE_COLOR);
@@ -4135,7 +4135,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   }
   _visibleRangesCache = null;  // new segment may change visible ranges
 
-  // During bulk load, skip expensive per-segment work — it runs once after the load.
+  // During bulk load, skip expensive per-segment work - it runs once after the load.
   if (_bulkLoading) return;
 
   // Extend time range slider if navigator is open (before filtering, so pinned max stays Infinity)
@@ -4145,7 +4145,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   if (_transcriptFilter.search.trim() && seg.style.display !== 'none') {
     _tnHighlightInSeg(seg);
   }
-  // Only check this new segment's badge — no need to re-scan all segments.
+  // Only check this new segment's badge - no need to re-scan all segments.
   if (_selectedSpeakerKeys.length) {
     const badge = seg.querySelector('.src-badge.src-speaker');
     if (badge) badge.classList.toggle('speaker-selected', _selectedSpeakerKeys.includes(badge.dataset.speakerKey));
@@ -4178,7 +4178,7 @@ function editSpeakerLabel(badge, speakerKey) {
 
   // Determine edit mode:
   // - "oneoff" only if the badge is already a per-segment override
-  // - "global" for everything else — first-touch edits always rename all segments
+  // - "global" for everything else - first-touch edits always rename all segments
   const editMode = badge.dataset.override ? 'oneoff' : 'global';
   const isDefault = _isDefaultName(currentName) || currentName === speakerKey;
 
@@ -4229,7 +4229,7 @@ function editSpeakerLabel(badge, speakerKey) {
     optionsWrap.appendChild(opt);
   });
 
-  // Voice Library section — populated asynchronously
+  // Voice Library section - populated asynchronously
   const vlSection = document.createElement('div');
   vlSection.className = 'speaker-picker-section speaker-picker-vl-section';
   vlSection.style.display = 'none';
@@ -4308,7 +4308,7 @@ function editSpeakerLabel(badge, speakerKey) {
     });
   }
 
-  // "Mark as Noise" button — suppresses segment and hides it with noise pill
+  // "Mark as Noise" button - suppresses segment and hides it with noise pill
   const noiseBtn = document.createElement('button');
   noiseBtn.className = 'speaker-picker-noise-btn';
   noiseBtn.innerHTML = '<i class="fa-solid fa-volume-xmark"></i> Mark as Noise';
@@ -4709,7 +4709,7 @@ function copyTranscript() {
     const label = badge ? badge.textContent.trim() : '';
     const start = seg.dataset.start != null ? parseFloat(seg.dataset.start) : null;
     const timeStr = (start !== null && start >= 0) ? ` [${fmtDuration(start)}]` : '';
-    // Plain text only — exclude the badge node
+    // Plain text only - exclude the badge node
     const text = [...seg.childNodes]
       .filter(n => n.nodeType === Node.TEXT_NODE)
       .map(n => n.textContent)
@@ -4788,7 +4788,7 @@ function _applyFilterToSeg(seg) {
 
 function applyTranscriptFilter() {
   _segmentRegistry.forEach(_applyFilterToSeg);
-  _visibleRangesCache = null;  // filter changed — invalidate cached ranges
+  _visibleRangesCache = null;  // filter changed - invalidate cached ranges
   _tnHighlightMatches();
   _refreshMinimap(true);
 }
@@ -5080,7 +5080,7 @@ function _tnRefreshSpeakerPills() {
   const allKeys = new Set();
   groups.forEach(g => g.speakerKeys.forEach(k => allKeys.add(k)));
 
-  // Separate noise group from regular speakers (skip in original-key mode — show all individually)
+  // Separate noise group from regular speakers (skip in original-key mode - show all individually)
   const noiseGroups = [];
   const speakerGroups = [];
   groups.forEach(g => {
@@ -5116,8 +5116,8 @@ function _tnRefreshSpeakerPills() {
       : escapeHtml(g.name);
     pill.innerHTML = `${pillLabel} <span class="tn-pill-count">${count}</span>`;
     pill.title = _showOriginalKeys && g.displayName && g.displayName !== g.name
-      ? `${g.name} → ${g.displayName} — ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`
-      : `${g.name} — ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`;
+      ? `${g.name} → ${g.displayName} - ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`
+      : `${g.name} - ${count} segment${count !== 1 ? 's' : ''}\nRight-click: jump to next`;
 
     pill.addEventListener('click', () => {
       _tnToggleSpeakerPill(g.speakerKeys, allKeys);
@@ -5131,7 +5131,7 @@ function _tnRefreshSpeakerPills() {
     container.appendChild(pill);
   });
 
-  // Single merged noise pill — all noise groups combined
+  // Single merged noise pill - all noise groups combined
   const totalNoiseCount = noiseGroups.reduce(
     (sum, g) => sum + g.speakerKeys.reduce((s2, k) => s2 + _speakerBadgeCount(k), 0), 0);
   if (totalNoiseCount > 0) {
@@ -5283,7 +5283,7 @@ function _tnRefreshReassignDropdowns() {
     fromSel.appendChild(opt);
   });
 
-  // Rebuild "to" dropdown — includes all names, plus [Noise] option
+  // Rebuild "to" dropdown - includes all names, plus [Noise] option
   toSel.innerHTML = '<option value="" disabled selected>to…</option>';
   names.forEach(name => {
     const opt = document.createElement('option');
@@ -5979,7 +5979,7 @@ function _skipFilteredAudio(t) {
     if (t >= r.start && t < r.end) return; // playing a visible segment, all good
   }
 
-  // Current time is in a hidden gap — find the next visible range
+  // Current time is in a hidden gap - find the next visible range
   for (const r of ranges) {
     if (r.start > t) {
       _lastSkipTime = r.start;
@@ -5988,7 +5988,7 @@ function _skipFilteredAudio(t) {
     }
   }
 
-  // Past all visible segments — let playback end naturally
+  // Past all visible segments - let playback end naturally
 }
 
 let _currentPlayingSeg = null;
@@ -6033,7 +6033,7 @@ function _doProgrammaticScroll(el, opts) {
 }
 
 function highlightPlayingSegment(t) {
-  // Binary search on _segmentTimes (sorted by start) — O(log n) vs O(n) querySelectorAll.
+  // Binary search on _segmentTimes (sorted by start) - O(log n) vs O(n) querySelectorAll.
   let lo = 0, hi = _segmentTimes.length - 1, idx = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
@@ -6146,7 +6146,7 @@ function _audioToVideoTime(audioTime) {
   return Math.max(0, audioTime - _videoOffset);
 }
 
-// Video seek — cancels any in-flight seek before issuing a new one
+// Video seek - cancels any in-flight seek before issuing a new one
 let _videoScrubbing = false;    // true while the user is dragging the seek bar
 let _videoSeekDebounce = 0;     // timeout id for debounced seek during scrub
 
@@ -6214,7 +6214,7 @@ let _wasPlayingBeforeScrub = false;
           });
         }
       } else if (_wasPlayingBeforeScrub) {
-        // No video — just resume audio
+        // No video - just resume audio
         _playbackAudio.play();
       }
       _wasPlayingBeforeScrub = false;
@@ -6240,7 +6240,7 @@ seekPlayback = function(val) {
   _origSeekPlayback(val);
   if (_videoAvailable) {
     if (_videoScrubbing) {
-      // During scrub: debounce — only seek after user pauses dragging for 100ms
+      // During scrub: debounce - only seek after user pauses dragging for 100ms
       _seekVideoDebounced(_audioToVideoTime(parseFloat(val)), 100);
     } else {
       // Direct seek (click on bar, or programmatic): immediate
@@ -6268,7 +6268,7 @@ setPlaybackSpeed = function(val) {
   if (_videoAvailable) _playbackVideo.playbackRate = parseFloat(val);
 };
 
-// Periodic drift correction — runs on audio's timeupdate
+// Periodic drift correction - runs on audio's timeupdate
 _playbackAudio.addEventListener('timeupdate', () => {
   if (_videoAvailable && _videoVisible && !_playbackAudio.paused && !_videoScrubbing) {
     _syncVideoToAudio();
@@ -6329,7 +6329,7 @@ async function _screenPreviewLoop() {
         if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
       }
     } catch (_) {}
-    // Wait before next frame — ensures sequential, never piling up
+    // Wait before next frame - ensures sequential, never piling up
     await new Promise(r => setTimeout(r, _SCREEN_PREVIEW_DELAY));
   }
   _screenPreviewRunning = false;
@@ -6579,7 +6579,7 @@ function _minimapSegmentData() {
   return data;
 }
 
-/** Mark minimap data as stale — next render will rebuild. */
+/** Mark minimap data as stale - next render will rebuild. */
 function _invalidateMinimapCache() { _minimapDirty = true; }
 
 /** Render the minimap canvas with colored blocks per segment. */
@@ -6657,7 +6657,7 @@ function _updateMinimapViewport() {
   const mapH      = container.clientHeight;
 
   if (scrollH <= clientH) {
-    // Everything fits — viewport covers full minimap
+    // Everything fits - viewport covers full minimap
     viewport.style.top    = '0px';
     viewport.style.height = mapH + 'px';
     return;
@@ -6782,7 +6782,7 @@ function _updateMinimapFabVisibility() {
   }
 }
 
-/** Full minimap refresh — re-render canvas + viewport.
+/** Full minimap refresh - re-render canvas + viewport.
  *  Debounces during live recording to avoid per-segment redraws.
  *  Immediate when called from bulk actions (filter, speaker rename, etc.). */
 let _minimapRefreshTimer = 0;
@@ -6795,7 +6795,7 @@ function _refreshMinimap(immediate = false) {
   if (_minimapRefreshTimer)  { cancelAnimationFrame(_minimapRefreshTimer); _minimapRefreshTimer = 0; }
 
   if (!immediate && state.isRecording) {
-    // During live recording, debounce — segments arrive every ~0.5 s
+    // During live recording, debounce - segments arrive every ~0.5 s
     _minimapDebounceTimer = setTimeout(() => {
       _minimapDebounceTimer = 0;
       _minimapRefreshTimer = requestAnimationFrame(() => {
@@ -6856,7 +6856,7 @@ function createAssistantBubble() {
       </button>
     </div>`;
   el.appendChild(wrap);
-  scrollChatToBottom();  // response is starting — always scroll
+  scrollChatToBottom();  // response is starting - always scroll
   return wrap.querySelector('.chat-msg-body');
 }
 
@@ -6909,7 +6909,7 @@ function _renderToolWidget(msgWrap, toolCalls) {
     <div class="chat-tool-details">${itemsHtml}</div>`;
 
   // Auto-expand while tools are in progress, preserve manual toggle otherwise.
-  // Keep 'streaming' even after all tools complete — it's only removed on
+  // Keep 'streaming' even after all tools complete - it's only removed on
   // first chat_chunk so the collapse fires at the right time.
   if (!allDone) {
     widget.classList.add('open', 'streaming');
@@ -6966,7 +6966,7 @@ function appendUserBubble(text, attachments) {
   if (attachments?.length) {
     _renderBubbleAttachments(wrap.querySelector('.chat-msg-body'), attachments);
   }
-  // User sent a message — reset flag and force-scroll so the response is visible.
+  // User sent a message - reset flag and force-scroll so the response is visible.
   _chatAtBottom = true;
   scrollChatToBottom();
 }
@@ -7313,7 +7313,7 @@ async function loadSession(sessionId) {
 
   const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json());
   if (data.error) {
-    // Session not found — clean up URL and show a brief status message
+    // Session not found - clean up URL and show a brief status message
     history.replaceState(null, '', location.pathname);
     flashStatus('Session not found');
     return;
@@ -7364,14 +7364,14 @@ async function loadSession(sessionId) {
     if (!completed) return;  // load was cancelled by a newer loadSession call
     _finishBulkLoad();
   } else {
-    // Small transcript — render synchronously (fast enough)
+    // Small transcript - render synchronously (fast enough)
     segments.forEach(s =>
       appendTranscript(s.text, s.source_override || s.source || 'loopback', s.start_time, s.end_time,
                        s.id, s.label_override, s.source_override ? s.source : null)
     );
   }
 
-  // Handle pending search highlight — scroll to and flash the matching segment
+  // Handle pending search highlight - scroll to and flash the matching segment
   if (_pendingSearchHighlight) {
     const hl = _pendingSearchHighlight;
     _pendingSearchHighlight = null;
@@ -7794,7 +7794,7 @@ function saveDeviceSelection() {
   if (lbSel)  savePref('loopback_device', lbSel.value);
   if (micSel) savePref('mic_device',      micSel.value);
   // Release or acquire the browser getUserMedia stream immediately when the
-  // mic selector changes — otherwise a stale getUserMedia lock on the physical
+  // mic selector changes - otherwise a stale getUserMedia lock on the physical
   // mic device causes WASAPI shared-mode contention and garbled audio.
   syncBrowserMic();
 }
@@ -7804,7 +7804,7 @@ async function toggleAudioTest() {
     try {
       await fetch('/api/audio/test/stop', { method: 'POST' });
     } catch (_) { /* network error */ }
-    // Eagerly release browser mic regardless of server response —
+    // Eagerly release browser mic regardless of server response -
     // don't wait for SSE event which may be delayed or lost.
     state.isTesting = false;
     updateTestBtn();
@@ -7885,7 +7885,7 @@ function startVizLoop() {
       vizMicBars[i] += (mt > vizMicBars[i] ? 0.55 : 0.10) * (mt - vizMicBars[i]);
     }
 
-    // ── EQ bars — desktop fills upward from midline, mic fills downward ───
+    // ── EQ bars - desktop fills upward from midline, mic fills downward ───
     for (let i = 0; i < N_BARS; i++) {
       const x = i * barW + pad;
       const bw = barW - pad * 2;
@@ -8002,7 +8002,7 @@ function startBrandVizLoop() {
 
 /* ── Gain controls ───────────────────────────────────────────────────────── */
 let _gainSendTimer = null;
-let _gainLastInput = 0;   // timestamp of last user interaction — suppresses SSE sync
+let _gainLastInput = 0;   // timestamp of last user interaction - suppresses SSE sync
 
 function onGainInput(channel, val) {
   _gainLastInput = Date.now();
@@ -8284,7 +8284,7 @@ async function openSettings() {
     updateChatModelLabel(aiCfg.provider, aiCfg.model, currentAiModels);
   } catch (_) {}
 
-  // Startup toggle (Windows only — hidden on unsupported platforms)
+  // Startup toggle (Windows only - hidden on unsupported platforms)
   try {
     const startup = await fetch('/api/settings/startup').then(r => r.json());
     const row = document.getElementById('startup-row');
@@ -8296,7 +8296,7 @@ async function openSettings() {
     }
   } catch (_) {}
 
-  // Audio params — load eagerly so panels are ready when clicked
+  // Audio params - load eagerly so panels are ready when clicked
   _apRefresh().then(() => _syncScreenToggle());
 
   // Presets for all sections
@@ -8558,11 +8558,11 @@ async function topbarApplyUpdate() {
   } catch (_) {
     btn.disabled = false;
     btn.innerHTML = '<i class="fa-solid fa-download"></i> Retry';
-    btn.title = 'Update failed — click to retry';
+    btn.title = 'Update failed - click to retry';
   }
 }
 
-// Silent update check — shows the topbar button only if updates are found.
+// Silent update check - shows the topbar button only if updates are found.
 // Errors are silently ignored.
 async function _silentUpdateCheck() {
   try {
@@ -8571,10 +8571,10 @@ async function _silentUpdateCheck() {
     if (!data.error && !data.up_to_date && data.commits_behind > 0) {
       _showTopbarUpdate(data.commits_behind);
     }
-  } catch (_) { /* silent — don't bother the user if offline */ }
+  } catch (_) { /* silent - don't bother the user if offline */ }
 }
 
-// Periodic update check — runs every 15 minutes, but only when idle
+// Periodic update check - runs every 15 minutes, but only when idle
 // (no recording in progress).  Stops once an update is found.
 let _updateCheckInterval = null;
 function _startPeriodicUpdateCheck() {
@@ -9159,7 +9159,7 @@ function _renderDisplayGrid(selectedIdx) {
     return;
   }
 
-  // Calculate scale for thumbnails — fit all monitors into the grid
+  // Calculate scale for thumbnails - fit all monitors into the grid
   const allLeft   = Math.min(..._screenDisplays.map(d => d.x));
   const allTop    = Math.min(..._screenDisplays.map(d => d.y));
   const allRight  = Math.max(..._screenDisplays.map(d => d.x + d.width));
@@ -9167,7 +9167,7 @@ function _renderDisplayGrid(selectedIdx) {
   const totalW = allRight - allLeft;
   const totalH = allBottom - allTop;
 
-  // Grid is roughly 200px wide — scale to fit
+  // Grid is roughly 200px wide - scale to fit
   const gridW = 200;
   const scale = gridW / totalW;
   const gridH = totalH * scale;
@@ -9223,7 +9223,7 @@ async function selectScreenDisplay(idx) {
 async function toggleScreenRecordEnabled(enabled) {
   // Save via audio params system
   await _apSave('screen_record_enabled', enabled ? 1 : 0);
-  // Verify the save took effect — revert the checkbox if it didn't
+  // Verify the save took effect - revert the checkbox if it didn't
   _syncScreenToggle();
 }
 
@@ -9232,7 +9232,7 @@ function _syncScreenToggle() {
   const enabled = parseInt(_apCache.current.screen_record_enabled || 0);
   const toggle = document.getElementById('screen-record-toggle');
   if (toggle) toggle.checked = !!enabled;
-  // Toggle visual is handled by the pane collapse — no need to hide body here
+  // Toggle visual is handled by the pane collapse - no need to hide body here
 }
 
 async function loadScreenPresets() {
@@ -9431,13 +9431,13 @@ if (!_isHomePage) {
       openFingerprintPanel();
       history.replaceState(null, '', location.pathname);
     } else if (params.has('id')) {
-      // Defer until status has loaded — if the session is actively recording,
+      // Defer until status has loaded - if the session is actively recording,
       // the SSE status+replay events handle everything; only call loadSession
       // for past (non-recording) sessions.
       const _pendingSessionId = params.get('id');
       fetch('/api/status').then(r => r.json()).then(st => {
         if (st.recording && st.session_id === _pendingSessionId) {
-          // Active recording — SSE status event will set state; don't call loadSession
+          // Active recording - SSE status event will set state; don't call loadSession
           return;
         }
         loadSession(_pendingSessionId);

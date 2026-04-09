@@ -88,7 +88,7 @@ def download_ffmpeg(progress_cb=None) -> str:
 def kill_stale_ffmpeg() -> int:
     """Kill any orphaned ffmpeg processes left over from a previous session.
 
-    Returns the number of processes killed.  Safe to call at startup — only
+    Returns the number of processes killed.  Safe to call at startup - only
     targets ffmpeg.exe instances whose command line includes 'gdigrab' (our
     screen-recording invocations), so it won't disturb unrelated ffmpeg usage.
     """
@@ -111,7 +111,7 @@ def kill_stale_ffmpeg() -> int:
 
 # ── DPI awareness ────────────────────────────────────────────────────────────
 # Enable per-monitor DPI awareness so EnumDisplayMonitors returns physical
-# pixel coordinates and sizes — critical for correct gdigrab offsets on
+# pixel coordinates and sizes - critical for correct gdigrab offsets on
 # high-DPI / scaled displays.  Call once at import time; harmless if the
 # process (or a framework) already set a mode.
 try:
@@ -125,7 +125,7 @@ except (AttributeError, OSError):
 
 # ── Display enumeration (Windows) ────────────────────────────────────────────
 
-# MONITORINFOEXW is not in ctypes.wintypes — define it manually
+# MONITORINFOEXW is not in ctypes.wintypes - define it manually
 class _MONITORINFOEXW(ctypes.Structure):
     _fields_ = [
         ("cbSize", ctypes.wintypes.DWORD),
@@ -384,7 +384,7 @@ if brush:
 PRESETS = {
     "minimal": {
         "label": "Minimal",
-        "description": "Lowest resource usage — small files, reduced clarity",
+        "description": "Lowest resource usage - small files, reduced clarity",
         "framerate": 5,
         "crf": 38,
         "preset": "ultrafast",
@@ -408,7 +408,7 @@ PRESETS = {
     },
     "quality": {
         "label": "Quality",
-        "description": "High quality — larger files, more CPU",
+        "description": "High quality - larger files, more CPU",
         "framerate": 24,
         "crf": 22,
         "preset": "fast",
@@ -416,7 +416,7 @@ PRESETS = {
     },
     "maximum": {
         "label": "Maximum",
-        "description": "Best possible quality — significant CPU usage",
+        "description": "Best possible quality - significant CPU usage",
         "framerate": 30,
         "crf": 18,
         "preset": "medium",
@@ -491,7 +491,7 @@ class ScreenRecorder:
         """
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
-            raise RuntimeError("ffmpeg not found — install it or restart the app to auto-download")
+            raise RuntimeError("ffmpeg not found - install it or restart the app to auto-download")
 
         with self._lock:
             if self._proc and self._proc.poll() is None:
@@ -549,9 +549,9 @@ class ScreenRecorder:
             "-preset", preset,
             "-crf", str(crf),
             "-pix_fmt", "yuv420p",
-            # No audio — audio is captured separately
+            # No audio - audio is captured separately
             "-an",
-            # Fragmented MP4 — seekable during recording
+            # Fragmented MP4 - seekable during recording
             "-movflags", "frag_keyframe+empty_moov",
             self._frag_path,
         ])
@@ -608,7 +608,7 @@ class ScreenRecorder:
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            log.warn("screen", "ffmpeg did not exit in time — killing")
+            log.warn("screen", "ffmpeg did not exit in time - killing")
             proc.kill()
             proc.wait(timeout=5)
 
@@ -635,9 +635,9 @@ class ScreenRecorder:
                     log.info("screen", f"Saved: {final_path} ({size_mb:.1f} MB)")
                     return final_path
                 else:
-                    log.warn("screen", "Remux failed — keeping fragmented file")
+                    log.warn("screen", "Remux failed - keeping fragmented file")
             except Exception as e:
-                log.warn("screen", f"Remux error: {e} — keeping fragmented file")
+                log.warn("screen", f"Remux error: {e} - keeping fragmented file")
 
         # Fallback: rename the frag file as the final output
         try:
@@ -663,7 +663,7 @@ def capture_live_frame(display_index: int = 0, max_width: int = 960) -> bytes | 
         display_index = 0
     disp = displays[display_index]
 
-    # gdigrab is DPI-aware — use physical coordinates
+    # gdigrab is DPI-aware - use physical coordinates
     cap_x = disp["x"]
     cap_y = disp["y"]
     cap_w = disp["width"]

@@ -61,7 +61,7 @@ def _ensure_icons() -> None:
 
 
 def _create_fallback_icon(color: tuple[int, int, int], size: int = 64) -> "Image.Image":
-    """Programmatically draw a simple mic icon — used only if PNG assets are missing."""
+    """Programmatically draw a simple mic icon - used only if PNG assets are missing."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d   = ImageDraw.Draw(img)
     m   = 2

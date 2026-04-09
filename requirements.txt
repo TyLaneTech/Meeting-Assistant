@@ -31,7 +31,7 @@ speechbrain==1.0.3
 pyaudiowpatch>=0.2.12.7
 
 # ── Echo cancellation ───────────────────────────────────────────────────────
-# WebRTC AEC3 bindings — removes speaker echo from the microphone signal.
+# WebRTC AEC3 bindings - removes speaker echo from the microphone signal.
 aec-audio-processing>=1.0.0
 
 # ── Signal processing / numerics ──────────────────────────────────────────────

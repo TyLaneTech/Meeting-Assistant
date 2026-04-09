@@ -62,20 +62,20 @@ def detect_cuda_available() -> bool:
 def detect_device() -> tuple[str, str, str]:
     """Returns (device, compute_type, model_size). Prefers CUDA if available."""
     if detect_cuda_available():
-        log.info("whisper", "CUDA OK — using large-v3 (float16).")
+        log.info("whisper", "CUDA OK - using large-v3 (float16).")
         return "cuda", "float16", "large-v3"
-    log.info("whisper", "CUDA unavailable — using CPU.")
+    log.info("whisper", "CUDA unavailable - using CPU.")
     return "cpu", "int8", "small"
 
 
 # All available whisper presets: (label, device, compute_type, model_size, requires_cuda)
 WHISPER_PRESETS = [
-    {"id": "cuda-large-v3",  "label": "GPU — large-v3 (float16)",  "device": "cuda", "compute_type": "float16", "model_size": "large-v3",  "requires_cuda": True},
-    {"id": "cuda-medium",    "label": "GPU — medium (float16)",    "device": "cuda", "compute_type": "float16", "model_size": "medium",    "requires_cuda": True},
-    {"id": "cuda-small",     "label": "GPU — small (float16)",     "device": "cuda", "compute_type": "float16", "model_size": "small",     "requires_cuda": True},
-    {"id": "cpu-medium",     "label": "CPU — medium (int8)",       "device": "cpu",  "compute_type": "int8",    "model_size": "medium",    "requires_cuda": False},
-    {"id": "cpu-small",      "label": "CPU — small (int8)",        "device": "cpu",  "compute_type": "int8",    "model_size": "small",     "requires_cuda": False},
-    {"id": "cpu-tiny",       "label": "CPU — tiny (int8)",         "device": "cpu",  "compute_type": "int8",    "model_size": "tiny",      "requires_cuda": False},
+    {"id": "cuda-large-v3",  "label": "GPU - large-v3 (float16)",  "device": "cuda", "compute_type": "float16", "model_size": "large-v3",  "requires_cuda": True},
+    {"id": "cuda-medium",    "label": "GPU - medium (float16)",    "device": "cuda", "compute_type": "float16", "model_size": "medium",    "requires_cuda": True},
+    {"id": "cuda-small",     "label": "GPU - small (float16)",     "device": "cuda", "compute_type": "float16", "model_size": "small",     "requires_cuda": True},
+    {"id": "cpu-medium",     "label": "CPU - medium (int8)",       "device": "cpu",  "compute_type": "int8",    "model_size": "medium",    "requires_cuda": False},
+    {"id": "cpu-small",      "label": "CPU - small (int8)",        "device": "cpu",  "compute_type": "int8",    "model_size": "small",     "requires_cuda": False},
+    {"id": "cpu-tiny",       "label": "CPU - tiny (int8)",         "device": "cpu",  "compute_type": "int8",    "model_size": "tiny",      "requires_cuda": False},
 ]
 
 DIARIZER_OPTIONS = [
@@ -103,12 +103,12 @@ def get_cuda_available() -> bool:
 def get_default_model_config() -> tuple[str, str, str]:
     """Return the preferred default Whisper config, probing once lazily."""
     if get_cuda_available():
-        log.info("whisper", "CUDA OK — using large-v3 (float16).")
+        log.info("whisper", "CUDA OK - using large-v3 (float16).")
         return "cuda", "float16", "large-v3"
-    log.info("whisper", "CUDA unavailable — using CPU.")
+    log.info("whisper", "CUDA unavailable - using CPU.")
     return _DEFAULT_DEVICE, _DEFAULT_COMPUTE_TYPE, _DEFAULT_MODEL_SIZE
 
-# Minimum samples to pass to Whisper — very short clips produce garbage output.
+# Minimum samples to pass to Whisper - very short clips produce garbage output.
 _MIN_WHISPER_SAMPLES = 3_200   # 0.2 s at 16 kHz
 
 # Short-fragment threshold: Whisper adds a trailing period to tiny audio clips
@@ -126,7 +126,7 @@ _HALLUCINATION_THRESHOLD  = 0.50  # unique-ratio below this → treat as loop
 # Known Whisper hallucination phrases.  These are artifacts from the training
 # data (subtitles, YouTube outros, etc.) that Whisper hallucinates when the
 # audio is silent or contains only background noise.  Checked against the
-# lowercased text — if ANY phrase appears as a substring, the segment is
+# lowercased text - if ANY phrase appears as a substring, the segment is
 # discarded.  Also applied as a strip: if the phrase appears at the start or
 # end, it's removed and the remainder is kept (if any real speech remains).
 import re as _re
@@ -176,7 +176,7 @@ def _dedup_sentences(text: str) -> str:
     """Remove repeated sentences/clauses from Whisper output.
 
     Whisper sometimes loops a phrase like "SO I THINK THAT'S A GOOD QUESTION.
-    QUESTION. SO I THINK THAT'S A GOOD QUESTION." — the n-gram filter may not
+    QUESTION. SO I THINK THAT'S A GOOD QUESTION." - the n-gram filter may not
     catch this if there's enough variation.  This splits on sentence boundaries,
     normalises each, and keeps only the first occurrence.
     """
@@ -218,7 +218,7 @@ def _strip_fragment_period(text: str) -> str:
         return text
     words = text.split()
     if len(words) <= _FRAGMENT_MAX_WORDS and text.endswith("."):
-        # Only strip a plain period — preserve "..." or "!." etc.
+        # Only strip a plain period - preserve "..." or "!." etc.
         if not text.endswith(".."):
             text = text[:-1].rstrip()
     return text
@@ -259,7 +259,7 @@ class Transcriber:
         self.fingerprint_callback: Callable | None = None
         # (speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None
 
-        # Tunable parameters — loaded from saved settings, reset-able to defaults
+        # Tunable parameters - loaded from saved settings, reset-able to defaults
         from default_audio_params import get_all_defaults
         import settings as _settings
         defaults = get_all_defaults()
@@ -293,7 +293,7 @@ class Transcriber:
         return getattr(self.diarizer, "_device_name", None)
 
     def load_model(self) -> None:
-        """Download (first run) and load Whisper. Blocking — run in a thread."""
+        """Download (first run) and load Whisper. Blocking - run in a thread."""
         if self._auto_model_config:
             self.device, self.compute_type, self.model_size = get_default_model_config()
         log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
@@ -313,7 +313,7 @@ class Transcriber:
                 device=self.device,
                 compute_type=self.compute_type,
             )
-        # Warm up CUDA kernels — first inference is significantly slower
+        # Warm up CUDA kernels - first inference is significantly slower
         # due to kernel compilation and memory allocation.
         try:
             _warmup = np.zeros(self.TARGET_RATE, dtype=np.float32)
@@ -353,7 +353,7 @@ class Transcriber:
         self.load_model()
 
     def load_diarizer(self, hf_token: str, device: str | None = None) -> None:
-        """Load diart diarization pipeline. Blocking — run in a thread."""
+        """Load diart diarization pipeline. Blocking - run in a thread."""
         from diarizer import DiartDiarizer
         self.diarizer = DiartDiarizer(hf_token, device=device)
 
@@ -432,7 +432,7 @@ class Transcriber:
                     chunk = raw_window[i : i + chunk_bytes]
                     if len(chunk) == chunk_bytes:
                         chunks.append(chunk)
-                    # Drop the last partial chunk — too short for Whisper anyway.
+                    # Drop the last partial chunk - too short for Whisper anyway.
 
                 start_t = offset / file_rate
                 end_t   = (offset + n_read) / file_rate
@@ -478,12 +478,12 @@ class Transcriber:
 
         # ── Diarized path ────────────────────────────────────────────────────
         if self.diarizer is not None and not skip_diarizer:
-            # diart processes the new audio incrementally — no rolling buffer needed.
+            # diart processes the new audio incrementally - no rolling buffer needed.
             try:
                 segments = self.diarizer.process(audio)
             except Exception:
-                # Diarizer failure must not kill transcription — fall through.
-                log.error("diarizer", "Error in process() — falling back to plain Whisper:")
+                # Diarizer failure must not kill transcription - fall through.
+                log.error("diarizer", "Error in process() - falling back to plain Whisper:")
                 traceback.print_exc()
                 segments = []
 
@@ -513,7 +513,7 @@ class Transcriber:
                         except Exception:
                             pass
                     if batches and batches[-1][0] == label:
-                        # Same speaker as previous — append audio to batch
+                        # Same speaker as previous - append audio to batch
                         batches[-1][1].append(seg_audio)
                         batches[-1] = (label, batches[-1][1],
                                        batches[-1][2], chunk_start + end)
@@ -525,7 +525,7 @@ class Transcriber:
                     merged_audio = np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
                     self._run_whisper(merged_audio, label, use_vad=False,
                                      start_time=abs_start, end_time=abs_end)
-            # Diarizer was active — don't also run plain Whisper on the same audio.
+            # Diarizer was active - don't also run plain Whisper on the same audio.
             return
 
         # ── Plain Whisper path (no diarizer) ────────────────────────────────
@@ -544,11 +544,11 @@ class Transcriber:
         if len(audio) < _MIN_WHISPER_SAMPLES:
             return
 
-        # Proactively clear context if it has itself become repetitive — this
+        # Proactively clear context if it has itself become repetitive - this
         # prevents a contaminated prompt from seeding the next call.
         prompt = self._context[-self.prompt_chars:]
         if prompt and _repetition_ratio(prompt) < _HALLUCINATION_THRESHOLD:
-            log.warn("transcriber", "Context contaminated by repetition — clearing")
+            log.warn("transcriber", "Context contaminated by repetition - clearing")
             self._context = ""
             prompt = ""
 
@@ -580,12 +580,12 @@ class Transcriber:
                 # Remove repeated sentences (e.g. "QUESTION. SO I THINK...")
                 text = _dedup_sentences(text)
                 if not text:
-                    log.warn("transcriber", f"[{label}] Sentence-loop detected — discarding")
+                    log.warn("transcriber", f"[{label}] Sentence-loop detected - discarding")
                     self._context = ""
                     return
                 # Discard and clear context if output is a hallucination loop.
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:
-                    log.warn("transcriber", f"[{label}] Hallucination loop detected — discarding")
+                    log.warn("transcriber", f"[{label}] Hallucination loop detected - discarding")
                     self._context = ""
                     return
                 self._context = (self._context + " " + text)[-self.prompt_chars * 2:]
@@ -594,7 +594,7 @@ class Transcriber:
                 self.on_text_callback(text, label, start_time, end_time)
         except RuntimeError as e:
             if "cublas" in str(e) or "cuda" in str(e).lower():
-                log.warn("whisper", f"CUDA runtime error — switching to CPU: {e}")
+                log.warn("whisper", f"CUDA runtime error - switching to CPU: {e}")
                 self._switch_to_cpu()
                 self._run_whisper(audio, label, use_vad,
                                  start_time=start_time, end_time=end_time)
@@ -680,7 +680,7 @@ class Transcriber:
                     _flush()
 
             except queue.Empty:
-                # Queue dried up (genuine audio gap) — flush whatever we have
+                # Queue dried up (genuine audio gap) - flush whatever we have
                 _flush()
 
         # Final flush

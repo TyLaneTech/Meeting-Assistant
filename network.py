@@ -1,5 +1,5 @@
 """
-Network utilities — Cloudflare WARP management and cache-first model loading.
+Network utilities - Cloudflare WARP management and cache-first model loading.
 
 Corporate WARP uses TLS inspection which breaks pip/uv downloads.
 Git operations require WARP connected for routing.  HuggingFace model

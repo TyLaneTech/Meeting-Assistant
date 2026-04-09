@@ -46,7 +46,7 @@ class AudioCapture:
         self._mic_thread: threading.Thread | None = None
         self._mixer_thread: threading.Thread | None = None
 
-        # Reported to Transcriber — always mono after mixing
+        # Reported to Transcriber - always mono after mixing
         self.sample_rate: int | None = None
         self.channels: int = 1
 
@@ -63,12 +63,12 @@ class AudioCapture:
         self._resample_up: int = 1
         self._resample_down: int = 1
 
-        # WAV writer — set via start_wav() before start()
+        # WAV writer - set via start_wav() before start()
         self.wav_writer: WavWriter | None = None
         self._wav_path: str | None = None
         self._wav_append: bool = False
 
-        # Live RMS levels — read by app.py to push to the visualizer
+        # Live RMS levels - read by app.py to push to the visualizer
         self.loopback_level: float = 0.0
         self.mic_level: float = 0.0
 
@@ -76,7 +76,7 @@ class AudioCapture:
         self.loopback_gain: float = 1.0
         self.mic_gain: float = 1.0
 
-        # Echo cancellation (disabled by default — enable for speaker+mic setups)
+        # Echo cancellation (disabled by default - enable for speaker+mic setups)
         self.echo_cancel_enabled: bool = False
 
         # Rolling sample buffers for the FFT spectrum visualizer (post-gain)
@@ -127,14 +127,14 @@ class AudioCapture:
             if default_name in lb["name"] or lb["name"].startswith(default_name):
                 return lb
 
-        # 2. Prefix match — Windows can truncate long device names differently
+        # 2. Prefix match - Windows can truncate long device names differently
         #    for the output vs its loopback counterpart
         prefix = default_name[:20]
         for lb in all_loopbacks:
             if prefix and prefix in lb["name"]:
                 return lb
 
-        # 3. Word-level match — e.g. "USB Audio" appears in both names
+        # 3. Word-level match - e.g. "USB Audio" appears in both names
         words = [w for w in default_name.split() if len(w) >= 4]
         for lb in all_loopbacks:
             if any(w in lb["name"] for w in words):
@@ -238,7 +238,7 @@ class AudioCapture:
 
         # --- Microphone stream (best-effort) ---
         if mic_index == -2:
-            # Browser mic — no WASAPI stream; audio arrives via inject_mic_data()
+            # Browser mic - no WASAPI stream; audio arrives via inject_mic_data()
             self._mic_rate     = 48000   # browser AudioContext default
             self._mic_channels = 1
             self._has_mic      = True
@@ -283,12 +283,12 @@ class AudioCapture:
                 self._mic_stream = None
                 self._has_mic = False
         elif mic_index != -2:
-            # Neither -2 (browser) nor a valid WASAPI mic — loopback only
+            # Neither -2 (browser) nor a valid WASAPI mic - loopback only
             self._has_mic = False
             if mic_index == -1:
-                log.info("audio", "Microphone explicitly disabled — capturing loopback only.")
+                log.info("audio", "Microphone explicitly disabled - capturing loopback only.")
             else:
-                log.info("audio", "No microphone device found — capturing loopback only.")
+                log.info("audio", "No microphone device found - capturing loopback only.")
 
         # Open WAV writer now that sample_rate is known
         if self._wav_path:
@@ -336,7 +336,7 @@ class AudioCapture:
         self._loopback_thread = None
         self._mic_thread = None
         self._mixer_thread = None
-        # Finalize WAV *after* the mixer thread has stopped — calling stop_wav()
+        # Finalize WAV *after* the mixer thread has stopped - calling stop_wav()
         # while the mixer is still running is a race condition that can corrupt
         # the file or crash on a write to a closed handle.
         self.stop_wav()
@@ -411,13 +411,13 @@ class AudioCapture:
                 # Read however many frames WASAPI has ready, clamped to a
                 # reasonable range.  This adapts to the device's actual
                 # delivery cadence instead of demanding a fixed count that
-                # may not align with the WASAPI shared-mode period — the
+                # may not align with the WASAPI shared-mode period - the
                 # main cause of choppy mic input on Windows.
                 avail = stream.get_read_available()
                 if avail >= chunk:
                     n = min(avail, chunk * 4)  # cap to avoid huge reads
                 else:
-                    # Not enough data yet — do a blocking read for one
+                    # Not enough data yet - do a blocking read for one
                     # buffer's worth.  The large frames_per_buffer we
                     # requested when opening the stream means this aligns
                     # with the device period and won't underrun.
@@ -444,7 +444,7 @@ class AudioCapture:
     def _mixer_loop(self) -> None:
         # Use list-based accumulation instead of np.concatenate on every drain.
         # np.concatenate allocates a new array every call and copies all existing
-        # data — O(n²) over many calls.  Lists just append pointers, and a single
+        # data - O(n²) over many calls.  Lists just append pointers, and a single
         # np.concatenate at emit time is bounded by a small number of chunks.
         lb_parts: list[np.ndarray] = []
         lb_len = 0
@@ -454,7 +454,7 @@ class AudioCapture:
         # downstream audio_queue backs up.
         max_buf_samples = int((self.sample_rate or 48000) * 3.0)
 
-        # WebRTC AEC state — lazily initialised when echo cancellation is enabled
+        # WebRTC AEC state - lazily initialised when echo cancellation is enabled
         _aec_processor = None
         _aec_frame_size = 0
         _aec_mic_buf = np.array([], dtype=np.float32)
@@ -584,16 +584,16 @@ class AudioCapture:
                                     mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
                                     _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
                                     mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
-                                # else: not enough cleaned audio yet — use the original mic_chunk
+                                # else: not enough cleaned audio yet - use the original mic_chunk
                         elif _aec_processor is not None:
-                            # Echo cancellation was just disabled — tear down
+                            # Echo cancellation was just disabled - tear down
                             _aec_processor = None
                             _aec_frame_size = 0
                             _aec_mic_buf = np.array([], dtype=np.float32)
                             _aec_lb_buf  = np.array([], dtype=np.float32)
                             _aec_out_buf = np.array([], dtype=np.float32)
 
-                        # Source gating — decides which stream to send to the transcriber
+                        # Source gating - decides which stream to send to the transcriber
                         if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
                             src = "loopback"
                             mixed = lb_chunk
@@ -610,7 +610,7 @@ class AudioCapture:
 
                     int16_bytes = (mixed * 32767).astype(np.int16).tobytes()
 
-                    # Write to WAV (before queue — never lose audio even if queue is full)
+                    # Write to WAV (before queue - never lose audio even if queue is full)
                     sample_offset = -1
                     if self.wav_writer is not None:
                         sample_offset = self.wav_writer.write(int16_bytes)
@@ -655,7 +655,7 @@ def default_device_name_matches(output_name: str, loopback_name: str) -> bool:
 def enumerate_audio_devices() -> dict:
     """
     Return lists of available loopback and microphone input devices.
-    Creates and destroys a temporary PyAudio instance — safe to call
+    Creates and destroys a temporary PyAudio instance - safe to call
     even while recording is active.
 
     Input devices are filtered to WASAPI only (same API used for capture)
@@ -680,7 +680,7 @@ def enumerate_audio_devices() -> dict:
         inputs = []
         for i in range(pa.get_device_count()):
             info = pa.get_device_info_by_index(i)
-            # WASAPI only — skip MME / DirectSound duplicates
+            # WASAPI only - skip MME / DirectSound duplicates
             if wasapi_idx is not None and info.get("hostApi") != wasapi_idx:
                 continue
             # Must have at least one input channel

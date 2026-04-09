@@ -90,7 +90,7 @@
       <div class="viz-device-row">
         <label class="viz-device-lbl viz-lbl-desktop">Desktop</label>
         <select id="viz-loopback-sel" class="viz-select" onchange="saveDeviceSelection()">
-          <option value="">— loading —</option>
+          <option value="">- loading -</option>
         </select>
         <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list"><i class="fa-solid fa-rotate-right"></i></button>
       </div>
@@ -420,7 +420,7 @@
           <textarea
             id="summary-custom-prompt"
             class="summary-prompt-input"
-            placeholder="Optional: describe the context to shape the summary — e.g. &quot;This is a podcast interview. Summarize the guest's key insights and talking points instead of action items.&quot;"
+            placeholder="Optional: describe the context to shape the summary - e.g. &quot;This is a podcast interview. Summarize the guest's key insights and talking points instead of action items.&quot;"
             rows="3"
             oninput="saveSummaryPrompt()"
           ></textarea>

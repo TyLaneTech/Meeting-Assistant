@@ -350,7 +350,7 @@ SCREEN_RECORDING_DEFAULTS = {
         "tooltip": (
             "How many frames per second to capture from the display. Screen "
             "content is mostly static, so low framerates work well.<br><br>"
-            "<b>5–10 fps</b> is ideal for presentations and documents — minimal "
+            "<b>5–10 fps</b> is ideal for presentations and documents - minimal "
             "CPU usage and small files.<br>"
             "<b>15–24 fps</b> is smooth enough for video playback and demos.<br>"
             "<b>30 fps</b> produces very smooth video but significantly larger files."
@@ -363,15 +363,15 @@ SCREEN_RECORDING_DEFAULTS = {
     "screen_crf": {
         "value": 32,
         "label": "Quality (CRF)",
-        "description": "Constant Rate Factor — lower is better quality.",
+        "description": "Constant Rate Factor - lower is better quality.",
         "tooltip": (
             "Controls the quality-vs-size tradeoff for H.264 encoding. CRF "
-            "uses a perceptual quality model — the encoder adjusts bitrate "
+            "uses a perceptual quality model - the encoder adjusts bitrate "
             "automatically to maintain constant visual quality.<br><br>"
-            "<b>18–22</b>: Visually lossless — excellent quality, large files.<br>"
-            "<b>23–28</b>: Good quality — text is sharp, moderate file size.<br>"
-            "<b>29–35</b>: Acceptable quality — some softness, small files.<br>"
-            "<b>36+</b>: Low quality — blurry details, very small files.<br><br>"
+            "<b>18–22</b>: Visually lossless - excellent quality, large files.<br>"
+            "<b>23–28</b>: Good quality - text is sharp, moderate file size.<br>"
+            "<b>29–35</b>: Acceptable quality - some softness, small files.<br>"
+            "<b>36+</b>: Low quality - blurry details, very small files.<br><br>"
             "Each +6 roughly halves the file size."
         ),
         "min": 0,
@@ -382,15 +382,15 @@ SCREEN_RECORDING_DEFAULTS = {
     "screen_h264_preset": {
         "value": 2,
         "label": "Encoder Speed",
-        "description": "H.264 preset — faster encoding uses more disk, less CPU.",
+        "description": "H.264 preset - faster encoding uses more disk, less CPU.",
         "tooltip": (
             "The H.264 preset controls the trade-off between encoding speed "
             "and compression efficiency. All presets produce the same visual "
-            "quality at a given CRF — faster presets just use more bits.<br><br>"
+            "quality at a given CRF - faster presets just use more bits.<br><br>"
             "<b>0 (ultrafast)</b>: Minimal CPU, ~2× file size vs medium.<br>"
             "<b>2 (veryfast)</b>: Low CPU, good compression. Recommended.<br>"
             "<b>4 (fast)</b>: Moderate CPU, efficient compression.<br>"
-            "<b>5 (medium)</b>: FFmpeg default — balanced but heavier.<br>"
+            "<b>5 (medium)</b>: FFmpeg default - balanced but heavier.<br>"
             "<b>7+ (slow–veryslow)</b>: Maximum compression, high CPU."
         ),
         "min": 0,
@@ -408,8 +408,8 @@ SCREEN_RECORDING_DEFAULTS = {
             "automatically to maintain aspect ratio). Useful on high-DPI "
             "displays to reduce file size.<br><br>"
             "<b>0</b>: Native resolution (no scaling).<br>"
-            "<b>1920</b>: Full HD — good for 4K displays.<br>"
-            "<b>1280</b>: 720p — small files, still readable text.<br><br>"
+            "<b>1920</b>: Full HD - good for 4K displays.<br>"
+            "<b>1280</b>: 720p - small files, still readable text.<br><br>"
             "Values below 960 may make small text difficult to read."
         ),
         "min": 0,
@@ -424,7 +424,7 @@ SCREEN_RECORDING_DEFAULTS = {
 TRANSCRIPTION_PRESETS = {
     "responsive": {
         "label": "Responsive",
-        "description": "Fast updates, shorter segments — ideal for live captioning",
+        "description": "Fast updates, shorter segments - ideal for live captioning",
         "values": {
             "silence_threshold": 0.03,
             "silence_duration": 0.2,
@@ -439,7 +439,7 @@ TRANSCRIPTION_PRESETS = {
     },
     "balanced": {
         "label": "Balanced (Default)",
-        "description": "Good accuracy with reasonable latency — recommended for most meetings",
+        "description": "Good accuracy with reasonable latency - recommended for most meetings",
         "values": {
             "silence_threshold": 0.025,
             "silence_duration": 0.3,
@@ -454,7 +454,7 @@ TRANSCRIPTION_PRESETS = {
     },
     "accurate": {
         "label": "Accurate",
-        "description": "Higher accuracy with longer context — more latency, better results",
+        "description": "Higher accuracy with longer context - more latency, better results",
         "values": {
             "silence_threshold": 0.02,
             "silence_duration": 0.5,
@@ -469,7 +469,7 @@ TRANSCRIPTION_PRESETS = {
     },
     "quality": {
         "label": "Quality",
-        "description": "Maximum accuracy — significant latency, best for post-processing",
+        "description": "Maximum accuracy - significant latency, best for post-processing",
         "values": {
             "silence_threshold": 0.015,
             "silence_duration": 0.7,
@@ -673,7 +673,7 @@ def get_reanalysis_defaults() -> dict:
 DIARIZATION_PRESETS = {
     "responsive": {
         "label": "Responsive",
-        "description": "Fast speaker detection — may over-segment in noisy environments",
+        "description": "Fast speaker detection - may over-segment in noisy environments",
         "values": {
             "step_seconds": 0.15,
             "duration_seconds": 4.0,
@@ -685,7 +685,7 @@ DIARIZATION_PRESETS = {
     },
     "balanced": {
         "label": "Balanced (Default)",
-        "description": "Good speaker tracking for typical meetings — recommended",
+        "description": "Good speaker tracking for typical meetings - recommended",
         "values": {
             "step_seconds": 0.25,
             "duration_seconds": 5.0,
@@ -697,7 +697,7 @@ DIARIZATION_PRESETS = {
     },
     "conservative": {
         "label": "Conservative",
-        "description": "Fewer false speaker changes — better for small groups",
+        "description": "Fewer false speaker changes - better for small groups",
         "values": {
             "step_seconds": 0.35,
             "duration_seconds": 5.0,
@@ -709,7 +709,7 @@ DIARIZATION_PRESETS = {
     },
     "large_meeting": {
         "label": "Large Meeting",
-        "description": "Tuned for 5+ speakers — sensitive detection, stable centroids",
+        "description": "Tuned for 5+ speakers - sensitive detection, stable centroids",
         "values": {
             "step_seconds": 0.2,
             "duration_seconds": 5.0,

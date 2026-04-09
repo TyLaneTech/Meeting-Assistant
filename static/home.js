@@ -1,4 +1,4 @@
-/* ── Home Page — Global Chat & Dashboard ──────────────────────────────────── */
+/* ── Home Page - Global Chat & Dashboard ──────────────────────────────────── */
 
 marked.use({ breaks: true, gfm: true });
 
@@ -218,7 +218,7 @@ function _renderToolWidget(msgWrap, toolCalls) {
     <div class="chat-tool-details">${itemsHtml}</div>`;
 
   // Auto-expand while tools are in progress, preserve manual toggle otherwise.
-  // Keep 'streaming' even after all tools complete — it's only removed on
+  // Keep 'streaming' even after all tools complete - it's only removed on
   // first chat_chunk so the collapse fires at the right time.
   if (!allDone) {
     widget.classList.add('open', 'streaming');
@@ -378,7 +378,7 @@ function _onGlobalChatTitle(data) {
 /* ── SSE Setup ────────────────────────────────────────────────────────────── */
 
 function _initSSE() {
-  // Reuse app.js's SSE connection — never open a second one.
+  // Reuse app.js's SSE connection - never open a second one.
   const src = _sseSource || _sse;
   if (!src) return;  // should not happen; app.js always runs first
   _sse = src;

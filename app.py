@@ -1,5 +1,5 @@
 """
-Meeting Assistant — Flask web server.
+Meeting Assistant - Flask web server.
 Run: python app.py
 Opens http://127.0.0.1:5000 automatically.
 """
@@ -60,7 +60,7 @@ app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0   # disable static file caching
 app.config["TEMPLATES_AUTO_RELOAD"]     = True  # re-read templates on every request
 
-# Fingerprint DB stub — __init__ is called in _load_fingerprint_db() after
+# Fingerprint DB stub - __init__ is called in _load_fingerprint_db() after
 # all module-level globals (_state, _on_fingerprint_audio) are defined.
 fingerprint_db = SpeakerFingerprintDB.__new__(SpeakerFingerprintDB)
 fingerprint_db._db_path   = storage.DB_PATH
@@ -94,11 +94,11 @@ del _saved_prefs
 _client_queues: dict[str, queue.Queue] = {}
 _cq_lock = threading.Lock()
 
-# Mutable session state — always access under _state_lock
+# Mutable session state - always access under _state_lock
 _state: dict = {
     "session_id": None,
     "is_recording": False,
-    "segments": [],          # list[{text, source}] — in-memory copy for current session
+    "segments": [],          # list[{text, source}] - in-memory copy for current session
     "summary": "",
     "chat_history": [],      # list[{role, content}]
     "pending_segments": 0,       # segments since last auto-summary
@@ -327,7 +327,7 @@ _FILLER_WORDS = frozenset({
 # Patterns that are noise when they appear as the entire text
 _NOISE_PATTERNS = [
     re.compile(r"^(ha|he|heh|hah|ho)+[.!?…]*$", re.I),           # laughter
-    re.compile(r"^[.…!?\-–—\s]+$"),                                # pure punctuation
+    re.compile(r"^[.…!?\-–-\s]+$"),                                # pure punctuation
     re.compile(r"^(um|uh|ah|oh|hm|mm|mhm|mmhmm)[\s,.…!?]*$", re.I),  # pure filler sounds
 ]
 
@@ -395,7 +395,7 @@ def _on_segment(
 
         # Auto-detect noise/filler segments from diarized speakers.
         # Only label as noise if this speaker hasn't produced any real
-        # (non-noise) segments yet — once confirmed, keep the speaker label.
+        # (non-noise) segments yet - once confirmed, keep the speaker label.
         original_source = None
         duration = end_time - start_time if end_time > start_time else 0.0
         confirmed = _state.get("_confirmed_speakers", set())
@@ -546,7 +546,7 @@ def _run_summary(
             if clears_pending and is_active:
                 _state["summary_manual_pending"] = False
             elif is_auto:
-                # Bail if a manual is queued — it will run as soon as we finish
+                # Bail if a manual is queued - it will run as soon as we finish
                 if _state["summary_manual_pending"]:
                     return
                 # Re-read in case a prior run updated the summary while we waited
@@ -569,7 +569,7 @@ def _run_summary(
                 storage.save_summary(session_id, content)
 
             if existing_summary:
-                # ── Incremental patch — check for preemption before the AI call ─
+                # ── Incremental patch - check for preemption before the AI call ─
                 with _state_lock:
                     if is_auto and _state.get("summary_manual_pending"):
                         return
@@ -587,7 +587,7 @@ def _run_summary(
                 _persist(content)
                 _push("summary_replace", {"content": content, "session_id": session_id})
             else:
-                # ── First summary — stream it so the user sees it appear ──────
+                # ── First summary - stream it so the user sees it appear ──────
                 _push("summary_start", {"session_id": session_id})
                 chunks: list[str] = []
 
@@ -695,7 +695,7 @@ def _load_model() -> None:
 def _load_diarizer() -> None:
     hf_token = os.getenv("HUGGING_FACE_KEY")
     if not hf_token:
-        log.warn("diarizer", "HUGGING_FACE_KEY not set — speaker diarization disabled.")
+        log.warn("diarizer", "HUGGING_FACE_KEY not set - speaker diarization disabled.")
         return
     try:
         saved_device = settings.get("diarizer_device", "")
@@ -923,7 +923,7 @@ def session_view():
 
 @app.route("/api/events")
 def events():
-    """SSE endpoint — streams all real-time events to the browser."""
+    """SSE endpoint - streams all real-time events to the browser."""
     cid = str(uuid.uuid4())
     q: queue.Queue = queue.Queue(maxsize=200)
     with _cq_lock:
@@ -951,7 +951,7 @@ def events():
                 }
                 q.put(f"event: replay\ndata: {json.dumps(replay_payload)}\n\n")
         except Exception:
-            pass  # non-fatal — client will simply have a partial transcript
+            pass  # non-fatal - client will simply have a partial transcript
 
     def generate():
         try:
@@ -1103,7 +1103,7 @@ def start_audio_test():
     loopback_device = body.get("loopback_device")
     mic_device      = body.get("mic_device")
 
-    # A dummy queue — the mixer writes into it but nothing reads it.
+    # A dummy queue - the mixer writes into it but nothing reads it.
     # We only care about the live loopback_level / mic_level attributes.
     test_queue: queue.Queue = queue.Queue(maxsize=100)
     capture = AudioCapture(test_queue)
@@ -1216,7 +1216,7 @@ def start_recording():
     _ec_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
 
-    # Set up WAV recording — append to existing file on resume
+    # Set up WAV recording - append to existing file on resume
     wav_dir = Path(__file__).parent / "data" / "audio"
     wav_path = str(wav_dir / f"{session_id}.wav")
     capture.start_wav(wav_path, append=bool(resume_session_id))
@@ -1289,7 +1289,7 @@ def start_recording():
             log.warn("screen", f"Could not start screen recording: {e}")
 
     verb = "Resumed" if resume_session_id else "Started"
-    log.info("recording", f"{verb} — session {session_id}")
+    log.info("recording", f"{verb} - session {session_id}")
     _push_status({
         "recording": True,
         "session_id": session_id,
@@ -1306,14 +1306,14 @@ def stop_recording():
             return jsonify({"error": "Not recording"}), 400
         sid = _state["session_id"]
         capture: AudioCapture = _state["audio_capture"]
-        # Snapshot transcript now — state may change before cleanup thread runs
+        # Snapshot transcript now - state may change before cleanup thread runs
         # plain_snapshot is used for title generation (no source labels needed)
         plain_snapshot = " ".join(s["text"] for s in _state["segments"])
         transcript_snapshot = _build_transcript(_state["segments"], _state["speaker_labels"])
         _state["is_recording"] = False
         _state["audio_capture"] = None
 
-    # Return immediately — cleanup blocks for up to 12 s (thread join) so we
+    # Return immediately - cleanup blocks for up to 12 s (thread join) so we
     # must not do it on the Flask request handler thread or the server hangs.
     def _cleanup() -> None:
         if capture:
@@ -1325,7 +1325,7 @@ def stop_recording():
         if sid:
             storage.end_session(sid)
             seg_count = len(_state.get("segments", []))
-            log.info("recording", f"Stopped — session {sid} ({seg_count} segments)")
+            log.info("recording", f"Stopped - session {sid} ({seg_count} segments)")
         _push_status({"recording": False, "session_id": sid})
         # Auto-title: use full formatted transcript (with speaker labels) for better context
         if sid and (transcript_snapshot or plain_snapshot).strip():
@@ -1512,9 +1512,9 @@ def settings_status():
 # Available models per provider (ordered: most capable first)
 _AI_MODELS = {
     "anthropic": [
-        {"id": "claude-opus-4-6",           "label": "Claude Opus 4.6 — most capable"},
-        {"id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4.6 — recommended"},
-        {"id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4.5 — fastest"},
+        {"id": "claude-opus-4-6",           "label": "Claude Opus 4.6"},
+        {"id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4.6"},
+        {"id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4.5"},
     ],
     "openai": [
         {"id": "gpt-5.4",              "label": "GPT-5.4"},
@@ -2123,7 +2123,7 @@ def set_diarizer_model():
 
     with _state_lock:
         _state["diarizer_ready"] = False
-        _state["diarizer_failed"] = False   # reset — we're retrying
+        _state["diarizer_failed"] = False   # reset - we're retrying
     _push_status()
 
     def _reload():
@@ -2344,7 +2344,7 @@ def chat():
                         _state["chat_history"].append({"role": "assistant", "content": full})
             _push("chat_done", {"request_id": request_id})
 
-        # Build frame extractor — works for both live and completed recordings.
+        # Build frame extractor - works for both live and completed recordings.
         # During live recording: seek into the fragmented MP4 being written,
         # falling back to a live screen capture if seeking fails.
         # After recording: seek into the finalized MP4.
@@ -2377,7 +2377,7 @@ def chat_stop():
     if rid and rid in _chat_cancel:
         _chat_cancel[rid].set()
         return jsonify({"ok": True})
-    # No specific request_id — cancel all active chat streams
+    # No specific request_id - cancel all active chat streams
     for ev in _chat_cancel.values():
         ev.set()
     return jsonify({"ok": True})
@@ -2457,7 +2457,7 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         limit = tool_input.get("limit", 10)
         results = storage.search_sessions(query, limit=limit)
         if not results:
-            return "No matching sessions found.", False, f"Search: '{query}' — no results", None
+            return "No matching sessions found.", False, f"Search: '{query}' - no results", None
         # Enrich results with folder names and summaries
         folders = {f["id"]: f["name"] for f in storage.list_folders()}
         for r in results:
@@ -2469,7 +2469,7 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
                 if summary:
                     r["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
         text = json.dumps(results, indent=2)
-        return text, False, f"Search: '{query}' — {len(results)} results", None
+        return text, False, f"Search: '{query}' - {len(results)} results", None
 
     if name == "semantic_search":
         query = tool_input.get("query", "")
@@ -2493,7 +2493,7 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
         if not results:
-            return "No semantically similar sessions found.", False, f"Semantic: '{query}' — no results", None
+            return "No semantically similar sessions found.", False, f"Semantic: '{query}' - no results", None
         # Enrich with folder names and summaries
         folders = {f["id"]: f["name"] for f in storage.list_folders()}
         for r in results:
@@ -2505,7 +2505,7 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
                 if summary:
                     r["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
         text = json.dumps(results, indent=2)
-        return text, False, f"Semantic: '{query}' — {len(results)} results", None
+        return text, False, f"Semantic: '{query}' - {len(results)} results", None
 
     if name == "get_session_detail":
         session_id = tool_input.get("session_id", "")
@@ -2516,7 +2516,7 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         transcript = _build_transcript(sess["segments"], labels)
         # Truncate very long transcripts
         if len(transcript) > 200000:
-            transcript = transcript[:200000] + "\n\n... [transcript truncated — too long to show in full]"
+            transcript = transcript[:200000] + "\n\n... [transcript truncated - too long to show in full]"
         summary = sess.get("summary", "")
         result = f"Session: {sess.get('title', 'Untitled')}\n"
         result += f"Started: {sess.get('started_at', 'unknown')}\n"
@@ -3384,7 +3384,7 @@ def fp_suggestions():
 
 @app.route("/api/fingerprint/dismiss", methods=["POST"])
 def fp_dismiss():
-    """User dismissed a fingerprint match — suppress it for this session."""
+    """User dismissed a fingerprint match - suppress it for this session."""
     data = request.get_json(silent=True) or {}
     session_id  = (data.get("session_id") or "").strip()
     speaker_key = (data.get("speaker_key") or "").strip()
@@ -3593,7 +3593,7 @@ def update_check():
         count = int(count_r.stdout.strip() or "0")
         return jsonify({"up_to_date": count == 0, "commits_behind": count})
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out — check your connection"}), 504
+        return jsonify({"error": "Timed out - check your connection"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3675,7 +3675,7 @@ def main() -> None:
     _active_provider = settings.get("ai_provider", "openai")
 
     if config.needs_setup(_active_provider):
-        log.warn("app", "First-run setup required — browser will open to configure API keys.")
+        log.warn("app", "First-run setup required - browser will open to configure API keys.")
     log.info("app", f"Meeting Assistant starting at {url}")
 
     # Start Flask in a daemon thread so the main thread is free for the tray
@@ -3708,14 +3708,14 @@ def main() -> None:
             _force_quit()
 
         _tray = MeetingTray(url, _state_snapshot, _on_tray_quit)
-        log.info("tray", "System tray active — right-click for menu.")
+        log.info("tray", "System tray active - right-click for menu.")
         # Run tray in a daemon thread so the main thread stays in Python code
         # where it can receive signals (Ctrl+C).  pystray's Win32 message loop
         # blocks in native C, which prevents Python signal handlers from firing.
         threading.Thread(target=_tray.run, daemon=True).start()
 
     except ImportError:
-        log.warn("tray", "pystray/Pillow not installed — running without system tray.")
+        log.warn("tray", "pystray/Pillow not installed - running without system tray.")
         log.warn("tray", "Install with: pip install pystray Pillow")
 
     # Wait for Flask to bind
@@ -3731,7 +3731,7 @@ def main() -> None:
     # requests so the UI can render immediately and show startup progress.
     _start_background_initializers()
 
-    # Open browser — go to settings page if keys are missing
+    # Open browser - go to settings page if keys are missing
     if config.needs_setup(_active_provider):
         webbrowser.open(f"{url}?settings=1")
     #else: webbrowser.open(url)

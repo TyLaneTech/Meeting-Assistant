@@ -121,7 +121,7 @@ html, body {height: 100%;background: var(--bg);color: var(--fg);font-family: var
   gap: 0px;
 }
 
-/* Title + tool buttons row — wraps when narrow */
+/* Title + tool buttons row - wraps when narrow */
 .sidebar-header-row {
   display: flex;
   align-items: center;
@@ -556,7 +556,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   background: var(--bg);
 }
 
-/* Gain output meter — two stacked tracks (desktop top, mic bottom) */
+/* Gain output meter - two stacked tracks (desktop top, mic bottom) */
 .viz-level-meter {
   display: flex;
   flex-direction: column;
@@ -890,7 +890,7 @@ button#sidebar-close-btn {
 /* ── Workspace ─────────────────────────────────────────────────────────────── */
 .workspace {
   display: grid;
-  /* cols + handles — JS overrides with pixel values once layout is known */
+  /* cols + handles - JS overrides with pixel values once layout is known */
   grid-template-columns: 1fr 4px 1.1fr 4px 1.1fr;
   flex: 1;
   overflow: hidden;
@@ -1193,7 +1193,7 @@ button#sidebar-close-btn {
   height: 100%;
 }
 
-/* Viewport indicator — frosted glass slab */
+/* Viewport indicator - frosted glass slab */
 .minimap-viewport {
   position: absolute;
   left: -2px;
@@ -2560,7 +2560,7 @@ button#sidebar-close-btn {
   gap: 14px; padding: 13px 16px; min-height: 56px;
 }
 .settings-row:not(:last-child) { border-bottom: 1px solid var(--border); }
-.settings-row-info { flex: 1; min-width: 0; }
+.settings-row-info { flex: 1; min-width: 0; text-align: -webkit-left;}
 .settings-row-label { font-size: 13px; font-weight: 600; color: var(--fg); }
 .settings-row-desc { font-size: 11px; color: var(--fg-muted); margin-top: 2px; line-height: 1.35; }
 
@@ -2585,7 +2585,7 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
 .key-vis-btn { font-size: 14px; color: var(--fg-subtle); }
 .key-vis-btn:hover { color: var(--fg); }
 .key-status { font-size: 11px; height: 16px; }
-.key-status.key-set     { color: var(--green); }
+.key-status.key-set     {display: none;color: var(--green);}
 .key-status.key-missing { color: var(--red); }
 .key-status.key-optional { color: var(--fg-subtle); }
 
@@ -4580,7 +4580,7 @@ button.icon-btn.fingerprint-btn {
   overflow: hidden;
 }
 
-/* (home-specific sidebar styles removed — now uses shared .sidebar from session page) */
+/* (home-specific sidebar styles removed - now uses shared .sidebar from session page) */
 
 /* ── Top Bar ──────────────────────────────────────────────────────────────── */
 
@@ -4602,7 +4602,7 @@ button.icon-btn.fingerprint-btn {
   gap: 10px;
 }
 
-/* .home-logo and .home-brand removed — uses shared .brand-icon / .brand-name */
+/* .home-logo and .home-brand removed - uses shared .brand-icon / .brand-name */
 
 .home-nav {
   display: flex;

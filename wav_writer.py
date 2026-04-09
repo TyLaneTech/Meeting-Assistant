@@ -50,7 +50,7 @@ class WavWriter:
 
             if existing_channels != 1:
                 log.warn("audio", f"WAV file has {existing_channels} channels, "
-                                  f"expected mono — file may be corrupted on append")
+                                  f"expected mono - file may be corrupted on append")
 
             # If the existing file has a different sample rate, resample
             # incoming audio to match so playback speed stays correct.
@@ -61,7 +61,7 @@ class WavWriter:
                 self._resample_down = sample_rate // g
                 log.warn("audio",
                          f"WAV sample rate mismatch: file={existing_rate} Hz, "
-                         f"capture={sample_rate} Hz — resampling to {existing_rate} Hz")
+                         f"capture={sample_rate} Hz - resampling to {existing_rate} Hz")
 
             # Convert existing WAV samples to equivalent input-rate samples
             # so offset tracking is continuous across recordings.
@@ -72,7 +72,7 @@ class WavWriter:
             else:
                 self._input_samples_written = self._total_samples
 
-            # Open for raw binary append — write PCM after existing data
+            # Open for raw binary append - write PCM after existing data
             self._raw = open(path, "r+b")
             self._raw.seek(0, 2)  # seek to end
         else:

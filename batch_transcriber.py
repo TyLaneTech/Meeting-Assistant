@@ -85,7 +85,7 @@ class BatchTranscriber:
         else:
             device = device_pref
         if device == "cuda" and not torch.cuda.is_available():
-            log.warn("batch", "CUDA requested but not available — falling back to CPU")
+            log.warn("batch", "CUDA requested but not available - falling back to CPU")
             device = "cpu"
         torch_device = torch.device(device)
 
@@ -104,12 +104,12 @@ class BatchTranscriber:
         self._report_progress(0.40)
 
         if not segments:
-            # No diarization results — transcribe the whole file as one segment
-            log.warn("batch", "No diarization segments — transcribing full file")
+            # No diarization results - transcribe the whole file as one segment
+            log.warn("batch", "No diarization segments - transcribing full file")
             segments = [("Speaker 1", 0.0, total_duration)]
 
         # ── Fire fingerprint callbacks ────────────────────────────────────────
-        # Pass ALL segments to the callback (even short ones) — the accumulator
+        # Pass ALL segments to the callback (even short ones) - the accumulator
         # in _on_fingerprint_audio handles the minimum duration threshold.
         if self.fingerprint_callback:
             for speaker, start, end in segments:
@@ -143,7 +143,7 @@ class BatchTranscriber:
         try:
             from pyannote.audio import Pipeline as PyannotePipeline
         except ImportError:
-            log.error("batch", "pyannote.audio not installed — skipping diarization")
+            log.error("batch", "pyannote.audio not installed - skipping diarization")
             return []
 
         log.info("batch", "Loading diarization pipeline...")
@@ -237,7 +237,7 @@ class BatchTranscriber:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Re-enable TF32 — pyannote disables it for reproducibility but
+        # Re-enable TF32 - pyannote disables it for reproducibility but
         # it significantly speeds up Whisper inference on RTX GPUs.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -301,7 +301,7 @@ class BatchTranscriber:
             seg_duration = len(seg_audio) / TARGET_RATE
             if seg_duration > 60:
                 log.warn("batch", f"Long segment: {speaker} {start:.1f}s-{end:.1f}s "
-                         f"({seg_duration:.1f}s) — will be internally chunked")
+                         f"({seg_duration:.1f}s) - will be internally chunked")
             chunks.append({"raw": seg_audio, "sampling_rate": TARGET_RATE})
             chunk_meta.append((speaker, start, end))
 

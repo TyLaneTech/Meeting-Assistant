@@ -16,7 +16,7 @@ import torch
 import torchaudio
 
 # torchaudio 2.x removed several symbols that older pyannote.audio references
-# at import time.  Shim them before pyannote is imported — we never use
+# at import time.  Shim them before pyannote is imported - we never use
 # torchaudio for file I/O so these stubs are never actually called.
 if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
@@ -71,7 +71,7 @@ try:
 except Exception:
     pass
 
-# Suppress the long torchcodec warning — irrelevant since we always pass
+# Suppress the long torchcodec warning - irrelevant since we always pass
 # pre-loaded waveform tensors, never file paths.
 warnings.filterwarnings(
     "ignore",
@@ -83,7 +83,7 @@ with warnings.catch_warnings():
     from pyannote.audio import Pipeline
 
 # Patch the hf_hub_download reference that pyannote.audio already bound at
-# import time — the global shim above only covers future callers.
+# import time - the global shim above only covers future callers.
 try:
     import pyannote.audio.core.model as _pa_model
     if hasattr(_pa_model, "hf_hub_download"):
@@ -121,12 +121,12 @@ warnings.filterwarnings(
 # Newer speechbrain versions (>=1.1) use LazyModule for optional integrations
 # (k2_fsa, huggingface, Kaldi, etc.).  If the optional dependency isn't
 # installed the lazy import raises an opaque ImportError that kills the entire
-# diarizer init — often triggered indirectly by inspect.stack() inside
+# diarizer init - often triggered indirectly by inspect.stack() inside
 # pytorch_lightning.
 #
 # Strategy: install a custom meta-path finder that intercepts ANY import under
 # "speechbrain.integrations" (and the legacy "speechbrain.k2_integration") and
-# returns an empty stub module.  This is future-proof — new sub-packages added
+# returns an empty stub module.  This is future-proof - new sub-packages added
 # by SpeechBrain updates won't require manual additions here.
 import sys as _sys
 import types as _types
@@ -224,7 +224,7 @@ class DiartDiarizer:
             from diart.models import SegmentationModel, EmbeddingModel
         except Exception as e:
             raise RuntimeError(
-                f"Failed to import diart — check that diart, pyannote.audio, and "
+                f"Failed to import diart - check that diart, pyannote.audio, and "
                 f"speechbrain are installed and compatible: {e}"
             ) from e
 
@@ -247,7 +247,7 @@ class DiartDiarizer:
                         _stub.__package__ = _key
                         _sys.modules[_key] = _stub
         except ImportError:
-            pass  # speechbrain too old to have LazyModule — nothing to fix
+            pass  # speechbrain too old to have LazyModule - nothing to fix
 
         # Load saved audio params
         from default_audio_params import DIARIZATION_DEFAULTS
@@ -348,7 +348,7 @@ class DiartDiarizer:
             chunk = self._buf[:duration_samples]
 
             # Create SlidingWindowFeature with correct absolute timestamps.
-            # data shape: (samples, 1) — mono, channel-last as diart expects.
+            # data shape: (samples, 1) - mono, channel-last as diart expects.
             sw = SlidingWindow(
                 start=self._buf_start_sec,
                 duration=1.0 / self.SAMPLE_RATE,

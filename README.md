@@ -1,6 +1,6 @@
 # Meeting Assistant
 
-> Real-time meeting transcription, speaker identification, and AI-powered analysis — running entirely on your machine. No audio leaves your computer.
+> Real-time meeting transcription, speaker identification, and AI-powered analysis - running entirely on your machine. No audio leaves your computer.
 
 ---
 
@@ -19,7 +19,7 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 | **Live Transcription** | Real-time speech-to-text via faster-whisper with configurable model sizes |
 | **Speaker Diarization** | Neural speaker identification using pyannote/diart streaming pipeline |
 | **AI Summaries** | Auto-updating summaries that adapt structure to meeting content |
-| **Chat Interface** | Ask questions about the meeting during or after — with timestamp references |
+| **Chat Interface** | Ask questions about the meeting during or after - with timestamp references |
 | **Session Management** | Organized session history with folders, search, and full audio playback |
 | **Voice Library** | Cross-session speaker fingerprinting that learns and improves over time |
 | **Analytics Dashboard** | Real-time speaking time distribution, segment counts, and timeline visualization |
@@ -27,11 +27,11 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 
 ### Transcript Tools
 
-- **Transcript Navigator** — search with match navigation, speaker filtering pills, dual-handle time range slider
-- **Speaker Manager** — rename, recolor, merge speakers with multi-select and bulk operations
-- **Noise Detection** — automatic identification and filtering of filler words, laughter, and crosstalk fragments
-- **Playback Sync** — audio playback tracks the transcript with filtered speaker skipping
-- **Timestamp Linking** — click any `[M:SS]` reference in summaries to jump to that moment
+- **Transcript Navigator** - search with match navigation, speaker filtering pills, dual-handle time range slider
+- **Speaker Manager** - rename, recolor, merge speakers with multi-select and bulk operations
+- **Noise Detection** - automatic identification and filtering of filler words, laughter, and crosstalk fragments
+- **Playback Sync** - audio playback tracks the transcript with filtered speaker skipping
+- **Timestamp Linking** - click any `[M:SS]` reference in summaries to jump to that moment
 
 ---
 
@@ -40,10 +40,10 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 | Requirement | Details |
 |---|---|
 | **Operating System** | Windows 10 or 11 (WASAPI loopback capture is Windows-only) |
-| **Python** | 3.10 or higher — [python.org/downloads](https://www.python.org/downloads/) (check "Add to PATH") |
-| **AI API Key** | [Anthropic](https://console.anthropic.com/settings/keys) or [OpenAI](https://platform.openai.com/api-keys) — for summaries and chat |
-| **HuggingFace Token** | *(Optional)* — enables speaker diarization ([get one here](https://huggingface.co/settings/tokens)) |
-| **NVIDIA GPU** | *(Optional)* — CUDA acceleration for transcription and diarization; falls back to CPU |
+| **Python** | 3.10 or higher - [python.org/downloads](https://www.python.org/downloads/) (check "Add to PATH") |
+| **AI API Key** | [Anthropic](https://console.anthropic.com/settings/keys) or [OpenAI](https://platform.openai.com/api-keys) - for summaries and chat |
+| **HuggingFace Token** | *(Optional)* - enables speaker diarization ([get one here](https://huggingface.co/settings/tokens)) |
+| **NVIDIA GPU** | *(Optional)* - CUDA acceleration for transcription and diarization; falls back to CPU |
 
 ---
 
@@ -56,7 +56,7 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 4. Hit Record
 ```
 
-`launch.bat` handles everything on first run — virtual environment creation, GPU detection, PyTorch installation, pip dependencies, model downloads, and browser launch. Subsequent starts are fast.
+`launch.bat` handles everything on first run - virtual environment creation, GPU detection, PyTorch installation, pip dependencies, model downloads, and browser launch. Subsequent starts are fast.
 
 ### Updating
 
@@ -109,10 +109,10 @@ Audio Input (WASAPI)
 
 ### Audio Capture
 
-- **Library:** `pyaudiowpatch` — PyAudio fork with Windows WASAPI loopback support
+- **Library:** `pyaudiowpatch` - PyAudio fork with Windows WASAPI loopback support
 - **Loopback:** Captures system audio output (what you hear)
 - **Microphone:** WASAPI input device or browser `getUserMedia` injection
-- **Source-gated mixing:** Prevents echo duplication by analyzing RMS levels — when one source dominates, the other is suppressed
+- **Source-gated mixing:** Prevents echo duplication by analyzing RMS levels - when one source dominates, the other is suppressed
 - **Sample rate:** Device native (typically 48 kHz), resampled to 16 kHz for Whisper via `scipy.signal.resample_poly`
 - **Recording format:** WAV, 16-bit signed integer, mono
 
@@ -122,12 +122,12 @@ Audio Input (WASAPI)
 
 | Preset | Model | Compute | Quantization | Quality |
 |---|---|---|---|---|
-| GPU — Large | `large-v3` | CUDA | float16 | Highest accuracy |
-| GPU — Medium | `medium` | CUDA | float16 | Good balance |
-| GPU — Small | `small` | CUDA | float16 | Fast, decent |
-| CPU — Medium | `medium` | CPU | int8 | Moderate speed |
-| CPU — Small | `small` | CPU | int8 | Fastest on CPU |
-| CPU — Tiny | `tiny` | CPU | int8 | Fastest, lower accuracy |
+| GPU - Large | `large-v3` | CUDA | float16 | Highest accuracy |
+| GPU - Medium | `medium` | CUDA | float16 | Good balance |
+| GPU - Small | `small` | CUDA | float16 | Fast, decent |
+| CPU - Medium | `medium` | CPU | int8 | Moderate speed |
+| CPU - Small | `small` | CPU | int8 | Fastest on CPU |
+| CPU - Tiny | `tiny` | CPU | int8 | Fastest, lower accuracy |
 
 **Optimizations:**
 - **Rolling context:** 800 characters of prior text passed as `initial_prompt` to maintain coherence across chunks
@@ -137,7 +137,7 @@ Audio Input (WASAPI)
 
 ### Speaker Diarization (diart + pyannote)
 
-[diart](https://github.com/juanmc2005/diart) provides **online streaming diarization** — speaker identification happens incrementally as audio arrives, not as a batch process after recording.
+[diart](https://github.com/juanmc2005/diart) provides **online streaming diarization** - speaker identification happens incrementally as audio arrives, not as a batch process after recording.
 
 | Component | Model | Purpose |
 |---|---|---|
@@ -173,7 +173,7 @@ Noise segments are hidden by default and can be toggled visible via the Noise pi
 
 ## Voice Library
 
-The Voice Library provides **cross-session speaker identification** — once you name a speaker in one meeting, they're automatically recognized in future meetings.
+The Voice Library provides **cross-session speaker identification** - once you name a speaker in one meeting, they're automatically recognized in future meetings.
 
 ### How It Works
 
@@ -187,7 +187,7 @@ The Voice Library provides **cross-session speaker identification** — once you
 
 - **Automatic creation:** Renaming a speaker during a session creates or updates their global voice profile
 - **Manual profiles:** Create empty profiles in advance and link them during recording
-- **Merge profiles:** Combine duplicate identities — all embeddings are reassigned and the centroid is recomputed
+- **Merge profiles:** Combine duplicate identities - all embeddings are reassigned and the centroid is recomputed
 - **Optimize:** Prune redundant embeddings (keeps newest 30 per profile)
 - **Bulk operations:** Multi-select profiles for bulk delete, merge, or optimize
 - **Search & filter:** Find profiles by name in the Voice Library panel
@@ -212,10 +212,10 @@ Sessions can be organized into folders via the sidebar. Drag sessions between fo
 
 ### Session Lifecycle
 
-1. **Start recording** — a new session is created with a UUID
-2. **During recording** — transcript segments, summaries, and audio are saved continuously
-3. **Stop recording** — the session is finalized and receives an AI-generated title
-4. **After recording** — browse history, replay audio synced to transcript, chat about content, or reanalyze with different settings
+1. **Start recording** - a new session is created with a UUID
+2. **During recording** - transcript segments, summaries, and audio are saved continuously
+3. **Stop recording** - the session is finalized and receives an AI-generated title
+4. **After recording** - browse history, replay audio synced to transcript, chat about content, or reanalyze with different settings
 
 ### Reanalyze
 
@@ -230,11 +230,11 @@ Re-run the full transcription and diarization pipeline on a completed session's 
 
 The analytics panel (chart icon in the transcript header) provides real-time session statistics:
 
-- **Donut chart** — visual speaking time distribution across all speakers
-- **KPI cards** — session duration, speaker count, total segments, average words per minute
-- **Timeline swimlanes** — animated participation chart showing when each speaker was active
-- **Speaking time bars** — horizontal bar chart with duration and percentage share
-- **Segment count bars** — segment distribution across speakers
+- **Donut chart** - visual speaking time distribution across all speakers
+- **KPI cards** - session duration, speaker count, total segments, average words per minute
+- **Timeline swimlanes** - animated participation chart showing when each speaker was active
+- **Speaking time bars** - horizontal bar chart with duration and percentage share
+- **Segment count bars** - segment distribution across speakers
 
 All charts animate on scroll with staggered reveal effects.
 
@@ -254,7 +254,7 @@ Meeting Assistant supports two AI providers, switchable at runtime via Settings:
 ### Summary Generation
 
 - **Incremental updates:** Only sections with genuinely new high-level content are modified
-- **Adaptive structure:** No rigid template — the summary structure adapts to meeting content
+- **Adaptive structure:** No rigid template - the summary structure adapts to meeting content
 - **Timestamp markers:** Key moments include `[M:SS]` references that link to audio playback
 - **Custom prompts:** Shape the summary with context like *"This is a quarterly board review"*
 - **Auto-summary:** Triggers every 6 new segments (configurable, can be disabled)
@@ -287,8 +287,8 @@ Dynamic tooltips show the current status on hover.
 **All audio processing happens locally.** No audio data ever leaves your machine.
 
 The only outbound network calls are:
-- **AI API** (Anthropic or OpenAI) — transcript text only, for summaries and chat
-- **HuggingFace Hub** — model files downloaded once and cached locally
+- **AI API** (Anthropic or OpenAI) - transcript text only, for summaries and chat
+- **HuggingFace Hub** - model files downloaded once and cached locally
 
 All data is stored in `data/` next to the application:
 
@@ -318,12 +318,12 @@ A `.env` file is created automatically from the template on first run:
 
 Runtime-configurable options accessible from the web interface:
 
-- **Audio devices** — loopback and microphone source selection
-- **Whisper model** — auto-detected optimal preset or manual selection
-- **Diarizer device** — GPU or CPU for speaker identification
-- **AI provider & model** — switch between Anthropic and OpenAI at any time
-- **Auto-summary** — toggle automatic summary generation
-- **Custom prompt** — persistent context that shapes all AI outputs
+- **Audio devices** - loopback and microphone source selection
+- **Whisper model** - auto-detected optimal preset or manual selection
+- **Diarizer device** - GPU or CPU for speaker identification
+- **AI provider & model** - switch between Anthropic and OpenAI at any time
+- **Auto-summary** - toggle automatic summary generation
+- **Custom prompt** - persistent context that shapes all AI outputs
 
 ---
 
@@ -333,7 +333,7 @@ Runtime-configurable options accessible from the web interface:
 <summary><strong>"Loading model…" never goes away</strong></summary>
 <br>
 
-The Whisper model downloads on first run — `large-v3` is ~3 GB. Check the terminal window for download progress.
+The Whisper model downloads on first run - `large-v3` is ~3 GB. Check the terminal window for download progress.
 
 </details>
 
@@ -342,7 +342,7 @@ The Whisper model downloads on first run — `large-v3` is ~3 GB. Check the term
 <br>
 
 - Click the refresh button next to the desktop device selector to re-scan audio devices
-- Ensure something is actively playing — WASAPI loopback only captures active audio output
+- Ensure something is actively playing - WASAPI loopback only captures active audio output
 - Use **Test Audio** to verify sources before recording
 
 </details>
@@ -362,7 +362,7 @@ Speaker diarization requires a HuggingFace token. Add one in Settings. On first 
 - Ensure NVIDIA drivers are up to date
 - The launcher auto-detects CUDA via `nvidia-smi` and installs the appropriate PyTorch build
 - Check terminal output on startup for GPU detection messages
-- CPU fallback is automatic — the app works without a GPU
+- CPU fallback is automatic - the app works without a GPU
 
 </details>
 
@@ -393,7 +393,7 @@ Set `PORT=7000` (or any available port) in your `.env` file.
 
 ```
 Meeting Assistant/
-├── launch.bat             ← Entry point — double-click to run
+├── launch.bat             ← Entry point - double-click to run
 ├── launch.py              ← Setup automation (venv, GPU, deps, launch)
 ├── app.py                 ← Flask server, SSE streaming, session state, API routes
 ├── transcriber.py         ← faster-whisper integration, chunking, hallucination detection

@@ -61,7 +61,7 @@ def load() -> dict:
                 if isinstance(saved, dict):
                     settings.update(saved)
             except (json.JSONDecodeError, OSError):
-                pass  # corrupted file — fall back to defaults
+                pass  # corrupted file - fall back to defaults
         return settings
 
 
