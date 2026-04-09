@@ -10,4 +10,5 @@ __pycache__/
 *.pyc
 .venv/
 tools/
+models/
 .model_download.py

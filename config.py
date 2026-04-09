@@ -32,6 +32,11 @@ if not os.getenv("HUGGING_FACE_KEY", "").strip():
 if not os.getenv("HF_TOKEN", "").strip():
     os.environ["HF_TOKEN"] = _BUNDLED_HF_TOKEN
 
+# Pin HuggingFace cache to a project-local directory so pre-downloaded models
+# are always found at runtime, regardless of the user's global HF_HOME.
+_MODEL_CACHE = str(Path(__file__).parent / "models")
+os.environ.setdefault("HF_HOME", _MODEL_CACHE)
+
 # Suppress HuggingFace symlinks warning on Windows (symlinks require Developer Mode
 # or admin rights; caching still works fine without them).
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")

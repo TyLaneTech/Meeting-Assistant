@@ -77,17 +77,20 @@ def warp_reconnect() -> bool:
 
 def _is_model_cached(model_id: str) -> bool:
     """Check if a HuggingFace model/pipeline is already in the local cache."""
-    try:
-        from huggingface_hub import try_to_load_from_cache
-        # Pipeline configs are stored as config.yaml
-        result = try_to_load_from_cache(model_id, "config.yaml")
-        if result is not None and isinstance(result, str):
-            return True
-        # Also check for pytorch_model.bin (model weights)
-        result = try_to_load_from_cache(model_id, "pytorch_model.bin")
-        return result is not None and isinstance(result, str)
-    except Exception:
+    import os
+    from pathlib import Path
+    hf_home = os.environ.get("HF_HOME", "")
+    if not hf_home:
         return False
+    # HF hub stores models under hub/models--<org>--<name>/snapshots/
+    cache_dir = Path(hf_home) / "hub" / ("models--" + model_id.replace("/", "--"))
+    snapshots = cache_dir / "snapshots"
+    # If at least one snapshot directory with files exists, it's cached
+    if snapshots.is_dir():
+        for snap in snapshots.iterdir():
+            if snap.is_dir() and any(snap.iterdir()):
+                return True
+    return False
 
 
 def _load_hf_pipeline(model_id: str, hf_token: str):
