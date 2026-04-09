@@ -7453,7 +7453,7 @@ document.getElementById('chat-input')?.addEventListener('paste', e => {
   // Trim leading/trailing whitespace from pasted text
   if (!hasFile) {
     const ta = e.target;
-    setTimeout(() => { ta.value = ta.value.trim(); }, 0);
+    setTimeout(() => { ta.value = ta.value.trim(); _autogrowChatInput(); }, 0);
   }
 });
 
