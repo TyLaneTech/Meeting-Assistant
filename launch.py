@@ -637,26 +637,30 @@ def main():
     print()
 
     result = subprocess.run(
-        [sys.executable, "-u", "app.py"],
+        [sys.executable, "-u", "-X", "faulthandler", "app.py"],
         stderr=subprocess.PIPE, text=True,
     )
     if result.returncode != 0:
         print()
-        _err("Meeting Assistant exited with an error.")
+        _err(f"Meeting Assistant exited with an error (code {result.returncode}).")
         if result.stderr:
-            # Show the last portion of stderr (the traceback)
+            # Show the last portion of stderr (the traceback or fault info)
             lines = result.stderr.strip().splitlines()
-            # Find the last traceback block
+            # Find the last traceback or Fatal Python error block
             tb_start = 0
             for i, line in enumerate(lines):
-                if line.startswith("Traceback"):
+                if line.startswith("Traceback") or line.startswith("Fatal Python error"):
                     tb_start = i
             relevant = lines[tb_start:]
-            if len(relevant) > 30:
-                relevant = relevant[-30:]
+            if len(relevant) > 40:
+                relevant = relevant[-40:]
             print()
             for line in relevant:
                 print(f"  {RED}{line}{R}")
+        else:
+            print()
+            print(f"  {RED}No error output captured. The process may have crashed in native code.{R}")
+            print(f"  {RED}Exit code: {result.returncode}{R}")
         print()
         input("Press Enter to exit...")
 

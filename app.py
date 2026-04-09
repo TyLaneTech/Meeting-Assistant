@@ -3,6 +3,9 @@ Meeting Assistant - Flask web server.
 Run: python app.py
 Opens http://127.0.0.1:5000 automatically.
 """
+import faulthandler
+faulthandler.enable()  # dump traceback on native crashes (SIGSEGV, etc.)
+
 import json
 import logging
 import os
