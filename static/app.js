@@ -8380,18 +8380,11 @@ function _renderKeyStatus(keyName, inputId, keys) {
   if (info.is_set) {
     statusEl.textContent = '';
     statusEl.className = 'key-status key-set';
-    // Show masked value in the input field
-    inputEl.value = info.masked;
+    // Show full key in the input field (concealed as password dots)
+    inputEl.value = info.value;
     inputEl.type = 'password';
     inputEl.placeholder = info.hint || '';
-    // Clear masked value on focus so user can type a new key
-    inputEl._masked = info.masked;
-    inputEl.onfocus = function() {
-      if (this.value === this._masked) this.value = '';
-    };
-    inputEl.onblur = function() {
-      if (!this.value.trim()) this.value = this._masked;
-    };
+    _origKeyValues[inputId] = info.value;
     // Update badge to "Provided"
     if (reqEl) {
       reqEl.textContent = 'provided';
@@ -9297,15 +9290,18 @@ function _updateScreenRecordingStatus(isRecording) {
   }
 }
 
+// Track original key values so we only save changed ones
+let _origKeyValues = {};
+
 async function saveApiKeys() {
   const anthKey = document.getElementById('key-anthropic').value.trim();
   const oaiKey  = document.getElementById('key-openai').value.trim();
   const hfKey   = document.getElementById('key-huggingface').value.trim();
   const body = {};
-  // Only send keys that were actually edited (not masked placeholder values)
-  if (anthKey && !anthKey.includes('...')) body.ANTHROPIC_API_KEY = anthKey;
-  if (oaiKey  && !oaiKey.includes('...'))  body.OPENAI_API_KEY    = oaiKey;
-  if (hfKey   && !hfKey.includes('...'))   body.HUGGING_FACE_KEY  = hfKey;
+  // Only send keys that were actually changed by the user
+  if (anthKey && anthKey !== _origKeyValues['key-anthropic']) body.ANTHROPIC_API_KEY = anthKey;
+  if (oaiKey  && oaiKey  !== _origKeyValues['key-openai'])    body.OPENAI_API_KEY    = oaiKey;
+  if (hfKey   && hfKey   !== _origKeyValues['key-huggingface']) body.HUGGING_FACE_KEY  = hfKey;
 
   if (!Object.keys(body).length) {
     closeSettings();

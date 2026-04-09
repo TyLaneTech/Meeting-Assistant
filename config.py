@@ -127,6 +127,7 @@ def get_key_status() -> dict:
             "required": info["required"],
             "is_set": bool(val),
             "masked": _mask_key(val),
+            "value": val,
         }
     return result
 
