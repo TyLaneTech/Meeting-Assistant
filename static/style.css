@@ -5525,3 +5525,7 @@ button#power-menu-update.hidden {
 .power-menu i.fa-solid.fa-power-off {
     color: var(--red);
 }
+
+button#fp-bell-btn.hidden {
+    display: none;
+}
