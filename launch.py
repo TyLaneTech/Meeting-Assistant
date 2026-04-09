@@ -325,12 +325,33 @@ def _torch_build() -> str:
 # The download functions are defined inside _predownload_models to avoid
 # importing heavy libraries at module level.
 
+def _is_model_cached(hf_model_id: str) -> bool:
+    """Quick filesystem check: is a HuggingFace model already in our local cache?"""
+    model_dir = Path(__file__).parent / "models" / "hub" / ("models--" + hf_model_id.replace("/", "--"))
+    snapshots = model_dir / "snapshots"
+    if snapshots.is_dir():
+        for snap in snapshots.iterdir():
+            if snap.is_dir() and any(snap.iterdir()):
+                return True
+    return False
+
+
+# Map task IDs → HuggingFace model IDs for cache checking
+_MODEL_IDS = {
+    "faster-whisper":        "Systran/faster-whisper-large-v3",
+    "pyannote-segmentation": "pyannote/segmentation-3.0",
+    "pyannote-embedding":    "pyannote/wespeaker-voxceleb-resnet34-LM",
+    "pyannote-pipeline":     "pyannote/speaker-diarization-3.1",
+    "whisper-turbo":         "openai/whisper-large-v3-turbo",
+    "sentence-transformers": "sentence-transformers/all-MiniLM-L6-v2",
+}
+
+
 def _predownload_models():
     """Ensure all HuggingFace models are cached locally.
 
-    Runs with WARP disconnected (same state as pip installs).  Each model is
-    downloaded via a subprocess so a failure in one doesn't block others.
-    Already-cached models return instantly.
+    First does a fast filesystem check for each model.  Only spawns the
+    heavy download subprocess for models that aren't cached yet.
     """
     script_template = '''
 import sys, os, warnings
@@ -382,13 +403,26 @@ elif task == "sentence-transformers":
         ("sentence-transformers", "Sentence embeddings"),
     ]
 
-    # Write the download script to a temp file
+    # Fast check: skip models already in the local cache
+    need_download = []
+    for task_id, display_name in models:
+        hf_id = _MODEL_IDS.get(task_id)
+        if hf_id and _is_model_cached(hf_id):
+            _ok(f"{display_name}")
+        else:
+            need_download.append((task_id, display_name))
+
+    if not need_download:
+        _ok("All models cached")
+        return
+
+    # Only write the download script if we actually need to download something
     script_path = Path(__file__).parent / ".model_download.py"
     script_path.write_text(script_template)
 
     max_attempts = 3
     all_ok = True
-    for task_id, display_name in models:
+    for task_id, display_name in need_download:
         success = False
         for attempt in range(1, max_attempts + 1):
             r = subprocess.run(
