@@ -8371,21 +8371,57 @@ function _renderKeyStatus(keyName, inputId, keys) {
   const inputEl  = document.getElementById(inputId);
   if (!statusEl || !inputEl) return;
 
+  // Update the req/opt badge
+  const reqEl = document.getElementById(inputId + '-req');
+  const optEl = document.getElementById(inputId.replace('key-', 'key-') + '-req');
+  const keyRow = inputEl.closest('.settings-key-row');
+  const linkEl = keyRow?.querySelector('.settings-key-link');
+
   if (info.is_set) {
-    statusEl.textContent = 'Configured: ' + info.masked;
+    statusEl.textContent = '';
     statusEl.className = 'key-status key-set';
-    inputEl.placeholder = info.masked;
+    // Show masked value in the input field
+    inputEl.value = info.masked;
+    inputEl.type = 'password';
+    inputEl.placeholder = info.hint || '';
+    // Clear masked value on focus so user can type a new key
+    inputEl._masked = info.masked;
+    inputEl.onfocus = function() {
+      if (this.value === this._masked) this.value = '';
+    };
+    inputEl.onblur = function() {
+      if (!this.value.trim()) this.value = this._masked;
+    };
+    // Update badge to "Provided"
+    if (reqEl) {
+      reqEl.textContent = 'provided';
+      reqEl.className = 'settings-req key-provided';
+    }
+    // Hide "Get a key" link
+    if (linkEl) linkEl.style.display = 'none';
   } else {
     statusEl.textContent = info.required ? 'Not set' : 'Not set - optional';
     statusEl.className = 'key-status ' + (info.required ? 'key-missing' : 'key-optional');
+    inputEl.value = '';
+    inputEl.placeholder = info.hint || '';
+    // Restore badge
+    if (reqEl) {
+      reqEl.textContent = info.required ? 'required' : 'optional';
+      reqEl.className = info.required ? 'settings-req' : 'settings-opt';
+    }
+    // Show "Get a key" link
+    if (linkEl) linkEl.style.display = '';
   }
 }
 
 function closeSettings() {
   document.getElementById('settings-overlay').classList.add('hidden');
-  // Clear password fields
+  // Reset password fields to hidden state
   ['key-anthropic', 'key-openai', 'key-huggingface'].forEach(id => {
-    document.getElementById(id).value = '';
+    const el = document.getElementById(id);
+    el.type = 'password';
+    const btn = el.parentElement.querySelector('.key-vis-btn');
+    if (btn) btn.innerHTML = '<i class="fa-solid fa-eye"></i>';
   });
   // Reset update button
   const btn = document.getElementById('check-update-btn');
@@ -9266,9 +9302,10 @@ async function saveApiKeys() {
   const oaiKey  = document.getElementById('key-openai').value.trim();
   const hfKey   = document.getElementById('key-huggingface').value.trim();
   const body = {};
-  if (anthKey) body.ANTHROPIC_API_KEY = anthKey;
-  if (oaiKey)  body.OPENAI_API_KEY    = oaiKey;
-  if (hfKey)   body.HUGGING_FACE_KEY  = hfKey;
+  // Only send keys that were actually edited (not masked placeholder values)
+  if (anthKey && !anthKey.includes('...')) body.ANTHROPIC_API_KEY = anthKey;
+  if (oaiKey  && !oaiKey.includes('...'))  body.OPENAI_API_KEY    = oaiKey;
+  if (hfKey   && !hfKey.includes('...'))   body.HUGGING_FACE_KEY  = hfKey;
 
   if (!Object.keys(body).length) {
     closeSettings();
