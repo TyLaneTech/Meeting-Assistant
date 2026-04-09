@@ -21,6 +21,9 @@ nvidia-cudnn-cu12
 torch>=2.0.0
 torchaudio>=2.0.0
 diart
+# Pin speechbrain to avoid LazyModule crashes in >=1.1 that break
+# inspect.stack() during pyannote/pytorch_lightning model loading.
+speechbrain==1.0.3
 
 # ── Audio capture ─────────────────────────────────────────────────────────────
 # pyaudiowpatch is a fork of PyAudio with Windows WASAPI loopback support.

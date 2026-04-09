@@ -229,16 +229,17 @@ class DiartDiarizer:
             ) from e
 
         # ── Neutralise speechbrain LazyModules already in sys.modules ────────
-        # SpeechBrain injects LazyModule objects directly into sys.modules at
-        # import time.  inspect.stack() (called by pytorch_lightning) iterates
-        # sys.modules.values() and calls hasattr(mod, '__file__') on each one,
-        # triggering LazyModule.__getattr__ → ensure_module() → ImportError
-        # for optional deps that aren't installed.  Replace them with inert stubs.
-        _sb_prefixes = ("speechbrain.integrations", "speechbrain.k2_integration")
+        # SpeechBrain >=1.1 injects LazyModule objects into sys.modules for
+        # optional integrations AND deprecated redirect paths (wordemb,
+        # lobes.models.*, nnet.loss.*, etc.).  inspect.stack() (called by
+        # pytorch_lightning) iterates sys.modules.values() and calls
+        # hasattr(mod, '__file__') on each, triggering LazyModule.__getattr__
+        # → ensure_module() → ImportError for optional deps.
+        # Replace ALL speechbrain LazyModules with inert stubs.
         try:
             from speechbrain.utils.importutils import LazyModule as _LM
             for _key in list(_sys.modules):
-                if any(_key == p or _key.startswith(p + ".") for p in _sb_prefixes):
+                if _key.startswith("speechbrain."):
                     _mod = _sys.modules[_key]
                     if isinstance(_mod, _LM):
                         _stub = _types.ModuleType(_key)

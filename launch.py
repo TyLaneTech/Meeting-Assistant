@@ -453,10 +453,27 @@ def main():
     print(SEP_HEAVY)
     print()
 
-    result = subprocess.run([sys.executable, "app.py"])
+    result = subprocess.run(
+        [sys.executable, "-u", "app.py"],
+        stderr=subprocess.PIPE, text=True,
+    )
     if result.returncode != 0:
         print()
         _err("Meeting Assistant exited with an error.")
+        if result.stderr:
+            # Show the last portion of stderr (the traceback)
+            lines = result.stderr.strip().splitlines()
+            # Find the last traceback block
+            tb_start = 0
+            for i, line in enumerate(lines):
+                if line.startswith("Traceback"):
+                    tb_start = i
+            relevant = lines[tb_start:]
+            if len(relevant) > 30:
+                relevant = relevant[-30:]
+            print()
+            for line in relevant:
+                print(f"  {RED}{line}{R}")
         print()
         input("Press Enter to exit...")
 
