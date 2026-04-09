@@ -2378,13 +2378,15 @@ def chat():
         video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
         live_path = _screen_recorder.live_video_path
 
-        def _saving_extractor(ts, sid=session_id):
+        display_idx = int(settings.get("screen_display", 0))
+
+        def _saving_extractor(ts, sid=session_id, _didx=display_idx):
             """Extract frame, save to disk, return (jpeg_bytes, url)."""
             jpeg = None
             if live_path:
                 jpeg = extract_frame(live_path, ts)
                 if not jpeg:
-                    jpeg = capture_live_frame()
+                    jpeg = capture_live_frame(display_index=_didx)
             elif video_path.exists():
                 jpeg = extract_frame(str(video_path), ts)
             if not jpeg:
