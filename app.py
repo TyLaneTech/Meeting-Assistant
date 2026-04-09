@@ -707,9 +707,8 @@ def _cuda_diarizer_safe() -> bool:
     try:
         r = subprocess.run(
             [sys.executable, "-c",
-             "import torch; "
-             "t = torch.randn(16, 16, device='cuda'); "
-             "r = torch.nn.functional.conv1d(t.unsqueeze(0), torch.randn(1, 16, 3, device='cuda')); "
+             "import torch; t = torch.randn(2, 2, device='cuda'); "
+             "from speechbrain.inference.speaker import EncoderClassifier; "
              "print('ok')"],
             capture_output=True, text=True, timeout=30,
         )

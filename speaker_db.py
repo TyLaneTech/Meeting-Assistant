@@ -139,23 +139,6 @@ class SpeakerFingerprintDB:
             log.warn("fingerprint", "No HF token - voice library disabled.")
             return
 
-        # torchaudio 2.x removed symbols that older pyannote.audio references.
-        # The diarizer has these shims too, but speaker_db may load first.
-        try:
-            import torchaudio as _ta
-            if not hasattr(_ta, "AudioMetaData"):
-                import collections
-                _ta.AudioMetaData = collections.namedtuple(
-                    "AudioMetaData",
-                    ["sample_rate", "num_frames", "num_channels", "bits_per_sample", "encoding"],
-                )
-            if not hasattr(_ta, "list_audio_backends"):
-                _ta.list_audio_backends = lambda: ["soundfile"]
-            if not hasattr(_ta, "set_audio_backend"):
-                _ta.set_audio_backend = lambda backend: None
-        except ImportError:
-            pass
-
         try:
             # PyTorch 2.6: patch torch.load to use weights_only=False for trusted
             # local pyannote checkpoints (many internal globals, not enumerable).
