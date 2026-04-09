@@ -1,13 +1,14 @@
 """
-Network utilities — Cloudflare WARP management.
+Network utilities — Cloudflare WARP management and cache-first model loading.
 
-Corporate WARP setups use TLS inspection which breaks pip/uv and
-HuggingFace model downloads (untrusted CA).  Git operations require
-WARP connected for routing.
+Corporate WARP uses TLS inspection which breaks pip/uv downloads.
+Git operations require WARP connected for routing.  HuggingFace model
+downloads may fail with WARP in either state depending on timing.
 
-- Call warp_disconnect() before pip/uv installs and HF model downloads
-- Call warp_reconnect() before git fetch/pull operations
-- Both are safe to call repeatedly and no-op when WARP isn't installed.
+Strategy:
+- launch.py toggles WARP off for pip, back on after.
+- Runtime model loads use _load_hf_pipeline() which tries the local cache
+  first, then toggles WARP off to attempt a fresh download if needed.
 """
 import shutil
 import subprocess
@@ -72,3 +73,46 @@ def warp_reconnect() -> bool:
     except Exception as e:
         log.warn("network", f"Failed to reconnect WARP: {e}")
         return False
+
+
+def _load_hf_pipeline(model_id: str, hf_token: str):
+    """Load a pyannote Pipeline, trying local cache first.
+
+    1. Try local_files_only (no network needed — WARP state irrelevant)
+    2. On cache miss, disconnect WARP and try a fresh download
+    3. If that also fails, reconnect WARP and try once more
+
+    Returns the Pipeline object or None on failure.
+    """
+    from pyannote.audio import Pipeline as PyannotePipeline
+
+    # Attempt 1: local cache only — no network, no WARP issues
+    try:
+        return PyannotePipeline.from_pretrained(
+            model_id,
+            use_auth_token=hf_token,
+            local_files_only=True,
+        )
+    except Exception:
+        log.info("network", f"Model '{model_id}' not in cache, downloading...")
+
+    # Attempt 2: download with WARP off
+    warp_disconnect()
+    try:
+        return PyannotePipeline.from_pretrained(
+            model_id,
+            use_auth_token=hf_token,
+        )
+    except Exception:
+        pass
+
+    # Attempt 3: download with WARP on
+    warp_reconnect()
+    try:
+        return PyannotePipeline.from_pretrained(
+            model_id,
+            use_auth_token=hf_token,
+        )
+    except Exception as e:
+        log.error("network", f"Failed to load '{model_id}' (tried cache, WARP off, WARP on): {e}")
+        return None

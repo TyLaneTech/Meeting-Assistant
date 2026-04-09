@@ -153,12 +153,12 @@ class BatchTranscriber:
 
         log.info("batch", "Loading diarization pipeline...")
         try:
-            from network import warp_disconnect
-            warp_disconnect()
-            pipeline = PyannotePipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=self.hf_token,
+            from network import _load_hf_pipeline
+            pipeline = _load_hf_pipeline(
+                "pyannote/speaker-diarization-3.1", self.hf_token,
             )
+            if pipeline is None:
+                raise RuntimeError("Pipeline download failed (check network / HF token)")
             pipeline.to(torch_device)
         except Exception as e:
             log.error("batch", f"Failed to load diarization pipeline: {e}")
@@ -284,9 +284,6 @@ class BatchTranscriber:
 
         attn_impl = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
         log.info("batch", f"Loading Whisper model: {model_name} (attn: {attn_impl})")
-
-        from network import warp_disconnect
-        warp_disconnect()
 
         torch_dtype = torch.float16 if device == "cuda" else torch.float32
         whisper_pipe = hf_pipeline(
