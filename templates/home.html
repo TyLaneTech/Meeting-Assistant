@@ -174,6 +174,15 @@
         </nav>
       </div>
       <div class="topbar-right">
+        <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
+          <span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording
+        </button>
+        <div class="status-pill" id="status-pill">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Loading model…</span>
+          <span id="recording-duration" class="recording-duration hidden"></span>
+        </div>
+        <div class="topbar-sep"></div>
         <button class="btn btn-update hidden" id="topbar-update-btn" onclick="topbarApplyUpdate()" title="Update available">
           <i class="fa-solid fa-download"></i> Update
         </button>
@@ -190,14 +199,7 @@
             <button class="hidden" id="power-menu-update" onclick="confirmUpdateRestart(); closePowerMenu()"><i class="fa-solid fa-download"></i> Update &amp; Restart</button>
           </div>
         </div>
-        <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
-          <span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording
-        </button>
-        <div class="status-pill" id="status-pill">
-          <span class="status-dot" id="status-dot"></span>
-          <span id="status-text">Loading model…</span>
-          <span id="recording-duration" class="recording-duration hidden"></span>
-        </div>
+        <div class="topbar-sep"></div>
         <div class="home-search-wrap">
           <i class="fa-solid fa-magnifying-glass home-search-icon"></i>
           <input type="text" id="home-search-input" class="home-search-input"
