@@ -2158,6 +2158,7 @@ button#sidebar-close-btn {
 .chat-tool-widget.open.streaming .chat-tool-details {
   max-height: none;
   overflow-y: visible;
+  transition: none;
 }
 .chat-tool-details::-webkit-scrollbar { width: 4px; }
 .chat-tool-details::-webkit-scrollbar-track { background: transparent; }

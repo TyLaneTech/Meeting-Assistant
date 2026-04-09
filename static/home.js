@@ -217,12 +217,15 @@ function _renderToolWidget(msgWrap, toolCalls) {
     </button>
     <div class="chat-tool-details">${itemsHtml}</div>`;
 
-  // Auto-expand while tools are in progress, preserve manual toggle otherwise
+  // Auto-expand while tools are in progress, preserve manual toggle otherwise.
+  // Keep 'streaming' even after all tools complete — it's only removed on
+  // first chat_chunk so the collapse fires at the right time.
   if (!allDone) {
     widget.classList.add('open', 'streaming');
-  } else {
-    widget.classList.remove('streaming');
-    if (isOpen) widget.classList.add('open');
+  } else if (widget.classList.contains('streaming')) {
+    widget.classList.add('open');
+  } else if (isOpen) {
+    widget.classList.add('open');
   }
 }
 
