@@ -5763,6 +5763,35 @@ async function triggerSummary() {
   });
 }
 
+async function copySummary() {
+  const el = document.getElementById('summary');
+  if (!el || !el.textContent.trim()) return;
+  try {
+    // Copy as rich text (HTML) so headings/lists/formatting are preserved on paste
+    const html = el.innerHTML;
+    const plain = el.innerText;
+    const blob = new Blob([html], { type: 'text/html' });
+    const blobPlain = new Blob([plain], { type: 'text/plain' });
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        'text/html': blob,
+        'text/plain': blobPlain,
+      }),
+    ]);
+    // Brief visual feedback on the button
+    const btn = el.closest('.col-summary').querySelector('[title="Copy summary"]');
+    if (btn) {
+      const orig = btn.innerHTML;
+      btn.innerHTML = '<i class="fa-solid fa-check"></i>';
+      setTimeout(() => { btn.innerHTML = orig; }, 1500);
+    }
+  } catch {
+    // Fallback: plain text
+    const plain = el.innerText;
+    await navigator.clipboard.writeText(plain);
+  }
+}
+
 function toggleSummaryPrompt() {
   const area = document.getElementById('summary-prompt-area');
   const btn  = document.getElementById('summary-prompt-toggle');
