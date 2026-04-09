@@ -217,7 +217,12 @@ function _renderToolWidget(msgWrap, toolCalls) {
     </button>
     <div class="chat-tool-details">${itemsHtml}</div>`;
 
-  if (isOpen) widget.classList.add('open');
+  // Auto-expand while tools are in progress, preserve manual toggle otherwise
+  if (!allDone) {
+    widget.classList.add('open');
+  } else if (isOpen) {
+    widget.classList.add('open');
+  }
 }
 
 function _copyChatMsg(btn) {
@@ -312,6 +317,9 @@ function _onGlobalChatChunk(data) {
   const full = _homeState.currentChunks.join('');
   if (_homeState.currentMsgWrap) {
     _setAssistantProcessing(_homeState.currentMsgWrap, false);
+    // Collapse tool widget when response starts streaming
+    const tw = _homeState.currentMsgWrap.querySelector('.chat-tool-widget');
+    if (tw) tw.classList.remove('open');
     _updateAssistantBody(_homeState.currentMsgWrap, full);
     _scrollChatToBottom();
   }

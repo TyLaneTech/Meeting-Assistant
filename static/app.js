@@ -2117,6 +2117,9 @@ function connectSSE(afterSegId = 0) {
       const wrap = state.chatCursor.closest('.chat-msg');
       if (wrap) {
         _setAssistantProcessing(wrap, false);
+        // Collapse tool widget when response starts streaming
+        const tw = wrap.querySelector('.chat-tool-widget');
+        if (tw) tw.classList.remove('open');
         // Reveal body and actions on first content
         state.chatCursor.style.display = '';
         const actions = wrap.querySelector('.chat-msg-actions');
@@ -6905,7 +6908,12 @@ function _renderToolWidget(msgWrap, toolCalls) {
     </button>
     <div class="chat-tool-details">${itemsHtml}</div>`;
 
-  if (isOpen) widget.classList.add('open');
+  // Auto-expand while tools are in progress, preserve manual toggle otherwise
+  if (!allDone) {
+    widget.classList.add('open');
+  } else if (isOpen) {
+    widget.classList.add('open');
+  }
 }
 
 function _toolDisplayName(name) {
