@@ -217,11 +217,21 @@ class Transcriber:
             self.device, self.compute_type, self.model_size = get_default_model_config()
         log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
         from faster_whisper import WhisperModel
-        self.model = WhisperModel(
-            self.model_size,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
+        try:
+            self.model = WhisperModel(
+                self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
+        except Exception as e:
+            if not self._clear_bad_model_cache(str(e)):
+                raise
+            log.info("whisper", "Retrying after cache clear…")
+            self.model = WhisperModel(
+                self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
         # Warm up CUDA kernels — first inference is significantly slower
         # due to kernel compilation and memory allocation.
         try:
@@ -230,6 +240,27 @@ class Transcriber:
         except Exception:
             pass
         log.info("whisper", "Model ready.")
+
+    def _clear_bad_model_cache(self, error_msg: str) -> bool:
+        """Delete a corrupted HuggingFace model cache and return True if cleared."""
+        import shutil
+        from faster_whisper.utils import _MODELS
+        repo_id = _MODELS.get(self.model_size, self.model_size)
+        # HF hub cache stores models under models--<org>--<name>
+        cache_dir_name = "models--" + repo_id.replace("/", "--")
+        hf_cache = os.path.join(
+            os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface")),
+            "hub",
+        )
+        model_cache = os.path.join(hf_cache, cache_dir_name)
+        if os.path.isdir(model_cache):
+            log.info("whisper", f"Clearing corrupted model cache: {model_cache}")
+            try:
+                shutil.rmtree(model_cache)
+                return True
+            except OSError as rm_err:
+                log.info("whisper", f"Failed to clear cache: {rm_err}")
+        return False
 
     def reload_model(self, device: str, compute_type: str, model_size: str) -> None:
         """Reload Whisper with a different configuration. Blocking."""

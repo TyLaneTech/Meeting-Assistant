@@ -114,21 +114,60 @@ warnings.filterwarnings(
 
 # ── Speechbrain lazy-module resilience ───────────────────────────────────────
 # Newer speechbrain versions (>=1.1) use LazyModule for optional integrations
-# like k2_fsa, Kaldi, etc. If the optional dependency isn't installed the lazy
-# import raises an opaque error that kills the entire diarizer init.
-# Pre-emptively stub these modules so the lazy loader never fires.
+# (k2_fsa, huggingface, Kaldi, etc.).  If the optional dependency isn't
+# installed the lazy import raises an opaque ImportError that kills the entire
+# diarizer init — often triggered indirectly by inspect.stack() inside
+# pytorch_lightning.
+#
+# Strategy: install a custom meta-path finder that intercepts ANY import under
+# "speechbrain.integrations" (and the legacy "speechbrain.k2_integration") and
+# returns an empty stub module.  This is future-proof — new sub-packages added
+# by SpeechBrain updates won't require manual additions here.
 import sys as _sys
 import types as _types
-for _mod_name in (
-    "speechbrain.integrations",
-    "speechbrain.integrations.k2_fsa",
-    "speechbrain.k2_integration",
-):
-    if _mod_name not in _sys.modules:
-        _stub = _types.ModuleType(_mod_name)
-        _stub.__path__ = []          # mark as package so sub-imports don't crash
-        _stub.__package__ = _mod_name
-        _sys.modules[_mod_name] = _stub
+import importlib.abc as _importlib_abc
+import importlib.machinery as _importlib_machinery
+
+
+class _SpeechBrainIntegrationStubFinder(_importlib_abc.MetaPathFinder):
+    """Auto-stub any missing speechbrain.integrations.* submodule."""
+
+    _PREFIXES = ("speechbrain.integrations", "speechbrain.k2_integration")
+
+    def find_module(self, fullname, path=None):
+        # find_module is the legacy protocol but still honoured; keep it for
+        # broad Python 3.x compat alongside find_spec.
+        if any(fullname == p or fullname.startswith(p + ".") for p in self._PREFIXES):
+            if fullname not in _sys.modules:
+                return self
+        return None
+
+    def load_module(self, fullname):
+        if fullname in _sys.modules:
+            return _sys.modules[fullname]
+        mod = _types.ModuleType(fullname)
+        mod.__path__ = []
+        mod.__package__ = fullname
+        mod.__loader__ = self
+        _sys.modules[fullname] = mod
+        return mod
+
+    def find_spec(self, fullname, path, target=None):
+        if any(fullname == p or fullname.startswith(p + ".") for p in self._PREFIXES):
+            if fullname not in _sys.modules:
+                return _importlib_machinery.ModuleSpec(fullname, self)
+        return None
+
+    def create_module(self, spec):
+        return None  # use default semantics
+
+    def exec_module(self, module):
+        module.__path__ = []
+        module.__package__ = module.__name__
+
+
+# Install early, before any pyannote / diart import triggers speechbrain lazy loads
+_sys.meta_path.insert(0, _SpeechBrainIntegrationStubFinder())
 
 def _merge_turns(
     turns: list[tuple[str, float, float]],
@@ -183,6 +222,26 @@ class DiartDiarizer:
                 f"Failed to import diart — check that diart, pyannote.audio, and "
                 f"speechbrain are installed and compatible: {e}"
             ) from e
+
+        # ── Neutralise speechbrain LazyModules already in sys.modules ────────
+        # SpeechBrain injects LazyModule objects directly into sys.modules at
+        # import time.  inspect.stack() (called by pytorch_lightning) iterates
+        # sys.modules.values() and calls hasattr(mod, '__file__') on each one,
+        # triggering LazyModule.__getattr__ → ensure_module() → ImportError
+        # for optional deps that aren't installed.  Replace them with inert stubs.
+        _sb_prefixes = ("speechbrain.integrations", "speechbrain.k2_integration")
+        try:
+            from speechbrain.utils.importutils import LazyModule as _LM
+            for _key in list(_sys.modules):
+                if any(_key == p or _key.startswith(p + ".") for p in _sb_prefixes):
+                    _mod = _sys.modules[_key]
+                    if isinstance(_mod, _LM):
+                        _stub = _types.ModuleType(_key)
+                        _stub.__path__ = []
+                        _stub.__package__ = _key
+                        _sys.modules[_key] = _stub
+        except ImportError:
+            pass  # speechbrain too old to have LazyModule — nothing to fix
 
         # Load saved audio params
         from default_audio_params import DIARIZATION_DEFAULTS

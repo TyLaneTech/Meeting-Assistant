@@ -13,6 +13,9 @@ import log
 Callback = Callable[[str], None]
 ToolEventCallback = Callable[[str, dict], None]  # (event_type, payload) → None
 FrameExtractor = Callable[[float], bytes | None]  # timestamp → JPEG bytes or None
+# Generic tool executor: (tool_name, tool_input) → (content, is_error, summary, extra)
+# content: str or list of blocks; is_error: bool; summary: str for UI; extra: optional dict (e.g. image)
+ToolExecutor = Callable[[str, dict], tuple]
 
 # Tool definition used for Anthropic structured patch output.
 # Array-of-sections format so the model can create, rename, or restructure
@@ -101,6 +104,75 @@ _SCREENSHOT_FUNC_OAI = {
         "parameters": _SCREENSHOT_TOOL["input_schema"],
     },
 }
+
+# ── Global Chat tools ────────────────────────────────────────────────────────
+
+_GLOBAL_TOOLS = [
+    {
+        "name": "search_transcripts",
+        "description": (
+            "Search across all meeting transcripts using keyword/full-text search. "
+            "Returns matching snippets with session titles, IDs, and context. "
+            "Use this for specific words, phrases, or names."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query terms"},
+                "limit": {"type": "integer", "description": "Max results (default 10)", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "semantic_search",
+        "description": (
+            "Search meetings by meaning and topic similarity. Better for conceptual "
+            "queries like 'discussions about project deadlines' or 'feedback on the design' "
+            "rather than exact words. Returns ranked session matches."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Conceptual search query"},
+                "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_session_detail",
+        "description": (
+            "Load the full transcript and summary of a specific meeting session. "
+            "Use this after searching to get detailed context from a particular meeting. "
+            "The transcript may be truncated for very long sessions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "The session ID to load"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "list_speakers",
+        "description": (
+            "List all known speakers from the Voice Library with their names, "
+            "colors, and the number of sessions they appear in. Use this when "
+            "the user asks about participants or specific people."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+]
+
+_GLOBAL_TOOLS_OAI = [
+    {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+    for t in _GLOBAL_TOOLS
+]
 
 # Models that support Anthropic extended thinking
 _ANTHROPIC_THINKING_MODELS = {
@@ -436,6 +508,53 @@ class AIAssistant:
         log.info("summary", f"Updated: {updated}")
         return self._build_summary(sections)
 
+    _SYSTEM_GLOBAL_QA = (
+        "You are an intelligent meeting assistant with access to a library of "
+        "recorded meetings. You can search across all sessions by keyword or "
+        "semantic meaning, load full transcripts and summaries, and look up "
+        "speakers.\n\n"
+        "## How to respond\n"
+        "- Use your tools to find relevant information before answering — "
+        "do not guess or make up content\n"
+        "- Always cite which session(s) your information comes from, including "
+        "the session title\n"
+        "- When quoting specific moments, include timestamps as [M:SS]\n"
+        "- If the user asks about something you can't find, say so clearly\n"
+        "- Answer directly and concisely using markdown formatting\n"
+        "- When multiple sessions are relevant, synthesize information across them\n"
+        "- For questions about who said what, be precise about speaker attribution\n"
+        "- Always respond in English regardless of any foreign words or phrases "
+        "in the transcripts\n\n"
+        "## Tool usage strategy\n"
+        "- Start with `search_transcripts` for specific keywords or phrases\n"
+        "- Use `semantic_search` for conceptual/thematic queries\n"
+        "- Use `get_session_detail` to load full context after finding relevant sessions\n"
+        "- Use `list_speakers` when the user asks about participants or people\n"
+        "- You may call tools multiple times to gather enough context"
+    )
+
+    def ask_global(
+        self,
+        chat_history: list[dict],
+        on_token: Callback,
+        on_done: Callable[[], None] | None = None,
+        cancel: "threading.Event | None" = None,
+        on_tool_event: ToolEventCallback | None = None,
+        tool_executor: "ToolExecutor | None" = None,
+    ) -> None:
+        """Stream an answer for the Global Chat (cross-session Q&A)."""
+        self._stream_with_tools(
+            self._SYSTEM_GLOBAL_QA,
+            chat_history,
+            on_token,
+            on_done,
+            cancel=cancel,
+            on_tool_event=on_tool_event,
+            tools_anthropic=_GLOBAL_TOOLS,
+            tools_openai=_GLOBAL_TOOLS_OAI,
+            tool_executor=tool_executor,
+        )
+
     def generate_title(self, transcript: str) -> str:
         """Return a 2-3 word title for the meeting, or '' on failure/no content."""
         if not transcript.strip():
@@ -635,11 +754,14 @@ class AIAssistant:
         cancel: "threading.Event | None" = None,
         frame_extractor: FrameExtractor | None = None,
         on_tool_event: ToolEventCallback | None = None,
+        tools_anthropic: list | None = None,
+        tools_openai: list | None = None,
+        tool_executor: "ToolExecutor | None" = None,
     ) -> None:
         """Stream with tool-use loop (up to 5 iterations).
 
-        When the model calls ``get_screenshot``, we extract a frame via
-        *frame_extractor* and feed the image back, then continue streaming.
+        Accepts either a ``frame_extractor`` (legacy screenshot-only mode)
+        or generic ``tool_executor`` + tool lists for arbitrary tool handling.
         """
         try:
             if self.client is None:
@@ -648,21 +770,105 @@ class AIAssistant:
                     f"Add it in Settings.*"
                 )
                 return
+            # Default to screenshot tools if no explicit tools provided
+            a_tools = tools_anthropic or [_SCREENSHOT_TOOL]
+            o_tools = tools_openai or [_SCREENSHOT_FUNC_OAI]
             if self.provider == "openai":
                 self._tool_loop_openai(
                     system, messages, on_token, cancel, frame_extractor,
                     on_tool_event=on_tool_event,
+                    tools=o_tools, tool_executor=tool_executor,
                 )
             else:
                 self._tool_loop_anthropic(
                     system, messages, on_token, cancel, frame_extractor,
                     on_tool_event=on_tool_event,
+                    tools=a_tools, tool_executor=tool_executor,
                 )
         except Exception as e:
             on_token(f"\n\n*Error: {e}*")
         finally:
             if on_done:
                 on_done()
+
+    def _execute_tool_anthropic(
+        self,
+        tu: dict,
+        frame_extractor: FrameExtractor | None,
+        tool_executor: "ToolExecutor | None",
+        on_tool_event: ToolEventCallback | None,
+    ) -> dict:
+        """Execute a single tool call and return an Anthropic tool_result block."""
+        # Notify frontend about the tool call
+        if on_tool_event:
+            on_tool_event("tool_call", {"name": tu["name"], "input": tu["input"]})
+
+        # Try generic executor first
+        if tool_executor:
+            try:
+                content, is_error, summary, extra = tool_executor(tu["name"], tu["input"])
+                result = {
+                    "type": "tool_result",
+                    "tool_use_id": tu["id"],
+                    "content": content,
+                }
+                if is_error:
+                    result["is_error"] = True
+                if on_tool_event:
+                    payload = {"name": tu["name"], "success": not is_error, "summary": summary}
+                    if extra:
+                        payload.update(extra)
+                    on_tool_event("tool_result", payload)
+                return result
+            except Exception:
+                pass  # fall through to built-in handlers
+
+        # Built-in: get_screenshot
+        if tu["name"] == "get_screenshot" and frame_extractor:
+            ts = tu["input"].get("timestamp", 0)
+            jpeg = frame_extractor(float(ts))
+            if jpeg:
+                b64 = base64.b64encode(jpeg).decode()
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "name": tu["name"], "success": True,
+                        "summary": f"Captured screenshot at {ts:.1f}s", "image": b64,
+                    })
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tu["id"],
+                    "content": [
+                        {"type": "text", "text": f"Screenshot at {ts:.1f}s:"},
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/jpeg", "data": b64,
+                        }},
+                    ],
+                }
+            else:
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "name": tu["name"], "success": False,
+                        "summary": "Could not extract frame",
+                    })
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tu["id"],
+                    "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
+                    "is_error": True,
+                }
+
+        # Unknown tool
+        if on_tool_event:
+            on_tool_event("tool_result", {
+                "name": tu["name"], "success": False,
+                "summary": f"Unknown tool: {tu['name']}",
+            })
+        return {
+            "type": "tool_result",
+            "tool_use_id": tu["id"],
+            "content": f"Unknown tool: {tu['name']}",
+            "is_error": True,
+        }
 
     def _tool_loop_anthropic(
         self,
@@ -672,11 +878,14 @@ class AIAssistant:
         cancel: "threading.Event | None",
         frame_extractor: FrameExtractor | None,
         on_tool_event: ToolEventCallback | None = None,
+        tools: list | None = None,
+        tool_executor: "ToolExecutor | None" = None,
     ) -> None:
         import anthropic
 
         msgs = list(messages)  # working copy
         max_rounds = 5
+        a_tools = tools or [_SCREENSHOT_TOOL]
 
         for _ in range(max_rounds):
             if cancel and cancel.is_set():
@@ -686,13 +895,12 @@ class AIAssistant:
             if self.model in _ANTHROPIC_THINKING_MODELS:
                 kwargs["thinking"] = {"type": "adaptive"}
 
-            # Stream this turn so tokens appear incrementally in the UI.
             with self.client.messages.stream(
                 model=self.model,
                 max_tokens=4096,
                 system=system,
                 messages=msgs,
-                tools=[_SCREENSHOT_TOOL],
+                tools=a_tools,
                 **kwargs,
             ) as stream:
                 for text in stream.text_stream:
@@ -702,7 +910,6 @@ class AIAssistant:
                     on_token(text)
                 response = stream.get_final_message()
 
-            # Collect any tool_use blocks from the completed response.
             tool_uses: list[dict] = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -712,78 +919,92 @@ class AIAssistant:
                         "input": block.input,
                     })
 
-            # If no tool calls, we're done
             if not tool_uses or response.stop_reason != "tool_use":
                 return
 
-            # Build assistant message with all content blocks
             msgs.append({"role": "assistant", "content": response.content})
 
-            # Process each tool call and build tool results
             tool_results = []
             for tu in tool_uses:
-                # Notify frontend about the tool call
-                if on_tool_event:
-                    on_tool_event("tool_call", {
-                        "name": tu["name"],
-                        "input": tu["input"],
-                    })
-
-                if tu["name"] == "get_screenshot" and frame_extractor:
-                    ts = tu["input"].get("timestamp", 0)
-                    jpeg = frame_extractor(float(ts))
-                    if jpeg:
-                        b64 = base64.b64encode(jpeg).decode()
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tu["id"],
-                            "content": [
-                                {"type": "text", "text": f"Screenshot at {ts:.1f}s:"},
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/jpeg",
-                                        "data": b64,
-                                    },
-                                },
-                            ],
-                        })
-                        if on_tool_event:
-                            on_tool_event("tool_result", {
-                                "name": tu["name"],
-                                "success": True,
-                                "summary": f"Captured screenshot at {ts:.1f}s",
-                                "image": b64,
-                            })
-                    else:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tu["id"],
-                            "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
-                            "is_error": True,
-                        })
-                        if on_tool_event:
-                            on_tool_event("tool_result", {
-                                "name": tu["name"],
-                                "success": False,
-                                "summary": "Could not extract frame",
-                            })
-                else:
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tu["id"],
-                        "content": f"Unknown tool: {tu['name']}",
-                        "is_error": True,
-                    })
-                    if on_tool_event:
-                        on_tool_event("tool_result", {
-                            "name": tu["name"],
-                            "success": False,
-                            "summary": f"Unknown tool: {tu['name']}",
-                        })
+                tool_results.append(self._execute_tool_anthropic(
+                    tu, frame_extractor, tool_executor, on_tool_event,
+                ))
 
             msgs.append({"role": "user", "content": tool_results})
+
+    def _execute_tool_openai(
+        self,
+        tc_id: str,
+        tc_name: str,
+        tc_args_raw: str,
+        msgs: list[dict],
+        frame_extractor: FrameExtractor | None,
+        tool_executor: "ToolExecutor | None",
+        on_tool_event: ToolEventCallback | None,
+    ) -> None:
+        """Execute a single OpenAI tool call, appending results to msgs."""
+        try:
+            parsed_args = json.loads(tc_args_raw)
+        except Exception:
+            parsed_args = {}
+
+        if on_tool_event:
+            on_tool_event("tool_call", {"name": tc_name, "input": parsed_args})
+
+        # Try generic executor first
+        if tool_executor:
+            try:
+                content, is_error, summary, extra = tool_executor(tc_name, parsed_args)
+                result_text = content if isinstance(content, str) else json.dumps(content)
+                msgs.append({"role": "tool", "tool_call_id": tc_id, "content": result_text})
+                if on_tool_event:
+                    payload = {"name": tc_name, "success": not is_error, "summary": summary}
+                    if extra:
+                        payload.update(extra)
+                    on_tool_event("tool_result", payload)
+                return
+            except Exception:
+                pass  # fall through
+
+        # Built-in: get_screenshot
+        if tc_name == "get_screenshot" and frame_extractor:
+            ts = float(parsed_args.get("timestamp", 0))
+            jpeg = frame_extractor(ts)
+            if jpeg:
+                b64 = base64.b64encode(jpeg).decode()
+                msgs.append({
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": f"Screenshot at {ts:.1f}s captured. The image follows.",
+                })
+                msgs.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"[Screenshot at {ts:.1f}s from the screen recording:]"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
+                })
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "name": tc_name, "success": True,
+                        "summary": f"Captured screenshot at {ts:.1f}s", "image": b64,
+                    })
+            else:
+                msgs.append({
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
+                })
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "name": tc_name, "success": False, "summary": "Could not extract frame",
+                    })
+            return
+
+        # Unknown tool
+        msgs.append({"role": "tool", "tool_call_id": tc_id, "content": f"Unknown tool: {tc_name}"})
+        if on_tool_event:
+            on_tool_event("tool_result", {
+                "name": tc_name, "success": False, "summary": f"Unknown tool: {tc_name}",
+            })
 
     def _tool_loop_openai(
         self,
@@ -793,26 +1014,27 @@ class AIAssistant:
         cancel: "threading.Event | None",
         frame_extractor: FrameExtractor | None,
         on_tool_event: ToolEventCallback | None = None,
+        tools: list | None = None,
+        tool_executor: "ToolExecutor | None" = None,
     ) -> None:
         import openai
 
         converted = self._to_openai_messages(messages)
         msgs = [{"role": "system", "content": system}] + converted
         max_rounds = 5
+        o_tools = tools or [_SCREENSHOT_FUNC_OAI]
 
         for _ in range(max_rounds):
             if cancel and cancel.is_set():
                 return
 
-            # Stream this turn so tokens appear incrementally in the UI.
             stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=msgs,
-                tools=[_SCREENSHOT_FUNC_OAI],
+                tools=o_tools,
                 stream=True,
             )
 
-            # Accumulate streamed content and tool-call deltas.
             full_content = ""
             tool_calls_acc: dict[int, dict] = {}
             finish_reason = None
@@ -835,11 +1057,9 @@ class AIAssistant:
                         if tc.function.arguments:
                             entry["arguments"] += tc.function.arguments
 
-            # If no tool calls, we're done
             if not tool_calls_acc or finish_reason != "tool_calls":
                 return
 
-            # Reconstruct the assistant message for history
             tc_list = [
                 {"id": v["id"], "type": "function",
                  "function": {"name": v["name"], "arguments": v["arguments"]}}
@@ -847,78 +1067,11 @@ class AIAssistant:
             ]
             msgs.append({"role": "assistant", "content": full_content or None, "tool_calls": tc_list})
 
-            # Process each accumulated tool call
             for v in tool_calls_acc.values():
-                tc_id   = v["id"]
-                tc_name = v["name"]
-
-                if on_tool_event:
-                    try:
-                        parsed_args = json.loads(v["arguments"])
-                    except Exception:
-                        parsed_args = {}
-                    on_tool_event("tool_call", {
-                        "name": tc_name,
-                        "input": parsed_args,
-                    })
-
-                if tc_name == "get_screenshot" and frame_extractor:
-                    args = json.loads(v["arguments"])
-                    ts = float(args.get("timestamp", 0))
-                    jpeg = frame_extractor(ts)
-                    if jpeg:
-                        b64 = base64.b64encode(jpeg).decode()
-                        # Tool result as text, then follow up with a user
-                        # message containing the image (OpenAI tool messages
-                        # don't support image content directly)
-                        msgs.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": f"Screenshot at {ts:.1f}s captured. The image follows.",
-                        })
-                        msgs.append({
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": f"[Screenshot at {ts:.1f}s from the screen recording:]"},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{b64}",
-                                    },
-                                },
-                            ],
-                        })
-                        if on_tool_event:
-                            on_tool_event("tool_result", {
-                                "name": tc_name,
-                                "success": True,
-                                "summary": f"Captured screenshot at {ts:.1f}s",
-                                "image": b64,
-                            })
-                    else:
-                        msgs.append({
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": "Could not extract frame — the timestamp may be out of range or no video is available.",
-                        })
-                        if on_tool_event:
-                            on_tool_event("tool_result", {
-                                "name": tc_name,
-                                "success": False,
-                                "summary": "Could not extract frame",
-                            })
-                else:
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": f"Unknown tool: {tc_name}",
-                    })
-                    if on_tool_event:
-                        on_tool_event("tool_result", {
-                            "name": tc_name,
-                            "success": False,
-                            "summary": f"Unknown tool: {tc_name}",
-                        })
+                self._execute_tool_openai(
+                    v["id"], v["name"], v["arguments"], msgs,
+                    frame_extractor, tool_executor, on_tool_event,
+                )
 
     # ── Summary helpers ────────────────────────────────────────────────────────
 

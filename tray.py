@@ -173,10 +173,10 @@ class MeetingTray:
         """Return a tooltip string reflecting current state."""
         key = self._get_tray_state()
         tooltips = {
-            "setup":     "Meeting Assistant — Setup required",
-            "recording": "Meeting Assistant — Recording",
-            "ready":     "Meeting Assistant — Ready",
-            "loading":   "Meeting Assistant — Loading models…",
+            "setup":     "Meeting Assistant | Setup required",
+            "recording": "Meeting Assistant | Recording",
+            "ready":     "Meeting Assistant | Ready",
+            "loading":   "Meeting Assistant | Loading models…",
         }
         return tooltips.get(key, "Meeting Assistant")
 
