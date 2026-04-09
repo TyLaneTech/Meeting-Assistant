@@ -5901,7 +5901,7 @@ function saveSummaryPrompt() {
 function _applyPromptText(text) {
   const ta = document.getElementById('summary-custom-prompt');
   ta.value = text || '';
-  const show = !!ta.value.trim() || localStorage.getItem('summary-prompt-open') === '1';
+  const show = localStorage.getItem('summary-prompt-open') === '1';
   document.getElementById('summary-prompt-area').classList.toggle('hidden', !show);
   document.getElementById('summary-prompt-toggle').classList.toggle('active', show);
   _syncSummaryBottomRadius();
