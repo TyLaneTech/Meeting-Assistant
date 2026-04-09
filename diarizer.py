@@ -262,6 +262,8 @@ class DiartDiarizer:
         self._merge_gap        = float(p["merge_gap_seconds"])
 
         # Load the same underlying models pyannote/speaker-diarization-3.1 uses.
+        from network import ensure_warp_disconnected
+        ensure_warp_disconnected()
         log.info("diarizer", "Loading segmentation model…")
         try:
             seg = SegmentationModel.from_pretrained(
