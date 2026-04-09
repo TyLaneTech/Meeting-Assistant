@@ -2900,6 +2900,23 @@ function _fpRemoveFromQueue(speakerKey) {
   _fpUpdateBell();
   _fpRenderNotifPanel();
   _fpUpdateInlineIcons();
+  // Auto-collapse the panel once all suggestions are processed
+  _fpAutoCollapseIfEmpty();
+}
+
+function _fpAutoCollapseIfEmpty() {
+  if (_fpNotifQueue.length > 0) return;
+  const panel = document.getElementById('fp-notif-panel');
+  if (!panel || panel.classList.contains('collapsed')) return;
+  // Short delay so the user sees "No pending suggestions" before it collapses
+  setTimeout(() => {
+    if (_fpNotifQueue.length === 0 && !panel.classList.contains('collapsed')) {
+      panel.classList.add('collapsed');
+      const btn = document.getElementById('fp-bell-btn');
+      if (btn) btn.classList.remove('open');
+      _syncPanelBottomRadius();
+    }
+  }, 1200);
 }
 
 function _fpGetSuggestion(speakerKey) {
@@ -3100,6 +3117,7 @@ function fpNotifDismissAll() {
   _fpUpdateBell();
   _fpRenderNotifPanel();
   _fpUpdateInlineIcons();
+  _fpAutoCollapseIfEmpty();
   if (_fpToastActive) _fpHideToast();
   for (const item of items) {
     fetch('/api/fingerprint/dismiss', {
