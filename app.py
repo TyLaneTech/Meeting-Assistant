@@ -3502,6 +3502,54 @@ def shutdown():
     return jsonify({"ok": True})
 
 
+@app.route("/api/restart", methods=["POST"])
+def restart():
+    """Gracefully stop everything, then relaunch via Start Menu shortcut."""
+    def _do_restart() -> None:
+        global _tray
+        with _state_lock:
+            sid      = _state["session_id"]
+            capture  = _state["audio_capture"]
+            test_cap = _state["test_capture"]
+            _state["is_recording"] = False
+            _state["is_testing"]   = False
+            _state["audio_capture"] = None
+            _state["test_capture"]  = None
+        if test_cap:
+            test_cap.stop()
+        if capture:
+            capture.stop()
+        _transcriber.stop()
+        if sid:
+            storage.end_session(sid)
+        time.sleep(0.5)
+
+        root = Path(__file__).parent
+        lnk_path = (
+            Path(os.environ.get("APPDATA", ""))
+            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            / "Meeting Assistant.lnk"
+        )
+        if lnk_path.exists():
+            os.startfile(str(lnk_path))
+        else:
+            bat = root / "launch.bat"
+            if bat.exists():
+                subprocess.Popen(
+                    ["cmd.exe", "/c", str(bat)],
+                    cwd=str(root),
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
+                )
+
+        if _tray is not None:
+            _tray.stop()
+            _tray = None
+        os._exit(0)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 # ── Update / self-update ──────────────────────────────────────────────────────
 
 _UPDATE_REMOTES = [

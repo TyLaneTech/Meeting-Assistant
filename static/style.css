@@ -763,6 +763,39 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 .btn-send   {background: var(--accent);color: #0d1117;height: -webkit-fill-available;font-weight: 600;}
 .btn-danger { background: var(--surface2); color: var(--fg-muted); border: 1px solid var(--border); }
 .btn-danger:hover { color: var(--red) !important; border-color: var(--red); }
+.btn-icon-only { padding: 6px 8px; min-width: unset; }
+
+/* Power menu dropdown */
+.power-menu-wrap { position: relative; }
+.power-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px;
+  z-index: 999;
+  min-width: 140px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.power-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+.power-menu button:hover { background: var(--surface3); }
+.power-menu button:first-child:hover { color: var(--red); }
+.power-menu.hidden { display: none; }
 
 .icon-btn {
   background: none;

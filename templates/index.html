@@ -193,9 +193,15 @@
         <button class="btn btn-settings" onclick="openSettings()" title="Settings">
           <i class="fa-solid fa-gear"></i> Settings
         </button>
-        <button class="btn btn-danger" onclick="confirmShutdown()" title="Stop the server and close">
-          <i class="fa-solid fa-power-off"></i> Shut Down
-        </button>
+        <div class="power-menu-wrap">
+          <button class="btn btn-danger btn-icon-only" onclick="togglePowerMenu()" title="Power options">
+            <i class="fa-solid fa-power-off"></i>
+          </button>
+          <div class="power-menu hidden" id="power-menu">
+            <button onclick="confirmShutdown(); closePowerMenu()"><i class="fa-solid fa-power-off"></i> Shut Down</button>
+            <button onclick="confirmRestart(); closePowerMenu()"><i class="fa-solid fa-rotate-right"></i> Restart</button>
+          </div>
+        </div>
         <div class="topbar-sep"></div>
         <div class="pane-toggle-group">
           <button class="pane-toggle-btn active" id="pane-toggle-transcript"

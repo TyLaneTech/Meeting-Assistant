@@ -7479,8 +7479,30 @@ function _finishBulkLoad() {
 }
 
 /* ── Shutdown ────────────────────────────────────────────────────────────── */
+/* ── Power menu ────────────────────────────────────────────────────────── */
+
+function togglePowerMenu() {
+  const menu = document.getElementById('power-menu');
+  menu.classList.toggle('hidden');
+  if (!menu.classList.contains('hidden')) {
+    // Close on outside click
+    setTimeout(() => {
+      document.addEventListener('click', _closePowerMenuOutside, { once: true });
+    }, 0);
+  }
+}
+function closePowerMenu() {
+  document.getElementById('power-menu')?.classList.add('hidden');
+}
+function _closePowerMenuOutside(e) {
+  const wrap = document.querySelector('.power-menu-wrap');
+  if (wrap && !wrap.contains(e.target)) closePowerMenu();
+  else if (!document.getElementById('power-menu')?.classList.contains('hidden')) {
+    document.addEventListener('click', _closePowerMenuOutside, { once: true });
+  }
+}
+
 function confirmShutdown() {
-  // Inline confirmation rather than browser alert (looks nicer)
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
   overlay.innerHTML = `
@@ -7506,6 +7528,41 @@ async function doShutdown() {
       <p style="font-size:16px;font-weight:600;color:#e6edf3">Meeting Assistant shut down.</p>
       <p style="font-size:13px">You can close this tab.</p>
     </div>`;
+}
+
+function confirmRestart() {
+  const overlay = document.createElement('div');
+  overlay.className = 'overlay';
+  overlay.innerHTML = `
+    <div class="dialog">
+      <h3>Restart server?</h3>
+      <p>This will stop recording (if active) and restart the Meeting Assistant.</p>
+      <div class="dialog-btns">
+        <button class="btn" style="background:var(--accent);color:#fff" onclick="doRestart()">Restart</button>
+        <button class="btn" style="background:var(--surface2);color:var(--fg)"
+                onclick="this.closest('.overlay').remove()">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+}
+
+async function doRestart() {
+  document.querySelector('.overlay')?.remove();
+  await fetch('/api/restart', { method: 'POST' }).catch(() => {});
+  document.body.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:center;height:100vh;
+                flex-direction:column;gap:12px;color:#8b949e;font-family:system-ui">
+      <span style="font-size:40px"><img id="shutdown-icon" class="brand-icon shutdown-icon" src="/static/images/logo.png" alt=""></span>
+      <p style="font-size:16px;font-weight:600;color:#e6edf3">Restarting...</p>
+      <p style="font-size:13px">The page will reload when the server is back.</p>
+    </div>`;
+  // Poll until the server is back, then reload
+  const poll = setInterval(async () => {
+    try {
+      const r = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
+      if (r.ok) { clearInterval(poll); location.reload(); }
+    } catch {}
+  }, 2000);
 }
 
 /* ── Misc helpers ────────────────────────────────────────────────────────── */
