@@ -2115,7 +2115,13 @@ function connectSSE(afterSegId = 0) {
     state.chatBuffer += JSON.parse(e.data).text;
     if (state.chatCursor) {
       const wrap = state.chatCursor.closest('.chat-msg');
-      if (wrap) _setAssistantProcessing(wrap, false);
+      if (wrap) {
+        _setAssistantProcessing(wrap, false);
+        // Reveal body and actions on first content
+        state.chatCursor.style.display = '';
+        const actions = wrap.querySelector('.chat-msg-actions');
+        if (actions) actions.style.display = '';
+      }
       state.chatCursor.innerHTML = renderMd(state.chatBuffer);
       state.chatCursor.classList.add('typing-cursor');
       scrollChatToBottom();
@@ -6811,8 +6817,8 @@ function createAssistantBubble() {
       </div>
       <span class="chat-processing-label">Thinking</span>
     </div>
-    <div class="chat-msg-body markdown-body"></div>
-    <div class="chat-msg-actions">
+    <div class="chat-msg-body markdown-body" style="display:none"></div>
+    <div class="chat-msg-actions" style="display:none">
       <button class="chat-msg-action-btn" title="Copy response" onclick="_copyChatMsg(this)">
         <i class="fa-regular fa-copy"></i> Copy
       </button>
@@ -6972,6 +6978,7 @@ async function sendMessage() {
   } else {
     const err = await resp.json().catch(() => ({}));
     const bubble = createAssistantBubble();
+    bubble.style.display = '';
     bubble.textContent = `Error: ${err.error || 'Unknown error'}`;
     state.aiChatBusy = false;
     _setChatBusy(false);
@@ -7335,12 +7342,15 @@ async function loadSession(sessionId) {
         appendUserBubble(m.content, atts);
       } else {
         const b = createAssistantBubble();
-        // Hide the processing indicator for restored messages
+        // Restored messages: show body/actions, hide processing indicator
         const wrap = b.closest('.chat-msg');
         if (wrap) {
           const proc = wrap.querySelector('.chat-processing');
           if (proc) proc.classList.remove('active');
+          const actions = wrap.querySelector('.chat-msg-actions');
+          if (actions) actions.style.display = '';
         }
+        b.style.display = '';
         b.innerHTML = renderMd(m.content);
         linkifyTimestamps(b);
         // Restore tool-call widget if present

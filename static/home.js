@@ -146,7 +146,7 @@ function _createAssistantBubble() {
         </button>
       </div>
     </div>
-    <div class="chat-msg-body markdown-body"></div>
+    <div class="chat-msg-body markdown-body" style="display:none"></div>
     <div class="chat-processing">
       <span class="chat-processing-label">Thinking</span>
       <span class="chat-processing-dots"><span></span><span></span><span></span></span>
@@ -166,6 +166,7 @@ function _setAssistantProcessing(msgWrap, active, label) {
 function _updateAssistantBody(msgWrap, text) {
   const body = msgWrap.querySelector('.chat-msg-body');
   if (!body) return;
+  body.style.display = '';
   body.innerHTML = renderMd(text);
   body.querySelectorAll('pre code').forEach(block => {
     try { hljs.highlightElement(block); } catch {}
