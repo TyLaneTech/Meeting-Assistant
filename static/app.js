@@ -2367,15 +2367,20 @@ function onStatus(d) {
   }
 
   if (!state.isRecording) {
+    const pill = dot.parentElement;
     if (state.isReanalyzing) {
       dot.className = 'status-dot recording';
       text.textContent = 'Reanalyzing…';
+      pill.removeAttribute('title');
     } else if (!state.recordingReady) {
       dot.className = 'status-dot loading';
-      text.textContent = state.recordingReadyReason || 'Loading transcription model…';
+      const msg = state.recordingReadyReason || 'Loading transcription model…';
+      text.textContent = msg;
+      pill.setAttribute('title', msg);
     } else {
       dot.className = 'status-dot ready';
       text.textContent = state.modelInfo || 'Ready';
+      pill.removeAttribute('title');
     }
   }
 
