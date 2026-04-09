@@ -20,7 +20,8 @@ function _linkifyTimestampsInMd(md) {
     const [m, s] = start.split(':').map(Number);
     const sec = m * 60 + s;
     const label = end ? `${start} - ${end}` : start;
-    return `<span class="ts-pill" data-ts="${sec}" onclick="seekPlayback(${sec})">${label}</span>`;
+    const title = end ? `Jump to ${start} - ${end}` : `Jump to ${start}`;
+    return `<a class="timestamp-link" href="#" title="${title}" onclick="event.preventDefault();seekPlayback(${sec})">${label}</a>`;
   });
 }
 
