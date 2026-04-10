@@ -302,7 +302,7 @@ DIARIZATION_DEFAULTS = {
         "type": "number",
     },
     "segment_break_silence": {
-        "value": 1.5,
+        "value": 0.75,
         "label": "Segment Break Silence",
         "unit": "s",
         "description": "Silence gap that forces a new transcript segment for the same speaker.",

@@ -3026,34 +3026,6 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                      f"falling back to real-time pipeline")
             _transcriber.process_wav_file(wav_path)
 
-        # Trigger a fresh summary from the new transcript
-        with _state_lock:
-            if _state["session_id"] == session_id:
-                segments = list(_state["segments"])
-                labels = dict(_state["speaker_labels"])
-            else:
-                segments = []
-                labels = {}
-
-        if not segments:
-            # Load from DB in case segments were not kept in memory
-            sess = storage.get_session(session_id)
-            if sess:
-                segments = sess["segments"]
-                labels = sess.get("speaker_labels") or {}
-
-        # Only auto-generate summary if the user has Auto enabled or provided a custom prompt
-        auto_summary_enabled = settings.get("auto_summary", True)
-        if segments and (auto_summary_enabled or custom_prompt):
-            transcript = _build_transcript(segments, labels)
-            meta = _build_session_meta(
-                segments, labels,
-                is_live=False,
-                custom_prompt=custom_prompt,
-            )
-            _run_summary(session_id, "", transcript, len(segments), custom_prompt, meta,
-                         is_auto=False)
-
         _push("reanalysis_done", {"session_id": session_id})
     except Exception as e:
         log.error("reanalysis", f"{e}")
