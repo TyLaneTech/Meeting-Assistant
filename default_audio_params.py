@@ -322,6 +322,94 @@ DIARIZATION_DEFAULTS = {
     },
 }
 
+AUTO_GAIN_DEFAULTS = {
+    "agc_loopback_enabled": {
+        "value": 1,
+        "label": "Desktop Auto Gain",
+        "description": "Automatically boost quiet desktop audio to a consistent level.",
+        "tooltip": (
+            "Applies gentle dynamic gain to the desktop (loopback) audio so that "
+            "quiet participants are brought closer in volume to louder ones. The "
+            "gain envelope tracks slowly to avoid pumping artifacts.<br><br>"
+            "<b>Enable</b> when meeting participants have mismatched volume levels.<br>"
+            "<b>Leave disabled</b> if desktop audio levels are already consistent."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+    },
+    "agc_mic_enabled": {
+        "value": 1,
+        "label": "Microphone Auto Gain",
+        "description": "Automatically boost quiet microphone audio to a consistent level.",
+        "tooltip": (
+            "Applies gentle dynamic gain to the microphone input. Useful if your "
+            "mic level varies or is set low.<br><br>"
+            "<b>Enable</b> if your mic audio is consistently too quiet.<br>"
+            "<b>Leave disabled</b> if your mic level is already adequate."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+    },
+    "agc_target_rms": {
+        "value": 0.15,
+        "label": "AGC Target Level",
+        "description": "Target RMS level that the auto-gain normalises toward.",
+        "tooltip": (
+            "The desired RMS amplitude (0\u20131) for the auto-gain output. Audio "
+            "quieter than this is boosted; audio louder is left untouched.<br><br>"
+            "<b>Higher values</b> produce louder normalised output.<br>"
+            "<b>Lower values</b> are more conservative."
+        ),
+        "min": 0.05,
+        "max": 0.35,
+        "step": 0.01,
+        "type": "number",
+        "agc_param": True,
+    },
+    "agc_max_gain": {
+        "value": 4.0,
+        "label": "AGC Max Boost",
+        "unit": "\u00d7",
+        "description": "Maximum gain multiplier the auto-gain will apply.",
+        "tooltip": (
+            "Caps the auto-gain boost to prevent amplifying silence or background "
+            "noise into distortion.<br><br>"
+            "<b>Higher values</b> can rescue very quiet audio but risk boosting "
+            "noise.<br>"
+            "<b>Lower values</b> are safer but won't help extremely quiet sources."
+        ),
+        "min": 1.5,
+        "max": 10.0,
+        "step": 0.5,
+        "type": "number",
+        "agc_param": True,
+    },
+    "agc_gate_threshold": {
+        "value": 0.005,
+        "label": "AGC Noise Gate",
+        "description": "RMS level below which auto-gain will not boost.",
+        "tooltip": (
+            "Acts as a noise gate for the auto-gain. Audio with an RMS level "
+            "below this threshold is treated as silence or background noise and "
+            "will not be boosted, preventing the gain from jumping around during "
+            "quiet moments or brief noise bursts.<br><br>"
+            "<b>Higher values</b> make the gate stricter \u2014 only clearly audible "
+            "speech triggers boosting.<br>"
+            "<b>Lower values</b> allow quieter signals to be boosted, but may "
+            "amplify room tone."
+        ),
+        "min": 0.005,
+        "max": 0.05,
+        "step": 0.001,
+        "type": "number",
+        "agc_param": True,
+    },
+}
+
 ECHO_CANCELLATION_DEFAULTS = {
     "echo_cancel_enabled": {
         "value": 0,
@@ -750,7 +838,7 @@ DIARIZATION_DEFAULT_PRESET = "balanced"
 
 _ALL_DEFAULTS_DICTS = (
     TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
-    ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
+    AUTO_GAIN_DEFAULTS, ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
 )
 
 

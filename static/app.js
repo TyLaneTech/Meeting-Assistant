@@ -2289,6 +2289,7 @@ function connectSSE(afterSegId = 0) {
     if (d.lb_gain  != null) _syncGainSlider('lb',  d.lb_gain);
     if (d.mic_gain != null) _syncGainSlider('mic', d.mic_gain);
     updateLevelMeters(vizLbTarget, vizMicTarget, vizHasMic);
+    _updateAgcDebug(d.agc);
   });
 
   src.addEventListener('audio_test_status', e => {
@@ -2303,6 +2304,7 @@ function connectSSE(afterSegId = 0) {
       vizLbSpec    = [];
       vizMicSpec   = [];
       updateLevelMeters(0, 0, false);
+      _updateAgcDebug(null);
     }
   });
 
@@ -2614,7 +2616,7 @@ async function toggleRecording() {
     const micVal = document.getElementById('viz-mic-sel')?.value;
     const body = {};
     if (lbVal  !== '' && lbVal  !== null && lbVal  !== undefined) body.loopback_device = parseInt(lbVal, 10);
-    if (micVal !== '' && micVal !== null && micVal !== undefined) body.mic_device      = parseInt(micVal, 10);
+    Object.assign(body, parseMicSelection(micVal));
 
     if (state.isViewingPast) {
       // Resume the currently-viewed session instead of starting a new one
@@ -7983,7 +7985,7 @@ async function loadAudioDevices() {
 
   // Saved choices from server prefs (with localStorage fallback for migration)
   const savedLb  = _prefs.loopback_device ?? localStorage.getItem('viz-loopback-idx') ?? '';
-  const savedMic = _prefs.mic_device      ?? localStorage.getItem('viz-mic-idx')      ?? '-2';
+  const savedMic = _prefs.mic_device      ?? localStorage.getItem('viz-mic-idx')      ?? '';
 
   lbSel.innerHTML  = '<option value="">- loading -</option>';
   micSel.innerHTML = '<option value="-1">None</option>';
@@ -8012,16 +8014,59 @@ async function loadAudioDevices() {
     }
   }
 
-  // Populate mic selector - Browser Mic is always first, then None, then WASAPI devices
-  micSel.innerHTML = '<option value="-2">Browser Mic (this tab)</option><option value="-1">None</option>';
-  for (const d of data.input) {
-    const opt = document.createElement('option');
-    opt.value       = d.index;
-    opt.textContent = d.name;
-    micSel.appendChild(opt);
+  // Populate mic selector - FFmpeg (dshow) devices + None.
+  // Browser mic (-2) and WASAPI mic (device index) options are disabled in favor
+  // of FFmpeg subprocess capture which is far more reliable on Windows.  Both
+  // Browser and WASAPI suffered from choppy/distorted audio caused by shared-mode
+  // WASAPI contention and Chrome getUserMedia processing.  The backend code for
+  // both paths is retained (mic_index=-2 for browser, positive index for WASAPI)
+  // in case we need to reverse course.
+  micSel.innerHTML = '';
+  if (data.dshow?.length) {
+    for (const d of data.dshow) {
+      const opt = document.createElement('option');
+      opt.value       = 'ffmpeg:' + d.name;
+      opt.textContent = d.name;
+      micSel.appendChild(opt);
+    }
+  }
+  {
+    const none = document.createElement('option');
+    none.value = '-1'; none.textContent = 'None';
+    micSel.appendChild(none);
   }
   if (savedMic && [...micSel.options].some(o => o.value === String(savedMic))) {
     micSel.value = savedMic;
+  } else if (savedMic && savedMic !== '-1' && !String(savedMic).startsWith('ffmpeg:')) {
+    // Legacy saved value (WASAPI index or browser mic "-2") — try to match by
+    // device name.  WASAPI and dshow names for the same physical mic are usually
+    // identical, so find the WASAPI name from data.input and look for a matching
+    // ffmpeg option.
+    let legacyName = null;
+    if (savedMic === '-2') {
+      // Browser mic has no name to match — just fall through to first dshow device
+    } else {
+      const idx = parseInt(savedMic, 10);
+      const wasapiDev = (data.input || []).find(d => d.index === idx);
+      if (wasapiDev) legacyName = wasapiDev.name;
+    }
+    if (legacyName) {
+      // Fuzzy match: score each dshow option by how many words overlap with the
+      // legacy WASAPI name.  Longest overlap wins.  This handles truncation,
+      // different suffixes, and reordering between WASAPI and dshow names.
+      const legacyWords = legacyName.toLowerCase().split(/[\s\-_()]+/).filter(w => w.length >= 3);
+      let bestMatch = null, bestScore = 0;
+      for (const o of micSel.options) {
+        if (!o.value.startsWith('ffmpeg:')) continue;
+        const dshowWords = o.textContent.toLowerCase().split(/[\s\-_()]+/).filter(w => w.length >= 3);
+        const score = legacyWords.filter(w => dshowWords.some(dw => dw.includes(w) || w.includes(dw))).length;
+        if (score > bestScore) { bestScore = score; bestMatch = o; }
+      }
+      if (bestMatch && bestScore >= 1) {
+        micSel.value = bestMatch.value;
+        savePref('mic_device', bestMatch.value);
+      }
+    }
   }
 
   // Re-apply disabled state if currently recording
@@ -8055,7 +8100,7 @@ async function toggleAudioTest() {
     const micVal = document.getElementById('viz-mic-sel')?.value;
     const body   = {};
     if (lbVal  !== '' && lbVal  != null) body.loopback_device = parseInt(lbVal,  10);
-    if (micVal !== '' && micVal != null) body.mic_device      = parseInt(micVal, 10);
+    Object.assign(body, parseMicSelection(micVal));
 
     const resp = await fetch('/api/audio/test/start', {
       method:  'POST',
@@ -8067,6 +8112,107 @@ async function toggleAudioTest() {
       alert(err.error || 'Failed to start audio test');
     }
   }
+}
+
+async function autoDetectDevices() {
+  const btn = document.getElementById('viz-autodetect-btn');
+  const testBtn = document.getElementById('viz-test-btn');
+  const lbSel = document.getElementById('viz-loopback-sel');
+  const micSel = document.getElementById('viz-mic-sel');
+  if (!btn) return;
+
+  // Save current options so we can restore them after
+  const lbOpts = lbSel ? lbSel.innerHTML : '';
+  const micOpts = micSel ? micSel.innerHTML : '';
+
+  btn.disabled = true;
+  btn.classList.add('detecting');
+  btn.innerHTML = '<i class="fa-duotone fa-spinner fa-spin"></i>';
+  if (testBtn) testBtn.disabled = true;
+  if (lbSel)  { lbSel.innerHTML  = '<option>Analysing\u2026</option>'; lbSel.disabled  = true; }
+  if (micSel) { micSel.innerHTML = '<option>Analysing\u2026</option>'; micSel.disabled = true; }
+
+  try {
+    const resp = await fetch('/api/audio/auto-detect', { method: 'POST' });
+    const data = await resp.json();
+
+    // Restore original options before selecting
+    if (lbSel)  lbSel.innerHTML  = lbOpts;
+    if (micSel) micSel.innerHTML = micOpts;
+
+    if (!resp.ok) {
+      alert(data.error || 'Auto-detect failed');
+      return;
+    }
+
+    let changed = false;
+    if (data.best_loopback && lbSel) {
+      const idx = String(data.best_loopback.index);
+      if ([...lbSel.options].some(o => o.value === idx)) {
+        lbSel.value = idx;
+        changed = true;
+      }
+    }
+
+    if (data.best_mic && micSel) {
+      const val = 'ffmpeg:' + data.best_mic.name;
+      if ([...micSel.options].some(o => o.value === val)) {
+        micSel.value = val;
+        changed = true;
+      }
+    }
+
+    if (changed) saveDeviceSelection();
+  } catch (e) {
+    // Restore options on error too
+    if (lbSel)  lbSel.innerHTML  = lbOpts;
+    if (micSel) micSel.innerHTML = micOpts;
+    alert('Auto-detect failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('detecting');
+    btn.innerHTML = '<i class="fa-duotone fa-wand-magic-sparkles"></i>';
+    if (testBtn) testBtn.disabled = false;
+    if (lbSel)  lbSel.disabled  = false;
+    if (micSel) micSel.disabled = false;
+  }
+}
+
+/** Update the AGC debug panel in the sidebar. */
+function _updateAgcDebug(agc) {
+  const el = document.getElementById('agc-debug');
+  if (!el) return;
+  if (!agc) { el.style.display = 'none'; return; }
+  el.style.display = '';
+
+  const fmt = (v) => v < 0.001 ? v.toExponential(1) : v.toFixed(4);
+  const renderCol = (id, label, cssClass, enabled, gain, env, gated, target) => {
+    const col = document.getElementById(id);
+    if (!col) return;
+    if (!enabled) {
+      col.innerHTML = `<div class="agc-src ${cssClass}">${label}</div><div class="agc-idle">disabled</div>`;
+      return;
+    }
+    const status = gated ? '<span class="agc-gated">GATED</span>'
+                  : gain > 1.01 ? `<span class="agc-boosting">BOOST ${gain.toFixed(1)}\u00d7</span>`
+                  : '<span class="agc-idle">1.0\u00d7</span>';
+    col.innerHTML = `<div class="agc-src ${cssClass}">${label}</div>`
+      + `<div class="agc-val"><span class="agc-lbl">Status</span> ${status}</div>`
+      + `<div class="agc-val"><span class="agc-lbl">Gain</span> ${gain.toFixed(2)}\u00d7</div>`
+      + `<div class="agc-val"><span class="agc-lbl">Env</span> ${fmt(env)}</div>`
+      + `<div class="agc-val"><span class="agc-lbl">Target</span> ${fmt(target)}</div>`;
+  };
+  renderCol('agc-debug-lb',  'Desktop', 'lb',  agc.lb_enabled,  agc.lb_gain,  agc.lb_env,  agc.lb_gated,  agc.target);
+  renderCol('agc-debug-mic', 'Mic',     'mic', agc.mic_enabled, agc.mic_gain, agc.mic_env, agc.mic_gated, agc.target);
+}
+
+/** Parse the mic selector value into {mic_device, ffmpeg_mic_name} for the API. */
+function parseMicSelection(micVal) {
+  if (micVal == null || micVal === '') return {};
+  if (typeof micVal === 'string' && micVal.startsWith('ffmpeg:')) {
+    return { mic_device: -3, ffmpeg_mic_name: micVal.slice(7) };
+  }
+  return { mic_device: parseInt(micVal, 10) };
 }
 
 /* ── Audio visualizer ────────────────────────────────────────────────────── */
@@ -8084,8 +8230,14 @@ function updateLevelMeters(lb, mic, hasMic) {
   const toH = v => Math.round(Math.min(100, Math.log1p(v * 60) / Math.log1p(60) * 100));
   const lbEl  = document.getElementById('viz-meter-lb');
   const micEl = document.getElementById('viz-meter-mic');
-  if (lbEl)  lbEl.style.height  = toH(lb) + '%';
-  if (micEl) micEl.style.height = hasMic ? toH(mic) + '%' : '0%';
+  if (lbEl) {
+    lbEl.style.height = toH(lb) + '%';
+    lbEl.classList.toggle('peak', lb > 0.55);
+  }
+  if (micEl) {
+    micEl.style.height = hasMic ? toH(mic) + '%' : '0%';
+    micEl.classList.toggle('peak', hasMic && mic > 0.55);
+  }
 }
 
 function startVizLoop() {
@@ -8132,16 +8284,32 @@ function startVizLoop() {
       const bw = barW - pad * 2;
 
       // Desktop bar (top half, grows up from midline)
-      const lbH = Math.max(1, vizLbBars[i] * (midY - 3));
-      const lbAlpha = lbActive ? 0.25 + 0.75 * vizLbBars[i] : 0.12;
-      ctx.fillStyle = `rgba(88,166,255,${lbAlpha.toFixed(2)})`;
+      const lbV = vizLbBars[i];
+      const lbH = Math.max(1, lbV * (midY - 3));
+      const lbAlpha = lbActive ? 0.25 + 0.75 * lbV : 0.12;
+      const lbGrad = ctx.createLinearGradient(0, midY, 0, midY - lbH);
+      lbGrad.addColorStop(0, `rgba(88,166,255,${lbAlpha.toFixed(2)})`);
+      // Subtle lighten toward tip — ~25% shift, not full white
+      const lbT = Math.min(1, lbV * 1.2) * 0.25;
+      const lbR = Math.round(88  + (255 - 88)  * lbT);
+      const lbG = Math.round(166 + (255 - 166) * lbT);
+      lbGrad.addColorStop(1, `rgba(${lbR},${lbG},255,${Math.min(1, lbAlpha + 0.1 * lbT).toFixed(2)})`);
+      ctx.fillStyle = lbGrad;
       ctx.fillRect(x, midY - lbH, bw, lbH);
 
       // Mic bar (bottom half, grows down from midline)
       if (vizHasMic) {
-        const micH = Math.max(1, vizMicBars[i] * (midY - 3));
-        const micAlpha = micActive ? 0.25 + 0.75 * vizMicBars[i] : 0.12;
-        ctx.fillStyle = `rgba(0,180,100,${micAlpha.toFixed(2)})`;
+        const micV = vizMicBars[i];
+        const micH = Math.max(1, micV * (midY - 3));
+        const micAlpha = micActive ? 0.25 + 0.75 * micV : 0.12;
+        const micGrad = ctx.createLinearGradient(0, midY + 2, 0, midY + 2 + micH);
+        micGrad.addColorStop(0, `rgba(0,180,100,${micAlpha.toFixed(2)})`);
+        const micT = Math.min(1, micV * 1.2) * 0.25;
+        const micR = Math.round(0   + 255 * micT);
+        const micG = Math.round(180 + (255 - 180) * micT);
+        const micB = Math.round(100 + (255 - 100) * micT);
+        micGrad.addColorStop(1, `rgba(${micR},${micG},${micB},${Math.min(1, micAlpha + 0.1 * micT).toFixed(2)})`);
+        ctx.fillStyle = micGrad;
         ctx.fillRect(x, midY + 2, bw, micH);
       }
     }
@@ -8882,12 +9050,15 @@ function _apRenderSection(containerId, paramDefs, current) {
   if (!container || !paramDefs) return;
   container.innerHTML = '';
 
-  // Find any toggle master key in this section (controls enabled state of siblings)
-  let toggleMasterKey = null;
+  // Find toggle key(s) that control enabled state of sibling params.
+  // If multiple toggles exist, non-toggle params are disabled only when ALL toggles are off.
+  const toggleKeys = [];
   let toggleInverted = false; // when true, ON disables siblings instead of enabling them
   for (const [k, s] of Object.entries(paramDefs)) {
-    if (s.type === 'toggle') { toggleMasterKey = k; toggleInverted = !!s.inverts_siblings; break; }
+    if (s.type === 'toggle') { toggleKeys.push(k); toggleInverted = !!s.inverts_siblings; }
   }
+  const toggleMasterKey = toggleKeys[0] || null;
+  const hasMultipleToggles = toggleKeys.length > 1;
 
   for (const [key, spec] of Object.entries(paramDefs)) {
     const val = current[key] ?? spec.value;
@@ -8932,9 +9103,18 @@ function _apRenderSection(containerId, paramDefs, current) {
         lbl.textContent = cb.checked ? 'Enabled' : 'Disabled';
         const saveFn = containerId === 'ap-reanalysis-params' ? _raSave : _apSave;
         saveFn(key, v);
-        // Enable/disable sibling params in this section
-        const siblingsEnabled = toggleInverted ? !cb.checked : cb.checked;
-        _apSetSectionEnabled(containerId, key, siblingsEnabled);
+        // Enable/disable sibling params in this section.
+        // With multiple toggles, non-toggle params are enabled if ANY toggle is on.
+        if (hasMultipleToggles) {
+          const anyOn = toggleKeys.some(tk => {
+            const el = document.getElementById(`ap-toggle-${tk}`);
+            return el ? el.checked : false;
+          });
+          _apSetSectionEnabled(containerId, toggleKeys, anyOn);
+        } else {
+          const siblingsEnabled = toggleInverted ? !cb.checked : cb.checked;
+          _apSetSectionEnabled(containerId, [key], siblingsEnabled);
+        }
       });
       continue;
     }
@@ -8982,8 +9162,9 @@ function _apRenderSection(containerId, paramDefs, current) {
 
     // Standard slider param
     const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
-    const toggleOn = !!parseInt(current[toggleMasterKey] ?? 0);
-    const isDisabled = (toggleMasterKey && key !== toggleMasterKey && (toggleInverted ? toggleOn : !toggleOn));
+    const anyToggleOn = toggleKeys.some(tk => !!parseInt(current[tk] ?? 0));
+    const isToggle = toggleKeys.includes(key);
+    const isDisabled = (toggleKeys.length > 0 && !isToggle && (toggleInverted ? anyToggleOn : !anyToggleOn));
 
     param.innerHTML = `
       <div class="ap-header">
@@ -9044,11 +9225,12 @@ function _apRenderSection(containerId, paramDefs, current) {
   }
 }
 
-function _apSetSectionEnabled(containerId, toggleKey, enabled) {
+function _apSetSectionEnabled(containerId, skipKeys, enabled) {
   const container = document.getElementById(containerId);
   if (!container) return;
+  const skip = new Set(Array.isArray(skipKeys) ? skipKeys : [skipKeys]);
   for (const param of container.querySelectorAll('.ap-param')) {
-    if (param.dataset.apKey === toggleKey) continue;
+    if (skip.has(param.dataset.apKey)) continue;
     param.classList.toggle('ap-disabled', !enabled);
     for (const el of param.querySelectorAll('input, button')) {
       el.disabled = !enabled;
@@ -9109,6 +9291,7 @@ async function _apRefresh() {
   if (_apCache) {
     _apRenderSection('ap-transcription-params', _apCache.transcription, _apCache.current);
     _apRenderSection('ap-diarization-params',   _apCache.diarization,   _apCache.current);
+    _apRenderSection('ap-agc-params',           _apCache.auto_gain,         _apCache.current);
     _apRenderSection('ap-echo-params',          _apCache.echo_cancellation, _apCache.current);
     _apRenderSection('ap-screen-params',        _apCache.screen_recording,  _apCache.current);
   }
@@ -9127,7 +9310,7 @@ async function _apSave(key, value) {
     if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
       // Update reset button visibility
-      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.auto_gain && _apCache.auto_gain[key]) || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
       const resetBtn = document.getElementById(`ap-reset-${key}`);
       if (resetBtn && spec) {
         const isDefault = Math.abs(value - spec.value) < 1e-9;
@@ -9234,7 +9417,7 @@ async function _apResetOne(key) {
       if (resetBtn) resetBtn.classList.add('ap-reset-hidden');
     } else if (res.ok && _apCache) {
       _apCache.current = res.audio_params;
-      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
+      const spec = (_apCache.transcription[key] || _apCache.diarization[key] || (_apCache.auto_gain && _apCache.auto_gain[key]) || (_apCache.echo_cancellation && _apCache.echo_cancellation[key]) || (_apCache.screen_recording && _apCache.screen_recording[key]));
       if (spec) {
         if (spec.type === 'toggle') {
           const cb = document.getElementById(`ap-toggle-${key}`);
@@ -9623,7 +9806,14 @@ window.addEventListener('beforeunload', () => {
 
 refreshSidebar();
 _checkSemanticSearchReady();
-fetch('/api/status').then(r => r.json()).then(onStatus);
+fetch('/api/status').then(r => r.json()).then(d => {
+  // Stop any orphaned audio test left over from a previous page session
+  // (e.g. user refreshed while testing). Must happen before onStatus.
+  if (d.is_testing) {
+    fetch('/api/audio/test/stop', { method: 'POST' }).catch(() => {});
+  }
+  onStatus(d);
+});
 
 if (!_isHomePage) {
   fetch('/api/ai_settings')

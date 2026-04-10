@@ -40,9 +40,13 @@ import config
 import settings
 import storage
 from ai_assistant import AIAssistant
-from audio_capture import AudioCapture, enumerate_audio_devices
+from audio_capture import (
+    AudioCapture, enumerate_audio_devices, enumerate_dshow_audio_devices,
+    auto_detect_devices,
+)
 from default_audio_params import (
-    TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
+    TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, AUTO_GAIN_DEFAULTS,
+    SCREEN_RECORDING_DEFAULTS,
     TRANSCRIPTION_PRESETS, TRANSCRIPTION_DEFAULT_PRESET,
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
@@ -209,6 +213,7 @@ def _status_payload(extra: dict | None = None) -> dict:
     with _state_lock:
         payload = {
             "recording": _state["is_recording"],
+            "is_testing": _state["is_testing"],
             "session_id": _state["session_id"],
             "model_ready": _state["model_ready"],
             "model_info": _state["model_info"],
@@ -795,7 +800,7 @@ def _level_push_loop() -> None:
             is_test = _state["is_testing"]
             capture = _state["audio_capture"] if is_rec else _state["test_capture"]
         if capture and (is_rec or is_test):
-            _push("audio_level", {
+            payload = {
                 "loopback":    round(capture.loopback_level, 4),
                 "mic":         round(capture.mic_level, 4),
                 "has_mic":     capture._has_mic,
@@ -803,7 +808,23 @@ def _level_push_loop() -> None:
                 "mic_spectrum":capture.compute_spectrum(capture._mic_fft_buf),
                 "lb_gain":     capture.loopback_gain,
                 "mic_gain":    capture.mic_gain,
-            })
+            }
+            # Include AGC debug info when either AGC is enabled
+            if capture.agc_loopback_enabled or capture.agc_mic_enabled:
+                payload["agc"] = {
+                    "lb_gain":     round(float(capture.agc_lb_gain), 2),
+                    "lb_env":      round(float(capture.agc_lb_envelope), 5),
+                    "lb_gated":    bool(capture.agc_lb_gated),
+                    "lb_enabled":  bool(capture.agc_loopback_enabled),
+                    "mic_gain":    round(float(capture.agc_mic_gain), 2),
+                    "mic_env":     round(float(capture.agc_mic_envelope), 5),
+                    "mic_gated":   bool(capture.agc_mic_gated),
+                    "mic_enabled": bool(capture.agc_mic_enabled),
+                    "target":      float(capture.agc_target_rms),
+                    "gate":        float(capture.agc_gate_threshold),
+                    "max_gain":    float(capture.agc_max_gain),
+                }
+            _push("audio_level", payload)
 
 
 threading.Thread(target=_level_push_loop, daemon=True).start()
@@ -989,9 +1010,27 @@ def get_status():
 @app.route("/api/audio/devices")
 def get_audio_devices():
     try:
-        return jsonify(enumerate_audio_devices())
+        data = enumerate_audio_devices()
+        data["dshow"] = enumerate_dshow_audio_devices()
+        return jsonify(data)
     except Exception as e:
-        return jsonify({"error": str(e), "loopback": [], "input": []}), 500
+        return jsonify({"error": str(e), "loopback": [], "input": [], "dshow": []}), 500
+
+
+@app.route("/api/audio/auto-detect", methods=["POST"])
+def auto_detect_audio():
+    """Test all audio devices simultaneously and return the best ones."""
+    with _state_lock:
+        if _state["is_recording"]:
+            return jsonify({"error": "Cannot auto-detect while recording"}), 400
+        if _state["is_testing"]:
+            return jsonify({"error": "Stop audio test before auto-detecting"}), 400
+    try:
+        result = auto_detect_devices()
+        return jsonify(result)
+    except Exception as e:
+        log.error("audio", f"Auto-detect failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/audio/gain", methods=["POST"])
@@ -1106,13 +1145,26 @@ def start_audio_test():
     body = request.get_json(silent=True) or {}
     loopback_device = body.get("loopback_device")
     mic_device      = body.get("mic_device")
+    ffmpeg_mic_name = body.get("ffmpeg_mic_name")
 
     # A dummy queue - the mixer writes into it but nothing reads it.
     # We only care about the live loopback_level / mic_level attributes.
     test_queue: queue.Queue = queue.Queue(maxsize=100)
     capture = AudioCapture(test_queue)
+
+    # Apply audio processing settings so the test reflects real behavior
+    from default_audio_params import get_all_defaults
+    _params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
+    capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
+    capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
+    capture.agc_mic_enabled = bool(int(_params.get("agc_mic_enabled", 0)))
+    capture.agc_target_rms = float(_params.get("agc_target_rms", 0.15))
+    capture.agc_max_gain = float(_params.get("agc_max_gain", 4.0))
+    capture.agc_gate_threshold = float(_params.get("agc_gate_threshold", 0.01))
+
     try:
-        capture.start(loopback_index=loopback_device, mic_index=mic_device)
+        capture.start(loopback_index=loopback_device, mic_index=mic_device,
+                      ffmpeg_mic_name=ffmpeg_mic_name)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1170,6 +1222,7 @@ def start_recording():
     title             = body.get("title")
     loopback_device   = body.get("loopback_device")   # int | None
     mic_device        = body.get("mic_device")         # int | None | -1
+    ffmpeg_mic_name   = body.get("ffmpeg_mic_name")    # str | None (for mic_device=-3)
     resume_session_id = body.get("resume_session_id")  # str | None
 
     # ── Resume an existing session ──────────────────────────────────────────
@@ -1219,6 +1272,11 @@ def start_recording():
     from default_audio_params import get_all_defaults
     _ec_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
+    capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
+    capture.agc_mic_enabled = bool(int(_ec_params.get("agc_mic_enabled", 0)))
+    capture.agc_target_rms = float(_ec_params.get("agc_target_rms", 0.15))
+    capture.agc_max_gain = float(_ec_params.get("agc_max_gain", 4.0))
+    capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
 
     # Set up WAV recording - append to existing file on resume
     wav_dir = Path(__file__).parent / "data" / "audio"
@@ -1228,6 +1286,7 @@ def start_recording():
         capture.start(
             loopback_index=loopback_device,
             mic_index=mic_device,
+            ffmpeg_mic_name=ffmpeg_mic_name,
         )
     except Exception as e:
         capture.stop_wav()
@@ -1666,7 +1725,7 @@ def get_audio_params():
     """Return current audio parameter values, defaults, and metadata."""
     from default_audio_params import (
         TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
-        ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
+        AUTO_GAIN_DEFAULTS, ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
         get_all_defaults,
     )
     saved = settings.load().get("audio_params", {})
@@ -1676,6 +1735,7 @@ def get_audio_params():
         "current": current,
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
+        "auto_gain": AUTO_GAIN_DEFAULTS,
         "echo_cancellation": ECHO_CANCELLATION_DEFAULTS,
         "screen_recording": SCREEN_RECORDING_DEFAULTS,
     })
@@ -1724,6 +1784,7 @@ def reset_audio_section():
     section_map = {
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
+        "auto_gain": AUTO_GAIN_DEFAULTS,
         "screen_recording": SCREEN_RECORDING_DEFAULTS,
     }
     data = request.get_json(silent=True) or {}
@@ -1882,11 +1943,16 @@ def _apply_audio_params(params: dict) -> None:
     if _transcriber.diarizer is not None:
         _transcriber.diarizer.apply_params(params)
 
-    # Push echo cancellation toggle to the active AudioCapture instance
+    # Push echo cancellation and AGC toggles to the active AudioCapture instance
     with _state_lock:
         capture = _state.get("audio_capture")
     if capture is not None:
         capture.echo_cancel_enabled = bool(int(params.get("echo_cancel_enabled", 0)))
+        capture.agc_loopback_enabled = bool(int(params.get("agc_loopback_enabled", 0)))
+        capture.agc_mic_enabled = bool(int(params.get("agc_mic_enabled", 0)))
+        capture.agc_target_rms = float(params.get("agc_target_rms", 0.15))
+        capture.agc_max_gain = float(params.get("agc_max_gain", 4.0))
+        capture.agc_gate_threshold = float(params.get("agc_gate_threshold", 0.01))
 
 
 @app.route("/api/screen/displays", methods=["GET"])

@@ -96,10 +96,11 @@
         <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list"><i class="fa-solid fa-rotate-right"></i></button>
       </div>
       <div class="viz-gain-row">
-        <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
-        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1"
-               oninput="onGainInput('lb', this.value)">
-        <span id="viz-lb-gain-val" class="viz-gain-val viz-lbl-desktop">1.0×</span>
+        <div class="gain-group-left">
+            <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
+            <span id="viz-lb-gain-val" class="viz-gain-val viz-lbl-desktop">1.0×</span>
+        </div>
+        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('lb', this.value)">
       </div>
 
       <!-- Waveform canvas + level meter -->
@@ -117,10 +118,11 @@
 
       <!-- Mic gain + device -->
       <div class="viz-gain-row">
-        <label class="viz-gain-lbl viz-lbl-mic">Gain</label>
-        <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1"
-               oninput="onGainInput('mic', this.value)">
-        <span id="viz-mic-gain-val" class="viz-gain-val viz-lbl-mic">1.0×</span>
+        <div class="gain-group-left">
+            <label class="viz-gain-lbl viz-lbl-mic">Gain</label>
+            <span id="viz-mic-gain-val" class="viz-gain-val viz-lbl-mic">1.0×</span>
+        </div>
+            <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('mic', this.value)">
       </div>
       <div class="viz-device-row">
         <label class="viz-device-lbl viz-lbl-mic">Mic</label>
@@ -130,9 +132,21 @@
         </select>
       </div>
 
-      <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
-        <i class="fa-solid fa-play"></i> Test Audio
-      </button>
+      <div class="viz-btn-row">
+        <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
+          <i class="fa-solid fa-play"></i> Test Audio
+        </button>
+        <button id="viz-autodetect-btn" class="btn viz-test-btn viz-autodetect-btn" onclick="autoDetectDevices()" title="Auto-detect best audio devices">
+          <i class="fa-duotone fa-wand-magic-sparkles"></i>
+        </button>
+      </div>
+      <div id="agc-debug" class="agc-debug" style="display:none">
+        <div class="agc-debug-title">AGC Debug</div>
+        <div class="agc-debug-grid">
+          <div class="agc-debug-col" id="agc-debug-lb"></div>
+          <div class="agc-debug-col" id="agc-debug-mic"></div>
+        </div>
+      </div>
       </div><!-- /pane-body-audio -->
     </div>
     <div class="sidebar-pane" id="screen-capture-section">
@@ -567,7 +581,7 @@
           <div class="fp-panel-empty">No voice profiles yet.</div>
         </div>
         <div class="fp-bulk-actions hidden" id="fp-bulk-actions">
-          <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkOptimize()" title="Optimize selected"><i class="fa-solid fa-wand-magic-sparkles"></i> Optimize</button>
+          <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkOptimize()" title="Optimize selected"><i class="fa-duotone fa-wand-magic-sparkles"></i> Optimize</button>
           <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkMerge()" title="Merge selected into one"><i class="fa-solid fa-merge"></i> Merge</button>
           <button class="speaker-manager-btn fp-detail-delete-btn fp-bulk-btn" onclick="_fpBulkDelete()" title="Delete selected"><i class="fa-solid fa-trash"></i> Delete</button>
         </div>
@@ -627,6 +641,9 @@
         </button>
         <button class="settings-nav-item" data-target="section-reanalysis" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-arrows-rotate"></i><span>Reanalysis</span>
+        </button>
+        <button class="settings-nav-item" data-target="section-agc" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-sliders"></i><span>Auto Gain</span>
         </button>
         <button class="settings-nav-item" data-target="section-echo" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-tower-broadcast"></i><span>Echo Cancellation</span>
@@ -770,6 +787,22 @@
           </div>
           <div class="ap-reset-all-wrap">
             <button class="ap-reset-all-btn" onclick="resetReanalysisParams()">
+              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
+            </button>
+          </div>
+        </div>
+
+        <!-- Auto Gain -->
+        <div class="settings-panel" id="section-agc">
+          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
+            Gently boosts quiet audio sources to a consistent level. Useful when
+            meeting participants have mismatched volumes.
+          </p>
+          <div class="settings-group" id="ap-agc-params">
+            <!-- Populated dynamically by JS -->
+          </div>
+          <div class="ap-reset-all-wrap">
+            <button class="ap-reset-all-btn" onclick="resetSection('auto_gain')">
               <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
             </button>
           </div>

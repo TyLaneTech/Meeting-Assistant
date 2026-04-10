@@ -5,6 +5,8 @@ mixing both streams into a single mono feed for transcription.
 """
 import collections
 import queue
+import re
+import subprocess
 import threading
 import time
 import traceback
@@ -20,7 +22,7 @@ from wav_writer import WavWriter
 # FFT window size for the spectrum visualizer.  2048 samples ≈ 43 ms at 48 kHz,
 # giving ~23 Hz frequency resolution.  The deque keeps the most recent window
 # and is refilled by the mixer loop at ~512 samples per chunk.
-_FFT_SIZE = 2048
+_FFT_SIZE = 4096
 _N_BARS   = 32   # number of log-spaced frequency bands sent to the frontend
 
 # On Windows, calling Pa_StopStream / Pa_CloseStream on a WASAPI loopback stream
@@ -79,10 +81,29 @@ class AudioCapture:
         # Echo cancellation (disabled by default - enable for speaker+mic setups)
         self.echo_cancel_enabled: bool = False
 
+        # Automatic gain control (soft compressor / normaliser)
+        self.agc_loopback_enabled: bool = True
+        self.agc_mic_enabled: bool = True
+        self.agc_target_rms: float = 0.15
+        self.agc_max_gain: float = 4.0
+        self.agc_gate_threshold: float = 0.005
+
+        # Live AGC debug state (read by the level-push loop for the UI)
+        self.agc_lb_gain: float = 1.0
+        self.agc_lb_envelope: float = 0.0
+        self.agc_lb_gated: bool = True
+        self.agc_mic_gain: float = 1.0
+        self.agc_mic_envelope: float = 0.0
+        self.agc_mic_gated: bool = True
+
         # Rolling sample buffers for the FFT spectrum visualizer (post-gain)
         self._lb_fft_buf:  collections.deque = collections.deque(maxlen=_FFT_SIZE)
         self._mic_fft_buf: collections.deque = collections.deque(maxlen=_FFT_SIZE)
         self._hann_window: np.ndarray | None = None   # precomputed; set on first use
+
+        # FFmpeg subprocess mic capture (mic_index=-3)
+        self._ffmpeg_proc: subprocess.Popen | None = None
+        self._ffmpeg_mic_name: str | None = None
 
     # ── Device discovery ──────────────────────────────────────────────────────
 
@@ -209,12 +230,14 @@ class AudioCapture:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def start(self, loopback_index: int | None = None, mic_index: int | None = None) -> None:
+    def start(self, loopback_index: int | None = None, mic_index: int | None = None,
+              ffmpeg_mic_name: str | None = None) -> None:
         """
         Start capture.  loopback_index / mic_index override auto-detection;
         pass mic_index=-1 to explicitly disable the microphone,
-        or mic_index=-2 to receive mic audio injected from the browser
-        (via inject_mic_data()) rather than opening a WASAPI device.
+        mic_index=-2 to receive mic audio injected from the browser
+        (via inject_mic_data()), or mic_index=-3 to capture via an ffmpeg
+        subprocess using DirectShow (requires ffmpeg_mic_name).
         """
         self._pa = pyaudio.PyAudio()
 
@@ -237,7 +260,44 @@ class AudioCapture:
         )
 
         # --- Microphone stream (best-effort) ---
-        if mic_index == -2:
+        if mic_index == -3:
+            # FFmpeg subprocess mic via DirectShow - completely independent of
+            # Python/WASAPI audio stack for maximum reliability.
+            from screen_recorder import find_ffmpeg
+            ffmpeg_path = find_ffmpeg()
+            if not ffmpeg_path:
+                log.warn("audio", "ffmpeg not found - cannot use FFmpeg mic capture")
+                mic_info = None
+            elif not ffmpeg_mic_name:
+                log.warn("audio", "No DirectShow mic device name provided for ffmpeg capture")
+                mic_info = None
+            else:
+                self._mic_rate     = 48000
+                self._mic_channels = 1
+                self._has_mic      = True
+                self._ffmpeg_mic_name = ffmpeg_mic_name
+                if self._mic_rate != self.sample_rate:
+                    g = gcd(self.sample_rate, self._mic_rate)
+                    self._resample_up   = self.sample_rate // g
+                    self._resample_down = self._mic_rate    // g
+                cmd = [
+                    ffmpeg_path,
+                    "-f", "dshow",
+                    "-i", f"audio={ffmpeg_mic_name}",
+                    "-f", "s16le",
+                    "-acodec", "pcm_s16le",
+                    "-ar", str(self._mic_rate),
+                    "-ac", "1",
+                    "-loglevel", "error",
+                    "pipe:1",
+                ]
+                log.info("audio", f"Mic: ffmpeg dshow '{ffmpeg_mic_name}' @ {self._mic_rate} Hz, 1 ch")
+                self._ffmpeg_proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                mic_info = None   # skip the WASAPI-open block below
+        elif mic_index == -2:
             # Browser mic - no WASAPI stream; audio arrives via inject_mic_data()
             self._mic_rate     = 48000   # browser AudioContext default
             self._mic_channels = 1
@@ -282,8 +342,8 @@ class AudioCapture:
                 log.warn("audio", f"Mic unavailable: {e}")
                 self._mic_stream = None
                 self._has_mic = False
-        elif mic_index != -2:
-            # Neither -2 (browser) nor a valid WASAPI mic - loopback only
+        elif mic_index not in (-2, -3):
+            # Neither -2 (browser) nor -3 (ffmpeg) nor a valid WASAPI mic
             self._has_mic = False
             if mic_index == -1:
                 log.info("audio", "Microphone explicitly disabled - capturing loopback only.")
@@ -305,11 +365,15 @@ class AudioCapture:
         )
         self._loopback_thread.start()
 
-        if self._has_mic and self._mic_stream is not None:
-            # Only start a capture thread when there's an actual WASAPI stream.
-            # For browser mic (mic_index=-2) _mic_stream is None; data arrives
-            # externally via inject_mic_data() which feeds _mic_q directly.
-            #
+        if self._has_mic and self._ffmpeg_proc is not None:
+            # FFmpeg subprocess mic - read raw PCM from stdout
+            self._mic_thread = threading.Thread(
+                target=self._ffmpeg_capture_loop,
+                daemon=True,
+            )
+            self._mic_thread.start()
+        elif self._has_mic and self._mic_stream is not None:
+            # WASAPI mic stream.
             # NOTE: Do NOT pass _mic_buf_size here.  _mic_buf_size is the
             # frames_per_buffer for the WASAPI stream's internal ring buffer
             # (large = prevents underruns).  The *read* chunk size must stay
@@ -327,6 +391,12 @@ class AudioCapture:
 
     def stop(self) -> None:
         self.is_running = False
+        # Terminate ffmpeg subprocess so the capture thread unblocks on stdout.read()
+        if self._ffmpeg_proc is not None:
+            try:
+                self._ffmpeg_proc.terminate()
+            except Exception:
+                pass
         # Wait for the capture and mixer threads to finish their current iteration
         # and exit naturally (they check is_running at the top of every loop).
         # Loopback/mic streams always have data so stream.read() returns quickly.
@@ -353,6 +423,7 @@ class AudioCapture:
             _stream_graveyard.append(self._pa)
         self._loopback_stream = None
         self._mic_stream = None
+        self._ffmpeg_proc = None
         self._pa = None
 
     def compute_spectrum(self, buf: collections.deque) -> list[float]:
@@ -372,8 +443,11 @@ class AudioCapture:
             self._hann_window = np.hanning(n).astype(np.float32)
 
         windowed = samples * self._hann_window
-        fft_mag  = np.abs(np.fft.rfft(windowed)) / (n * 0.5)   # normalise by window area
-        freqs    = np.fft.rfftfreq(n, d=1.0 / (self.sample_rate or 48000))
+        # Zero-pad to _FFT_SIZE so low-frequency bins always have enough
+        # resolution (~11.7 Hz at 4096/48 kHz) regardless of buffer fill.
+        padded = windowed if n >= _FFT_SIZE else np.pad(windowed, (0, _FFT_SIZE - n))
+        fft_mag  = np.abs(np.fft.rfft(padded)) / (n * 0.5)   # normalise by window area
+        freqs    = np.fft.rfftfreq(len(padded), d=1.0 / (self.sample_rate or 48000))
 
         f_min  = 40.0
         f_max  = min(20000.0, (self.sample_rate or 48000) / 2.0)
@@ -432,6 +506,81 @@ class AudioCapture:
                     break
                 time.sleep(0.01)  # brief pause to avoid a tight error loop
 
+    def _ffmpeg_capture_loop(self) -> None:
+        """Read raw PCM from an ffmpeg subprocess capturing via DirectShow."""
+        # 512 frames * 2 bytes (Int16) * 1 channel = 1024 bytes per chunk
+        read_size = self.CHUNK_SIZE * 2
+        proc = self._ffmpeg_proc
+        try:
+            while self.is_running and proc and proc.poll() is None:
+                data = proc.stdout.read(read_size)
+                if not data:
+                    break
+                try:
+                    self._mic_q.put_nowait(data)
+                except queue.Full:
+                    pass
+        except Exception:
+            if self.is_running:
+                log.warn("audio", f"ffmpeg mic capture error:\n{traceback.format_exc()}")
+        finally:
+            # Drain stderr for diagnostics
+            if proc and proc.poll() is None:
+                proc.terminate()
+            if proc:
+                try:
+                    stderr_out = proc.stderr.read() if proc.stderr else b""
+                    if proc.wait(timeout=3) != 0 and stderr_out:
+                        log.warn("audio", f"ffmpeg mic exited with code {proc.returncode}: "
+                                          f"{stderr_out.decode(errors='replace')[:500]}")
+                except Exception:
+                    pass
+
+    # ── AGC (automatic gain control) ─────────────────────────────────────────
+
+    @staticmethod
+    def _agc_apply(chunk: np.ndarray, envelope: float, target_rms: float,
+                   max_gain: float, gate_threshold: float,
+                   sample_rate: int) -> tuple[np.ndarray, float, float, bool]:
+        """Apply soft automatic gain to a chunk.
+
+        Returns (gained_chunk, new_envelope, applied_gain, is_gated).
+
+        Uses a slow-tracking RMS envelope (fast attack ~50 ms, slow release
+        ~1.5 s) to compute a smooth gain multiplier.  Gain is capped at
+        *max_gain* and only boosts — signals already above *target_rms* are
+        left untouched (gain clamped to 1.0).
+
+        *gate_threshold* is a noise gate: if the envelope is below this level
+        the signal is treated as silence/background noise and no boost is applied.
+        This prevents amplifying room tone or short noise bursts.
+        """
+        chunk_rms = float(np.sqrt(np.mean(chunk ** 2)))
+        # Envelope time constants (in per-chunk coefficients)
+        chunk_dur = len(chunk) / max(sample_rate, 1)
+        attack  = 1.0 - np.exp(-chunk_dur / 0.05)   # ~50 ms attack
+        release = 1.0 - np.exp(-chunk_dur / 1.5)     # ~1.5 s release
+        coeff = attack if chunk_rms > envelope else release
+        envelope += coeff * (chunk_rms - envelope)
+
+        # Noise gate: don't boost signals below the gate threshold
+        # (silence, room tone, brief noise bursts).
+        # Only boost (gain >= 1.0).  If signal is already loud, gain = 1.
+        gated = envelope <= gate_threshold
+        if not gated and envelope < target_rms:
+            gain = min(target_rms / envelope, max_gain)
+        else:
+            gain = 1.0
+
+        # Transient protection: if the *actual* chunk RMS times the computed
+        # gain would overshoot the target, instantly cap the gain so the
+        # output stays near target_rms.  This prevents hard-clipping when a
+        # loud speaker suddenly jumps in while the envelope is still low.
+        if chunk_rms > 1e-6 and chunk_rms * gain > target_rms:
+            gain = target_rms / chunk_rms
+
+        return np.clip(chunk * gain, -1.0, 1.0), envelope, gain, gated
+
     # ── Mixer thread ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -453,6 +602,10 @@ class AudioCapture:
         # Cap internal buffers at 3 seconds to prevent unbounded growth if the
         # downstream audio_queue backs up.
         max_buf_samples = int((self.sample_rate or 48000) * 3.0)
+
+        # AGC envelope state (per-source, persists across chunks)
+        _agc_lb_env  = 0.0
+        _agc_mic_env = 0.0
 
         # WebRTC AEC state - lazily initialised when echo cancellation is enabled
         _aec_processor = None
@@ -518,6 +671,20 @@ class AudioCapture:
                     )
                     lb_pos += self.CHUNK_SIZE
 
+                    # AGC for loopback
+                    if self.agc_loopback_enabled:
+                        lb_chunk, _agc_lb_env, _g, _gated = self._agc_apply(
+                            lb_chunk, _agc_lb_env, self.agc_target_rms,
+                            self.agc_max_gain, self.agc_gate_threshold,
+                            self.sample_rate or 48000,
+                        )
+                        self.agc_lb_gain = _g
+                        self.agc_lb_envelope = _agc_lb_env
+                        self.agc_lb_gated = _gated
+                    else:
+                        self.agc_lb_gain = 1.0
+                        self.agc_lb_gated = True
+
                     lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
                     self.loopback_level = lb_rms
                     self._lb_fft_buf.extend(lb_chunk.tolist())
@@ -528,6 +695,21 @@ class AudioCapture:
                             -1.0, 1.0,
                         )
                         mic_pos += self.CHUNK_SIZE
+
+                        # AGC for microphone
+                        if self.agc_mic_enabled:
+                            mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(
+                                mic_chunk, _agc_mic_env, self.agc_target_rms,
+                                self.agc_max_gain, self.agc_gate_threshold,
+                                self.sample_rate or 48000,
+                            )
+                            self.agc_mic_gain = _g
+                            self.agc_mic_envelope = _agc_mic_env
+                            self.agc_mic_gated = _gated
+                        else:
+                            self.agc_mic_gain = 1.0
+                            self.agc_mic_gated = True
+
                         mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
@@ -647,6 +829,181 @@ class AudioCapture:
                 time.sleep(0.05)
 
 
+def auto_detect_devices() -> dict:
+    """Test all audio devices simultaneously and return the best ones.
+
+    Opens every loopback and dshow mic device in parallel, plays a system
+    chime so loopback devices have signal, captures ~2 s of audio, then
+    picks the devices with the highest RMS.
+
+    Returns {"best_loopback": {...}, "best_mic": {...}, "loopback": [...], "mic": [...]}.
+    """
+    pa = pyaudio.PyAudio()
+    stop_event = threading.Event()
+
+    # ── Enumerate ────────────────────────────────────────────────────────
+    loopbacks = list(pa.get_loopback_device_info_generator())
+    dshow_mics = enumerate_dshow_audio_devices()
+    log.info("auto-detect", f"Found {len(loopbacks)} loopback, {len(dshow_mics)} dshow mic devices")
+
+    # ── Open all loopback streams (main thread, single PyAudio) ──────────
+    lb_streams: list[tuple[dict, object, list]] = []  # (info, stream, data_chunks)
+    for lb in loopbacks:
+        try:
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=max(1, lb["maxInputChannels"]),
+                rate=int(lb["defaultSampleRate"]),
+                input=True,
+                input_device_index=lb["index"],
+                frames_per_buffer=512,
+            )
+            lb_streams.append((lb, stream, []))
+            log.info("auto-detect", f"  Opened loopback: {lb['name']}")
+        except Exception as e:
+            log.warn("auto-detect", f"  Failed loopback '{lb['name']}': {e}")
+
+    # ── Spawn ffmpeg for each dshow mic ──────────────────────────────────
+    from screen_recorder import find_ffmpeg
+    ffmpeg_path = find_ffmpeg()
+    mic_procs: list[tuple[dict, subprocess.Popen, list]] = []  # (info, proc, data_chunks)
+    if ffmpeg_path:
+        for mic in dshow_mics:
+            try:
+                proc = subprocess.Popen(
+                    [ffmpeg_path, "-f", "dshow",
+                     "-i", f"audio={mic['name']}",
+                     "-f", "s16le", "-ar", "48000", "-ac", "1",
+                     "-loglevel", "error", "pipe:1"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                mic_procs.append((mic, proc, []))
+                log.info("auto-detect", f"  Opened dshow mic: {mic['name']}")
+            except Exception as e:
+                log.warn("auto-detect", f"  Failed dshow '{mic['name']}': {e}")
+
+    # ── Reader threads ───────────────────────────────────────────────────
+    def _lb_reader(stream, buf, stop_ev):
+        while not stop_ev.is_set():
+            try:
+                data = stream.read(512, exception_on_overflow=False)
+                buf.append(data)
+            except Exception:
+                if not stop_ev.is_set():
+                    break
+
+    def _mic_reader(proc, buf, stop_ev):
+        while not stop_ev.is_set():
+            try:
+                data = proc.stdout.read(1024)
+                if not data:
+                    break
+                buf.append(data)
+            except Exception:
+                break
+
+    threads: list[threading.Thread] = []
+    for _, stream, buf in lb_streams:
+        t = threading.Thread(target=_lb_reader, args=(stream, buf, stop_event), daemon=True)
+        t.start()
+        threads.append(t)
+    for _, proc, buf in mic_procs:
+        t = threading.Thread(target=_mic_reader, args=(proc, buf, stop_event), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # ── Play test sample through default audio output ──────────────────
+    from pathlib import Path
+    sample_path = Path(__file__).parent / "audio" / "test_sample.mp3"
+
+    time.sleep(0.3)  # let streams stabilize
+
+    def _play_sample():
+        try:
+            from playsound import playsound
+            playsound(str(sample_path))
+        except Exception as e:
+            log.warn("auto-detect", f"  playsound failed: {e}")
+
+    if sample_path.exists():
+        log.info("auto-detect", f"  Playing test sample: {sample_path.name}")
+        play_thread = threading.Thread(target=_play_sample, daemon=True)
+        play_thread.start()
+    else:
+        log.warn("auto-detect", f"  Test sample not found: {sample_path}")
+
+    time.sleep(3.0)  # capture window — matches the 3s sample duration
+    stop_event.set()
+    for t in threads:
+        t.join(timeout=1)
+
+    # ── Compute RMS per device ───────────────────────────────────────────
+    def _compute_rms(chunks: list[bytes]) -> float:
+        if not chunks:
+            return 0.0
+        raw = b"".join(chunks)
+        if len(raw) < 2:
+            return 0.0
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        return float(np.sqrt(np.mean(samples ** 2)))
+
+    lb_results = []
+    for info, stream, buf in lb_streams:
+        rms = _compute_rms(buf)
+        lb_results.append({"index": int(info["index"]), "name": info["name"],
+                           "rms": round(rms, 6)})
+        log.info("auto-detect", f"  Loopback '{info['name']}': RMS={rms:.6f}")
+
+    mic_results = []
+    for info, proc, buf in mic_procs:
+        rms = _compute_rms(buf)
+        mic_results.append({"name": info["name"], "rms": round(rms, 6)})
+        log.info("auto-detect", f"  Mic '{info['name']}': RMS={rms:.6f}")
+
+    # ── Cleanup ──────────────────────────────────────────────────────────
+    for _, stream, _ in lb_streams:
+        _stream_graveyard.append(stream)
+    _stream_graveyard.append(pa)
+
+    for _, proc, _ in mic_procs:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    # ── Pick winners ─────────────────────────────────────────────────────
+    lb_results.sort(key=lambda d: d["rms"], reverse=True)
+    mic_results.sort(key=lambda d: d["rms"], reverse=True)
+
+    best_lb = lb_results[0] if lb_results else None
+    best_mic = mic_results[0] if mic_results else None
+
+    if best_lb:
+        log.info("auto-detect", f"  >> Best loopback: '{best_lb['name']}' (RMS={best_lb['rms']:.6f})")
+    if best_mic:
+        log.info("auto-detect", f"  >> Best mic: '{best_mic['name']}' (RMS={best_mic['rms']:.6f})")
+
+    # ── Play completion chime ───────────────────────────────────────────
+    complete_path = Path(__file__).parent / "audio" / "complete.mp3"
+    if complete_path.exists():
+        def _play_complete():
+            try:
+                from playsound import playsound
+                playsound(str(complete_path))
+            except Exception:
+                pass
+        threading.Thread(target=_play_complete, daemon=True).start()
+
+    return {
+        "best_loopback": best_lb,
+        "best_mic": best_mic,
+        "loopback": lb_results,
+        "mic": mic_results,
+    }
+
+
 def default_device_name_matches(output_name: str, loopback_name: str) -> bool:
     """Check if a loopback device corresponds to the given output device."""
     return output_name in loopback_name
@@ -696,3 +1053,39 @@ def enumerate_audio_devices() -> dict:
         return {"loopback": loopbacks, "input": inputs}
     finally:
         pa.terminate()
+
+
+def enumerate_dshow_audio_devices() -> list[dict]:
+    """List DirectShow audio input devices via ffmpeg.
+
+    Returns a list of {"name": "..."} dicts.  These names are what ffmpeg
+    expects in ``-i audio=<name>``.  Returns an empty list if ffmpeg is
+    unavailable or the query fails.
+    """
+    from screen_recorder import find_ffmpeg
+    ffmpeg_path = find_ffmpeg()
+    if not ffmpeg_path:
+        return []
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-f", "dshow", "-list_devices", "true", "-i", "dummy"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        # ffmpeg prints device list to stderr
+        output = result.stderr
+    except Exception:
+        return []
+
+    devices: list[dict] = []
+    for line in output.splitlines():
+        # Skip "Alternative name" lines which contain internal device IDs
+        if "Alternative name" in line:
+            continue
+        # Device lines look like: [in#0 @ ...] "Device Name" (audio)
+        if "(audio)" not in line.lower():
+            continue
+        m = re.search(r'"(.+?)"', line)
+        if m:
+            devices.append({"name": m.group(1)})
+    return devices
