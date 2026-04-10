@@ -3093,8 +3093,6 @@ def reanalyze_session(session_id: str):
         _state["session_id"] = session_id
         _state["is_reanalyzing"] = True
         _state["segments"] = []
-        _state["summary"] = ""
-        _state["chat_history"] = []
         _state["pending_segments"] = 0
         _state["summarized_seg_count"] = 0
         _state["speaker_labels"] = {}

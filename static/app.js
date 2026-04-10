@@ -1861,16 +1861,14 @@ async function deleteSession(e, sessionId) {
 }
 
 async function reanalyzeSession(e, sessionId) {
-  e.stopPropagation();
+  if (e) e.stopPropagation();
   if (state.isRecording) { alert('Cannot reanalyze while recording.'); return; }
   if (state.isReanalyzing) { alert('Reanalysis already in progress.'); return; }
-  if (!confirm('Reanalyze this session from its recorded audio?\n\nThis will clear the current transcript, summary, and chat, then retranscribe from scratch.')) return;
 
   // Load the session as active so incoming transcript SSE events land on screen
   if (sessionId !== state.sessionId) {
     const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json());
     if (data.error) { alert(data.error); return; }
-    clearAll();
     state.sessionId     = sessionId;
     state.isViewingPast = false;
     document.getElementById('record-btn').disabled = true;
@@ -1878,11 +1876,13 @@ async function reanalyzeSession(e, sessionId) {
       data.speaker_profiles.forEach(p => applySpeakerProfileUpdate(p));
     }
   } else {
-    // Already viewing - just clear the display
-    clearAll();
     state.isViewingPast = false;
     document.getElementById('record-btn').disabled = true;
   }
+
+  // Clear only the transcript display - keep chat and summary intact
+  const transcriptEl = document.getElementById('transcript');
+  if (transcriptEl) transcriptEl.innerHTML = '';
 
   // Keep playback available during reanalysis - the WAV file still exists
   initPlayback(sessionId);
@@ -1897,6 +1897,11 @@ async function reanalyzeSession(e, sessionId) {
     const err = await resp.json().catch(() => ({}));
     alert(err.error || 'Failed to start reanalysis');
   }
+}
+
+async function reanalyzeCurrentSession() {
+  if (!state.sessionId) return;
+  await reanalyzeSession(null, state.sessionId);
 }
 
 function newSession() {
