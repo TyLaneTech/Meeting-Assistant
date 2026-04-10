@@ -756,7 +756,9 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 }
 .agc-debug-grid {
   display: flex;
-  gap: 12px;
+  /* gap: 10px; */
+  flex-direction: row;
+  justify-content: space-between;
 }
 .agc-debug-col {
   flex: 1;
@@ -5750,4 +5752,9 @@ button#viz-autodetect-btn {
 button#viz-autodetect-btn:hover {
     filter: brightness(1.25);
     background-color: var(--surface);
+}
+
+.agc-val {
+    display: flex;
+    flex-direction: row;
 }
