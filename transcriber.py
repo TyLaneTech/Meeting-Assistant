@@ -114,7 +114,7 @@ _MIN_WHISPER_SAMPLES = 3_200   # 0.2 s at 16 kHz
 # Short-fragment threshold: Whisper adds a trailing period to tiny audio clips
 # (e.g. a single word from diarization).  Outputs with this few words or fewer
 # are considered fragments and have their trailing period stripped.
-_FRAGMENT_MAX_WORDS = 4
+_FRAGMENT_MAX_WORDS = 2
 
 # Repetition / hallucination-loop detection.
 # Whisper can get stuck repeating a short phrase when conditioned on a
