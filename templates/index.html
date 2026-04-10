@@ -406,11 +406,13 @@
       <!-- ── Summary ────────────────────────────────────────────────── -->
       <div class="col col-summary">
         <div class="col-header">
-          <span class="col-title">Summary</span>
-          <button class="icon-btn active" id="auto-summary-btn"
-                  title="Toggle auto-summary" onclick="toggleAutoSummary()">Auto</button>
-          <span class="badge hidden" id="summary-badge">updating…</span>
-          <div class="col-actions">
+          <div class="col-actions left">
+            <span class="col-title">Summary</span>
+            <button class="icon-btn active" id="auto-summary-btn"
+                    title="Toggle auto-summary" onclick="toggleAutoSummary()">Auto</button>
+            <span class="badge hidden" id="summary-badge">updating…</span>
+          </div>
+          <div class="col-actions right">
             <button class="icon-btn" id="summary-prompt-toggle"
                     title="Custom summary instructions" onclick="toggleSummaryPrompt()"><i class="fa-solid fa-gear"></i></button>
             <button class="icon-btn" title="Copy summary" onclick="copySummary()"><i class="fa-solid fa-copy"></i></button>
