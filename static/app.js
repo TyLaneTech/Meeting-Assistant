@@ -2287,10 +2287,7 @@ function connectSSE(afterSegId = 0) {
     _fpRenderNotifPanel();
     document.getElementById('transcript').innerHTML =
       '<p class="empty-hint">Reanalyzing audio…</p>';
-    document.getElementById('summary').innerHTML =
-      '<p class="empty-hint">Summary will regenerate after reanalysis completes.</p>';
-    document.getElementById('chat-messages').innerHTML =
-      '<p class="empty-hint">Ask questions about the meeting here.</p>';
+    // Keep summary and chat intact - only the transcript is retranscribed
     // Keep playback active - the WAV file still exists during reanalysis
   });
 
