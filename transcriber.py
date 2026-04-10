@@ -274,6 +274,7 @@ class Transcriber:
         self.vad_min_silence_ms  = int(p["vad_min_silence_ms"])
         self.vad_speech_pad_ms   = int(p["vad_speech_pad_ms"])
         self.compression_ratio_threshold = float(p["compression_ratio_threshold"])
+        self.segment_break_silence = float(p.get("segment_break_silence", 1.5))
 
     @property
     def device_info(self) -> str:
@@ -512,11 +513,20 @@ class Transcriber:
                                                       chunk_start + end)
                         except Exception:
                             pass
+                    # Merge consecutive same-speaker segments, but break into
+                    # a new segment if the silence gap exceeds the threshold.
                     if batches and batches[-1][0] == label:
-                        # Same speaker as previous - append audio to batch
-                        batches[-1][1].append(seg_audio)
-                        batches[-1] = (label, batches[-1][1],
-                                       batches[-1][2], chunk_start + end)
+                        prev_end = batches[-1][3] - chunk_start  # relative end of previous
+                        gap = start - prev_end
+                        if gap < self.segment_break_silence:
+                            # Same speaker, short gap - append to batch
+                            batches[-1][1].append(seg_audio)
+                            batches[-1] = (label, batches[-1][1],
+                                           batches[-1][2], chunk_start + end)
+                        else:
+                            # Same speaker but long pause - start new segment
+                            batches.append((label, [seg_audio],
+                                            chunk_start + start, chunk_start + end))
                     else:
                         batches.append((label, [seg_audio],
                                         chunk_start + start, chunk_start + end))

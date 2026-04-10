@@ -301,6 +301,25 @@ DIARIZATION_DEFAULTS = {
         "step": 0.05,
         "type": "number",
     },
+    "segment_break_silence": {
+        "value": 1.5,
+        "label": "Segment Break Silence",
+        "unit": "s",
+        "description": "Silence gap that forces a new transcript segment for the same speaker.",
+        "tooltip": (
+            "When the same speaker continues after a pause longer than this "
+            "threshold, a new transcript segment is created instead of appending "
+            "to the current one. This breaks long monologues into readable "
+            "paragraphs.<br><br>"
+            "<b>Higher values</b> produce fewer, longer segments (more merging).<br>"
+            "<b>Lower values</b> create more frequent breaks, improving readability "
+            "of long monologues."
+        ),
+        "min": 0.5,
+        "max": 5.0,
+        "step": 0.25,
+        "type": "number",
+    },
 }
 
 ECHO_CANCELLATION_DEFAULTS = {
