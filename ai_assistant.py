@@ -105,6 +105,10 @@ _SCREENSHOT_FUNC_OAI = {
     },
 }
 
+# ── Native web search (server-side, executed by the provider) ────────────────
+_WEB_SEARCH_ANTHROPIC = {"type": "web_search_20250305", "name": "web_search"}
+_WEB_SEARCH_OAI       = {"type": "web_search_preview"}
+
 # ── Global Chat tools ────────────────────────────────────────────────────────
 
 _GLOBAL_TOOLS = [
@@ -286,7 +290,13 @@ class AIAssistant:
         "- Only timestamp moments worth jumping to - avoid tagging every sentence\n"
         "- Use exact timestamps from the transcript only. No tildes or "
         "approximations like [~17:30].\n\n"
-        "- Always respond in English regardless of any foreign words or phrases in the transcript"
+        "- Always respond in English regardless of any foreign words or phrases in the transcript\n\n"
+        "## Web search\n"
+        "You have access to a web search tool. Use it **sparingly** and only when "
+        "a search would genuinely add value — for example, clarifying industry-specific "
+        "terminology, looking up a product or company mentioned in the meeting, or "
+        "providing context on an external event referenced by a speaker. Your primary "
+        "focus should always remain on the meeting transcript itself."
     )
 
     _SYSTEM_SUMMARY = (
@@ -408,14 +418,11 @@ class AIAssistant:
             f"{summary_block}"
         )
 
-        if frame_extractor:
-            self._stream_with_tools(
-                system, chat_history, on_token, on_done,
-                cancel=cancel, frame_extractor=frame_extractor,
-                on_tool_event=on_tool_event,
-            )
-        else:
-            self._stream(system, chat_history, on_token, on_done, cancel=cancel)
+        self._stream_with_tools(
+            system, chat_history, on_token, on_done,
+            cancel=cancel, frame_extractor=frame_extractor,
+            on_tool_event=on_tool_event,
+        )
 
     def summarize(
         self,
@@ -577,7 +584,13 @@ class AIAssistant:
         "- Results include folder names when sessions are organized into folders - "
         "use this to provide project/team context\n"
         "- Speaker history shows segment counts per session to indicate how "
-        "active someone was in each meeting"
+        "active someone was in each meeting\n\n"
+        "## Web search\n"
+        "You also have access to a web search tool. Use it **sparingly** — only "
+        "when a search would genuinely add value beyond the meeting data. Good "
+        "uses: clarifying industry terms or acronyms mentioned in meetings, looking "
+        "up a company or product referenced by a speaker, providing context on an "
+        "external event. Your primary focus should always be the stored meetings."
     )
 
     def ask_global(
@@ -825,9 +838,10 @@ class AIAssistant:
                     f"Add it in Settings.*"
                 )
                 return
-            # Default to screenshot tools if no explicit tools provided
-            a_tools = tools_anthropic or [_SCREENSHOT_TOOL]
-            o_tools = tools_openai or [_SCREENSHOT_FUNC_OAI]
+            # Default to screenshot tools if no explicit tools provided;
+            # always include native web search alongside other tools.
+            a_tools = (tools_anthropic or [_SCREENSHOT_TOOL]) + [_WEB_SEARCH_ANTHROPIC]
+            o_tools = (tools_openai or [_SCREENSHOT_FUNC_OAI]) + [_WEB_SEARCH_OAI]
             if self.provider == "openai":
                 self._tool_loop_openai(
                     system, messages, on_token, cancel, frame_extractor,
@@ -969,15 +983,40 @@ class AIAssistant:
                 tools=a_tools,
                 **kwargs,
             ) as stream:
-                for text in stream.text_stream:
+                # Event-based iteration so we can detect server tools
+                # (native web search) in real time alongside text.
+                for event in stream:
                     if cancel and cancel.is_set():
                         stream.close()
                         return
-                    if not round_had_text and had_text:
-                        on_token("\n\n---\n\n")
-                    round_had_text = True
-                    on_token(text)
+                    if event.type == "text":
+                        if not round_had_text and had_text:
+                            on_token("\n\n---\n\n")
+                        round_had_text = True
+                        on_token(event.text)
+                    elif event.type == "content_block_start":
+                        cb = event.content_block
+                        if getattr(cb, "type", "") == "server_tool_use" and on_tool_event:
+                            on_tool_event("tool_call", {
+                                "name": getattr(cb, "name", "web_search"),
+                                "input": getattr(cb, "input", {}),
+                            })
                 response = stream.get_final_message()
+
+            # Emit tool_result events for any server-side tools (web search)
+            if on_tool_event:
+                for block in response.content:
+                    if getattr(block, "type", "") == "web_search_tool_result":
+                        content = getattr(block, "content", [])
+                        n = sum(
+                            1 for c in (content if isinstance(content, list) else [])
+                            if getattr(c, "type", "") == "web_search_result"
+                        )
+                        on_tool_event("tool_result", {
+                            "name": "web_search",
+                            "success": True,
+                            "summary": f"Found {n} result{'s' if n != 1 else ''}",
+                        })
 
             if round_had_text:
                 had_text = True
@@ -1115,6 +1154,7 @@ class AIAssistant:
             round_had_text = False
             tool_calls_acc: dict[int, dict] = {}
             finish_reason = None
+            _oai_annotations: list = []
             for chunk in stream:
                 if cancel and cancel.is_set():
                     break
@@ -1137,9 +1177,29 @@ class AIAssistant:
                             entry["name"] += tc.function.name
                         if tc.function.arguments:
                             entry["arguments"] += tc.function.arguments
+                # Track URL citation annotations (native web search)
+                for ann in getattr(delta, "annotations", None) or []:
+                    _oai_annotations.append(ann)
 
             if round_had_text:
                 had_text = True
+
+            # Emit tool events for native web search if annotations detected
+            if on_tool_event and _oai_annotations:
+                url_cites = [
+                    a for a in _oai_annotations
+                    if getattr(a, "type", "") == "url_citation"
+                ]
+                if url_cites:
+                    on_tool_event("tool_call", {
+                        "name": "web_search",
+                        "input": {},
+                    })
+                    on_tool_event("tool_result", {
+                        "name": "web_search",
+                        "success": True,
+                        "summary": f"Found {len(url_cites)} source{'s' if len(url_cites) != 1 else ''}",
+                    })
 
             if not tool_calls_acc or finish_reason != "tool_calls":
                 return

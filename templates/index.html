@@ -191,8 +191,8 @@
         <button class="btn btn-update hidden" id="topbar-update-btn" onclick="topbarApplyUpdate()" title="Update available">
           <i class="fa-solid fa-download"></i> Update
         </button>
-        <button class="btn btn-settings" onclick="openSettings()" title="Settings">
-          <i class="fa-solid fa-gear"></i> Settings
+        <button class="btn btn-settings btn-icon-only" onclick="openSettings()" title="Settings">
+          <i class="fa-solid fa-gear"></i>
         </button>
         <div class="power-menu-wrap">
           <button class="btn btn-danger btn-icon-only" onclick="togglePowerMenu()" title="Power options">
@@ -247,10 +247,10 @@
               <span class="fp-bell-badge" id="fp-bell-badge">0</span>
             </button>
             <button class="icon-btn" id="transcript-filter-btn" title="Filter transcript" onclick="openTranscriptFilter(this)"><i class="fa-solid fa-filter"></i></button>
-            <button class="icon-btn" id="analytics-btn" title="Session analytics" onclick="toggleAnalyticsPanel()"><i class="fa-solid fa-chart-pie"></i></button>
+            <button class="icon-btn" id="analytics-btn" title="Session analytics" onclick="toggleAnalyticsPanel()"><i class="fa-duotone fa-chart-pie"></i></button>
             <hr style="height: -webkit-fill-available; border: 1px solid #ffffff1c; height: 13px; margin-inline: 3px;">
-            <button class="icon-btn" id="btn-copy-transcript" title="Copy transcript" onclick="copyTranscript()"><i class="fa-solid fa-copy"></i></button>
-            <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-solid fa-eraser"></i></button>
+            <button class="icon-btn" id="btn-copy-transcript" title="Copy transcript" onclick="copyTranscript()"><i class="fa-duotone fa-copy"></i></button>
+            <button class="icon-btn" title="Clear transcript" onclick="clearTranscript()"><i class="fa-duotone fa-eraser"></i></button>
             <button class="icon-btn" id="btn-reanalyze" title="Reanalyze session" onclick="reanalyzeCurrentSession()"><i class="fa-solid fa-rotate-right"></i></button>
           </div>
         </div>
@@ -416,7 +416,7 @@
           <div class="col-actions right">
             <button class="icon-btn" id="summary-prompt-toggle"
                     title="Custom summary instructions" onclick="toggleSummaryPrompt()"><i class="fa-solid fa-gear"></i></button>
-            <button class="icon-btn" title="Copy summary" onclick="copySummary()"><i class="fa-solid fa-copy"></i></button>
+            <button class="icon-btn" title="Copy summary" onclick="copySummary()"><i class="fa-duotone fa-copy"></i></button>
             <button class="icon-btn" title="Refresh summary" onclick="triggerSummary()"><i class="fa-solid fa-rotate-right"></i></button>
           </div>
         </div>
@@ -460,7 +460,7 @@
             <span class="col-subtitle" id="chat-model-label"></span>
           </div>
           <div class="col-actions">
-            <button class="icon-btn" title="Clear chat" onclick="clearChat()"><i class="fa-solid fa-xmark"></i></button>
+            <button class="icon-btn" title="Clear chat" onclick="clearChat()"><i class="fa-duotone fa-eraser"></i></button>
           </div>
         </div>
         <div id="chat-messages" class="col-body chat-body">

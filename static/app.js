@@ -6,6 +6,75 @@ function renderMd(text) {
 }
 
 /**
+ * Typing-cursor manager.
+ * One cursor span is created and reused — after each render it's moved to the
+ * deepest last inline position. Chunk arrivals add a .streaming class that
+ * lights the cursor up; a debounce timer dims it back when chunks stop.
+ */
+let _typingCursor = null;
+let _typingCursorContainer = null;
+let _streamingTimer = null;
+const _STREAMING_TIMEOUT = 250;
+
+// Void / non-text elements the cursor must never descend into or land after
+const _CURSOR_SKIP = new Set([
+  'IMG','BR','HR','INPUT','SVG','VIDEO','AUDIO','CANVAS','IFRAME',
+  'COL','COLGROUP','SOURCE','TRACK','WBR','AREA','EMBED','OBJECT',
+]);
+
+function _deepestLastLeaf(el) {
+  let target = el;
+  outer:
+  while (true) {
+    // Walk backwards through children to skip void/non-text elements
+    const children = target.children;
+    for (let i = children.length - 1; i >= 0; i--) {
+      const child = children[i];
+      // Skip the cursor itself so we don't nest inside it
+      if (child === _typingCursor) continue;
+      if (_CURSOR_SKIP.has(child.tagName)) continue;
+      target = child;
+      continue outer;
+    }
+    break;
+  }
+  return target;
+}
+
+function _ensureTypingCursor(container) {
+  _typingCursorContainer = container;
+  if (!_typingCursor) {
+    _typingCursor = document.createElement('span');
+    _typingCursor.className = 'typing-cursor-span';
+  }
+  // Detach first so _deepestLastLeaf never sees the old position
+  if (_typingCursor.parentNode) _typingCursor.remove();
+  _deepestLastLeaf(container).appendChild(_typingCursor);
+}
+
+function _chunkArrived() {
+  if (!_typingCursor) return;
+  // If morphdom detached the cursor, re-anchor it
+  if (!_typingCursor.isConnected && _typingCursorContainer) {
+    _ensureTypingCursor(_typingCursorContainer);
+  }
+  _typingCursor.classList.add('streaming');
+  clearTimeout(_streamingTimer);
+  _streamingTimer = setTimeout(() => {
+    if (_typingCursor) _typingCursor.classList.remove('streaming');
+  }, _STREAMING_TIMEOUT);
+}
+
+function _removeTypingCursor() {
+  clearTimeout(_streamingTimer);
+  if (_typingCursor) {
+    _typingCursor.remove();
+    _typingCursor = null;
+  }
+  _typingCursorContainer = null;
+}
+
+/**
  * Diff-update a chat body element using morphdom to avoid re-creating
  * existing DOM nodes (which causes images to flash/reload).
  * Also wires up image onload handlers to fix auto-scroll when images
@@ -1358,7 +1427,7 @@ function _makeSessionEl(s) {
   nameEl.textContent = s.title;
   const metaEl = document.createElement('div');
   metaEl.className = 'session-meta';
-  metaEl.textContent = formatSessionMeta(s);
+  metaEl.innerHTML = formatSessionMeta(s);
   info.appendChild(nameEl);
   info.appendChild(metaEl);
 
@@ -1839,7 +1908,7 @@ function formatSessionMeta(s) {
     : start.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: start.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
   const timePart = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   const time = `${datePart}, ${timePart}`;
-  if (!s.ended_at) return `${time} · In progress`;
+  if (!s.ended_at) return `${time} <span class="session-meta-sep">|</span> In progress`;
   // Use actual transcript duration (last segment end_time) when available,
   // falling back to wall-clock duration between start/end timestamps.
   let secs = s.last_segment_time;
@@ -1847,7 +1916,7 @@ function formatSessionMeta(s) {
     const end = new Date(s.ended_at + 'Z');
     secs = (end - start) / 1000;
   }
-  return `${time} · ${fmtDuration(secs)}`;
+  return `${time} <span class="session-meta-sep">|</span> ${fmtDuration(secs)}`;
 }
 
 async function deleteSession(e, sessionId) {
@@ -2152,6 +2221,7 @@ function connectSSE(afterSegId = 0) {
     // Show "Thinking" indicator until first text chunk arrives
     const wrap = state.chatCursor?.closest('.chat-msg');
     if (wrap) _setAssistantProcessing(wrap, true, 'Thinking');
+    scrollChatToBottom(true);
   });
 
   src.addEventListener('chat_tool_event', e => {
@@ -2187,7 +2257,8 @@ function connectSSE(afterSegId = 0) {
       }
       // Use morphdom to diff-update instead of innerHTML to avoid image flashing
       _morphChatBody(state.chatCursor, state.chatBuffer);
-      state.chatCursor.classList.add('typing-cursor');
+      _ensureTypingCursor(state.chatCursor);
+      _chunkArrived();
       scrollChatToBottom();
     }
   });
@@ -2199,7 +2270,7 @@ function connectSSE(afterSegId = 0) {
       linkifyTimestamps(state.chatCursor);
       highlightCode('#chat-messages');
       _addCodeCopyButtons(state.chatCursor);
-      state.chatCursor.classList.remove('typing-cursor');
+      _removeTypingCursor();
       state.chatCursor = null;
     }
     state.chatToolCalls = [];
@@ -2485,15 +2556,15 @@ function updateRecordBtn() {
   btn.disabled = false;
   updateTopbarSessionTitle();
   if (state.isRecording) {
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop Recording';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop';
     btn.classList.add('recording');
     btn.classList.remove('resuming');
   } else if (state.isViewingPast) {
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Resume Session';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Resume';
     btn.classList.remove('recording');
     btn.classList.add('resuming');
   } else {
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start Recording';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start';
     btn.classList.remove('recording');
     btn.classList.remove('resuming');
   }
@@ -2532,7 +2603,7 @@ async function toggleRecording() {
   if (state.isRecording) {
     // Immediate visual feedback while the server tears down streams
     const btn = document.getElementById('record-btn');
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-spinner fa-spin"></i></span> Stopping Recording\u2026';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-spinner fa-spin"></i></span> Stopping\u2026';
     btn.style.background = 'var(--yellow)';
     btn.style.color = '#0d1117';
     btn.disabled = true;
@@ -3478,7 +3549,7 @@ async function _fpSelectProfile(globalId) {
         const keys = (s.speaker_keys || []).join(', ');
         return `<button class="fp-session-row" onclick="loadSession('${s.session_id}'); closeFingerprintPanel();">
           <span class="fp-session-title">${s.title || 'Untitled'}</span>
-          <span class="fp-session-meta">${date}${keys ? ' · ' + keys : ''} · ${s.seg_count} segs</span>
+          <span class="fp-session-meta">${date}${keys ? ' <span class="session-meta-sep">|</span> ' + keys : ''} <span class="session-meta-sep">|</span> ${s.seg_count} segs</span>
         </button>`;
       }).join('');
     }
@@ -3957,12 +4028,12 @@ function renderSpeakerManager() {
       meta.textContent = 'Saved participant';
     } else if (group.speakerKeys.length === 1) {
       const k = group.speakerKeys[0];
-      meta.textContent = `${k}${count ? ` · ${count} segment${count === 1 ? '' : 's'}` : ''}`;
+      meta.innerHTML = `${k}${count ? ` <span class="session-meta-sep">|</span> ${count} segment${count === 1 ? '' : 's'}` : ''}`;
     } else {
       // Multiple diarizer fragments - show key list as muted subtext
       const displayed = group.speakerKeys.slice(0, 3).join(', ');
       const extra = group.speakerKeys.length > 3 ? ` +${group.speakerKeys.length - 3}` : '';
-      meta.textContent = `${displayed}${extra}${count ? ` · ${count} segments` : ''}`;
+      meta.innerHTML = `${displayed}${extra}${count ? ` <span class="session-meta-sep">|</span> ${count} segments` : ''}`;
       meta.title = group.speakerKeys.join(', ');
     }
 
@@ -7007,6 +7078,8 @@ function _toolDisplayName(name) {
     semantic_search: 'Semantic Search',
     get_session_detail: 'Load Session',
     list_speakers: 'List Speakers',
+    get_speaker_history: 'Speaker History',
+    web_search: 'Web Search',
   };
   return map[name] || name;
 }
@@ -7019,6 +7092,9 @@ function _toolInputSummary(name, input) {
   if (name === 'semantic_search' && input?.query) return `"${input.query}"`;
   if (name === 'get_session_detail' && input?.session_id) return input.session_id.substring(0, 8) + '...';
   if (name === 'list_speakers') return 'Voice Library';
+  if (name === 'get_speaker_history' && input?.speaker_name) return `"${input.speaker_name}"`;
+  if (name === 'web_search' && input?.query) return `"${input.query}"`;
+  if (name === 'web_search') return 'searching…';
   return JSON.stringify(input || {});
 }
 

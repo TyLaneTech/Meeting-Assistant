@@ -57,6 +57,8 @@ function _toolDisplayName(name) {
     semantic_search: 'Semantic Search',
     get_session_detail: 'Load Session',
     list_speakers: 'List Speakers',
+    get_speaker_history: 'Speaker History',
+    web_search: 'Web Search',
   };
   return map[name] || name;
 }
@@ -66,6 +68,9 @@ function _toolInputSummary(name, input) {
   if (name === 'semantic_search' && input?.query) return `"${input.query}"`;
   if (name === 'get_session_detail' && input?.session_id) return input.session_id.substring(0, 8) + '...';
   if (name === 'list_speakers') return 'Voice Library';
+  if (name === 'get_speaker_history' && input?.speaker_name) return `"${input.speaker_name}"`;
+  if (name === 'web_search' && input?.query) return `"${input.query}"`;
+  if (name === 'web_search') return 'searching…';
   return JSON.stringify(input || {});
 }
 
@@ -101,7 +106,18 @@ function _formatCompactNumber(n) {
 
 const _chatContainer = () => document.getElementById('global-chat-messages');
 
-function _scrollChatToBottom() {
+let _globalChatAtBottom = true;
+const _GLOBAL_SCROLL_THRESHOLD = 60;
+
+(function _initGlobalScrollTracking() {
+  const el = _chatContainer();
+  if (el) el.addEventListener('scroll', () => {
+    _globalChatAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < _GLOBAL_SCROLL_THRESHOLD;
+  }, { passive: true });
+})();
+
+function _scrollChatToBottom(force = false) {
+  if (!force && !_globalChatAtBottom) return;
   const el = _chatContainer();
   if (el) el.scrollTop = el.scrollHeight;
 }
@@ -128,6 +144,8 @@ function _appendUserBubble(text) {
     </div>
     <div class="chat-msg-body">${escapeHtml(text)}</div>`;
   container.appendChild(wrap);
+  // User sent a message — reset flag and force-scroll
+  _globalChatAtBottom = true;
   _scrollChatToBottom();
 }
 
@@ -284,6 +302,7 @@ async function sendGlobalMessage() {
 
   const msgWrap = _createAssistantBubble();
   _setAssistantProcessing(msgWrap, true, 'Thinking');
+  _scrollChatToBottom();
   _homeState.currentMsgWrap = msgWrap;
   _homeState.currentChunks = [];
   _homeState.currentToolCalls = [];
@@ -332,6 +351,11 @@ function _onGlobalChatChunk(data) {
     const tw = _homeState.currentMsgWrap.querySelector('.chat-tool-widget.streaming');
     if (tw) tw.classList.remove('open', 'streaming');
     _updateAssistantBody(_homeState.currentMsgWrap, full);
+    const body = _homeState.currentMsgWrap.querySelector('.chat-msg-body');
+    if (body) {
+      _ensureTypingCursor(body);
+      _chunkArrived();
+    }
     _scrollChatToBottom();
   }
 }
@@ -361,6 +385,10 @@ function _onGlobalToolEvent(data) {
 
 function _onGlobalChatDone(data) {
   if (data.request_id !== _homeState.requestId) return;
+  // Remove typing cursor from finished message
+  if (_homeState.currentMsgWrap) {
+    _removeTypingCursor();
+  }
   _setChatBusy(false);
   _homeState.requestId = null;
   _homeState.currentMsgWrap = null;
@@ -466,6 +494,7 @@ async function switchConversation(convId) {
         }
       }
     }
+    _globalChatAtBottom = true;
     _scrollChatToBottom();
   } catch {}
 }
