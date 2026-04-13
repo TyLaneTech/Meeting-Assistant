@@ -246,19 +246,25 @@ class MeetingTray:
         webbrowser.open(f"{self._url}?settings=1")
 
     def _toggle_recording(self, icon=None, item=None) -> None:
-        """POST to local Flask API to start/stop recording."""
+        """Start or stop recording via the local Flask API."""
         st = self._get_state()
-        endpoint = "/api/recording/stop" if st.get("is_recording") else "/api/recording/start"
-        try:
-            req = urllib.request.Request(
-                f"{self._url}{endpoint}",
-                data=b"{}",
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-        except Exception as e:
-            print(f"[tray] toggle recording failed: {e}")
+        if st.get("is_recording"):
+            # Stop: direct API call is fine
+            try:
+                req = urllib.request.Request(
+                    f"{self._url}/api/recording/stop",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=5)
+            except Exception as e:
+                print(f"[tray] stop recording failed: {e}")
+        else:
+            # Start: open the session page with ?autostart so the recording
+            # goes through the same audio-initialisation path as a normal
+            # session-page start (avoids DirectShow echo issues).
+            webbrowser.open(f"{self._url}/session?autostart=1")
 
     def _quit(self, icon=None, item=None) -> None:
         self._on_quit(self._icon)

@@ -130,6 +130,8 @@ _state: dict = {
 }
 _state_lock = threading.Lock()
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
+_recording_cleanup_done = threading.Event()   # signalled when stop_recording cleanup finishes
+_recording_cleanup_done.set()                 # initially "done" (no cleanup pending)
 _screen_recorder = ScreenRecorder()
 _chat_cancel: dict[str, threading.Event] = {}  # request_id → cancel event
 _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
@@ -602,11 +604,11 @@ def _run_summary(
 
                 def on_token(t: str) -> None:
                     chunks.append(t)
-                    _push("summary_chunk", {"text": t})
+                    _push("summary_chunk", {"text": t, "session_id": session_id})
 
                 def on_done() -> None:
                     _persist("".join(chunks))
-                    _push("summary_done", {})
+                    _push("summary_done", {"session_id": session_id})
 
                 ai.summarize(transcript, on_token, on_done, custom_prompt=custom_prompt, meta=meta)
         finally:
@@ -621,6 +623,8 @@ def _run_summary(
 def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None:
     """Patch the current summary after speaker-label changes."""
     if not update_context.strip():
+        return
+    if not settings.get("auto_summary", True):
         return
 
     with _state_lock:
@@ -1055,13 +1059,33 @@ def list_sessions():
 
 @app.route("/api/search")
 def search():
-    """Full-text search across session titles and transcript content."""
+    """Full-text search across session titles, transcript content, and speaker names."""
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify([])
     limit = request.args.get("limit", 30, type=int)
-    results = storage.search_sessions(q, limit=limit)
-    return jsonify(results)
+    fts_results = storage.search_sessions(q, limit=limit)
+    speaker_results = storage.search_speakers(q, limit=limit)
+
+    # Merge speaker results into FTS results — speaker matches first
+    merged = {r["session_id"]: r for r in fts_results}
+    for sr in speaker_results:
+        sid = sr["session_id"]
+        if sid in merged:
+            # Prepend participant matches to existing results
+            merged[sid]["matches"] = sr["matches"] + merged[sid]["matches"]
+        else:
+            merged[sid] = sr
+    # Put sessions with participant matches first, then by original order
+    has_participant = []
+    no_participant = []
+    for r in merged.values():
+        if any(m["kind"] == "participant" for m in r["matches"]):
+            has_participant.append(r)
+        else:
+            no_participant.append(r)
+    results = has_participant + no_participant
+    return jsonify(results[:limit])
 
 
 @app.route("/api/search/semantic")
@@ -1211,6 +1235,14 @@ def start_recording():
         threading.Thread(target=test_cap.stop, daemon=True).start()
         _push("audio_test_status", {"testing": False})
 
+    # Wait for any in-flight cleanup from a previous stop to finish before
+    # opening new audio streams.  This prevents the old capture / transcriber
+    # from racing with the new one (e.g. _transcriber.stop() killing a freshly
+    # started transcriber thread, or old mixer threads still writing to the
+    # shared _audio_queue).
+    if not _recording_cleanup_done.wait(timeout=15):
+        log.warn("recording", "Previous cleanup did not finish in 15 s – starting anyway")
+
     # Drain stale audio from a previous session
     while not _audio_queue.empty():
         try:
@@ -1224,6 +1256,26 @@ def start_recording():
     mic_device        = body.get("mic_device")         # int | None | -1
     ffmpeg_mic_name   = body.get("ffmpeg_mic_name")    # str | None (for mic_device=-3)
     resume_session_id = body.get("resume_session_id")  # str | None
+
+    # Fall back to saved user preferences when the caller didn't specify devices
+    # (e.g. recording started from the home page which has no device selectors).
+    if loopback_device is None or mic_device is None:
+        _saved = settings.load()
+        if loopback_device is None and _saved.get("loopback_device"):
+            try:
+                loopback_device = int(_saved["loopback_device"])
+            except (ValueError, TypeError):
+                pass
+        if mic_device is None and _saved.get("mic_device"):
+            _mic_pref = str(_saved["mic_device"])
+            if _mic_pref.startswith("ffmpeg:"):
+                mic_device = -3
+                ffmpeg_mic_name = ffmpeg_mic_name or _mic_pref[7:]
+            else:
+                try:
+                    mic_device = int(_mic_pref)
+                except (ValueError, TypeError):
+                    pass
 
     # ── Resume an existing session ──────────────────────────────────────────
     if resume_session_id:
@@ -1265,6 +1317,9 @@ def start_recording():
         existing_labels    = {}
         existing_seg_count = 0
         next_speaker_label = 1
+
+    log.info("recording", f"Device selection: loopback={loopback_device}, "
+             f"mic={mic_device}, ffmpeg_mic={ffmpeg_mic_name!r}")
 
     capture = AudioCapture(_audio_queue)
 
@@ -1378,24 +1433,28 @@ def stop_recording():
 
     # Return immediately - cleanup blocks for up to 12 s (thread join) so we
     # must not do it on the Flask request handler thread or the server hangs.
+    _recording_cleanup_done.clear()
     def _cleanup() -> None:
-        if capture:
-            capture.stop()   # joins threads then finalizes WAV
-        _transcriber.stop()
-        # Stop screen recording if active
-        if _screen_recorder.is_recording:
-            _screen_recorder.stop()
-        if sid:
-            storage.end_session(sid)
-            seg_count = len(_state.get("segments", []))
-            log.info("recording", f"Stopped - session {sid} ({seg_count} segments)")
-        _push_status({"recording": False, "session_id": sid})
-        # Auto-title: use full formatted transcript (with speaker labels) for better context
-        if sid and (transcript_snapshot or plain_snapshot).strip():
-            title = ai.generate_title(transcript_snapshot or plain_snapshot)
-            if title:
-                storage.update_session_title(sid, title)
-                _push("session_title", {"session_id": sid, "title": title})
+        try:
+            if capture:
+                capture.stop()   # joins threads then finalizes WAV
+            _transcriber.stop()
+            # Stop screen recording if active
+            if _screen_recorder.is_recording:
+                _screen_recorder.stop()
+            if sid:
+                storage.end_session(sid)
+                seg_count = len(_state.get("segments", []))
+                log.info("recording", f"Stopped - session {sid} ({seg_count} segments)")
+            _push_status({"recording": False, "session_id": sid})
+            # Auto-title: use full formatted transcript (with speaker labels) for better context
+            if sid and (transcript_snapshot or plain_snapshot).strip():
+                title = ai.generate_title(transcript_snapshot or plain_snapshot)
+                if title:
+                    storage.update_session_title(sid, title)
+                    _push("session_title", {"session_id": sid, "title": title})
+        finally:
+            _recording_cleanup_done.set()
 
     threading.Thread(target=_cleanup, daemon=True).start()
     # Update semantic embedding in background after session ends
@@ -2966,49 +3025,64 @@ def update_speaker_label(session_id: str):
     # "Speaker N"), ensure a global profile exists and the key is linked to it.
     if fingerprint_db._ready and name and not _is_default_speaker_name(name):
         def _sync_voice_profile(sid, keys, label, col):
-            profile = fingerprint_db.find_by_name(label)
-            if profile is None:
-                gid = fingerprint_db.create_global_speaker(label, col)
-                log.info("fingerprint", f"Auto-created profile {label!r} from session label")
-            else:
-                gid = profile["id"]
-            for k in keys:
-                existing = fingerprint_db.get_link(sid, k)
-                if existing != gid:
-                    fingerprint_db.link_session_speaker(sid, k, gid)
-                _push("speaker_linked", {
-                    "session_id": sid, "speaker_key": k,
-                    "global_id": gid, "name": label,
-                })
-            # Extract embeddings to strengthen the profile
-            for k in keys:
-                # Try live accumulator first
-                with _state_lock:
-                    accum = _state.get("speaker_audio_accum", {})
-                    seg_audio = accum.get(k, {}).get("audio")
-                    seg_audio = seg_audio.copy() if seg_audio is not None else None
-                if seg_audio is not None and len(seg_audio) / 16000 >= fingerprint_db.MIN_DURATION_SEC:
-                    emb = fingerprint_db.extract_embedding(seg_audio)
-                    if emb is not None:
-                        fingerprint_db.add_embedding(gid, sid, k, emb, len(seg_audio) / 16000)
-                        log.info("fingerprint", f"Added embedding from accumulator for {label!r}")
-                        continue
-                # Fallback: extract from WAV file (past session or accumulator empty)
-                wav_path = Path(__file__).parent / "data" / "audio" / f"{sid}.wav"
-                if wav_path.exists():
-                    segments = storage.get_segments_by_speaker(sid, k)
-                    added = 0
-                    for seg in segments:
-                        if added >= 5:
-                            break
-                        emb = fingerprint_db.extract_embedding_from_wav(
-                            str(wav_path), seg["start_time"], seg["end_time"])
+            try:
+                profile = fingerprint_db.find_by_name(label)
+                if profile is None:
+                    gid = fingerprint_db.create_global_speaker(label, col)
+                    global_color = col
+                    log.info("fingerprint", f"Auto-created profile {label!r} from session label")
+                else:
+                    gid = profile["id"]
+                    # Inherit the global profile's color unless the user explicitly
+                    # set one in this request.
+                    global_color = col or profile.get("color")
+                for k in keys:
+                    existing = fingerprint_db.get_link(sid, k)
+                    if existing != gid:
+                        fingerprint_db.link_session_speaker(sid, k, gid)
+                    # Sync session speaker color to the global profile color
+                    if global_color:
+                        storage.save_speaker_label(sid, k, name=label, color=global_color)
+                        _push("speaker_label", {
+                            "session_id": sid, "speaker_key": k,
+                            "name": label, "color": global_color,
+                        })
+                    _push("speaker_linked", {
+                        "session_id": sid, "speaker_key": k,
+                        "global_id": gid, "name": label,
+                    })
+                # Extract embeddings to strengthen the profile
+                for k in keys:
+                    # Try live accumulator first
+                    with _state_lock:
+                        accum = _state.get("speaker_audio_accum", {})
+                        seg_audio = accum.get(k, {}).get("audio")
+                        seg_audio = seg_audio.copy() if seg_audio is not None else None
+                    if seg_audio is not None and len(seg_audio) / 16000 >= fingerprint_db.MIN_DURATION_SEC:
+                        emb = fingerprint_db.extract_embedding(seg_audio)
                         if emb is not None:
-                            fingerprint_db.add_embedding(gid, sid, k, emb,
-                                                         seg["end_time"] - seg["start_time"])
-                            added += 1
-                    if added:
-                        log.info("fingerprint", f"Added {added} embeddings from WAV for {label!r}")
+                            fingerprint_db.add_embedding(gid, sid, k, emb, len(seg_audio) / 16000)
+                            log.info("fingerprint", f"Added embedding from accumulator for {label!r}")
+                            continue
+                    # Fallback: extract from WAV file (past session or accumulator empty)
+                    wav_path = Path(__file__).parent / "data" / "audio" / f"{sid}.wav"
+                    if wav_path.exists():
+                        segments = storage.get_segments_by_speaker(sid, k)
+                        added = 0
+                        for seg in segments:
+                            if added >= 5:
+                                break
+                            emb = fingerprint_db.extract_embedding_from_wav(
+                                str(wav_path), seg["start_time"], seg["end_time"])
+                            if emb is not None:
+                                fingerprint_db.add_embedding(gid, sid, k, emb,
+                                                             seg["end_time"] - seg["start_time"])
+                                added += 1
+                        if added:
+                            log.info("fingerprint", f"Added {added} embeddings from WAV for {label!r}")
+            except Exception as e:
+                log.error("fingerprint", f"_sync_voice_profile failed: {e}")
+                import traceback; traceback.print_exc()
         _fp_executor.submit(
             _sync_voice_profile,
             session_id, [s["speaker_key"] for s in updated_speakers],
@@ -3144,6 +3218,84 @@ def reanalyze_session(session_id: str):
         daemon=True,
     ).start()
     return jsonify({"ok": True})
+
+
+@app.route("/api/sessions/upload", methods=["POST"])
+def upload_session():
+    """Create a new session from an uploaded audio or video file."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    with _state_lock:
+        if _state["is_recording"]:
+            return jsonify({"error": "Cannot upload while recording"}), 400
+        if _state.get("is_reanalyzing"):
+            return jsonify({"error": "Reanalysis already in progress"}), 400
+
+    # Create session
+    session_id = storage.create_session()
+    audio_dir = Path(__file__).parent / "data" / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = audio_dir / f"{session_id}.wav"
+
+    # Save the uploaded file to a temp location
+    import tempfile
+    suffix = Path(f.filename).suffix.lower()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix,
+                                      dir=str(audio_dir))
+    try:
+        f.save(tmp)
+        tmp.close()
+        tmp_path = tmp.name
+
+        # Determine if this is a video file by probing with FFmpeg
+        ffmpeg_bin = find_ffmpeg()
+        if not ffmpeg_bin:
+            os.unlink(tmp_path)
+            storage.delete_session(session_id)
+            return jsonify({"error": "FFmpeg not found – required for file processing"}), 500
+
+        # Convert any audio/video to 16-bit 16kHz mono WAV for the pipeline
+        cmd = [
+            ffmpeg_bin, "-y", "-i", tmp_path,
+            "-vn",                     # strip video
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            str(wav_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace")[:500]
+            os.unlink(tmp_path)
+            storage.delete_session(session_id)
+            return jsonify({"error": f"FFmpeg conversion failed: {stderr}"}), 500
+
+        os.unlink(tmp_path)
+    except Exception as exc:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+        storage.delete_session(session_id)
+        return jsonify({"error": str(exc)}), 500
+
+    # Set up state and launch reanalysis (same as normal reanalysis)
+    with _state_lock:
+        _state["session_id"] = session_id
+        _state["is_reanalyzing"] = True
+        _state["segments"] = []
+        _state["pending_segments"] = 0
+        _state["summarized_seg_count"] = 0
+        _state["speaker_labels"] = {}
+
+    threading.Thread(
+        target=_run_reanalysis,
+        args=(session_id, str(wav_path), ""),
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "session_id": session_id}), 201
 
 
 @app.route("/api/sessions/<session_id>", methods=["PATCH"])
@@ -3293,7 +3445,18 @@ def fp_update_speaker(global_id: str):
         color = _normalize_speaker_color(data.get("color")) if "color" in data else ...
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    fingerprint_db.rename_global_speaker(global_id, name=name or None, color=color)
+    resolved = fingerprint_db.rename_global_speaker(global_id, name=name or None, color=color)
+    # Push SSE updates to all linked sessions
+    if resolved:
+        for label in fingerprint_db.get_linked_labels(global_id):
+            sid = label["session_id"]
+            with _state_lock:
+                if _state.get("session_id") == sid:
+                    _state["speaker_labels"][label["speaker_key"]] = resolved["name"]
+            _push("speaker_label", {
+                "session_id": sid, "speaker_key": label["speaker_key"],
+                "name": resolved["name"], "color": resolved["color"],
+            })
     return jsonify({"ok": True})
 
 
@@ -3313,7 +3476,18 @@ def fp_merge_speaker(global_id: str):
     source_id = (data.get("source_id") or "").strip()
     if not source_id:
         return jsonify({"error": "source_id is required"}), 400
-    fingerprint_db.merge_global_speakers(keep_id=global_id, merge_id=source_id)
+    resolved = fingerprint_db.merge_global_speakers(keep_id=global_id, merge_id=source_id)
+    # Push SSE updates to all linked sessions (including newly merged ones)
+    if resolved:
+        for label in fingerprint_db.get_linked_labels(global_id):
+            sid = label["session_id"]
+            with _state_lock:
+                if _state.get("session_id") == sid:
+                    _state["speaker_labels"][label["speaker_key"]] = resolved["name"]
+            _push("speaker_label", {
+                "session_id": sid, "speaker_key": label["speaker_key"],
+                "name": resolved["name"], "color": resolved["color"],
+            })
     return jsonify({"ok": True})
 
 
@@ -3321,8 +3495,8 @@ def fp_merge_speaker(global_id: str):
 def fp_optimize_speaker(global_id: str):
     if not fingerprint_db.ready:
         return _fp_unavailable()
-    fingerprint_db.prune_embeddings(global_id, keep_newest=30)
-    return jsonify({"ok": True})
+    result = fingerprint_db.prune_embeddings(global_id)
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/fingerprint/speakers/<global_id>/sessions", methods=["GET"])
@@ -3353,8 +3527,164 @@ def fp_bulk_optimize():
     if not ids or not isinstance(ids, list):
         return jsonify({"error": "ids list is required"}), 400
     for gid in ids:
-        fingerprint_db.prune_embeddings(str(gid), keep_newest=30)
+        fingerprint_db.prune_embeddings(str(gid))
     return jsonify({"ok": True, "optimized": len(ids)})
+
+
+@app.route("/api/fingerprint/unlinked-labels", methods=["GET"])
+def fp_unlinked_labels():
+    """Return distinct unlinked speaker names with session counts, plus profile list."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    groups = fingerprint_db.get_unlinked_speaker_groups()
+    profiles = fingerprint_db.list_global_speakers()
+    return jsonify({"groups": groups, "profiles": profiles})
+
+
+@app.route("/api/fingerprint/unlinked-sessions", methods=["GET"])
+def fp_unlinked_sessions():
+    """Return sessions where a specific unlinked speaker name appears."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    name = request.args.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name param is required"}), 400
+    sessions = fingerprint_db.get_unlinked_speaker_sessions(name)
+    return jsonify({"sessions": sessions})
+
+
+def _train_from_bulk_link(global_id: str, affected: list[dict], profile_name: str,
+                          max_per_session: int = 3):
+    """Background: extract voice embeddings from WAV files for newly linked labels.
+    Skips sessions that already have embeddings for this profile+speaker_key,
+    and only uses segments with healthy duration (≥ MIN_DURATION_SEC)."""
+    audio_dir = Path(__file__).parent / "data" / "audio"
+    added_total = 0
+    for label in affected:
+        sid, key = label["session_id"], label["speaker_key"]
+        # Skip if this session/speaker already has embeddings for this profile
+        if fingerprint_db.get_latest_embedding(global_id, sid, key) is not None:
+            continue
+        wav_path = audio_dir / f"{sid}.wav"
+        if not wav_path.exists():
+            continue
+        segments = storage.get_segments_by_speaker(sid, key)
+        added = 0
+        for seg in segments:
+            if added >= max_per_session:
+                break
+            duration = seg["end_time"] - seg["start_time"]
+            if duration < fingerprint_db.MIN_DURATION_SEC:
+                continue
+            emb = fingerprint_db.extract_embedding_from_wav(
+                str(wav_path), seg["start_time"], seg["end_time"])
+            if emb is not None:
+                fingerprint_db.add_embedding(global_id, sid, key, emb, duration)
+                added += 1
+        added_total += added
+    if added_total:
+        log.info("fingerprint",
+                 f"Bulk-link training: added {added_total} embeddings for {profile_name!r}")
+
+
+@app.route("/api/fingerprint/bulk-link", methods=["POST"])
+def fp_bulk_link():
+    """Link all unlinked speaker_labels matching a name to a global profile."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    global_id = (data.get("global_id") or "").strip()
+    create_new = data.get("create_new", False)
+
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if not global_id and not create_new:
+        return jsonify({"error": "global_id or create_new is required"}), 400
+
+    if create_new:
+        existing = fingerprint_db.find_by_name(name)
+        if existing:
+            global_id = existing["id"]
+        else:
+            global_id = fingerprint_db.create_global_speaker(name)
+
+    affected = fingerprint_db.bulk_link_by_name(name, global_id)
+    profile = fingerprint_db.get_global_speaker(global_id)
+
+    # Push SSE events for all affected labels
+    for label in affected:
+        sid = label["session_id"]
+        with _state_lock:
+            if _state.get("session_id") == sid:
+                _state["speaker_labels"][label["speaker_key"]] = profile["name"]
+        _push("speaker_label", {
+            "session_id": sid, "speaker_key": label["speaker_key"],
+            "name": profile["name"], "color": profile.get("color"),
+        })
+        _push("speaker_linked", {
+            "session_id": sid, "speaker_key": label["speaker_key"],
+            "global_id": global_id, "name": profile["name"],
+        })
+
+    # Train voice fingerprint from WAV segments in background
+    if affected:
+        _fp_executor.submit(_train_from_bulk_link, global_id, affected, profile["name"])
+
+    return jsonify({"ok": True, "linked_count": len(affected), "global_id": global_id})
+
+
+@app.route("/api/fingerprint/bulk-link-all", methods=["POST"])
+def fp_bulk_link_all():
+    """Batch link multiple speaker names to global profiles."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    mappings = data.get("mappings", [])
+    if not mappings or not isinstance(mappings, list):
+        return jsonify({"error": "mappings list is required"}), 400
+
+    total_linked = 0
+    for mapping in mappings:
+        name = (mapping.get("name") or "").strip()
+        global_id = (mapping.get("global_id") or "").strip()
+        create_new = mapping.get("create_new", False)
+        if not name:
+            continue
+        if not global_id and not create_new:
+            continue
+
+        if create_new:
+            existing = fingerprint_db.find_by_name(name)
+            if existing:
+                global_id = existing["id"]
+            else:
+                global_id = fingerprint_db.create_global_speaker(name)
+
+        affected = fingerprint_db.bulk_link_by_name(name, global_id)
+        profile = fingerprint_db.get_global_speaker(global_id)
+        if not profile:
+            continue
+
+        for label in affected:
+            sid = label["session_id"]
+            with _state_lock:
+                if _state.get("session_id") == sid:
+                    _state["speaker_labels"][label["speaker_key"]] = profile["name"]
+            _push("speaker_label", {
+                "session_id": sid, "speaker_key": label["speaker_key"],
+                "name": profile["name"], "color": profile.get("color"),
+            })
+            _push("speaker_linked", {
+                "session_id": sid, "speaker_key": label["speaker_key"],
+                "global_id": global_id, "name": profile["name"],
+            })
+        # Train voice fingerprint from WAV segments in background
+        if affected:
+            _fp_executor.submit(_train_from_bulk_link, global_id, affected, profile["name"])
+        total_linked += len(affected)
+
+    return jsonify({"ok": True, "total_linked": total_linked})
 
 
 @app.route("/api/fingerprint/confirm", methods=["POST"])

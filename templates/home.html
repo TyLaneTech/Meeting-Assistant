@@ -376,53 +376,71 @@
       <p class="fingerprint-panel-subtitle">Cross-session speaker identity profiles</p>
       <button class="icon-btn fingerprint-panel-close" onclick="closeFingerprintPanel()"><i class="fa-solid fa-xmark"></i></button>
     </div>
+    <div class="fp-tab-bar">
+      <button class="fp-tab active" data-tab="profiles" onclick="fpSwitchTab('profiles')">Profiles</button>
+      <button class="fp-tab" data-tab="match" onclick="fpSwitchTab('match')">Match Speakers</button>
+    </div>
     <div class="fingerprint-panel-body">
-      <div class="fingerprint-panel-list" id="fingerprint-profile-list">
-        <div class="fp-list-toolbar">
-          <input type="text" class="fp-search-input" id="fp-search-input" placeholder="Search profiles..." oninput="_fpFilterList()" />
-          <button type="button" class="icon-btn fp-select-toggle" id="fp-select-toggle" title="Select multiple" onclick="_fpToggleSelectMode()"><i class="fa-solid fa-check-double"></i></button>
-        </div>
-        <div class="fp-select-bar hidden" id="fp-select-bar">
-          <label class="fp-select-all-label"><input type="checkbox" id="fp-select-all" onchange="_fpToggleSelectAll(this.checked)" /> All</label>
-          <span class="fp-select-count" id="fp-select-count">0 selected</span>
-        </div>
-        <div class="fp-profile-scroll" id="fp-profile-scroll">
-          <div class="fp-panel-empty">No voice profiles yet.</div>
-        </div>
-        <div class="fp-bulk-actions hidden" id="fp-bulk-actions">
-          <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkOptimize()" title="Optimize selected"><i class="fa-duotone fa-wand-magic-sparkles"></i> Optimize</button>
-          <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkMerge()" title="Merge selected into one"><i class="fa-solid fa-merge"></i> Merge</button>
-          <button class="speaker-manager-btn fp-detail-delete-btn fp-bulk-btn" onclick="_fpBulkDelete()" title="Delete selected"><i class="fa-solid fa-trash"></i> Delete</button>
-        </div>
-      </div>
-      <div class="fingerprint-panel-detail hidden" id="fingerprint-profile-detail">
-        <div class="fp-detail-name-row">
-          <input class="fp-detail-name-input" id="fp-detail-name" placeholder="Name" />
-          <div class="speaker-color-grid fp-detail-color-grid" id="fp-detail-color-grid"></div>
-        </div>
-        <div class="fp-detail-meta" id="fp-detail-meta"></div>
-        <div class="fp-detail-sessions" id="fp-detail-sessions"></div>
-        <div class="fp-detail-actions">
-            <div class="actions-left">
-                <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpDetailSave()">Save</button>
-                <button class="speaker-manager-btn speaker-manager-btn-secondary" onclick="fpDetailOptimize()">Optimize</button>
-            </div>
-          <div class="fp-detail-merge-wrap">
-            <select id="fp-detail-merge-sel" class="fp-detail-merge-sel">
-              <option value="">Merge into…</option>
-            </select>
-            <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpDetailMerge()">Merge</button>
+      <div class="fp-tab-content" id="fp-tab-profiles">
+        <div class="fingerprint-panel-list" id="fingerprint-profile-list">
+          <div class="fp-list-toolbar">
+            <input type="text" class="fp-search-input" id="fp-search-input" placeholder="Search profiles..." oninput="_fpFilterList()" />
+            <button type="button" class="icon-btn fp-select-toggle" id="fp-select-toggle" title="Select multiple" onclick="_fpToggleSelectMode()"><i class="fa-solid fa-check-double"></i></button>
           </div>
-          <button class="speaker-manager-btn fp-detail-delete-btn" onclick="fpDetailDelete()">Delete</button>
+          <div class="fp-select-bar hidden" id="fp-select-bar">
+            <label class="fp-select-all-label"><input type="checkbox" id="fp-select-all" onchange="_fpToggleSelectAll(this.checked)" /> All</label>
+            <span class="fp-select-count" id="fp-select-count">0 selected</span>
+          </div>
+          <div class="fp-profile-scroll" id="fp-profile-scroll">
+            <div class="fp-panel-empty">No voice profiles yet.</div>
+          </div>
+          <div class="fp-bulk-actions hidden" id="fp-bulk-actions">
+            <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkOptimize()" title="Optimize selected"><i class="fa-duotone fa-wand-magic-sparkles"></i> Optimize</button>
+            <button class="speaker-manager-btn speaker-manager-btn-secondary fp-bulk-btn" onclick="_fpBulkMerge()" title="Merge selected into one"><i class="fa-solid fa-merge"></i> Merge</button>
+            <button class="speaker-manager-btn fp-detail-delete-btn fp-bulk-btn" onclick="_fpBulkDelete()" title="Delete selected"><i class="fa-solid fa-trash"></i> Delete</button>
+          </div>
+        </div>
+        <div class="fingerprint-panel-detail hidden" id="fingerprint-profile-detail">
+          <div class="fp-panel-top">
+              <div class="fp-detail-name-row">
+              <input class="fp-detail-name-input" id="fp-detail-name" placeholder="Name" />
+              <div class="speaker-color-grid fp-detail-color-grid" id="fp-detail-color-grid"></div>
+              </div>
+              <div class="fp-detail-meta" id="fp-detail-meta"></div>
+              <div class="fp-detail-sessions" id="fp-detail-sessions"></div>
+          </div>
+
+          <div class="fp-panel-bottom">
+              <div class="fp-detail-actions">
+                  <div class="actions-left">
+                      <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpDetailSave()">Save</button>
+                      <button class="speaker-manager-btn speaker-manager-btn-secondary" onclick="fpDetailOptimize()">Optimize</button>
+                  </div>
+              <div class="fp-detail-merge-wrap">
+                  <select id="fp-detail-merge-sel" class="fp-detail-merge-sel">
+                  <option value="">Merge into…</option>
+                  </select>
+                  <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpDetailMerge()">Merge</button>
+              </div>
+              <button class="speaker-manager-btn fp-detail-delete-btn" onclick="fpDetailDelete()">Delete</button>
+          </div>
+          </div>
+        </div>
+        <div class="fingerprint-panel-new" id="fingerprint-panel-new" style="display:none">
+          <input class="fp-detail-name-input" id="fp-new-name" placeholder="New profile name" />
+          <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpCreateProfile()">Create</button>
+          <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpCancelNew()">Cancel</button>
         </div>
       </div>
-      <div class="fingerprint-panel-new" id="fingerprint-panel-new" style="display:none">
-        <input class="fp-detail-name-input" id="fp-new-name" placeholder="New profile name" />
-        <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpCreateProfile()">Create</button>
-        <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpCancelNew()">Cancel</button>
+      <div class="fp-tab-content hidden" id="fp-tab-match">
+        <div class="fp-match-empty hidden" id="fp-match-empty">No unlinked speakers found across your meetings.</div>
+        <div class="fp-match-scroll" id="fp-match-scroll"></div>
+        <div class="fp-match-actions hidden" id="fp-match-actions">
+          <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpBulkLinkAll()">Apply All</button>
+        </div>
       </div>
     </div>
-    <div class="fingerprint-panel-footer">
+    <div class="fingerprint-panel-footer" id="fp-footer-profiles">
       <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="fpShowNew()"><i class="fa-solid fa-plus"></i> New Profile</button>
     </div>
   </div>

@@ -244,6 +244,55 @@ def search_sessions(query: str, limit: int = 50) -> list[dict]:
     return results
 
 
+def search_speakers(query: str, limit: int = 20) -> list[dict]:
+    """Search speaker_labels by name. Returns sessions grouped by speaker match,
+    each with a 'participant' kind match entry."""
+    if not query or not query.strip():
+        return []
+    pattern = f"%{query.strip()}%"
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT sl.session_id, sl.name AS speaker_name,
+                   s.title, s.started_at
+            FROM speaker_labels sl
+            JOIN sessions s ON s.id = sl.session_id
+            WHERE sl.name LIKE ? COLLATE NOCASE
+              AND sl.name != ''
+            GROUP BY sl.session_id, lower(sl.name)
+            ORDER BY s.started_at DESC
+            LIMIT ?
+            """,
+            (pattern, limit * 3),
+        ).fetchall()
+
+    from collections import OrderedDict
+    sessions: OrderedDict[str, dict] = OrderedDict()
+    for r in rows:
+        sid = r["session_id"]
+        name = r["speaker_name"]
+        # Highlight the matching portion in the speaker name
+        idx = name.lower().find(query.strip().lower())
+        if idx >= 0:
+            snippet = (name[:idx] + "<mark>" + name[idx:idx+len(query.strip())]
+                       + "</mark>" + name[idx+len(query.strip()):])
+        else:
+            snippet = name
+        if sid not in sessions:
+            sessions[sid] = {
+                "session_id": sid,
+                "title": r["title"] or "",
+                "matches": [],
+            }
+        if len(sessions[sid]["matches"]) < 3:
+            sessions[sid]["matches"].append({
+                "kind": "participant",
+                "snippet": snippet,
+            })
+
+    return list(sessions.values())[:limit]
+
+
 # ── Semantic embeddings ──────────────────────────────────────────────────────
 
 def save_session_embedding(session_id: str, embedding_bytes: bytes) -> None:

@@ -30,6 +30,12 @@ _AUTO_APPLY_THRESHOLD = 0.82   # cosine sim → apply silently
 _MIN_DURATION_SEC     = 2.5    # minimum audio before extracting embedding
 _EMB_DIM              = 256    # WeSpeaker embedding dimension
 
+_SPEAKER_PALETTE = [
+    '#58a6ff', '#f47067', '#00b464', '#d2a8ff', '#f0883e', '#db61a2',
+    '#e3b341', '#2dd4bf', '#a78bfa', '#79c0ff', '#ef6e4e', '#86e89d',
+    '#f6c177', '#6cb6ff', '#ff9bce', '#768390',
+]
+
 _SUPPRESSED_LOAD_SUBSTRINGS = (
     "Warning: You are sending unauthenticated requests to the HF Hub.",
     "Please set a HF_TOKEN to enable higher rate limits and faster downloads.",
@@ -135,6 +141,8 @@ class SpeakerFingerprintDB:
         self._ready   = False
         self._inference = None
 
+        self._backfill_colors()
+
         if not hf_token:
             log.warn("fingerprint", "No HF token - voice library disabled.")
             return
@@ -176,6 +184,30 @@ class SpeakerFingerprintDB:
 
     # ── Public helpers ────────────────────────────────────────────────────────
 
+    def _backfill_colors(self) -> None:
+        """Assign palette colors to any global speakers that have NULL color."""
+        try:
+            with _conn(self._db_path) as c:
+                rows = c.execute(
+                    "SELECT id FROM global_speakers WHERE color IS NULL OR color = '' "
+                    "ORDER BY created_at"
+                ).fetchall()
+                if not rows:
+                    return
+                # Count existing colored speakers to offset palette index
+                offset = c.execute(
+                    "SELECT COUNT(*) FROM global_speakers WHERE color IS NOT NULL AND color != ''"
+                ).fetchone()[0]
+                for i, r in enumerate(rows):
+                    color = _SPEAKER_PALETTE[(offset + i) % len(_SPEAKER_PALETTE)]
+                    c.execute(
+                        "UPDATE global_speakers SET color = ? WHERE id = ?",
+                        (color, r["id"]),
+                    )
+            log.info("fingerprint", f"Backfilled colors for {len(rows)} speaker profile(s)")
+        except Exception:
+            pass  # DB may not exist yet on first run
+
     @property
     def ready(self) -> bool:
         return self._ready
@@ -183,9 +215,14 @@ class SpeakerFingerprintDB:
     # ── Profile CRUD ──────────────────────────────────────────────────────────
 
     def create_global_speaker(self, name: str, color: str | None = None) -> str:
-        """Create a new global profile. Returns global_id."""
+        """Create a new global profile. Returns global_id.
+        Auto-assigns a palette color if none provided."""
         gid = uuid.uuid4().hex
         now = _now()
+        if not color:
+            with _conn(self._db_path) as c:
+                count = c.execute("SELECT COUNT(*) FROM global_speakers").fetchone()[0]
+            color = _SPEAKER_PALETTE[count % len(_SPEAKER_PALETTE)]
         with _conn(self._db_path) as c:
             c.execute(
                 "INSERT INTO global_speakers (id, name, color, emb_count, created_at, updated_at) "
@@ -200,8 +237,10 @@ class SpeakerFingerprintDB:
         global_id: str,
         name: str | None = None,
         color: str | None = ...,  # type: ignore[assignment]
-    ) -> None:
-        """Update name and/or color. Pass color=None to clear; omit to keep."""
+    ) -> dict:
+        """Update name and/or color. Pass color=None to clear; omit to keep.
+        Propagates changes to all linked speaker_labels rows.
+        Returns resolved {name, color} of the profile."""
         with _conn(self._db_path) as c:
             if name is not None:
                 c.execute(
@@ -213,6 +252,18 @@ class SpeakerFingerprintDB:
                     "UPDATE global_speakers SET color=?, updated_at=? WHERE id=?",
                     (color, _now(), global_id),
                 )
+            # Propagate resolved name/color to all linked speaker_labels
+            row = c.execute(
+                "SELECT name, color FROM global_speakers WHERE id = ?",
+                (global_id,),
+            ).fetchone()
+            if row:
+                c.execute(
+                    "UPDATE speaker_labels SET name=?, color=? WHERE global_id=?",
+                    (row["name"], row["color"], global_id),
+                )
+                return {"name": row["name"], "color": row["color"]}
+        return {}
 
     def delete_global_speaker(self, global_id: str) -> None:
         """Delete profile and all embeddings. Nulls speaker_labels.global_id via FK cascade."""
@@ -226,8 +277,10 @@ class SpeakerFingerprintDB:
             c.execute("DELETE FROM global_speakers WHERE id = ?", (global_id,))
         log.info("fingerprint", f"Deleted global profile {global_id[:8]}")
 
-    def merge_global_speakers(self, keep_id: str, merge_id: str) -> None:
-        """Move all embeddings from merge_id → keep_id, recompute centroid, delete merge_id."""
+    def merge_global_speakers(self, keep_id: str, merge_id: str) -> dict:
+        """Move all embeddings from merge_id → keep_id, recompute centroid, delete merge_id.
+        Propagates kept profile's name/color to all linked speaker_labels.
+        Returns resolved {name, color} of the kept profile."""
         with _conn(self._db_path) as c:
             c.execute(
                 "UPDATE speaker_embeddings SET global_id = ? WHERE global_id = ?",
@@ -238,8 +291,19 @@ class SpeakerFingerprintDB:
                 (keep_id, merge_id),
             )
             c.execute("DELETE FROM global_speakers WHERE id = ?", (merge_id,))
+            # Propagate kept profile's name/color to all linked labels
+            row = c.execute(
+                "SELECT name, color FROM global_speakers WHERE id = ?",
+                (keep_id,),
+            ).fetchone()
+            if row:
+                c.execute(
+                    "UPDATE speaker_labels SET name=?, color=? WHERE global_id=?",
+                    (row["name"], row["color"], keep_id),
+                )
         self.recompute_centroid(keep_id)
         log.info("fingerprint", f"Merged {merge_id[:8]} → {keep_id[:8]}")
+        return {"name": row["name"], "color": row["color"]} if row else {}
 
     def list_global_speakers(self) -> list[dict]:
         with _conn(self._db_path) as c:
@@ -301,6 +365,81 @@ class SpeakerFingerprintDB:
             by_session[sid]["seg_count"] += r["seg_count"]
 
         return list(by_session.values())
+
+    def get_linked_labels(self, global_id: str) -> list[dict]:
+        """Return all speaker_labels rows linked to a global profile."""
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                "SELECT session_id, speaker_key, name, color "
+                "FROM speaker_labels WHERE global_id = ?",
+                (global_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_unlinked_speaker_groups(self) -> list[dict]:
+        """Return distinct speaker names that need linking or have stale names.
+        Includes: unlinked labels (global_id IS NULL) and labels whose display
+        name doesn't match their linked profile's name.
+        Excludes default 'Speaker N' names."""
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                """
+                SELECT sl.name,
+                       COUNT(DISTINCT sl.session_id) AS session_count,
+                       COUNT(*) AS label_count
+                FROM speaker_labels sl
+                LEFT JOIN global_speakers gs ON gs.id = sl.global_id
+                WHERE (sl.global_id IS NULL OR lower(sl.name) != lower(gs.name))
+                  AND lower(sl.name) NOT GLOB 'speaker [0-9]*'
+                  AND sl.name != ''
+                GROUP BY lower(sl.name)
+                ORDER BY session_count DESC, lower(sl.name)
+                """,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_unlinked_speaker_sessions(self, name: str) -> list[dict]:
+        """Return sessions where an unlinked/mismatched speaker name appears."""
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                """
+                SELECT DISTINCT s.id AS session_id, s.title, s.started_at
+                FROM speaker_labels sl
+                JOIN sessions s ON s.id = sl.session_id
+                LEFT JOIN global_speakers gs ON gs.id = sl.global_id
+                WHERE lower(sl.name) = lower(?)
+                  AND (sl.global_id IS NULL OR lower(sl.name) != lower(gs.name))
+                ORDER BY s.started_at DESC
+                """,
+                (name.strip(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def bulk_link_by_name(self, name: str, global_id: str) -> list[dict]:
+        """Link all speaker_labels matching name to a global profile.
+        Updates their global_id, name, and color to match the profile.
+        Handles both unlinked labels and already-linked labels with stale names.
+        Returns list of affected {session_id, speaker_key} pairs."""
+        with _conn(self._db_path) as c:
+            profile = c.execute(
+                "SELECT name, color FROM global_speakers WHERE id = ?",
+                (global_id,),
+            ).fetchone()
+            if not profile:
+                return []
+            affected = c.execute(
+                "SELECT session_id, speaker_key FROM speaker_labels "
+                "WHERE lower(name) = lower(?)",
+                (name.strip(),),
+            ).fetchall()
+            affected = [dict(r) for r in affected]
+            if affected:
+                c.execute(
+                    "UPDATE speaker_labels SET global_id=?, name=?, color=? "
+                    "WHERE lower(name) = lower(?)",
+                    (global_id, profile["name"], profile["color"], name.strip()),
+                )
+        return affected
 
     # ── Embedding extraction ──────────────────────────────────────────────────
 
@@ -513,26 +652,88 @@ class SpeakerFingerprintDB:
                 )
         return affected
 
-    def prune_embeddings(self, global_id: str, keep_newest: int = 30) -> None:
-        """Delete oldest embeddings beyond keep_newest, then recompute centroid."""
+    def prune_embeddings(
+        self,
+        global_id: str,
+        outlier_threshold: float = 0.55,
+        dedup_threshold: float = 0.98,
+    ) -> dict:
+        """Quality-based pruning: remove outliers and near-duplicates.
+
+        1. Remove outliers — embeddings with low similarity to the current centroid
+           (likely noisy or misattributed audio).
+        2. Remove near-duplicates — when two embeddings are almost identical
+           (cosine sim ≥ dedup_threshold), drop the shorter-duration one.
+
+        No hard cap — the pool grows naturally and stays healthy through
+        outlier/dedup passes alone.
+
+        Returns {before, after, outliers_removed, duplicates_removed}."""
         with _conn(self._db_path) as c:
-            count = c.execute(
-                "SELECT COUNT(*) FROM speaker_embeddings WHERE global_id = ?",
+            rows = c.execute(
+                "SELECT id, embedding, duration_sec FROM speaker_embeddings "
+                "WHERE global_id = ? ORDER BY id",
                 (global_id,),
-            ).fetchone()[0]
-            to_delete = count - keep_newest
-            if to_delete > 0:
-                ids = c.execute(
-                    "SELECT id FROM speaker_embeddings WHERE global_id = ? "
-                    "ORDER BY id ASC LIMIT ?",
-                    (global_id, to_delete),
-                ).fetchall()
+            ).fetchall()
+
+            before = len(rows)
+            if before <= 1:
+                return {"before": before, "after": before,
+                        "outliers_removed": 0, "duplicates_removed": 0}
+
+            ids        = [r["id"] for r in rows]
+            embs       = np.stack([_blob_to_emb(r["embedding"]) for r in rows])
+            durations  = np.array([r["duration_sec"] or 0.0 for r in rows], dtype=np.float32)
+
+            # Compute centroid from all current embeddings
+            centroid = _normalize(embs.mean(axis=0))
+
+            # Cosine similarities to centroid (embeddings are L2-normalized)
+            sims = embs @ centroid
+
+            # --- Pass 1: remove outliers ---
+            outlier_mask = sims < outlier_threshold
+            outlier_ids = [ids[i] for i in range(before) if outlier_mask[i]]
+            keep_mask = ~outlier_mask
+            ids       = [ids[i] for i in range(before) if keep_mask[i]]
+            embs      = embs[keep_mask]
+            durations = durations[keep_mask]
+
+            # --- Pass 2: remove near-duplicates (keep longer-duration one) ---
+            dedup_drop = set()
+            n = len(ids)
+            if n > 1:
+                # Pairwise cosine similarity matrix
+                pair_sims = embs @ embs.T
+                for i in range(n):
+                    if i in dedup_drop:
+                        continue
+                    for j in range(i + 1, n):
+                        if j in dedup_drop:
+                            continue
+                        if pair_sims[i, j] >= dedup_threshold:
+                            # Drop the one with shorter duration
+                            drop = j if durations[i] >= durations[j] else i
+                            dedup_drop.add(drop)
+
+            dedup_ids = [ids[i] for i in dedup_drop]
+
+            # --- Execute deletions ---
+            all_remove = outlier_ids + dedup_ids
+            if all_remove:
                 c.executemany(
                     "DELETE FROM speaker_embeddings WHERE id = ?",
-                    [(r["id"],) for r in ids],
+                    [(rid,) for rid in all_remove],
                 )
+
+        after = before - len(all_remove) if all_remove else before
         self.recompute_centroid(global_id)
-        log.info("fingerprint", f"Pruned {global_id[:8]}: kept newest {keep_newest}")
+        log.info("fingerprint",
+                 f"Optimized {global_id[:8]}: {before}→{after} "
+                 f"(outliers={len(outlier_ids)}, dupes={len(dedup_ids)})")
+        return {"before": before, "after": after,
+                "outliers_removed": len(outlier_ids),
+                "duplicates_removed": len(dedup_ids)}
 
     def get_latest_embedding(self, global_id: str, session_id: str, speaker_key: str) -> np.ndarray | None:
         """Return the most recently added embedding for a given (session, speaker_key, global_id)."""

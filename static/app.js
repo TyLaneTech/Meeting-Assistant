@@ -652,6 +652,9 @@ const state = {
   sidebarOpen:    true,
 };
 
+// Per-session summary stream tracking: { [sessionId]: { buffer, streaming, mode } }
+const _summaryStreams = {};
+
 // Apply sidebar layout from cache synchronously - eliminates flash before async prefs load
 {
   const _lc = _getLayoutCache();
@@ -1164,6 +1167,7 @@ function _renderSidebar() {
             if (m.segment_id != null || m.kind === 'segment') snip.classList.add('clickable');
             const kindLabel = m.kind === 'title' ? ''
               : m.kind === 'semantic' ? ''
+              : m.kind === 'participant' ? '<span class="search-match-kind search-match-participant"><i class="fa-solid fa-user"></i> participant</span>'
               : `<span class="search-match-kind">${escapeHtml(m.kind)}</span>`;
             snip.innerHTML = kindLabel + m.snippet;
             // Click snippet → load session and jump to matching segment
@@ -1982,6 +1986,59 @@ function newSession() {
   _applyPromptText('');
   updateRecordBtn();
   refreshSidebar();
+  _syncUploadBtn();
+}
+
+/* ── Audio/Video upload ──────────────────────────────────────────────────── */
+
+/** Show upload button only when on a blank/new session (no recording, no past session). */
+function _syncUploadBtn() {
+  const btn = document.getElementById('upload-audio-btn');
+  if (!btn) return;
+  const show = !state.sessionId && !state.isRecording && !state.isViewingPast && !state.isReanalyzing;
+  btn.classList.toggle('hidden', !show);
+}
+
+async function handleAudioUpload(input) {
+  const file = input.files?.[0];
+  input.value = '';  // reset so the same file can be re-selected
+  if (!file) return;
+
+  // Immediate visual feedback
+  const btn = document.getElementById('upload-audio-btn');
+  if (btn) { btn.disabled = true; btn.style.opacity = '.35'; }
+  flashStatus('Uploading…');
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const resp = await fetch('/api/sessions/upload', { method: 'POST', body: form });
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.error || 'Upload failed'); return; }
+
+    // The backend created a session and started reanalysis – load it
+    const sessionId = data.session_id;
+    state.sessionId     = sessionId;
+    state.isViewingPast = false;
+    state.isReanalyzing = true;
+    history.pushState({}, '', '/session?id=' + sessionId);
+
+    // Clear display for incoming transcript
+    clearAll();
+    state.sessionId = sessionId;
+
+    const transcriptEl = document.getElementById('transcript');
+    if (transcriptEl) transcriptEl.innerHTML = '';
+
+    document.getElementById('record-btn').disabled = true;
+    refreshSidebar();
+    _syncUploadBtn();
+  } catch (e) {
+    alert('Upload failed: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+  }
 }
 
 function startEditTitle(e, sessionId, currentTitle) {
@@ -2169,7 +2226,14 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('summary_busy', e => {
     const d = JSON.parse(e.data);
-    if (d.session_id && d.session_id !== state.sessionId) return;
+    const sid = d.session_id;
+    if (sid) {
+      // Track busy state per session
+      if (!_summaryStreams[sid]) _summaryStreams[sid] = { buffer: '', streaming: false, mode: '' };
+      _summaryStreams[sid].mode = d.busy ? (d.mode || 'generating') : '';
+      if (!d.busy) _summaryStreams[sid].streaming = false;
+    }
+    if (sid && sid !== state.sessionId) return;
     const badge = document.getElementById('summary-badge');
     if (d.busy) {
       badge.textContent = d.mode === 'generating' ? 'generating…' : 'updating…';
@@ -2179,7 +2243,11 @@ function connectSSE(afterSegId = 0) {
     }
   });
 
-  src.addEventListener('summary_start', () => {
+  src.addEventListener('summary_start', e => {
+    const d = JSON.parse(e.data);
+    const sid = d.session_id || state.sessionId;
+    _summaryStreams[sid] = { buffer: '', streaming: true, mode: 'generating' };
+    if (sid !== state.sessionId) return;
     state.summaryStreaming = true;
     state.summaryBuffer = '';
     const el = document.getElementById('summary');
@@ -2188,7 +2256,13 @@ function connectSSE(afterSegId = 0) {
   });
 
   src.addEventListener('summary_chunk', e => {
-    state.summaryBuffer += JSON.parse(e.data).text;
+    const d = JSON.parse(e.data);
+    const sid = d.session_id || state.sessionId;
+    // Always accumulate into the per-session buffer
+    if (_summaryStreams[sid]) _summaryStreams[sid].buffer += d.text;
+    // Only update DOM if this is the active session
+    if (sid !== state.sessionId) return;
+    state.summaryBuffer += d.text;
     if (state.summaryCursor) {
       const html = renderMd(_linkifyTimestampsInMd(state.summaryBuffer));
       state.summaryCursor.innerHTML = html;
@@ -2196,7 +2270,14 @@ function connectSSE(afterSegId = 0) {
     }
   });
 
-  src.addEventListener('summary_done', () => {
+  src.addEventListener('summary_done', e => {
+    const d = JSON.parse(e.data);
+    const sid = d.session_id || state.sessionId;
+    if (_summaryStreams[sid]) {
+      _summaryStreams[sid].streaming = false;
+      _summaryStreams[sid].mode = '';
+    }
+    if (sid !== state.sessionId) return;
     state.summaryStreaming = false;
     state.summaryCursor = null;
     highlightCode('#summary');
@@ -2376,6 +2457,7 @@ function connectSSE(afterSegId = 0) {
     // Ensure playback is available during reanalysis
     if (!_playbackActive && state.sessionId) initPlayback(state.sessionId);
     _syncRecordBtnDisabled();
+    _syncUploadBtn();
     refreshSidebar();
   });
 
@@ -2403,6 +2485,7 @@ function connectSSE(afterSegId = 0) {
       if (s.has_video) initVideo(state.sessionId, s.video_offset);
     }).catch(() => {});
     _syncRecordBtnDisabled();
+    _syncUploadBtn();
     refreshSidebar();
   });
 
@@ -2417,6 +2500,7 @@ function connectSSE(afterSegId = 0) {
     text.textContent = state.modelInfo || 'Ready';
     alert('Reanalysis failed: ' + (d.error || 'unknown error'));
     _syncRecordBtnDisabled();
+    _syncUploadBtn();
     refreshSidebar();
   });
 
@@ -2446,6 +2530,19 @@ function _syncRecordBtnDisabled() {
   const btn = document.getElementById('record-btn');
   if (!btn) return;
   btn.disabled = !state.isRecording && (state.isReanalyzing || !state.recordingReady);
+}
+
+/** Returns a promise that resolves once the record button is enabled
+ *  (model loaded) AND audio devices have been enumerated. */
+function _waitForRecordReady() {
+  return (_devicesReady || Promise.resolve()).then(() => {
+    if (state.recordingReady) return;
+    return new Promise(resolve => {
+      const id = setInterval(() => {
+        if (state.recordingReady) { clearInterval(id); resolve(); }
+      }, 200);
+    });
+  });
 }
 
 function onStatus(d) {
@@ -2585,6 +2682,7 @@ function updateRecordBtn() {
   _syncRecordBtnDisabled();
   updateTestBtn();
   syncBrowserMic();
+  _syncUploadBtn();
 }
 
 function updateTestBtn() {
@@ -2611,9 +2709,16 @@ async function toggleRecording() {
     btn.disabled = true;
     await fetch('/api/recording/stop', { method: 'POST' });
   } else {
+    // On the home page, redirect to session page and let it handle the recording
+    // start.  This ensures every recording goes through the same audio path.
+    if (window._isHomePage) {
+      window.location.href = '/session?autostart=1';
+      return;
+    }
+
     // Read selected device indices from the dropdowns
-    const lbVal  = document.getElementById('viz-loopback-sel')?.value;
-    const micVal = document.getElementById('viz-mic-sel')?.value;
+    const lbVal  = document.getElementById('viz-loopback-sel')?.value ?? '';
+    const micVal = document.getElementById('viz-mic-sel')?.value ?? '';
     const body = {};
     if (lbVal  !== '' && lbVal  !== null && lbVal  !== undefined) body.loopback_device = parseInt(lbVal, 10);
     Object.assign(body, parseMicSelection(micVal));
@@ -3440,6 +3545,8 @@ async function _fpLoadProfiles() {
   } catch (e) {
     _fpProfiles = [];
   }
+  // Sort by sample count descending
+  _fpProfiles.sort((a, b) => (b.emb_count || 0) - (a.emb_count || 0));
   _fpRenderProfileList();
   if (_fpSelectedId) {
     const still = _fpProfiles.find(p => p.id === _fpSelectedId);
@@ -3525,7 +3632,20 @@ async function _fpSelectProfile(globalId) {
     btn.type = 'button';
     btn.className = 'speaker-color-btn' + (_fpDetailColor === color ? ' active' : '');
     btn.style.backgroundColor = color;
-    btn.addEventListener('click', () => { _fpDetailColor = color; _fpSelectProfile(globalId); });
+    btn.dataset.color = color;
+    btn.addEventListener('click', () => {
+      _fpDetailColor = color;
+      grid.querySelectorAll('.speaker-color-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.color === color));
+      // Auto-save color change
+      if (_fpSelectedId) {
+        fetch(`/api/fingerprint/speakers/${_fpSelectedId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ color }),
+        }).then(() => _fpLoadProfiles());
+      }
+    });
     grid.appendChild(btn);
   });
 
@@ -3723,6 +3843,251 @@ async function fpCreateProfile() {
   fpCancelNew();
   await _fpLoadProfiles();
   if (data.global_id) _fpSelectProfile(data.global_id);
+}
+
+/* ── Voice Library: Match Speakers tab ──────────────────────────────────── */
+
+let _fpMatchGroups = [];
+let _fpMatchProfiles = [];
+
+function fpSwitchTab(tab) {
+  document.querySelectorAll('.fp-tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.tab === tab));
+  const profilesTab = document.getElementById('fp-tab-profiles');
+  const matchTab = document.getElementById('fp-tab-match');
+  const footer = document.getElementById('fp-footer-profiles');
+  if (profilesTab) profilesTab.classList.toggle('hidden', tab !== 'profiles');
+  if (matchTab) matchTab.classList.toggle('hidden', tab !== 'match');
+  if (footer) footer.style.display = tab === 'profiles' ? '' : 'none';
+  if (tab === 'match') fpLoadUnlinked();
+}
+
+async function fpLoadUnlinked() {
+  const resp = await fetch('/api/fingerprint/unlinked-labels');
+  if (!resp.ok) return;
+  const data = await resp.json();
+  _fpMatchGroups = data.groups || [];
+  _fpMatchProfiles = data.profiles || [];
+  _fpRenderMatchTab();
+}
+
+function _fpRenderMatchTab() {
+  const scroll = document.getElementById('fp-match-scroll');
+  const empty = document.getElementById('fp-match-empty');
+  const actions = document.getElementById('fp-match-actions');
+  if (!scroll) return;
+
+  scroll.innerHTML = '';
+
+  if (_fpMatchGroups.length === 0) {
+    if (empty) empty.classList.remove('hidden');
+    if (actions) actions.classList.add('hidden');
+    return;
+  }
+
+  if (empty) empty.classList.add('hidden');
+  if (actions) actions.classList.remove('hidden');
+
+  // Sort: unmatched (no auto-selected profile) first, then matched
+  const sorted = [..._fpMatchGroups].sort((a, b) => {
+    const aMatch = _fpMatchProfiles.some(p => p.name.toLowerCase() === a.name.toLowerCase());
+    const bMatch = _fpMatchProfiles.some(p => p.name.toLowerCase() === b.name.toLowerCase());
+    if (aMatch === bMatch) return 0;
+    return aMatch ? 1 : -1;
+  });
+
+  sorted.forEach(group => {
+    const row = document.createElement('div');
+    row.className = 'fp-match-row';
+    row.dataset.name = group.name;
+
+    const matchingProfile = _fpMatchProfiles.find(p =>
+      p.name.toLowerCase() === group.name.toLowerCase());
+    const isUnmatched = !matchingProfile;
+
+    const info = document.createElement('div');
+    info.className = 'fp-match-info';
+
+    const nameLink = document.createElement('button');
+    nameLink.className = 'fp-match-name fp-match-name-link';
+    nameLink.textContent = group.name;
+    nameLink.title = 'Jump to session';
+    nameLink.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _fpMatchGoToSessions(group.name, nameLink);
+    });
+    info.appendChild(nameLink);
+
+    if (isUnmatched) {
+      const badge = document.createElement('span');
+      badge.className = 'fp-match-badge-unmatched';
+      badge.textContent = 'Unmatched';
+      info.appendChild(badge);
+    }
+
+    const countSpan = document.createElement('span');
+    countSpan.className = 'fp-match-count';
+    countSpan.textContent = `${group.session_count} session${group.session_count !== 1 ? 's' : ''}`
+      + (group.label_count > 1 ? ` · ${group.label_count} label${group.label_count !== 1 ? 's' : ''}` : '');
+    info.appendChild(countSpan);
+
+    const sel = document.createElement('select');
+    sel.className = 'fp-match-select';
+    sel.innerHTML = '<option value="">-- Select profile --</option>'
+      + '<option value="__new__">+ Create New Profile</option>'
+      + _fpMatchProfiles.map(p =>
+        `<option value="${p.id}">${escapeHtml(p.name)}</option>`
+      ).join('');
+
+    if (matchingProfile) sel.value = matchingProfile.id;
+
+    // Update badge on selection change
+    sel.addEventListener('change', () => {
+      const badge = row.querySelector('.fp-match-badge-unmatched');
+      if (sel.value) {
+        if (badge) badge.remove();
+        row.classList.remove('fp-match-row-unmatched');
+      } else {
+        if (!badge) {
+          const b = document.createElement('span');
+          b.className = 'fp-match-badge-unmatched';
+          b.textContent = 'Unmatched';
+          info.querySelector('.fp-match-name').after(b);
+        }
+        row.classList.add('fp-match-row-unmatched');
+      }
+    });
+
+    if (isUnmatched) row.classList.add('fp-match-row-unmatched');
+
+    const btn = document.createElement('button');
+    btn.className = 'speaker-manager-btn speaker-manager-btn-ghost fp-match-link-btn';
+    btn.textContent = 'Link';
+    btn.addEventListener('click', () => fpLinkOne(row));
+
+    row.appendChild(info);
+    row.appendChild(sel);
+    row.appendChild(btn);
+    scroll.appendChild(row);
+  });
+}
+
+async function fpLinkOne(row) {
+  const name = row.dataset.name;
+  const sel = row.querySelector('.fp-match-select');
+  const value = sel ? sel.value : '';
+  if (!value) { alert('Select a profile or "Create New".'); return; }
+
+  const body = value === '__new__'
+    ? { name, create_new: true }
+    : { name, global_id: value };
+
+  const btn = row.querySelector('.fp-match-link-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Linking...'; }
+
+  const resp = await fetch('/api/fingerprint/bulk-link', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (resp.ok) {
+    row.remove();
+    _fpMatchGroups = _fpMatchGroups.filter(g => g.name.toLowerCase() !== name.toLowerCase());
+    if (_fpMatchGroups.length === 0) {
+      const empty = document.getElementById('fp-match-empty');
+      const actions = document.getElementById('fp-match-actions');
+      if (empty) empty.classList.remove('hidden');
+      if (actions) actions.classList.add('hidden');
+    }
+  } else {
+    if (btn) { btn.disabled = false; btn.textContent = 'Link'; }
+  }
+}
+
+async function fpBulkLinkAll() {
+  const rows = document.querySelectorAll('#fp-match-scroll .fp-match-row');
+  const mappings = [];
+  rows.forEach(row => {
+    const name = row.dataset.name;
+    const sel = row.querySelector('.fp-match-select');
+    const value = sel ? sel.value : '';
+    if (!value) return;
+    if (value === '__new__') {
+      mappings.push({ name, create_new: true });
+    } else {
+      mappings.push({ name, global_id: value });
+    }
+  });
+
+  if (mappings.length === 0) {
+    alert('Select at least one profile mapping to apply.');
+    return;
+  }
+
+  const btn = document.querySelector('#fp-match-actions button');
+  if (btn) { btn.disabled = true; btn.textContent = 'Applying...'; }
+
+  const resp = await fetch('/api/fingerprint/bulk-link-all', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mappings }),
+  });
+
+  if (resp.ok) {
+    await fpLoadUnlinked();
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'Apply All'; }
+}
+
+async function _fpMatchGoToSessions(speakerName, anchorEl) {
+  // Dismiss any existing popup
+  document.querySelectorAll('.fp-match-session-popup').forEach(el => el.remove());
+
+  const resp = await fetch(`/api/fingerprint/unlinked-sessions?name=${encodeURIComponent(speakerName)}`);
+  if (!resp.ok) return;
+  const data = await resp.json();
+  const sessions = data.sessions || [];
+  if (!sessions.length) return;
+
+  // Single session — jump directly
+  if (sessions.length === 1) {
+    closeFingerprintPanel();
+    loadSession(sessions[0].session_id);
+    return;
+  }
+
+  // Multiple sessions — show popup anchored to the name
+  const popup = document.createElement('div');
+  popup.className = 'fp-match-session-popup';
+
+  sessions.forEach(s => {
+    const btn = document.createElement('button');
+    btn.className = 'fp-match-session-item';
+    const date = s.started_at ? new Date(s.started_at).toLocaleDateString() : '';
+    btn.innerHTML = `<span class="fp-match-session-title">${escapeHtml(s.title || 'Untitled')}</span>`
+      + (date ? `<span class="fp-match-session-date">${date}</span>` : '');
+    btn.addEventListener('click', () => {
+      popup.remove();
+      closeFingerprintPanel();
+      loadSession(s.session_id);
+    });
+    popup.appendChild(btn);
+  });
+
+  // Position near the anchor
+  const row = anchorEl.closest('.fp-match-row');
+  row.style.position = 'relative';
+  row.appendChild(popup);
+
+  // Close on outside click
+  const dismiss = (e) => {
+    if (!popup.contains(e.target) && e.target !== anchorEl) {
+      popup.remove();
+      document.removeEventListener('mousedown', dismiss);
+    }
+  };
+  setTimeout(() => document.addEventListener('mousedown', dismiss), 0);
 }
 
 function clearSpeakerSelection() {
@@ -7641,6 +8006,28 @@ async function loadSession(sessionId) {
     linkifyTimestamps(sumEl);
   }
 
+  // Resume if a summary is currently streaming for this session
+  const activeStream = _summaryStreams[sessionId];
+  if (activeStream && activeStream.streaming) {
+    state.summaryStreaming = true;
+    state.summaryBuffer = activeStream.buffer;
+    const sumEl = document.getElementById('summary');
+    if (activeStream.buffer) {
+      sumEl.innerHTML = renderMd(_linkifyTimestampsInMd(activeStream.buffer));
+    } else {
+      sumEl.innerHTML = '';
+    }
+    state.summaryCursor = sumEl;
+    const badge = document.getElementById('summary-badge');
+    badge.textContent = activeStream.mode === 'updating' ? 'updating…' : 'generating…';
+    badge.classList.remove('hidden');
+  } else if (activeStream && activeStream.mode) {
+    // Busy but not yet streaming (e.g. waiting for AI response)
+    const badge = document.getElementById('summary-badge');
+    badge.textContent = activeStream.mode === 'updating' ? 'updating…' : 'generating…';
+    badge.classList.remove('hidden');
+  }
+
   if (data.chat_messages?.length) {
     document.getElementById('chat-messages').innerHTML = '';
     for (const m of data.chat_messages) {
@@ -7746,12 +8133,13 @@ function _closePowerMenuOutside(e) {
 }
 
 function confirmShutdown() {
+  if (!state.isRecording) { doShutdown(); return; }
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
   overlay.innerHTML = `
     <div class="dialog">
       <h3>Shut down server?</h3>
-      <p>This will stop recording (if active) and close the Meeting Assistant server.</p>
+      <p>A recording is in progress. This will stop it and close the Meeting Assistant server.</p>
       <div class="dialog-btns">
         <button class="btn btn-danger" onclick="doShutdown()">Shut Down</button>
         <button class="btn" style="background:var(--surface2);color:var(--fg)"
@@ -7764,22 +8152,19 @@ function confirmShutdown() {
 async function doShutdown() {
   document.querySelector('.overlay')?.remove();
   await fetch('/api/shutdown', { method: 'POST' }).catch(() => {});
-  document.body.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:center;height:100vh;
-                flex-direction:column;gap:12px;color:#8b949e;font-family:system-ui">
-      <span style="font-size:40px"><img id="shutdown-icon" class="brand-icon shutdown-icon" src="/static/images/logo.png" alt=""></span>
-      <p style="font-size:16px;font-weight:600;color:#e6edf3">Meeting Assistant shut down.</p>
-      <p style="font-size:13px">You can close this tab.</p>
-    </div>`;
+  const screen = _showTransitionScreen('Shut Down', 'You can close this tab.');
+  // Freeze the animation after a moment for a calm stopped state
+  setTimeout(() => screen.stop(), 3000);
 }
 
 function confirmRestart() {
+  if (!state.isRecording) { doRestart(); return; }
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
   overlay.innerHTML = `
     <div class="dialog">
       <h3>Restart server?</h3>
-      <p>This will stop recording (if active) and restart the Meeting Assistant.</p>
+      <p>A recording is in progress. This will stop it and restart the Meeting Assistant.</p>
       <div class="dialog-btns">
         <button class="btn" style="background:var(--accent);color:#fff" onclick="doRestart()">Restart</button>
         <button class="btn" style="background:var(--surface2);color:var(--fg)"
@@ -7790,12 +8175,13 @@ function confirmRestart() {
 }
 
 function confirmUpdateRestart() {
+  if (!state.isRecording) { doUpdateRestart(); return; }
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
   overlay.innerHTML = `
     <div class="dialog">
       <h3>Update &amp; Restart?</h3>
-      <p>This will pull the latest update, stop recording (if active), and restart.</p>
+      <p>A recording is in progress. This will stop it, pull the latest update, and restart.</p>
       <div class="dialog-btns">
         <button class="btn" style="background:var(--accent);color:#fff" onclick="doUpdateRestart()">Update &amp; Restart</button>
         <button class="btn" style="background:var(--surface2);color:var(--fg)"
@@ -7807,22 +8193,16 @@ function confirmUpdateRestart() {
 
 async function doUpdateRestart() {
   document.querySelector('.overlay')?.remove();
-  document.body.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:center;height:100vh;
-                flex-direction:column;gap:12px;color:#8b949e;font-family:system-ui">
-      <span style="font-size:40px"><img class="brand-icon shutdown-icon" src="/static/images/logo.png" alt=""></span>
-      <p style="font-size:16px;font-weight:600;color:#e6edf3">Updating &amp; Restarting...</p>
-      <p style="font-size:13px">The page will reload when the server is back.</p>
-    </div>`;
+  const screen = _showTransitionScreen('Updating & Restarting\u2026', 'The page will reload when the server is back.');
   try {
     const res = await fetch('/api/update/apply', { method: 'POST' });
     const data = await res.json();
     if (data.error) {
-      document.body.querySelector('p:first-of-type').textContent = 'Update failed: ' + data.error;
+      screen.titleEl.textContent = 'Update failed';
+      screen.subtitleEl.textContent = data.error;
       return;
     }
   } catch {}
-  // Poll until the server is back, then reload
   const poll = setInterval(async () => {
     try {
       const r = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
@@ -7831,17 +8211,109 @@ async function doUpdateRestart() {
   }, 2000);
 }
 
+function _showTransitionScreen(title, subtitle) {
+  document.body.innerHTML = '';
+  document.body.style.cssText = 'margin:0;overflow:hidden;background:var(--surface4, #0a0d10)';
+
+  // Inject styles
+  if (!document.getElementById('_ts_style')) {
+    const style = document.createElement('style');
+    style.id = '_ts_style';
+    style.textContent = `
+      @keyframes _ts_breathe {
+        0%, 100% { opacity: .25; transform: scale(1) }
+        50%      { opacity: .45; transform: scale(1.08) }
+      }
+      @keyframes _ts_fadein {
+        from { opacity: 0; transform: translateY(8px) }
+        to   { opacity: 1; transform: translateY(0) }
+      }
+      ._ts_wrap {
+        position: fixed; inset: 0;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+      ._ts_glow {
+        position: absolute;
+        width: 280px; height: 280px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(88,166,255,.12) 0%, transparent 70%);
+        animation: _ts_breathe 4s ease-in-out infinite;
+        pointer-events: none;
+      }
+      ._ts_logo {
+        position: relative;
+        width: 60px; height: 60px;
+        margin-bottom: 28px;
+        animation: _ts_breathe 4s ease-in-out infinite;
+        filter: drop-shadow(0 0 14px rgba(88,166,255,.25));
+      }
+      ._ts_bar_wrap {
+        display: flex; gap: 4px; align-items: center;
+        height: 20px; margin-bottom: 28px;
+        animation: _ts_fadein .5s ease .2s both;
+      }
+      ._ts_bar {
+        width: 3px; border-radius: 1.5px;
+        background: rgba(88,166,255,.5);
+        animation: _ts_eq var(--d, 1s) ease-in-out var(--delay, 0s) infinite alternate;
+      }
+      @keyframes _ts_eq {
+        0%   { height: var(--lo, 4px) }
+        100% { height: var(--hi, 16px) }
+      }
+      ._ts_title {
+        font-size: 17px; font-weight: 600; color: #e6edf3;
+        margin: 0 0 8px; letter-spacing: .2px;
+        animation: _ts_fadein .5s ease .1s both;
+      }
+      ._ts_sub {
+        font-size: 13px; color: #8b949e; margin: 0;
+        animation: _ts_fadein .5s ease .25s both;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  const wrap = document.createElement('div');
+  wrap.className = '_ts_wrap';
+
+  // Small EQ-style bars
+  const N = 5;
+  let bars = '';
+  for (let i = 0; i < N; i++) {
+    const d  = (.7 + Math.random() * .6).toFixed(2);
+    const dl = (i * .08).toFixed(2);
+    const lo = 3 + Math.floor(Math.random() * 3);
+    const hi = 10 + Math.floor(Math.random() * 8);
+    bars += `<span class="_ts_bar" style="--d:${d}s;--delay:${dl}s;--lo:${lo}px;--hi:${hi}px"></span>`;
+  }
+
+  wrap.innerHTML = `
+    <div class="_ts_glow"></div>
+    <img class="_ts_logo" src="/static/images/logo.png" alt="">
+    <div class="_ts_bar_wrap">${bars}</div>
+    <p class="_ts_title">${title}</p>
+    <p class="_ts_sub">${subtitle}</p>
+  `;
+  document.body.appendChild(wrap);
+
+  return {
+    stop: () => {
+      wrap.querySelectorAll('._ts_bar').forEach(b => b.style.animationPlayState = 'paused');
+      wrap.querySelector('._ts_logo').style.animationPlayState = 'paused';
+      wrap.querySelector('._ts_glow').style.animationPlayState = 'paused';
+    },
+    titleEl: wrap.querySelector('._ts_title'),
+    subtitleEl: wrap.querySelector('._ts_sub'),
+  };
+}
+
 async function doRestart() {
   document.querySelector('.overlay')?.remove();
   await fetch('/api/restart', { method: 'POST' }).catch(() => {});
-  document.body.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:center;height:100vh;
-                flex-direction:column;gap:12px;color:#8b949e;font-family:system-ui">
-      <span style="font-size:40px"><img id="shutdown-icon" class="brand-icon shutdown-icon" src="/static/images/logo.png" alt=""></span>
-      <p style="font-size:16px;font-weight:600;color:#e6edf3">Restarting...</p>
-      <p style="font-size:13px">The page will reload when the server is back.</p>
-    </div>`;
-  // Poll until the server is back, then reload
+  _showTransitionScreen('Restarting\u2026', 'The page will reload when the server is back.');
   const poll = setInterval(async () => {
     try {
       const r = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
@@ -7898,6 +8370,8 @@ function clearAll() {
   _clearAttachments();
   state.summaryBuffer    = '';
   state.summaryStreaming  = false;
+  state.summaryCursor    = null;
+  document.getElementById('summary-badge')?.classList.add('hidden');
   state.chatBuffer       = '';
   state.chatToolCalls    = [];
   destroyPlayback();
@@ -8072,6 +8546,11 @@ async function loadAudioDevices() {
   // Re-apply disabled state if currently recording
   lbSel.disabled  = state.isRecording;
   micSel.disabled = state.isRecording;
+
+  // Persist the resolved selection so pages without dropdowns (e.g. home page)
+  // can send the same device IDs when starting a recording.
+  if (lbSel.value && !_prefs.loopback_device) savePref('loopback_device', lbSel.value);
+  if (micSel.value && !_prefs.mic_device)     savePref('mic_device',      micSel.value);
 }
 
 function saveDeviceSelection() {
@@ -9838,9 +10317,9 @@ if (!_isHomePage) {
 }
 
 // Load preferences first, then init components that depend on saved values
-loadPreferences().then(() => {
-  loadAudioDevices();
+let _devicesReady = loadPreferences().then(() => {
   loadModelConfig();
+  return loadAudioDevices();
 });
 // Screen recording: load displays + sync toggle
 _apLoad().then(() => { try { _syncScreenToggle(); } catch {} });
@@ -9861,6 +10340,14 @@ if (!_isHomePage) {
     } else if (params.has('fingerprint')) {
       openFingerprintPanel();
       history.replaceState(null, '', location.pathname);
+    } else if (params.has('autostart')) {
+      // Auto-start recording once the model is ready.  Used by the home page
+      // and system tray so every recording goes through the session page's
+      // proven audio path.
+      history.replaceState(null, '', '/session');
+      _waitForRecordReady().then(() => {
+        if (!state.isRecording) toggleRecording();
+      });
     } else if (params.has('id')) {
       // Defer until status has loaded - if the session is actively recording,
       // the SSE status+replay events handle everything; only call loadSession
@@ -9888,4 +10375,7 @@ if (!_isHomePage) {
       updateRecordBtn();
     }
   });
+
+  // Initial sync of upload button visibility
+  _syncUploadBtn();
 }

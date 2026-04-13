@@ -900,7 +900,8 @@ function _renderHomeSearchResults() {
     const title = entry.title || sid;
     const matchHtml = (entry.matches || []).slice(0, 2).map(m => {
       const kindCls = m.kind || 'content';
-      const kindLabel = kindCls === 'semantic' ? 'AI' : kindCls === 'title' ? 'title' : 'content';
+      const kindLabel = kindCls === 'participant' ? '<i class="fa-solid fa-user"></i> participant'
+        : kindCls === 'semantic' ? 'AI' : kindCls === 'title' ? 'title' : 'content';
       const snippet = m.snippet || '';
       return `<div class="home-search-result-snippet">
         <span class="home-search-result-kind ${kindCls}">${kindLabel}</span>${snippet}
