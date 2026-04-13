@@ -283,11 +283,15 @@ class AudioCapture:
                 cmd = [
                     ffmpeg_path,
                     "-f", "dshow",
+                    "-rtbufsize", "32k",         # small DirectShow buffer for low latency
+                    "-audio_buffer_size", "40",   # dshow audio buffer in ms (default ~500)
                     "-i", f"audio={ffmpeg_mic_name}",
                     "-f", "s16le",
                     "-acodec", "pcm_s16le",
                     "-ar", str(self._mic_rate),
                     "-ac", "1",
+                    "-fflags", "+nobuffer",       # minimize internal buffering
+                    "-flags", "+low_delay",
                     "-loglevel", "error",
                     "pipe:1",
                 ]

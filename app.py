@@ -3896,6 +3896,18 @@ def _force_quit(delay: float = 0) -> None:
     os._exit(0)
 
 
+@app.route("/api/instance-handshake", methods=["POST"])
+def instance_handshake():
+    """Called by a new instance to check if it can take over."""
+    with _state_lock:
+        recording = _state["is_recording"]
+    if recording:
+        log.warn("app", "New instance attempted takeover — declined (recording active)")
+    else:
+        log.info("app", "New instance requested takeover — yielding (idle)")
+    return jsonify({"recording": recording})
+
+
 @app.route("/api/shutdown", methods=["POST"])
 def shutdown():
     """Gracefully stop recording (if active), remove tray, then exit."""
@@ -4066,6 +4078,53 @@ def update_apply():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _handshake_existing_instance(url: str) -> bool:
+    """Check for an existing instance and negotiate takeover.
+
+    Returns True if startup should continue, False if we must abort.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{url}/api/instance-handshake", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=3)
+        data = json.loads(resp.read())
+    except Exception:
+        return True  # nothing listening — port is free
+
+    if data.get("recording"):
+        log.error("app", "Another instance is running and has an active recording. "
+                         "Aborting to avoid interrupting it.")
+        print("\n  *** Another Meeting Assistant instance is recording on this port. ***")
+        print("  *** Stop the recording first, or shut down the other instance.   ***\n")
+        return False
+
+    # Existing instance is idle — ask it to shut down
+    log.info("app", "Idle instance detected on this port — requesting shutdown…")
+    try:
+        req = urllib.request.Request(
+            f"{url}/api/shutdown", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass  # may fail if it exits before responding — that's fine
+
+    # Wait for the port to free up
+    for _ in range(30):
+        time.sleep(0.3)
+        try:
+            urllib.request.urlopen(f"{url}/api/status", timeout=1)
+        except Exception:
+            log.info("app", "Previous instance shut down.")
+            return True
+
+    log.error("app", "Previous instance did not shut down in time. Aborting.")
+    return False
+
+
 def main() -> None:
     global _tray
 
@@ -4073,6 +4132,9 @@ def main() -> None:
 
     port = int(os.getenv("PORT", 6969))
     url = f"http://127.0.0.1:{port}"
+
+    if not _handshake_existing_instance(url):
+        sys.exit(1)
 
     _active_provider = settings.get("ai_provider", "openai")
 
