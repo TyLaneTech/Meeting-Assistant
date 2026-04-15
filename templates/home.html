@@ -504,6 +504,50 @@
               <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
             </div>
           </div>
+          <div class="settings-group tool-overrides-group" id="tool-overrides-group">
+            <div class="settings-row tool-overrides-header">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Per-tool overrides</div>
+                <div class="settings-row-desc" id="tool-overrides-desc">Use different providers or models for summarization vs. chat</div>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Summary provider</div>
+                <div class="settings-row-desc">AI engine for auto-summaries</div>
+              </div>
+              <div class="provider-toggle tool-provider-toggle" id="summary-provider-toggle">
+                <button id="summary-provider-btn-default" onclick="setToolProvider('summary', null)">Default</button>
+                <button id="summary-provider-btn-anthropic" onclick="setToolProvider('summary', 'anthropic')">Anthropic</button>
+                <button id="summary-provider-btn-openai" onclick="setToolProvider('summary', 'openai')">OpenAI</button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Summary model</div>
+                <div class="settings-row-desc">Which model to use for summaries</div>
+              </div>
+              <select id="summary-model-sel" onchange="setToolModel('summary', this.value)"></select>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Chat provider</div>
+                <div class="settings-row-desc">AI engine for chat conversations</div>
+              </div>
+              <div class="provider-toggle tool-provider-toggle" id="chat-provider-toggle">
+                <button id="chat-provider-btn-default" onclick="setToolProvider('chat', null)">Default</button>
+                <button id="chat-provider-btn-anthropic" onclick="setToolProvider('chat', 'anthropic')">Anthropic</button>
+                <button id="chat-provider-btn-openai" onclick="setToolProvider('chat', 'openai')">OpenAI</button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Chat model</div>
+                <div class="settings-row-desc">Which model to use for chat</div>
+              </div>
+              <select id="chat-model-sel" onchange="setToolModel('chat', this.value)"></select>
+            </div>
+          </div>
           <div class="settings-group" id="key-anthropic-field">
             <div class="settings-key-row">
               <div class="settings-key-header">

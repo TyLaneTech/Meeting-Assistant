@@ -24,6 +24,7 @@ import log
 from transcriber import (
     _HALLUCINATION_THRESHOLD,
     _repetition_ratio,
+    _clean_ellipses,
     _clean_hallucinations,
     _dedup_sentences,
 )
@@ -345,6 +346,7 @@ class BatchTranscriber:
                 text = result.get("text", "").strip()
                 if not text:
                     continue
+                text = _clean_ellipses(text)
                 text = _clean_hallucinations(text)
                 if not text:
                     continue

@@ -36,9 +36,15 @@ DEFAULTS: dict = {
     "diarization_enabled": True,
     "auto_summary": True,
 
-    # AI provider and model
+    # AI provider and model (primary / fallback)
     "ai_provider": "openai",
     "ai_model": "gpt-5.4",
+
+    # Per-tool overrides (null = use primary)
+    "summary_provider": None,
+    "summary_model": None,
+    "chat_provider": None,
+    "chat_model": None,
 
     # Screen recording
     "screen_display": 0,

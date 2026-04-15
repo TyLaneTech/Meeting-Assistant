@@ -435,6 +435,14 @@
             <span class="badge hidden" id="summary-badge">updating…</span>
           </div>
           <div class="col-actions right">
+            <div class="model-picker-wrap">
+              <button class="icon-btn model-picker-btn" id="summary-model-btn"
+                      title="Summary model" onclick="toggleModelPicker('summary')">
+                <i class="fa-solid fa-microchip"></i>
+                <span class="model-picker-label" id="summary-model-picker-label"></span>
+              </button>
+              <div class="model-picker-panel hidden" id="summary-model-picker"></div>
+            </div>
             <button class="icon-btn" id="summary-prompt-toggle"
                     title="Custom summary instructions" onclick="toggleSummaryPrompt()"><i class="fa-solid fa-gear"></i></button>
             <button class="icon-btn" title="Copy summary" onclick="copySummary()"><i class="fa-duotone fa-copy"></i></button>
@@ -493,6 +501,13 @@
             <button class="chat-attach-btn" onclick="document.getElementById('chat-file-input').click()" title="Attach file">
               <i class="fa-solid fa-paperclip"></i>
             </button>
+            <div class="model-picker-wrap model-picker-chat-wrap">
+              <button class="chat-model-picker-btn" id="chat-model-btn"
+                      title="Chat model" onclick="toggleModelPicker('chat')">
+                <i class="fa-solid fa-microchip"></i>
+              </button>
+              <div class="model-picker-panel model-picker-panel-up hidden" id="chat-model-picker"></div>
+            </div>
             <input type="file" id="chat-file-input" multiple accept="image/*,.pdf,.txt,.csv,.md,.json" style="display:none"
                    onchange="_handleFileSelect(this.files); this.value='';">
             <textarea

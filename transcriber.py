@@ -205,6 +205,24 @@ def _dedup_sentences(text: str) -> str:
     return result
 
 
+def _clean_ellipses(text: str) -> str:
+    """Collapse Whisper's per-word ellipsis artifacts into normal text.
+
+    Whisper sometimes outputs "Word... Next... Word..." when it's uncertain.
+    This strips trailing ellipses from each word and re-joins, preserving a
+    single trailing ellipsis if the original text ended with one (to indicate
+    an incomplete thought).
+    """
+    if "..." not in text:
+        return text
+    trailing = text.rstrip().endswith("...")
+    cleaned = _re.sub(r'\.{2,}', ' ', text)
+    cleaned = _re.sub(r'\s{2,}', ' ', cleaned).strip()
+    if trailing and cleaned and not cleaned.endswith("..."):
+        cleaned += "..."
+    return cleaned
+
+
 def _strip_fragment_period(text: str) -> str:
     """Strip a trailing period from short fragments.
 
@@ -583,6 +601,7 @@ class Transcriber:
             parts = [seg.text.strip() for seg in segments if seg.text.strip()]
             if parts:
                 text = _strip_fragment_period(" ".join(parts))
+                text = _clean_ellipses(text)
                 # Strip known hallucination phrases (subtitle credits, etc.)
                 text = _clean_hallucinations(text)
                 if not text:

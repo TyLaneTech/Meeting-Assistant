@@ -339,6 +339,7 @@ class AIAssistant:
         self.provider = provider
         self.model = model
         self.client = self._make_client(provider)
+        self._clients: dict[str, object] = {provider: self.client}
 
     def _make_client(self, provider: str):
         """Create the API client.  Returns None gracefully if no key is set."""
@@ -356,6 +357,12 @@ class AIAssistant:
             print(f"[ai] Could not initialise {provider} client: {e}")
             return None
 
+    def _get_client(self, provider: str):
+        """Return a cached client for the given provider, creating if needed."""
+        if provider not in self._clients or self._clients[provider] is None:
+            self._clients[provider] = self._make_client(provider)
+        return self._clients[provider]
+
     def reload_client(self, provider: str | None = None, model: str | None = None) -> None:
         """Re-create the client, optionally changing provider and/or model."""
         if provider is not None:
@@ -363,6 +370,14 @@ class AIAssistant:
         if model is not None:
             self.model = model
         self.client = self._make_client(self.provider)
+        self._clients[self.provider] = self.client
+
+    def _resolve(self, provider: str | None, model: str | None) -> tuple:
+        """Return (client, provider, model) using overrides or defaults."""
+        p = provider or self.provider
+        m = model or self.model
+        c = self._get_client(p) if p != self.provider else self.client
+        return c, p, m
 
     def ask(
         self,
@@ -374,6 +389,8 @@ class AIAssistant:
         cancel: "threading.Event | None" = None,
         frame_extractor: FrameExtractor | None = None,
         on_tool_event: ToolEventCallback | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Stream an answer to the latest question in chat_history.
 
@@ -422,6 +439,7 @@ class AIAssistant:
             system, chat_history, on_token, on_done,
             cancel=cancel, frame_extractor=frame_extractor,
             on_tool_event=on_tool_event,
+            provider=provider, model=model,
         )
 
     def summarize(
@@ -431,6 +449,8 @@ class AIAssistant:
         on_done: Callable[[], None] | None = None,
         custom_prompt: str = "",
         meta: dict | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Stream a structured meeting summary from a full transcript."""
         if not transcript.strip():
@@ -456,6 +476,7 @@ class AIAssistant:
             [{"role": "user", "content": prompt}],
             on_token,
             on_done,
+            provider=provider, model=model,
         )
 
     def patch_summary(
@@ -465,6 +486,8 @@ class AIAssistant:
         custom_prompt: str = "",
         meta: dict | None = None,
         update_context: str = "",
+        provider: str | None = None,
+        model: str | None = None,
     ) -> str:
         """Incrementally update a summary using the full transcript.
 
@@ -519,7 +542,7 @@ class AIAssistant:
         )
 
         try:
-            raw = self._complete_structured(system_prompt, user_prompt)
+            raw = self._complete_structured(system_prompt, user_prompt, provider=provider, model=model)
         except Exception as e:
             log.warn("summary", f"patch failed ({e}) - keeping existing summary")
             return existing_summary
@@ -601,6 +624,8 @@ class AIAssistant:
         cancel: "threading.Event | None" = None,
         on_tool_event: ToolEventCallback | None = None,
         tool_executor: "ToolExecutor | None" = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Stream an answer for the Global Chat (cross-session Q&A)."""
         self._stream_with_tools(
@@ -613,6 +638,7 @@ class AIAssistant:
             tools_anthropic=_GLOBAL_TOOLS,
             tools_openai=_GLOBAL_TOOLS_OAI,
             tool_executor=tool_executor,
+            provider=provider, model=model,
         )
 
     def generate_title(self, transcript: str) -> str:
@@ -635,6 +661,70 @@ class AIAssistant:
         except Exception:
             return ""
 
+    # ── Anthropic prompt caching ─────────────────────────────────────────────
+
+    @staticmethod
+    def _build_cached_kwargs(
+        system: str,
+        messages: list[dict],
+        model: str,
+        max_tokens: int = 4096,
+        tools: list | None = None,
+        extra: dict | None = None,
+    ) -> dict:
+        """Build Anthropic request kwargs with prompt-caching breakpoints.
+
+        Places two ``cache_control`` markers per request:
+
+        1. End of the stable prefix — the last tool definition (or the system
+           block when there are no tools).  Caches system + tool schemas.
+        2. End of the message history — the last content block of the last
+           message.  Creates a rolling cache of conversation context.
+
+        Reads cost ~10% of input tokens; writes cost ~125%.  The 5-min TTL
+        refreshes on each hit.
+        """
+        _CC = {"type": "ephemeral"}
+
+        system_blocks = [{"type": "text", "text": system}]
+        kwargs = {"model": model, "system": system_blocks, "max_tokens": max_tokens}
+        if extra:
+            kwargs.update(extra)
+
+        # ── Breakpoint 1: stable prefix (tools or system) ──────────────
+        if tools:
+            cached_tools = [dict(t) for t in tools]
+            cached_tools[-1] = {**cached_tools[-1], "cache_control": _CC}
+            kwargs["tools"] = cached_tools
+        else:
+            system_blocks[-1] = {**system_blocks[-1], "cache_control": _CC}
+
+        # ── Breakpoint 2: end of accumulated message history ───────────
+        cached_msgs: list[dict] = []
+        for msg in messages:
+            new_msg = dict(msg)
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_msg["content"] = [
+                    dict(b) if isinstance(b, dict) else b
+                    for b in content
+                ]
+            cached_msgs.append(new_msg)
+
+        for msg in reversed(cached_msgs):
+            content = msg.get("content")
+            if isinstance(content, list) and content:
+                last = content[-1]
+                if isinstance(last, dict):
+                    content[-1] = {**last, "cache_control": _CC}
+                break
+            elif isinstance(content, str) and content:
+                msg["content"] = [{"type": "text", "text": content, "cache_control": _CC}]
+                break
+
+        kwargs["messages"] = cached_msgs
+        return kwargs
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _stream(
@@ -644,21 +734,24 @@ class AIAssistant:
         on_token: Callback,
         on_done: Callable[[], None] | None,
         cancel: "threading.Event | None" = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Stream tokens from the active provider."""
         try:
             from network import warp_disconnect
             warp_disconnect()
-            if self.client is None:
+            client, prov, mdl = self._resolve(provider, model)
+            if client is None:
                 on_token(
-                    f"\n\n*Error: No {self.provider.title()} API key configured. "
+                    f"\n\n*Error: No {prov.title()} API key configured. "
                     f"Add it in Settings.*"
                 )
                 return
-            if self.provider == "openai":
-                self._stream_openai(system, messages, on_token, cancel)
+            if prov == "openai":
+                self._stream_openai(system, messages, on_token, cancel, client=client, model=mdl)
             else:
-                self._stream_anthropic(system, messages, on_token, cancel)
+                self._stream_anthropic(system, messages, on_token, cancel, client=client, model=mdl)
         except Exception as e:
             on_token(f"\n\n*Error: {e}*")
         finally:
@@ -666,19 +759,17 @@ class AIAssistant:
                 on_done()
 
     def _stream_anthropic(self, system: str, messages: list[dict], on_token: Callback,
-                           cancel: "threading.Event | None" = None) -> None:
+                           cancel: "threading.Event | None" = None,
+                           client=None, model: str | None = None) -> None:
         import anthropic
-        kwargs: dict = {}
-        if self.model in _ANTHROPIC_THINKING_MODELS:
-            kwargs["thinking"] = {"type": "adaptive"}
+        c = client or self.client
+        m = model or self.model
+        extra: dict = {}
+        if m in _ANTHROPIC_THINKING_MODELS:
+            extra["thinking"] = {"type": "adaptive"}
+        api_kwargs = self._build_cached_kwargs(system, messages, m, extra=extra)
         try:
-            with self.client.messages.stream(
-                model=self.model,
-                max_tokens=4096,
-                system=system,
-                messages=messages,
-                **kwargs,
-            ) as stream:
+            with c.messages.stream(**api_kwargs) as stream:
                 for text in stream.text_stream:
                     if cancel and cancel.is_set():
                         stream.close()
@@ -716,13 +807,16 @@ class AIAssistant:
         return out
 
     def _stream_openai(self, system: str, messages: list[dict], on_token: Callback,
-                        cancel: "threading.Event | None" = None) -> None:
+                        cancel: "threading.Event | None" = None,
+                        client=None, model: str | None = None) -> None:
         import openai
+        c = client or self.client
+        m = model or self.model
         converted = self._to_openai_messages(messages)
         full_messages = [{"role": "system", "content": system}] + converted
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
+            stream = c.chat.completions.create(
+                model=m,
                 #max_tokens=4096,
                 messages=full_messages,
                 stream=True,
@@ -739,17 +833,19 @@ class AIAssistant:
         except openai.RateLimitError:
             on_token("\n\n*Error: OpenAI rate limit reached. Please wait and retry.*")
 
-    def _complete(self, system: str, prompt: str, max_tokens: int = 1024) -> str:
+    def _complete(self, system: str, prompt: str, max_tokens: int = 1024,
+                   provider: str | None = None, model: str | None = None) -> str:
         """Non-streaming single completion from the active provider."""
         from network import warp_disconnect
         warp_disconnect()
-        if self.client is None:
+        client, prov, mdl = self._resolve(provider, model)
+        if client is None:
             raise RuntimeError(
-                f"No {self.provider.title()} API key configured. Add it in Settings."
+                f"No {prov.title()} API key configured. Add it in Settings."
             )
-        if self.provider == "openai":
-            response = self.client.chat.completions.create(
-                model=self.model,
+        if prov == "openai":
+            response = client.chat.completions.create(
+                model=mdl,
                 #max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
@@ -758,15 +854,16 @@ class AIAssistant:
             )
             return response.choices[0].message.content.strip()
         else:
-            response = self.client.messages.create(
-                model=self.model,
+            response = client.messages.create(
+                model=mdl,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
             )
             return response.content[0].text.strip()
 
-    def _complete_structured(self, system: str, prompt: str) -> dict:
+    def _complete_structured(self, system: str, prompt: str,
+                              provider: str | None = None, model: str | None = None) -> dict:
         """Structured completion returning a dict with section arrays.
 
         Anthropic: uses tool use so the SDK enforces the schema.
@@ -775,18 +872,19 @@ class AIAssistant:
         """
         from network import warp_disconnect
         warp_disconnect()
-        if self.client is None:
+        client, prov, mdl = self._resolve(provider, model)
+        if client is None:
             raise RuntimeError(
-                f"No {self.provider.title()} API key configured. Add it in Settings."
+                f"No {prov.title()} API key configured. Add it in Settings."
             )
-        if self.provider == "openai":
+        if prov == "openai":
             schema_hint = (
                 ' Respond with valid JSON matching: '
                 '{"sections": [{"name": str, "action": "append"|"replace", "content": str}]}. '
                 'Use an empty sections array if no updates are needed.'
             )
-            response = self.client.chat.completions.create(
-                model=self.model,
+            response = client.chat.completions.create(
+                model=mdl,
                 messages=[
                     {"role": "system", "content": system + schema_hint},
                     {"role": "user", "content": prompt},
@@ -796,8 +894,8 @@ class AIAssistant:
             text = response.choices[0].message.content.strip()
             return json.loads(text) if text else {}
         else:
-            response = self.client.messages.create(
-                model=self.model,
+            response = client.messages.create(
+                model=mdl,
                 max_tokens=1024,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
@@ -823,6 +921,8 @@ class AIAssistant:
         tools_anthropic: list | None = None,
         tools_openai: list | None = None,
         tool_executor: "ToolExecutor | None" = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         """Stream with tool-use loop (up to 50 iterations).
 
@@ -832,27 +932,28 @@ class AIAssistant:
         try:
             from network import warp_disconnect
             warp_disconnect()
-            if self.client is None:
+            client, prov, mdl = self._resolve(provider, model)
+            if client is None:
                 on_token(
-                    f"\n\n*Error: No {self.provider.title()} API key configured. "
+                    f"\n\n*Error: No {prov.title()} API key configured. "
                     f"Add it in Settings.*"
                 )
                 return
-            # Default to screenshot tools if no explicit tools provided;
-            # always include native web search alongside other tools.
             a_tools = (tools_anthropic or [_SCREENSHOT_TOOL]) + [_WEB_SEARCH_ANTHROPIC]
             o_tools = (tools_openai or [_SCREENSHOT_FUNC_OAI]) + [_WEB_SEARCH_OAI]
-            if self.provider == "openai":
+            if prov == "openai":
                 self._tool_loop_openai(
                     system, messages, on_token, cancel, frame_extractor,
                     on_tool_event=on_tool_event,
                     tools=o_tools, tool_executor=tool_executor,
+                    client=client, model=mdl,
                 )
             else:
                 self._tool_loop_anthropic(
                     system, messages, on_token, cancel, frame_extractor,
                     on_tool_event=on_tool_event,
                     tools=a_tools, tool_executor=tool_executor,
+                    client=client, model=mdl,
                 )
         except Exception as e:
             on_token(f"\n\n*Error: {e}*")
@@ -958,9 +1059,13 @@ class AIAssistant:
         on_tool_event: ToolEventCallback | None = None,
         tools: list | None = None,
         tool_executor: "ToolExecutor | None" = None,
+        client=None,
+        model: str | None = None,
     ) -> None:
         import anthropic
 
+        c = client or self.client
+        m = model or self.model
         msgs = list(messages)  # working copy
         max_rounds = 50
         a_tools = tools or [_SCREENSHOT_TOOL]
@@ -970,19 +1075,15 @@ class AIAssistant:
             if cancel and cancel.is_set():
                 return
 
-            kwargs: dict = {}
-            if self.model in _ANTHROPIC_THINKING_MODELS:
-                kwargs["thinking"] = {"type": "adaptive"}
+            extra: dict = {}
+            if m in _ANTHROPIC_THINKING_MODELS:
+                extra["thinking"] = {"type": "adaptive"}
+            api_kwargs = self._build_cached_kwargs(
+                system, msgs, m, tools=a_tools, extra=extra,
+            )
 
             round_had_text = False
-            with self.client.messages.stream(
-                model=self.model,
-                max_tokens=4096,
-                system=system,
-                messages=msgs,
-                tools=a_tools,
-                **kwargs,
-            ) as stream:
+            with c.messages.stream(**api_kwargs) as stream:
                 # Event-based iteration so we can detect server tools
                 # (native web search) in real time alongside text.
                 for event in stream:
@@ -1130,9 +1231,13 @@ class AIAssistant:
         on_tool_event: ToolEventCallback | None = None,
         tools: list | None = None,
         tool_executor: "ToolExecutor | None" = None,
+        client=None,
+        model: str | None = None,
     ) -> None:
         import openai
 
+        c = client or self.client
+        m = model or self.model
         converted = self._to_openai_messages(messages)
         msgs = [{"role": "system", "content": system}] + converted
         max_rounds = 50
@@ -1143,8 +1248,8 @@ class AIAssistant:
             if cancel and cancel.is_set():
                 return
 
-            stream = self.client.chat.completions.create(
-                model=self.model,
+            stream = c.chat.completions.create(
+                model=m,
                 messages=msgs,
                 tools=o_tools,
                 stream=True,

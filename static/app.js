@@ -9168,8 +9168,21 @@ async function openSettings() {
 
     // AI provider + model
     currentAiModels = { ...AI_MODELS, ..._getAiModels(aiCfg.models) };
+    _currentAiProvider = aiCfg.provider;
+    _currentAiModel = aiCfg.model;
     _applyAiConfig(aiCfg.provider, aiCfg.model, currentAiModels);
-    updateChatModelLabel(aiCfg.provider, aiCfg.model, currentAiModels);
+
+    // Per-tool overrides
+    _toolOverrides.summary_provider = aiCfg.summary_provider || null;
+    _toolOverrides.summary_model = aiCfg.summary_model || null;
+    _toolOverrides.chat_provider = aiCfg.chat_provider || null;
+    _toolOverrides.chat_model = aiCfg.chat_model || null;
+
+    const anthSet = !!(status.keys?.ANTHROPIC_API_KEY?.is_set);
+    const oaiSet = !!(status.keys?.OPENAI_API_KEY?.is_set);
+    _bothKeysSet = anthSet && oaiSet;
+    _applyToolOverrides();
+    _updateSessionModelLabels();
   } catch (_) {}
 
   // Startup toggle (Windows only - hidden on unsupported platforms)
@@ -9236,8 +9249,11 @@ async function setAiProvider(provider) {
       ...currentAiModels,
       [modelsData.provider]: modelsData.models || [],
     };
+    _currentAiProvider = data.provider;
+    _currentAiModel = data.model;
     _applyAiConfig(data.provider, data.model, currentAiModels);
-    updateChatModelLabel(data.provider, data.model, currentAiModels);
+    _applyToolOverrides();
+    _updateSessionModelLabels();
   } catch (_) {}
 }
 
@@ -9248,8 +9264,229 @@ async function setAiModel(model) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model }),
     }).then(r => r.json());
+    _currentAiProvider = data.provider;
+    _currentAiModel = data.model;
     _applyAiConfig(data.provider, data.model, currentAiModels);
-    updateChatModelLabel(data.provider, data.model, currentAiModels);
+    _applyToolOverrides();
+    _updateSessionModelLabels();
+  } catch (_) {}
+}
+
+/* ── Per-tool provider/model overrides ──────────────────────────────── */
+
+let _toolOverrides = {
+  summary_provider: null, summary_model: null,
+  chat_provider: null, chat_model: null,
+};
+let _bothKeysSet = false;
+
+function _effectiveProvider(tool) {
+  return _toolOverrides[tool + '_provider'] || _currentAiProvider;
+}
+function _effectiveModel(tool) {
+  const p = _effectiveProvider(tool);
+  const m = _toolOverrides[tool + '_model'];
+  if (m) {
+    const models = currentAiModels[p] || [];
+    if (models.some(x => x.id === m)) return m;
+  }
+  if (p === _currentAiProvider) return _currentAiModel;
+  const models = currentAiModels[p] || AI_MODELS[p] || [];
+  return models[0]?.id || '';
+}
+
+let _currentAiProvider = 'openai';
+let _currentAiModel = '';
+
+async function setToolProvider(tool, provider) {
+  try {
+    const data = await fetch('/api/ai_settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, provider }),
+    }).then(r => r.json());
+    _toolOverrides.summary_provider = data.summary_provider;
+    _toolOverrides.summary_model = data.summary_model;
+    _toolOverrides.chat_provider = data.chat_provider;
+    _toolOverrides.chat_model = data.chat_model;
+    _applyToolOverrides();
+    _updateSessionModelLabels();
+  } catch (_) {}
+}
+
+async function setToolModel(tool, model) {
+  try {
+    const data = await fetch('/api/ai_settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, model }),
+    }).then(r => r.json());
+    _toolOverrides.summary_provider = data.summary_provider;
+    _toolOverrides.summary_model = data.summary_model;
+    _toolOverrides.chat_provider = data.chat_provider;
+    _toolOverrides.chat_model = data.chat_model;
+    _applyToolOverrides();
+    _updateSessionModelLabels();
+  } catch (_) {}
+}
+
+function _applyToolOverrides() {
+  const group = document.getElementById('tool-overrides-group');
+  if (!group) return;
+
+  if (_bothKeysSet) {
+    group.classList.remove('disabled');
+    const existingHint = group.querySelector('.tool-overrides-hint');
+    if (existingHint) existingHint.remove();
+  } else {
+    group.classList.add('disabled');
+    if (!group.querySelector('.tool-overrides-hint')) {
+      const hint = document.createElement('div');
+      hint.className = 'tool-overrides-hint';
+      hint.textContent = 'Set both Anthropic and OpenAI keys to enable per-tool overrides';
+      group.appendChild(hint);
+    }
+  }
+
+  for (const tool of ['summary', 'chat']) {
+    const prov = _toolOverrides[tool + '_provider'];
+    for (const p of ['default', 'anthropic', 'openai']) {
+      const btn = document.getElementById(`${tool}-provider-btn-${p}`);
+      if (btn) btn.classList.toggle('active',
+        p === 'default' ? !prov : prov === p);
+    }
+
+    const sel = document.getElementById(`${tool}-model-sel`);
+    if (!sel) continue;
+    const effectiveProv = prov || _currentAiProvider;
+    const models = currentAiModels[effectiveProv] || AI_MODELS[effectiveProv] || [];
+    const currentModel = _effectiveModel(tool);
+    sel.innerHTML = '';
+    if (!prov) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '(Use primary model)';
+      opt.selected = true;
+      sel.appendChild(opt);
+      sel.disabled = true;
+    } else {
+      sel.disabled = false;
+      models.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label;
+        if (m.id === currentModel) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    }
+  }
+}
+
+function _updateSessionModelLabels() {
+  const sp = _effectiveProvider('summary');
+  const sm = _effectiveModel('summary');
+  const summaryLabel = document.getElementById('summary-model-picker-label');
+  if (summaryLabel) {
+    summaryLabel.textContent = _modelLabel(sp, sm);
+  }
+
+  const cp = _effectiveProvider('chat');
+  const cm = _effectiveModel('chat');
+  updateChatModelLabel(cp, cm, currentAiModels);
+}
+
+/* ── Model picker popout (session page) ────────────────────────────── */
+
+function toggleModelPicker(tool) {
+  const panel = document.getElementById(tool + '-model-picker');
+  if (!panel) return;
+  const wasHidden = panel.classList.contains('hidden');
+  document.querySelectorAll('.model-picker-panel').forEach(p => p.classList.add('hidden'));
+  if (wasHidden) {
+    _buildModelPickerPanel(tool);
+    panel.classList.remove('hidden');
+    _positionModelPicker(tool, panel);
+    const close = (e) => {
+      if (!panel.contains(e.target) && !e.target.closest('#' + tool + '-model-btn')) {
+        panel.classList.add('hidden');
+        document.removeEventListener('pointerdown', close);
+      }
+    };
+    setTimeout(() => document.addEventListener('pointerdown', close), 0);
+  }
+}
+
+function _positionModelPicker(tool, panel) {
+  const btn = document.getElementById(tool + '-model-btn');
+  if (!btn) return;
+  const r = btn.getBoundingClientRect();
+  const ph = panel.offsetHeight;
+  const pw = panel.offsetWidth;
+  if (tool === 'chat') {
+    panel.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+    panel.style.top = 'auto';
+  } else {
+    panel.style.top = (r.bottom + 4) + 'px';
+    panel.style.bottom = 'auto';
+  }
+  const right = window.innerWidth - r.right;
+  panel.style.left = 'auto';
+  panel.style.right = Math.max(4, right) + 'px';
+}
+
+function _buildModelPickerPanel(tool) {
+  const panel = document.getElementById(tool + '-model-picker');
+  if (!panel) return;
+  panel.innerHTML = '';
+
+  const currentProv = _effectiveProvider(tool);
+  const currentModel = _effectiveModel(tool);
+
+  for (const prov of ['anthropic', 'openai']) {
+    const models = currentAiModels[prov] || AI_MODELS[prov] || [];
+    if (!models.length) continue;
+    const section = document.createElement('div');
+    section.className = 'model-picker-section';
+    const label = document.createElement('div');
+    label.className = 'model-picker-section-label';
+    label.textContent = _providerLabel(prov);
+    section.appendChild(label);
+    for (const m of models) {
+      const item = document.createElement('div');
+      item.className = 'model-picker-item';
+      const isSelected = prov === currentProv && m.id === currentModel;
+      if (isSelected) item.classList.add('selected');
+      item.innerHTML =
+        `<span class="mp-check">${isSelected ? '<i class="fa-solid fa-check"></i>' : ''}</span>` +
+        `<span>${m.label}</span>`;
+      item.addEventListener('click', () => {
+        _selectModelFromPicker(tool, prov, m.id);
+        panel.classList.add('hidden');
+      });
+      section.appendChild(item);
+    }
+    panel.appendChild(section);
+  }
+}
+
+async function _selectModelFromPicker(tool, provider, model) {
+  try {
+    // Set provider first, then model
+    await fetch('/api/ai_settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, provider }),
+    });
+    const data = await fetch('/api/ai_settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tool, model }),
+    }).then(r => r.json());
+    _toolOverrides.summary_provider = data.summary_provider;
+    _toolOverrides.summary_model = data.summary_model;
+    _toolOverrides.chat_provider = data.chat_provider;
+    _toolOverrides.chat_model = data.chat_model;
+    _updateSessionModelLabels();
   } catch (_) {}
 }
 
@@ -10299,7 +10536,13 @@ if (!_isHomePage) {
     .then(r => r.json())
     .then(aiCfg => {
       currentAiModels = { ...AI_MODELS, ..._getAiModels(aiCfg.models) };
-      updateChatModelLabel(aiCfg.provider, aiCfg.model, currentAiModels);
+      _currentAiProvider = aiCfg.provider;
+      _currentAiModel = aiCfg.model;
+      _toolOverrides.summary_provider = aiCfg.summary_provider || null;
+      _toolOverrides.summary_model = aiCfg.summary_model || null;
+      _toolOverrides.chat_provider = aiCfg.chat_provider || null;
+      _toolOverrides.chat_model = aiCfg.chat_model || null;
+      _updateSessionModelLabels();
     })
     .catch(() => {});
 }

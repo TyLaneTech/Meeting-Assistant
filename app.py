@@ -584,12 +584,14 @@ def _run_summary(
                 with _state_lock:
                     if is_auto and _state.get("summary_manual_pending"):
                         return
+                sp, sm = _resolve_tool_ai("summary")
                 content = ai.patch_summary(
                     existing_summary,
                     transcript,
                     custom_prompt,
                     meta=meta,
                     update_context=update_context,
+                    provider=sp, model=sm,
                 )
                 # Check again after the (potentially slow) AI call
                 with _state_lock:
@@ -610,7 +612,9 @@ def _run_summary(
                     _persist("".join(chunks))
                     _push("summary_done", {"session_id": session_id})
 
-                ai.summarize(transcript, on_token, on_done, custom_prompt=custom_prompt, meta=meta)
+                sp, sm = _resolve_tool_ai("summary")
+                ai.summarize(transcript, on_token, on_done, custom_prompt=custom_prompt, meta=meta,
+                             provider=sp, model=sm)
         finally:
             with _state_lock:
                 if _state["session_id"] == session_id:
@@ -1547,11 +1551,11 @@ def set_keys():
             config.save_key(key_name, val)
             changed.append(key_name)
 
-    # Reload AI client if the active provider's key changed
-    active_provider = settings.get("ai_provider", "openai")
-    provider_key = "OPENAI_API_KEY" if active_provider == "openai" else "ANTHROPIC_API_KEY"
-    if provider_key in changed:
+    # Reload AI clients whose keys changed
+    if "OPENAI_API_KEY" in changed or "ANTHROPIC_API_KEY" in changed:
         ai.reload_client()
+        ai._clients.clear()
+        ai._clients[ai.provider] = ai.client
 
     # If HF key was just set and diarizer isn't loaded, start loading it
     if "HUGGING_FACE_KEY" in changed and data.get("HUGGING_FACE_KEY", "").strip():
@@ -1665,6 +1669,13 @@ def _models_for_provider(provider: str) -> list[dict]:
     return _AI_MODELS.get(provider, _AI_MODELS["openai"])
 
 
+def _resolve_tool_ai(tool: str) -> tuple[str | None, str | None]:
+    """Return (provider, model) overrides for a tool, or (None, None) if unset."""
+    p = settings.get(f"{tool}_provider")
+    m = settings.get(f"{tool}_model")
+    return (p, m)
+
+
 def _normalize_ai_selection(provider: str, model: str | None) -> tuple[str, str]:
     """Ensure provider/model are valid and aligned with each other."""
     provider = provider if provider in _AI_MODELS else "openai"
@@ -1672,6 +1683,34 @@ def _normalize_ai_selection(provider: str, model: str | None) -> tuple[str, str]
     if model in valid_ids:
         return provider, model
     return provider, _DEFAULT_MODEL.get(provider, next(iter(valid_ids), ""))
+
+
+_ANTHROPIC_CLASS_RE = re.compile(
+    r"^claude-(\w+)-(\d+(?:-\d+)*)(?:-(\d{8}))?(?:-latest)?$"
+)
+
+def _anthropic_latest_only(models: list[dict]) -> list[dict]:
+    """Keep only the latest version of each Anthropic model class."""
+    best: dict[str, dict] = {}
+    for m in models:
+        match = _ANTHROPIC_CLASS_RE.match(m["id"])
+        if not match:
+            continue
+        cls = match.group(1)           # e.g. "opus", "sonnet", "haiku"
+        ver = tuple(int(x) for x in match.group(2).split("-"))  # (4, 6)
+        date = match.group(3) or ""    # e.g. "20251001" or ""
+        key = (ver, date)
+        prev = best.get(cls)
+        if prev is None or key > prev["_sort"]:
+            best[cls] = {**m, "_sort": key}
+    order = ["opus", "sonnet", "haiku"]
+    ordered = [best[c] for c in order if c in best]
+    for cls in sorted(best.keys()):
+        if cls not in order:
+            ordered.append(best[cls])
+    for m in ordered:
+        m.pop("_sort", None)
+    return ordered or models
 
 
 def _fetch_anthropic_models() -> list[dict]:
@@ -1687,7 +1726,7 @@ def _fetch_anthropic_models() -> list[dict]:
             {"id": m.id, "label": getattr(m, "display_name", m.id)}
             for m in page.data
         ]
-        return result or _AI_MODELS["anthropic"]
+        return _anthropic_latest_only(result) if result else _AI_MODELS["anthropic"]
     except Exception as e:
         log.warn("ai", f"Failed to fetch Anthropic models: {e}")
         return _AI_MODELS["anthropic"]
@@ -1731,19 +1770,50 @@ def get_ai_settings_models():
 
 @app.route("/api/ai_settings", methods=["GET"])
 def get_ai_settings():
-    """Return current AI provider, model, and available options."""
+    """Return current AI provider, model, per-tool overrides, and available options."""
     provider, model = _normalize_ai_selection(ai.provider, ai.model)
     return jsonify({
         "provider": provider,
         "model": model,
         "models": _AI_MODELS,
+        "summary_provider": settings.get("summary_provider"),
+        "summary_model": settings.get("summary_model"),
+        "chat_provider": settings.get("chat_provider"),
+        "chat_model": settings.get("chat_model"),
     })
 
 
 @app.route("/api/ai_settings", methods=["POST"])
 def set_ai_settings():
-    """Update AI provider and/or model. Reloads the client immediately."""
+    """Update AI provider and/or model. Reloads the client immediately.
+
+    Accepts optional ``tool`` key ("summary" or "chat") to set per-tool
+    overrides instead of changing the primary provider/model.
+    """
     data = request.get_json(silent=True) or {}
+    tool = data.get("tool")
+
+    if tool in ("summary", "chat"):
+        tp = data.get("provider")
+        tm = data.get("model")
+        updates = {}
+        if "provider" in data:
+            updates[f"{tool}_provider"] = tp
+        if "model" in data:
+            updates[f"{tool}_model"] = tm
+        if updates:
+            settings.update(updates)
+        return jsonify({
+            "ok": True,
+            "tool": tool,
+            "summary_provider": settings.get("summary_provider"),
+            "summary_model": settings.get("summary_model"),
+            "chat_provider": settings.get("chat_provider"),
+            "chat_model": settings.get("chat_model"),
+            "provider": ai.provider,
+            "model": ai.model,
+        })
+
     new_provider = data.get("provider")
     new_model = data.get("model")
     target_provider = new_provider or ai.provider
@@ -2522,9 +2592,11 @@ def chat():
         if live_path or video_path.exists():
             fe = _saving_extractor
 
+        cp, cm = _resolve_tool_ai("chat")
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
                cancel=cancel_event, frame_extractor=fe,
-               on_tool_event=on_tool_event)
+               on_tool_event=on_tool_event,
+               provider=cp, model=cm)
 
     threading.Thread(target=run_chat, daemon=True).start()
     return jsonify({"request_id": request_id})
@@ -2834,11 +2906,13 @@ def global_chat():
 
             _push("global_chat_done", {"request_id": request_id})
 
+        cp, cm = _resolve_tool_ai("chat")
         ai.ask_global(
             chat_history, on_token, on_done,
             cancel=cancel_event,
             on_tool_event=on_tool_event,
             tool_executor=_global_tool_executor,
+            provider=cp, model=cm,
         )
 
     threading.Thread(target=run_global_chat, daemon=True).start()

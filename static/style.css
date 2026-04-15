@@ -2839,6 +2839,122 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
 .provider-toggle button.active { background: var(--surface2); color: var(--accent); font-weight: 700; }
 .provider-toggle button:not(.active):hover { background: var(--surface2); color: var(--fg); }
 
+/* ── Per-tool override section ─────────────────────────────────────── */
+.tool-overrides-group { position: relative; }
+.tool-overrides-group.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+.tool-overrides-group.disabled .tool-overrides-header { cursor: default; }
+.tool-overrides-hint {
+  position: absolute;
+  z-index: 100;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--surface3);
+  color: var(--fg-muted);
+  font-size: 11px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 12px rgba(0,0,0,.4);
+  white-space: nowrap;
+  pointer-events: none;
+  display: none;
+}
+.tool-overrides-group.disabled:hover .tool-overrides-hint { display: block; }
+.tool-provider-toggle button { font-size: 11px; padding: 5px 10px; }
+
+/* ── Model picker (summary header + chat input) ───────────────────── */
+.model-picker-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.model-picker-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+}
+.model-picker-label {
+  font-size: 11px;
+  color: var(--fg-muted);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-model-picker-btn {
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 6px 0 2px;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  transition: color .12s;
+}
+.chat-model-picker-btn:hover { color: var(--fg); }
+.model-picker-panel {
+  position: fixed;
+  z-index: 3000;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  min-width: 220px;
+  max-height: 340px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.model-picker-panel.hidden { display: none; }
+.model-picker-section {
+  padding: 6px 0 2px;
+}
+.model-picker-section:not(:first-child) {
+  border-top: 1px solid var(--border);
+}
+.model-picker-section-label {
+  padding: 4px 12px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--fg-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.model-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .1s, color .1s;
+}
+.model-picker-item:hover { background: var(--surface3); color: var(--fg); }
+.model-picker-item.selected { color: var(--green); font-weight: 600; }
+.model-picker-item .mp-check {
+  width: 14px;
+  font-size: 10px;
+  color: var(--green);
+  flex-shrink: 0;
+}
+.model-picker-item .mp-provider-icon {
+  font-size: 10px;
+  color: var(--fg-subtle);
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.model-picker-chat-wrap { margin-right: 0; }
+
 
 /* ── CustomSelect widget ─────────────────────────────────────────── */
 .cs-trigger {
@@ -5578,6 +5694,7 @@ button.icon-btn.fingerprint-btn {
   gap: 12px;
   min-height: 0;
   overflow-y: auto;
+  user-select: none;
   overflow-x: hidden;
   padding-right: 2px;
 }
