@@ -12,3 +12,4 @@ __pycache__/
 tools/
 models/
 .model_download.py
+**/update_plans/

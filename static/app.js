@@ -2545,6 +2545,20 @@ function _waitForRecordReady() {
   });
 }
 
+let _quietPromptLanding = null;
+let _quietPromptShown = false;
+
+async function showQuietStopConfirm(sessionId) {
+  if (_quietPromptShown || !sessionId) return;
+  _quietPromptShown = true;
+  const stop = confirm('Things have gone quiet. Stop this recording?');
+  if (stop) {
+    await fetch('/api/recording/stop', { method: 'POST' }).catch(() => {});
+  } else {
+    await fetch('/api/recording/quiet-prompt/dismiss', { method: 'POST' }).catch(() => {});
+  }
+}
+
 function onStatus(d) {
   const dot  = document.getElementById('status-dot');
   const text = document.getElementById('status-text');
@@ -2586,6 +2600,10 @@ function onStatus(d) {
       if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
       if (_pendingSpeakerProfiles.length) _flushPendingSpeakers(d.session_id);
       refreshSidebar();
+      if (_quietPromptLanding === d.session_id) {
+        setTimeout(() => showQuietStopConfirm(d.session_id), 150);
+        _quietPromptLanding = null;
+      }
     } else if (!d.recording) {
       stopDurationCounter();
       _updateBrandIcons(false);
@@ -6404,6 +6422,7 @@ function initPlayback(sessionId) {
     document.getElementById('playback-seek').value = _playbackAudio.currentTime;
     highlightPlayingSegment(_playbackAudio.currentTime);
     _updateMinimapPlayhead(t);
+    if (_sessionEditor?.profile) renderSessionEditorCanvas();
   };
 
   _playbackAudio.onended = () => {
@@ -6443,6 +6462,11 @@ function seekPlayback(val) {
 }
 
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && _sessionEditor) {
+    e.preventDefault();
+    closeSessionEditor();
+    return;
+  }
   if (e.code === 'Space' && _playbackActive
       && !e.target.closest('input, textarea, select, [contenteditable]')) {
     e.preventDefault();
@@ -6590,6 +6614,806 @@ function clearPlayingHighlight() {
       _currentPlayingSeg._groupSummary.classList.remove('playing');
     }
     _currentPlayingSeg = null;
+  }
+}
+
+/* ── Session trim/split editor ───────────────────────────────────────────── */
+let _sessionEditor = null;
+let _sessionEditorDrag = null;
+let _sessionEditorSuppressClick = false;
+let _sessionHasTrimBackup = false;
+
+async function openSessionEditor() {
+  if (!state.sessionId || state.isRecording || !_playbackActive) return;
+  const overlay = document.getElementById('session-editor-overlay');
+  overlay.classList.remove('hidden');
+  _sessionEditor = {
+    sessionId: state.sessionId,
+    mode: 'trim',
+    profile: null,
+    start: 0,
+    end: 0,
+    splitPoints: [],
+    titles: [],
+    viewStart: 0,
+    viewEnd: 0,
+    speakerFilter: new Set(),
+    speakerFilterCollapsed: false,
+    hasTrimBackup: _sessionHasTrimBackup,
+  };
+  document.getElementById('session-editor-subtitle').textContent = 'Loading audio profile...';
+  document.getElementById('session-editor-hint').textContent = 'Loading audio profile...';
+  setSessionEditorMode('trim');
+  try {
+    const profile = await fetch(`/api/sessions/${state.sessionId}/audio-profile?bins=1400`).then(r => r.json());
+    if (profile.error) throw new Error(profile.error);
+    _sessionEditor.profile = profile;
+    _sessionEditor.start = 0;
+    _sessionEditor.end = profile.duration || 0;
+    _sessionEditor.viewStart = 0;
+    _sessionEditor.viewEnd = profile.duration || 0;
+    const tail = sessionEditorQuietSuggestion(profile);
+    if (tail) _sessionEditor.end = Math.max(0, tail.start);
+    document.getElementById('session-editor-subtitle').textContent = `${fmtTime(profile.duration)} total`;
+    document.getElementById('session-editor-hint').textContent = 'Space bar play/pause. Wheel to zoom. Drag empty timeline to pan. Drag handles or split markers to adjust.';
+    sessionEditorSyncInputs();
+    sessionEditorUpdateSuggestionButton();
+    sessionEditorUpdateRestoreButton();
+    sessionEditorRenderSpeakerPills();
+    renderSessionEditor();
+  } catch (e) {
+    document.getElementById('session-editor-hint').textContent = e.message || 'Could not load audio profile';
+  }
+}
+
+function closeSessionEditor() {
+  document.getElementById('session-editor-overlay')?.classList.add('hidden');
+  _sessionEditor = null;
+  _sessionEditorDrag = null;
+}
+
+function _setPlaybackEditTrimmed(isTrimmed) {
+  _sessionHasTrimBackup = !!isTrimmed;
+  document.getElementById('playback-edit-btn')?.classList.toggle('trimmed', _sessionHasTrimBackup);
+}
+
+async function reloadSession(sessionId) {
+  if (state.sessionId === sessionId) state.sessionId = null;
+  return loadSession(sessionId);
+}
+
+function setSessionEditorMode(mode) {
+  if (!_sessionEditor) return;
+  _sessionEditor.mode = mode;
+  document.getElementById('session-editor-mode-trim')?.classList.toggle('active', mode === 'trim');
+  document.getElementById('session-editor-mode-split')?.classList.toggle('active', mode === 'split');
+  document.getElementById('session-editor-apply').textContent = mode === 'trim' ? 'Apply Trim' : 'Create Splits';
+  document.querySelector('.session-editor-fields')?.classList.toggle('split-mode', mode === 'split');
+  sessionEditorUpdateRestoreButton();
+  renderSessionEditor();
+}
+
+function sessionEditorSyncInputs() {
+  if (!_sessionEditor) return;
+  document.getElementById('session-editor-start').value = _sessionEditor.start.toFixed(1);
+  document.getElementById('session-editor-end').value = _sessionEditor.end.toFixed(1);
+}
+
+function sessionEditorUpdateTrimInputs() {
+  if (!_sessionEditor?.profile) return;
+  const dur = _sessionEditor.profile.duration || 0;
+  const start = parseFloat(document.getElementById('session-editor-start').value || '0');
+  const end = parseFloat(document.getElementById('session-editor-end').value || String(dur));
+  _sessionEditor.start = Math.max(0, Math.min(start, dur - 0.1));
+  _sessionEditor.end = Math.max(_sessionEditor.start + 0.1, Math.min(end, dur));
+  sessionEditorSyncInputs();
+  renderSessionEditor();
+}
+
+function _sessionEditorClampView() {
+  const ed = _sessionEditor;
+  if (!ed?.profile) return;
+  const dur = ed.profile.duration || 0;
+  const minSpan = Math.min(dur || 1, 5);
+  let span = Math.max(minSpan, (ed.viewEnd || dur) - (ed.viewStart || 0));
+  span = Math.min(span, dur || span);
+  let start = Math.max(0, Math.min(ed.viewStart || 0, Math.max(0, dur - span)));
+  ed.viewStart = start;
+  ed.viewEnd = Math.min(dur, start + span);
+}
+
+function sessionEditorFit() {
+  if (!_sessionEditor?.profile) return;
+  _sessionEditor.viewStart = 0;
+  _sessionEditor.viewEnd = _sessionEditor.profile.duration || 0;
+  renderSessionEditor();
+}
+
+function sessionEditorZoom(factor, centerTime = null) {
+  const ed = _sessionEditor;
+  if (!ed?.profile) return;
+  const dur = ed.profile.duration || 0;
+  const oldStart = ed.viewStart || 0;
+  const oldEnd = ed.viewEnd || dur;
+  const oldSpan = Math.max(0.1, oldEnd - oldStart);
+  const newSpan = Math.max(Math.min(dur, 5), Math.min(dur, oldSpan * factor));
+  const center = centerTime ?? ((oldStart + oldEnd) / 2);
+  const pct = oldSpan > 0 ? (center - oldStart) / oldSpan : 0.5;
+  ed.viewStart = center - newSpan * pct;
+  ed.viewEnd = ed.viewStart + newSpan;
+  _sessionEditorClampView();
+  renderSessionEditor();
+}
+
+function sessionEditorZoomIn() {
+  sessionEditorZoom(0.65, _playbackAudio.currentTime || null);
+}
+
+function sessionEditorZoomOut() {
+  sessionEditorZoom(1.5, _playbackAudio.currentTime || null);
+}
+
+function sessionEditorPan(deltaSec) {
+  if (!_sessionEditor?.profile) return;
+  _sessionEditor.viewStart += deltaSec;
+  _sessionEditor.viewEnd += deltaSec;
+  _sessionEditorClampView();
+  renderSessionEditor();
+}
+
+function sessionEditorQuietSuggestion(profile = _sessionEditor?.profile) {
+  if (!profile) return null;
+  const dur = profile.duration || 0;
+  const spans = (profile.quiet_spans || [])
+    .map(s => ({ ...s, len: (s.end || 0) - (s.start || 0) }))
+    .filter(s => s.len >= 3);
+  if (!spans.length) return null;
+
+  // Prefer true trailing silence, but accept the last substantial quiet span
+  // near the end because some recordings have a small click/noise after silence.
+  const nearEnd = Math.max(5, dur * 0.03);
+  const trailing = spans
+    .filter(s => s.end >= dur - nearEnd)
+    .sort((a, b) => b.len - a.len)[0];
+  if (trailing) return trailing;
+
+  return spans
+    .filter(s => s.start >= dur * 0.55)
+    .sort((a, b) => b.start - a.start || b.len - a.len)[0] || null;
+}
+
+function sessionEditorUpdateSuggestionButton() {
+  const btn = document.getElementById('session-editor-suggestion-btn');
+  if (!btn) return;
+  const suggestion = sessionEditorQuietSuggestion();
+  btn.disabled = !suggestion;
+  btn.classList.toggle('disabled', !suggestion);
+  btn.title = suggestion
+    ? `Use quiet span from ${fmtTime(suggestion.start)} to ${fmtTime(suggestion.end)}`
+    : 'No quiet span detected near the end of this session';
+}
+
+function sessionEditorUseSuggestion() {
+  if (!_sessionEditor?.profile) return;
+  const suggestion = sessionEditorQuietSuggestion();
+  const hint = document.getElementById('session-editor-hint');
+  if (!suggestion) {
+    if (hint) hint.textContent = 'No long quiet span was detected near the end of this session.';
+    return;
+  }
+  if (_sessionEditor.mode === 'trim') {
+    _sessionEditor.end = Math.max(_sessionEditor.start + 0.1, suggestion.start);
+    sessionEditorSyncInputs();
+    if (hint) hint.textContent = `Trim end moved to ${fmtTime(suggestion.start)}.`;
+  } else {
+    sessionEditorAddSplit(suggestion.start);
+    if (hint) hint.textContent = `Split point added at ${fmtTime(suggestion.start)}.`;
+  }
+  const span = Math.max(10, (_sessionEditor.viewEnd - _sessionEditor.viewStart) || 30);
+  _sessionEditor.viewStart = Math.max(0, suggestion.start - span * 0.25);
+  _sessionEditor.viewEnd = Math.min(_sessionEditor.profile.duration || 0, _sessionEditor.viewStart + span);
+  _sessionEditorClampView();
+  renderSessionEditor();
+}
+
+function sessionEditorAddSplitAtPlayhead() {
+  if (!_sessionEditor?.profile) return;
+  const t = Math.max(0, Math.min(_playbackAudio.currentTime || 0, _sessionEditor.profile.duration || 0));
+  sessionEditorAddSplit(t);
+}
+
+function sessionEditorAddSplit(t) {
+  if (!_sessionEditor?.profile) return;
+  const dur = _sessionEditor.profile.duration || 0;
+  if (t <= 1 || t >= dur - 1) return;
+  if (_sessionEditor.splitPoints.some(p => Math.abs(p - t) < 1)) return;
+  _sessionEditor.splitPoints.push(t);
+  _sessionEditor.splitPoints.sort((a, b) => a - b);
+  renderSessionEditor();
+}
+
+function sessionEditorRanges() {
+  if (!_sessionEditor?.profile) return [];
+  const dur = _sessionEditor.profile.duration || 0;
+  if (_sessionEditor.mode === 'trim') {
+    return [{ start: _sessionEditor.start, end: _sessionEditor.end, title: '' }];
+  }
+  const pts = [0, ..._sessionEditor.splitPoints, dur];
+  const ranges = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (pts[i + 1] - pts[i] > 1) {
+      ranges.push({ start: pts[i], end: pts[i + 1], title: _sessionEditor.titles[i] || `Part ${i + 1}` });
+    }
+  }
+  return ranges;
+}
+
+function sessionEditorSpeakerGroups() {
+  const ed = _sessionEditor;
+  if (!ed?.profile) return [];
+  const groups = new Map();
+  for (const segment of ed.profile.segments || []) {
+    const speakerKey = segment.speaker || segment.label || 'Unknown';
+    const label = (segment.label || speakerKey || 'Unknown').trim() || 'Unknown';
+    const groupKey = label.toLowerCase();
+    const current = groups.get(groupKey) || {
+      key: groupKey,
+      keys: [],
+      label,
+      color: segment.color || _sessionEditorSpeakerColor(label),
+      count: 0,
+      duration: 0,
+    };
+    if (!current.keys.includes(speakerKey)) current.keys.push(speakerKey);
+    current.count += 1;
+    current.duration += Math.max(0, (segment.end || 0) - (segment.start || 0));
+    if (segment.color) current.color = segment.color;
+    groups.set(groupKey, current);
+  }
+  return [...groups.values()].sort((a, b) => b.duration - a.duration || a.label.localeCompare(b.label));
+}
+
+function _sessionEditorSpeakerColor(key) {
+  const palette = typeof _SPEAKER_PALETTE !== 'undefined' && _SPEAKER_PALETTE.length
+    ? _SPEAKER_PALETTE
+    : ['#58a6ff', '#7ee787', '#f2cc60', '#ff7b72', '#bc8cff', '#39c5cf'];
+  let hash = 0;
+  for (let i = 0; i < String(key).length; i++) hash = ((hash << 5) - hash) + String(key).charCodeAt(i);
+  return palette[Math.abs(hash) % palette.length];
+}
+
+function _sessionEditorSpeakerVisible(key) {
+  const filter = _sessionEditor?.speakerFilter;
+  return !filter || filter.size === 0 || filter.has(key);
+}
+
+function _sessionEditorGroupVisible(group) {
+  const filter = _sessionEditor?.speakerFilter;
+  return !filter || filter.size === 0 || group.keys.some(key => filter.has(key));
+}
+
+function sessionEditorRenderSpeakerPills() {
+  const row = document.getElementById('session-editor-speakers');
+  const wrap = document.getElementById('session-editor-speaker-pills');
+  if (!row || !wrap) return;
+  const groups = sessionEditorSpeakerGroups();
+  row.classList.toggle('hidden', groups.length === 0);
+  row.classList.toggle('collapsed', _sessionEditor?.speakerFilterCollapsed === true);
+  const filter = _sessionEditor?.speakerFilter || new Set();
+  const visibleGroups = groups.filter(group => _sessionEditorGroupVisible(group)).length;
+  const summary = document.getElementById('session-editor-speaker-summary');
+  if (summary) {
+    summary.textContent = filter.has('__none__')
+      ? `Speakers (${groups.length}) hidden`
+      : filter.size > 0
+        ? `Speakers (${visibleGroups}/${groups.length})`
+        : `Speakers (${groups.length})`;
+  }
+  const chevron = document.getElementById('session-editor-speaker-chevron');
+  if (chevron) {
+    chevron.classList.toggle('fa-chevron-down', _sessionEditor?.speakerFilterCollapsed !== true);
+    chevron.classList.toggle('fa-chevron-right', _sessionEditor?.speakerFilterCollapsed === true);
+  }
+  document.getElementById('session-editor-speakers-all')?.classList.toggle('active', filter.size === 0);
+  document.getElementById('session-editor-speakers-none')?.classList.toggle('active', filter.has('__none__'));
+  wrap.innerHTML = '';
+  groups.forEach(group => {
+    const pill = document.createElement('button');
+    pill.type = 'button';
+    pill.className = 'session-editor-speaker-pill';
+    pill.classList.toggle('off', !_sessionEditorGroupVisible(group));
+    pill.style.setProperty('--speaker-color', group.color);
+    const sourceCount = group.keys.length;
+    pill.title = `${group.label}: ${group.count} segment${group.count === 1 ? '' : 's'}, ${fmtTime(group.duration)}${sourceCount > 1 ? `, ${sourceCount} speaker sources` : ''}`;
+
+    const label = document.createElement('span');
+    label.className = 'session-editor-speaker-label';
+    label.textContent = group.label;
+    pill.appendChild(label);
+
+    const count = document.createElement('span');
+    count.className = 'session-editor-speaker-count';
+    count.textContent = String(group.count);
+    pill.appendChild(count);
+
+    pill.addEventListener('click', () => sessionEditorToggleSpeaker(group.keys));
+    wrap.appendChild(pill);
+  });
+}
+
+function sessionEditorToggleSpeaker(keys) {
+  const groups = sessionEditorSpeakerGroups();
+  const speakerKeys = Array.isArray(keys) ? keys : [keys];
+  const allKeys = new Set(groups.flatMap(g => g.keys));
+  if (!_sessionEditor.speakerFilter || _sessionEditor.speakerFilter.size === 0) {
+    _sessionEditor.speakerFilter = new Set(speakerKeys);
+  } else if (speakerKeys.some(key => _sessionEditor.speakerFilter.has(key))) {
+    speakerKeys.forEach(key => _sessionEditor.speakerFilter.delete(key));
+    if (_sessionEditor.speakerFilter.size === 0) {
+      _sessionEditor.speakerFilter = new Set(['__none__']);
+    }
+  } else {
+    speakerKeys.forEach(key => _sessionEditor.speakerFilter.add(key));
+    _sessionEditor.speakerFilter.delete('__none__');
+    if (_sessionEditor.speakerFilter.size >= allKeys.size) _sessionEditor.speakerFilter.clear();
+  }
+  sessionEditorRenderSpeakerPills();
+  renderSessionEditorCanvas();
+}
+
+function sessionEditorToggleAllSpeakers(show) {
+  if (!_sessionEditor) return;
+  _sessionEditor.speakerFilter = show ? new Set() : new Set(['__none__']);
+  sessionEditorRenderSpeakerPills();
+  renderSessionEditorCanvas();
+}
+
+function sessionEditorToggleSpeakerPanel() {
+  if (!_sessionEditor) return;
+  _sessionEditor.speakerFilterCollapsed = !_sessionEditor.speakerFilterCollapsed;
+  sessionEditorRenderSpeakerPills();
+}
+
+function sessionEditorUpdateRestoreButton() {
+  const btn = document.getElementById('session-editor-restore');
+  if (!btn) return;
+  const show = _sessionEditor?.mode === 'trim' && _sessionEditor?.hasTrimBackup;
+  btn.classList.toggle('hidden', !show);
+  btn.disabled = !show;
+}
+
+function renderSessionEditor() {
+  renderSessionEditorCanvas();
+  renderSessionEditorRanges();
+}
+
+function renderSessionEditorRanges() {
+  const wrap = document.getElementById('session-editor-ranges');
+  if (!wrap || !_sessionEditor?.profile) return;
+  wrap.innerHTML = '';
+  const ranges = sessionEditorRanges();
+  ranges.forEach((range, i) => {
+    const row = document.createElement('div');
+    row.className = 'session-editor-range';
+    const meta = document.createElement('span');
+    meta.className = 'session-editor-range-time';
+    meta.textContent = `${fmtTime(range.start)} - ${fmtTime(range.end)}`;
+    row.appendChild(meta);
+    if (_sessionEditor.mode === 'split') {
+      const input = document.createElement('input');
+      input.value = range.title;
+      input.placeholder = `Part ${i + 1}`;
+      input.oninput = () => { _sessionEditor.titles[i] = input.value; };
+      row.appendChild(input);
+      if (i > 0) {
+        const btn = document.createElement('button');
+        btn.className = 'session-editor-range-remove';
+        btn.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+        btn.onclick = () => {
+          _sessionEditor.splitPoints.splice(i - 1, 1);
+          renderSessionEditor();
+        };
+        row.appendChild(btn);
+      }
+    }
+    wrap.appendChild(row);
+  });
+}
+
+function renderSessionEditorCanvas() {
+  const canvas = document.getElementById('session-editor-canvas');
+  const ed = _sessionEditor;
+  if (!canvas || !ed?.profile) return;
+  _sessionEditorClampView();
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(300, Math.floor(rect.width));
+  const h = Math.max(160, Math.floor(rect.height));
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const dur = ed.profile.duration || 1;
+  const viewStart = ed.viewStart || 0;
+  const viewEnd = ed.viewEnd || dur;
+  const viewSpan = Math.max(0.1, viewEnd - viewStart);
+  const xFor = t => ((t - viewStart) / viewSpan) * w;
+  const inView = (s, e) => e >= viewStart && s <= viewEnd;
+  const grd = ctx.createLinearGradient(0, 0, 0, h);
+  grd.addColorStop(0, '#161b22');
+  grd.addColorStop(1, '#0d1117');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, w, h);
+
+  const timeStep = _sessionEditorTickStep(viewSpan);
+  ctx.font = '11px sans-serif';
+  ctx.textBaseline = 'top';
+  for (let t = Math.ceil(viewStart / timeStep) * timeStep; t <= viewEnd; t += timeStep) {
+    const x = xFor(t);
+    ctx.strokeStyle = t % (timeStep * 2) === 0 ? 'rgba(139,148,158,0.22)' : 'rgba(139,148,158,0.12)';
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h - 28);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(201,209,217,0.62)';
+    ctx.fillText(fmtTime(t), x + 4, 8);
+  }
+
+  ctx.strokeStyle = 'rgba(139,148,158,0.28)';
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(110, 118, 129, 0.22)';
+  for (const s of ed.profile.quiet_spans || []) {
+    if (!inView(s.start, s.end)) continue;
+    ctx.fillRect(Math.max(0, xFor(s.start)), 0, Math.min(w, xFor(s.end)) - Math.max(0, xFor(s.start)), h - 28);
+  }
+
+  for (const b of ed.profile.bins || []) {
+    if (!inView(b.t0, b.t1)) continue;
+    const x0 = xFor(b.t0);
+    const x1 = Math.max(x0 + 1, xFor(b.t1));
+    const peak = Math.max(1, Math.min(h * 0.34, (b.peak || 0) * h * 1.7));
+    const rms = Math.max(1, Math.min(h * 0.24, (b.rms || 0) * h * 2.6));
+    ctx.fillStyle = 'rgba(88, 166, 255, 0.28)';
+    ctx.fillRect(x0, h / 2 - peak, x1 - x0, peak * 2);
+    ctx.fillStyle = 'rgba(126, 231, 135, 0.58)';
+    ctx.fillRect(x0, h / 2 - rms, x1 - x0, rms * 2);
+  }
+
+  ctx.fillStyle = 'rgba(13,17,23,0.56)';
+  ctx.fillRect(0, h - 35, w, 15);
+  ctx.strokeStyle = 'rgba(139,148,158,0.22)';
+  ctx.beginPath();
+  ctx.moveTo(0, h - 35);
+  ctx.lineTo(w, h - 35);
+  ctx.stroke();
+
+  for (const s of ed.profile.segments || []) {
+    const speakerKey = s.speaker || s.label || 'Unknown';
+    if (!_sessionEditorSpeakerVisible(speakerKey) || !inView(s.start, s.end)) continue;
+    ctx.fillStyle = s.color || _sessionEditorSpeakerColor(speakerKey);
+    ctx.fillRect(xFor(s.start), h - 31, Math.max(2, xFor(s.end) - xFor(s.start)), 9);
+  }
+
+  const ranges = sessionEditorRanges();
+  ctx.lineWidth = 2;
+  ranges.forEach(r => {
+    if (!inView(r.start, r.end)) return;
+    const x0 = Math.max(0, xFor(r.start));
+    const x1 = Math.min(w, xFor(r.end));
+    ctx.fillStyle = 'rgba(126, 231, 135, 0.08)';
+    ctx.fillRect(x0, 28, Math.max(2, x1 - x0), h - 62);
+    ctx.strokeStyle = 'rgba(126, 231, 135, 0.85)';
+    ctx.strokeRect(x0, 28, Math.max(2, x1 - x0), h - 62);
+  });
+
+  if (ed.mode === 'trim') {
+    _sessionEditorDrawHandle(ctx, xFor(ed.start), h, '#7ee787', 'Start');
+    _sessionEditorDrawHandle(ctx, xFor(ed.end), h, '#7ee787', 'End');
+  } else {
+    ctx.fillStyle = '#f2cc60';
+    ed.splitPoints.forEach((p, i) => {
+      if (p < viewStart || p > viewEnd) return;
+      const x = xFor(p);
+      ctx.fillRect(x - 2, 0, 4, h - 28);
+      ctx.fillStyle = '#f2cc60';
+      ctx.beginPath();
+      ctx.arc(x, 28, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(242,204,96,0.95)';
+      ctx.fillText(String(i + 1), x + 7, 20);
+    });
+  }
+  const playX = xFor(_playbackAudio.currentTime || 0);
+  if (playX >= 0 && playX <= w) {
+    ctx.fillStyle = '#f85149';
+    ctx.fillRect(playX - 1, 0, 2, h);
+  }
+
+  ctx.fillStyle = 'rgba(201,209,217,0.72)';
+  ctx.fillText(`${fmtTime(viewStart)} - ${fmtTime(viewEnd)}`, 10, h - 20);
+  _sessionEditorRenderOverview();
+}
+
+function _sessionEditorTickStep(span) {
+  const targetTicks = 8;
+  const raw = span / targetTicks;
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800];
+  return steps.find(s => s >= raw) || 3600;
+}
+
+function _sessionEditorDrawHandle(ctx, x, h, color, label) {
+  if (x < -20 || x > ctx.canvas.width + 20) return;
+  ctx.fillStyle = color;
+  ctx.fillRect(x - 2, 0, 4, h - 28);
+  ctx.beginPath();
+  ctx.moveTo(x, 18);
+  ctx.lineTo(x - 8, 6);
+  ctx.lineTo(x + 8, 6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = 'rgba(201,209,217,0.88)';
+  ctx.font = '11px sans-serif';
+  ctx.fillText(label, x + 8, 8);
+}
+
+function _sessionEditorRenderOverview() {
+  const ed = _sessionEditor;
+  const win = document.getElementById('session-editor-overview-window');
+  if (!ed?.profile || !win) return;
+  const dur = ed.profile.duration || 1;
+  const left = Math.max(0, Math.min(100, (ed.viewStart / dur) * 100));
+  const width = Math.max(2, Math.min(100 - left, ((ed.viewEnd - ed.viewStart) / dur) * 100));
+  win.style.left = left + '%';
+  win.style.width = width + '%';
+}
+
+function _sessionEditorMoveViewTo(start) {
+  const ed = _sessionEditor;
+  if (!ed?.profile) return;
+  const span = Math.max(0.1, (ed.viewEnd || 0) - (ed.viewStart || 0));
+  ed.viewStart = start;
+  ed.viewEnd = start + span;
+  _sessionEditorClampView();
+  renderSessionEditor();
+}
+
+function _sessionEditorOverviewTimeFromEvent(e) {
+  const overview = document.getElementById('session-editor-overview');
+  const rect = overview?.getBoundingClientRect();
+  const dur = _sessionEditor?.profile?.duration || 0;
+  if (!rect?.width || !dur) return 0;
+  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  return pct * dur;
+}
+
+function _sessionEditorTimeFromEvent(e) {
+  const canvas = document.getElementById('session-editor-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const ed = _sessionEditor;
+  const dur = ed?.profile?.duration || 0;
+  const viewStart = ed?.viewStart || 0;
+  const viewEnd = ed?.viewEnd || dur;
+  return Math.max(0, Math.min(dur, viewStart + ((e.clientX - rect.left) / rect.width) * (viewEnd - viewStart)));
+}
+
+function _sessionEditorXForTime(t) {
+  const canvas = document.getElementById('session-editor-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const ed = _sessionEditor;
+  if (!rect.width || !ed?.profile) return 0;
+  const viewStart = ed.viewStart || 0;
+  const viewEnd = ed.viewEnd || ed.profile.duration || 1;
+  return ((t - viewStart) / Math.max(0.1, viewEnd - viewStart)) * rect.width;
+}
+
+function _sessionEditorNearestSplit(clientX) {
+  const canvas = document.getElementById('session-editor-canvas');
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  let bestIdx = -1;
+  let bestDist = Infinity;
+  (_sessionEditor?.splitPoints || []).forEach((p, i) => {
+    const d = Math.abs(_sessionEditorXForTime(p) - x);
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  });
+  return bestDist <= 12 ? bestIdx : -1;
+}
+
+{
+  const canvas = document.getElementById('session-editor-canvas');
+  const overview = document.getElementById('session-editor-overview');
+  if (canvas) {
+    canvas.addEventListener('mousedown', e => {
+      if (!_sessionEditor?.profile) return;
+      const t = _sessionEditorTimeFromEvent(e);
+      const x = e.clientX - canvas.getBoundingClientRect().left;
+      if (_sessionEditor.mode === 'trim') {
+        const startDist = Math.abs(_sessionEditorXForTime(_sessionEditor.start) - x);
+        const endDist = Math.abs(_sessionEditorXForTime(_sessionEditor.end) - x);
+        if (Math.min(startDist, endDist) <= 14) {
+          _sessionEditorDrag = { type: startDist < endDist ? 'start' : 'end' };
+        } else {
+          _sessionEditorDrag = { type: 'pan', x: e.clientX, viewStart: _sessionEditor.viewStart, viewEnd: _sessionEditor.viewEnd, moved: false };
+        }
+      } else {
+        const idx = _sessionEditorNearestSplit(e.clientX);
+        if (idx >= 0) {
+          _sessionEditorDrag = { type: 'split', index: idx };
+        } else {
+          _sessionEditorDrag = { type: 'pan', x: e.clientX, viewStart: _sessionEditor.viewStart, viewEnd: _sessionEditor.viewEnd, moved: false };
+        }
+      }
+      canvas.classList.add('dragging');
+    });
+    canvas.addEventListener('dblclick', e => {
+      if (_sessionEditor?.mode === 'split') sessionEditorAddSplit(_sessionEditorTimeFromEvent(e));
+    });
+    canvas.addEventListener('click', e => {
+      if (!_sessionEditor?.profile || _sessionEditorSuppressClick) return;
+      _playbackAudio.currentTime = _sessionEditorTimeFromEvent(e);
+      renderSessionEditorCanvas();
+    });
+    canvas.addEventListener('wheel', e => {
+      if (!_sessionEditor?.profile) return;
+      e.preventDefault();
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        const rect = canvas.getBoundingClientRect();
+        const span = (_sessionEditor.viewEnd || 0) - (_sessionEditor.viewStart || 0);
+        sessionEditorPan((e.deltaX / Math.max(1, rect.width)) * span);
+      } else {
+        const center = _sessionEditorTimeFromEvent(e);
+        sessionEditorZoom(e.deltaY < 0 ? 0.82 : 1.22, center);
+      }
+    }, { passive: false });
+    window.addEventListener('mousemove', e => {
+      if (!_sessionEditorDrag || !_sessionEditor?.profile) return;
+      if (_sessionEditorDrag.type === 'overview') {
+        const rect = overview?.getBoundingClientRect();
+        const dur = _sessionEditor.profile.duration || 0;
+        if (!rect?.width || !dur) return;
+        const dx = e.clientX - _sessionEditorDrag.x;
+        if (Math.abs(dx) > 2) _sessionEditorDrag.moved = true;
+        const delta = (dx / rect.width) * dur;
+        _sessionEditor.viewStart = _sessionEditorDrag.viewStart + delta;
+        _sessionEditor.viewEnd = _sessionEditorDrag.viewEnd + delta;
+        _sessionEditorClampView();
+        renderSessionEditor();
+        return;
+      }
+      const t = _sessionEditorTimeFromEvent(e);
+      if (_sessionEditorDrag.type === 'start') _sessionEditor.start = Math.min(t, _sessionEditor.end - 0.1);
+      if (_sessionEditorDrag.type === 'end') _sessionEditor.end = Math.max(t, _sessionEditor.start + 0.1);
+      if (_sessionEditorDrag.type === 'split') {
+        const idx = _sessionEditorDrag.index;
+        const prev = idx > 0 ? _sessionEditor.splitPoints[idx - 1] + 1 : 1;
+        const next = idx < _sessionEditor.splitPoints.length - 1
+          ? _sessionEditor.splitPoints[idx + 1] - 1
+          : (_sessionEditor.profile.duration || 0) - 1;
+        _sessionEditor.splitPoints[idx] = Math.max(prev, Math.min(next, t));
+        _sessionEditor.splitPoints.sort((a, b) => a - b);
+      }
+      if (_sessionEditorDrag.type === 'pan') {
+        const rect = canvas.getBoundingClientRect();
+        const span = _sessionEditorDrag.viewEnd - _sessionEditorDrag.viewStart;
+        const dx = e.clientX - _sessionEditorDrag.x;
+        if (Math.abs(dx) > 2) _sessionEditorDrag.moved = true;
+        _sessionEditor.viewStart = _sessionEditorDrag.viewStart - (dx / rect.width) * span;
+        _sessionEditor.viewEnd = _sessionEditor.viewStart + span;
+        _sessionEditorClampView();
+      }
+      sessionEditorSyncInputs();
+      renderSessionEditor();
+    });
+    window.addEventListener('mouseup', () => {
+      canvas.classList.remove('dragging');
+      overview?.classList.remove('dragging');
+      if (_sessionEditorDrag?.moved) {
+        _sessionEditorSuppressClick = true;
+        setTimeout(() => { _sessionEditorSuppressClick = false; }, 0);
+      }
+      _sessionEditorDrag = null;
+    });
+  }
+  if (overview) {
+    overview.addEventListener('mousedown', e => {
+      if (!_sessionEditor?.profile) return;
+      e.preventDefault();
+      const clickedTime = _sessionEditorOverviewTimeFromEvent(e);
+      const span = Math.max(0.1, (_sessionEditor.viewEnd || 0) - (_sessionEditor.viewStart || 0));
+      const insideWindow = clickedTime >= _sessionEditor.viewStart && clickedTime <= _sessionEditor.viewEnd;
+      if (!insideWindow) {
+        _sessionEditorMoveViewTo(clickedTime - span / 2);
+      }
+      _sessionEditorDrag = {
+        type: 'overview',
+        x: e.clientX,
+        viewStart: _sessionEditor.viewStart,
+        viewEnd: _sessionEditor.viewEnd,
+        moved: false,
+      };
+      overview.classList.add('dragging');
+    });
+  }
+}
+
+async function applySessionEditor() {
+  if (!_sessionEditor?.profile) return;
+  const ed = _sessionEditor;
+  const btn = document.getElementById('session-editor-apply');
+  btn.disabled = true;
+  btn.textContent = ed.mode === 'trim' ? 'Trimming...' : 'Splitting...';
+  try {
+    let data;
+    if (ed.mode === 'trim') {
+      data = await fetch(`/api/sessions/${ed.sessionId}/trim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start: ed.start, end: ed.end }),
+      }).then(r => r.json());
+      if (data.error) throw new Error(data.error);
+      closeSessionEditor();
+      await reloadSession(ed.sessionId);
+    } else {
+      const ranges = sessionEditorRanges().map((r, i) => ({
+        start: r.start,
+        end: r.end,
+        title: _sessionEditor.titles[i] || r.title,
+      }));
+      data = await fetch(`/api/sessions/${ed.sessionId}/split`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ranges, delete_original: false }),
+      }).then(r => r.json());
+      if (data.error) throw new Error(data.error);
+      closeSessionEditor();
+      refreshSidebar();
+      if (data.sessions?.[0]?.session_id) await loadSession(data.sessions[0].session_id);
+    }
+  } catch (e) {
+    alert(e.message || 'Session edit failed');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = ed.mode === 'trim' ? 'Apply Trim' : 'Create Splits';
+    }
+  }
+}
+
+async function restoreSessionEditorOriginal() {
+  const ed = _sessionEditor;
+  if (!ed?.hasTrimBackup) return;
+  if (!confirm('Restore the original audio, video, transcript, and speaker labels for this session?')) return;
+  const btn = document.getElementById('session-editor-restore');
+  const applyBtn = document.getElementById('session-editor-apply');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Restoring...';
+  }
+  if (applyBtn) applyBtn.disabled = true;
+  try {
+    const data = await fetch(`/api/sessions/${ed.sessionId}/restore`, {
+      method: 'POST',
+    }).then(r => r.json());
+    if (data.error) throw new Error(data.error);
+    closeSessionEditor();
+    await reloadSession(ed.sessionId);
+  } catch (e) {
+    alert(e.message || 'Restore failed');
+    sessionEditorUpdateRestoreButton();
+  } finally {
+    if (btn) {
+      btn.textContent = 'Restore Original';
+      btn.disabled = false;
+    }
+    if (applyBtn) applyBtn.disabled = false;
   }
 }
 
@@ -7929,6 +8753,7 @@ async function loadSession(sessionId) {
   if (gen !== _loadGeneration) return;  // another load started while we were fetching
 
   clearAll();
+  _setPlaybackEditTrimmed(!!data.has_trim_backup);
   state.sessionId     = sessionId;
   state.isViewingPast = true;
   history.pushState({}, '', '/session?id=' + sessionId);
@@ -8342,6 +9167,7 @@ function clearAll() {
   _noiseSolo = false;
   _manualNoiseKeys = new Set();
   _showOriginalKeys = false;
+  _setPlaybackEditTrimmed(false);
   const keysToggleBtn = document.getElementById('tn-pill-keys-toggle');
   if (keysToggleBtn) keysToggleBtn.classList.remove('active');
   _navState = { matches: [], currentIdx: -1 };
@@ -9183,6 +10009,7 @@ async function openSettings() {
     _bothKeysSet = anthSet && oaiSet;
     _applyToolOverrides();
     _updateSessionModelLabels();
+    _renderQuietReminderSettings();
   } catch (_) {}
 
   // Startup toggle (Windows only - hidden on unsupported platforms)
@@ -9205,6 +10032,32 @@ async function openSettings() {
   loadDiarizationPresets();
   loadScreenPresets();
   loadScreenDisplays();
+}
+
+function _renderQuietReminderSettings() {
+  const enabled = document.getElementById('quiet-prompt-enabled');
+  if (!enabled) return;
+  enabled.checked = _prefs.quiet_prompt_enabled !== false;
+  document.getElementById('quiet-prompt-threshold').value = _prefs.quiet_prompt_threshold_sec ?? 30;
+  document.getElementById('quiet-prompt-rms').value = _prefs.quiet_prompt_audio_rms_threshold ?? 0.006;
+  document.getElementById('quiet-prompt-transcript').checked = _prefs.quiet_prompt_require_no_transcript !== false;
+  document.getElementById('quiet-prompt-cooldown').value = _prefs.quiet_prompt_cooldown_sec ?? 120;
+}
+
+function saveQuietReminderSettings() {
+  const updates = {
+    quiet_prompt_enabled: document.getElementById('quiet-prompt-enabled')?.checked !== false,
+    quiet_prompt_threshold_sec: parseFloat(document.getElementById('quiet-prompt-threshold')?.value || '30'),
+    quiet_prompt_audio_rms_threshold: parseFloat(document.getElementById('quiet-prompt-rms')?.value || '0.006'),
+    quiet_prompt_require_no_transcript: document.getElementById('quiet-prompt-transcript')?.checked !== false,
+    quiet_prompt_cooldown_sec: parseFloat(document.getElementById('quiet-prompt-cooldown')?.value || '120'),
+  };
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
 }
 
 /** Sync provider toggle buttons and model dropdown to the given values. */
@@ -10577,6 +11430,7 @@ if (!_isHomePage) {
   // Auto-load session if ?session=<id> is in the URL
   {
     const params = new URLSearchParams(location.search);
+    if (params.has('quiet_prompt')) _quietPromptLanding = params.get('id');
     if (params.has('settings') || params.has('setup')) {
       openSettings();
       history.replaceState(null, '', location.pathname);
@@ -10599,6 +11453,10 @@ if (!_isHomePage) {
       fetch('/api/status').then(r => r.json()).then(st => {
         if (st.recording && st.session_id === _pendingSessionId) {
           // Active recording - SSE status event will set state; don't call loadSession
+          if (_quietPromptLanding === _pendingSessionId) {
+            setTimeout(() => showQuietStopConfirm(_pendingSessionId), 250);
+            _quietPromptLanding = null;
+          }
           return;
         }
         loadSession(_pendingSessionId);

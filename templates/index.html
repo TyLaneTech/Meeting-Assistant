@@ -391,6 +391,8 @@
           </select>
           <button class="icon-btn playback-video-btn hidden" id="playback-video-toggle"
                   onclick="toggleVideoViewer()" title="Toggle screen recording"><i class="fa-solid fa-display"></i></button>
+          <button class="icon-btn playback-edit-btn" id="playback-edit-btn"
+                  onclick="openSessionEditor()" title="Trim / split session"><i class="fa-regular fa-scissors"></i></button>
         </div>
 
         <div id="transcript-selection-bar" class="transcript-selection-bar hidden">
@@ -691,6 +693,9 @@
         <button class="settings-nav-item" data-target="section-screen" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-display"></i><span>Screen Recording</span>
         </button>
+        <button class="settings-nav-item" data-target="section-reminders" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-bell"></i><span>Reminders</span>
+        </button>
         <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-microchip"></i><span>System</span>
         </button>
@@ -892,6 +897,53 @@
           </div>
         </div>
 
+        <!-- Recording Reminders -->
+        <div class="settings-panel" id="section-reminders">
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Quiet Recording Toast</div>
+                <div class="settings-row-desc">Windows notification when a recording goes quiet</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="quiet-prompt-enabled" onchange="saveQuietReminderSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Quiet Threshold</div>
+                <div class="settings-row-desc">Seconds of no audio before showing the toast</div>
+              </div>
+              <input type="number" id="quiet-prompt-threshold" class="settings-number-input" min="5" max="600" step="5" onchange="saveQuietReminderSettings()">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Audio Floor</div>
+                <div class="settings-row-desc">RMS level treated as activity</div>
+              </div>
+              <input type="number" id="quiet-prompt-rms" class="settings-number-input" min="0.001" max="0.2" step="0.001" onchange="saveQuietReminderSettings()">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Require No Transcript</div>
+                <div class="settings-row-desc">Only notify when both audio and transcript are quiet</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="quiet-prompt-transcript" onchange="saveQuietReminderSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Reminder Cooldown</div>
+                <div class="settings-row-desc">Minimum seconds between repeated quiet toasts</div>
+              </div>
+              <input type="number" id="quiet-prompt-cooldown" class="settings-number-input" min="0" max="1800" step="30" onchange="saveQuietReminderSettings()">
+            </div>
+          </div>
+        </div>
+
         <!-- System -->
         <div class="settings-panel" id="section-system">
           <div class="settings-group">
@@ -925,6 +977,59 @@
         </div>
 
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="session-editor-overlay">
+  <div class="dialog session-editor-dialog">
+    <div class="session-editor-header">
+      <div>
+        <div class="session-editor-title">Trim / Split</div>
+        <div class="session-editor-subtitle" id="session-editor-subtitle"></div>
+      </div>
+      <button class="icon-btn" onclick="closeSessionEditor()"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="session-editor-toolbar">
+      <div class="session-editor-mode">
+        <button class="active" id="session-editor-mode-trim" onclick="setSessionEditorMode('trim')">Trim</button>
+        <button id="session-editor-mode-split" onclick="setSessionEditorMode('split')">Split</button>
+      </div>
+      <div class="session-editor-tools">
+        <button class="session-editor-secondary" onclick="sessionEditorZoomOut()" title="Zoom out"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+        <button class="session-editor-secondary" onclick="sessionEditorZoomIn()" title="Zoom in"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+        <button class="session-editor-secondary" onclick="sessionEditorFit()" title="Fit timeline"><i class="fa-solid fa-arrows-left-right-to-line"></i></button>
+        <button class="session-editor-secondary" id="session-editor-suggestion-btn" onclick="sessionEditorUseSuggestion()" title="No quiet span detected">Use quiet suggestion</button>
+      </div>
+    </div>
+    <div class="session-editor-speakers hidden" id="session-editor-speakers">
+      <button class="session-editor-speaker-toggle" onclick="sessionEditorToggleSpeakerPanel()" title="Show or hide speaker filters">
+        <i class="fa-solid fa-chevron-down" id="session-editor-speaker-chevron"></i>
+        <span id="session-editor-speaker-summary">Speakers</span>
+      </button>
+      <div class="session-editor-speaker-actions">
+        <button class="session-editor-speaker-meta" id="session-editor-speakers-all" onclick="sessionEditorToggleAllSpeakers(true)" title="Show all speaker bars">All</button>
+        <button class="session-editor-speaker-meta" id="session-editor-speakers-none" onclick="sessionEditorToggleAllSpeakers(false)" title="Hide all speaker bars">None</button>
+      </div>
+      <div class="session-editor-speaker-pills" id="session-editor-speaker-pills"></div>
+    </div>
+    <div class="session-editor-stage">
+      <canvas id="session-editor-canvas" class="session-editor-canvas"></canvas>
+      <div class="session-editor-overview" id="session-editor-overview">
+        <div class="session-editor-overview-window" id="session-editor-overview-window"></div>
+      </div>
+      <div class="session-editor-hint" id="session-editor-hint">Loading audio profile...</div>
+    </div>
+    <div class="session-editor-fields">
+      <label>Start <input type="number" id="session-editor-start" min="0" step="0.1" onchange="sessionEditorUpdateTrimInputs()"></label>
+      <label>End <input type="number" id="session-editor-end" min="0" step="0.1" onchange="sessionEditorUpdateTrimInputs()"></label>
+      <button class="session-editor-secondary" onclick="sessionEditorAddSplitAtPlayhead()">Add Split</button>
+    </div>
+    <div class="session-editor-ranges" id="session-editor-ranges"></div>
+    <div class="session-editor-actions">
+      <button class="session-editor-secondary hidden" id="session-editor-restore" onclick="restoreSessionEditorOriginal()">Restore Original</button>
+      <button class="session-editor-secondary" onclick="closeSessionEditor()">Cancel</button>
+      <button class="session-editor-primary" id="session-editor-apply" onclick="applySessionEditor()">Apply Trim</button>
     </div>
   </div>
 </div>

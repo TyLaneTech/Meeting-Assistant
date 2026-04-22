@@ -37,6 +37,8 @@ import numpy as np
 import log
 
 import config
+import media_edit
+import notifications
 import settings
 import storage
 from ai_assistant import AIAssistant
@@ -127,6 +129,11 @@ _state: dict = {
     "fingerprint_dismissals": {},  # speaker_key → set[global_id]
     "fingerprint_suggestions": {},  # speaker_key → {session_id, speaker_key, current_name, matches}
     "speaker_offer_counts":   {},  # speaker_key → int (audio offers for diminishing returns)
+    "last_audio_activity_at": 0.0,
+    "last_transcript_activity_at": 0.0,
+    "quiet_prompt_sent_at": 0.0,
+    "quiet_prompt_armed": True,
+    "recording_started_at_monotonic": 0.0,
 }
 _state_lock = threading.Lock()
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
@@ -136,6 +143,8 @@ _screen_recorder = ScreenRecorder()
 _chat_cancel: dict[str, threading.Event] = {}  # request_id → cancel event
 _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
 _tray = None  # MeetingTray instance (set in main(), None if no tray)
+_server_url = f"http://127.0.0.1:{int(os.getenv('PORT', 6969))}"
+_quiet_audio_rms_threshold = float(settings.get("quiet_prompt_audio_rms_threshold", 0.006))
 _startup_init_lock = threading.Lock()
 _startup_init_started = False
 
@@ -463,6 +472,11 @@ def _on_segment(
                     del seg["_original_source"]
                     if seg.get("_seg_id"):
                         reclaim_segs.append(seg)
+
+        if source != _NOISE_LABEL:
+            now_mono = time.monotonic()
+            _state["last_transcript_activity_at"] = now_mono
+            _state["quiet_prompt_armed"] = True
 
         _state["pending_segments"] += 1
         should_summarize = (
@@ -808,6 +822,11 @@ def _level_push_loop() -> None:
             is_test = _state["is_testing"]
             capture = _state["audio_capture"] if is_rec else _state["test_capture"]
         if capture and (is_rec or is_test):
+            level = max(float(capture.loopback_level), float(capture.mic_level))
+            if is_rec and level >= _quiet_audio_rms_threshold:
+                with _state_lock:
+                    _state["last_audio_activity_at"] = time.monotonic()
+                    _state["quiet_prompt_armed"] = True
             payload = {
                 "loopback":    round(capture.loopback_level, 4),
                 "mic":         round(capture.mic_level, 4),
@@ -836,6 +855,48 @@ def _level_push_loop() -> None:
 
 
 threading.Thread(target=_level_push_loop, daemon=True).start()
+
+
+def _quiet_prompt_loop() -> None:
+    """Send a Windows toast when an active recording has gone quiet."""
+    global _quiet_audio_rms_threshold
+    while True:
+        time.sleep(1.0)
+        cfg = settings.load()
+        _quiet_audio_rms_threshold = float(cfg.get("quiet_prompt_audio_rms_threshold", 0.006))
+        if not cfg.get("quiet_prompt_enabled", True):
+            continue
+        threshold_sec = max(5.0, float(cfg.get("quiet_prompt_threshold_sec", 30)))
+        cooldown_sec = max(0.0, float(cfg.get("quiet_prompt_cooldown_sec", 120)))
+        require_no_transcript = bool(cfg.get("quiet_prompt_require_no_transcript", True))
+        now = time.monotonic()
+        with _state_lock:
+            if not _state["is_recording"] or not _state["session_id"]:
+                continue
+            sid = _state["session_id"]
+            last_audio = _state.get("last_audio_activity_at") or _state.get("recording_started_at_monotonic") or now
+            last_transcript = _state.get("last_transcript_activity_at") or _state.get("recording_started_at_monotonic") or now
+            sent_at = _state.get("quiet_prompt_sent_at") or 0.0
+            armed = bool(_state.get("quiet_prompt_armed", True))
+            audio_quiet = now - last_audio
+            transcript_quiet = now - last_transcript
+            if not armed:
+                continue
+            if audio_quiet < threshold_sec:
+                continue
+            if require_no_transcript and transcript_quiet < threshold_sec:
+                continue
+            if sent_at and now - sent_at < cooldown_sec:
+                continue
+            _state["quiet_prompt_armed"] = False
+            _state["quiet_prompt_sent_at"] = now
+
+        sent = notifications.send_quiet_recording_toast(sid, _server_url)
+        if sent:
+            log.info("notify", f"Quiet recording toast sent for session {sid[:8]}")
+
+
+threading.Thread(target=_quiet_prompt_loop, daemon=True).start()
 
 
 # ── Speaker fingerprint helpers ───────────────────────────────────────────────
@@ -1142,6 +1203,7 @@ def get_session(session_id: str):
     data["has_audio"] = wav_path.exists()
     data["has_video"] = video_path.exists()
     data["video_offset"] = float(settings.get(f"video_offset_{session_id}", 0))
+    data["has_trim_backup"] = media_edit.has_trim_backup(session_id)
     return jsonify(data)
 
 
@@ -1356,6 +1418,7 @@ def start_recording():
     _transcriber.start(capture.sample_rate, capture.channels,
                        next_speaker_label=next_speaker_label)
 
+    now_mono = time.monotonic()
     with _state_lock:
         _state.update({
             "is_recording": True,
@@ -1372,6 +1435,11 @@ def start_recording():
             "fingerprint_dismissals": {},
             "fingerprint_suggestions": {},
             "_confirmed_speakers":    set(),
+            "last_audio_activity_at": now_mono,
+            "last_transcript_activity_at": now_mono,
+            "quiet_prompt_sent_at": 0.0,
+            "quiet_prompt_armed": True,
+            "recording_started_at_monotonic": now_mono,
         })
 
     # ── Compute video offset for resumed sessions ────────────────────────
@@ -1434,6 +1502,7 @@ def stop_recording():
         transcript_snapshot = _build_transcript(_state["segments"], _state["speaker_labels"])
         _state["is_recording"] = False
         _state["audio_capture"] = None
+        _state["quiet_prompt_armed"] = True
 
     # Return immediately - cleanup blocks for up to 12 s (thread join) so we
     # must not do it on the Flask request handler thread or the server hangs.
@@ -1465,6 +1534,18 @@ def stop_recording():
     if sid:
         threading.Thread(target=update_session_embedding, args=(sid,), daemon=True).start()
     return jsonify({"ok": True})
+
+
+@app.route("/api/recording/quiet-prompt/dismiss", methods=["POST"])
+def dismiss_quiet_prompt():
+    """Acknowledge the quiet recording reminder without stopping."""
+    with _state_lock:
+        if not _state["is_recording"]:
+            return jsonify({"ok": True, "recording": False})
+        _state["quiet_prompt_armed"] = False
+        _state["quiet_prompt_sent_at"] = time.monotonic()
+        sid = _state["session_id"]
+    return jsonify({"ok": True, "session_id": sid})
 
 
 @app.route("/api/summarize", methods=["POST"])
@@ -3176,6 +3257,169 @@ def session_audio(session_id: str):
     return send_file(str(wav_path), mimetype="audio/wav", conditional=True)
 
 
+@app.route("/api/sessions/<session_id>/audio-profile")
+def session_audio_profile(session_id: str):
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+    try:
+        bins = request.args.get("bins", 1200, type=int)
+        cfg = settings.load()
+        profile = media_edit.build_audio_profile(
+            session_id,
+            bins=bins,
+            segments=sess.get("segments", []),
+            speaker_profiles=sess.get("speaker_profiles", []),
+            quiet_threshold=float(cfg.get("quiet_prompt_audio_rms_threshold", 0.006)),
+            min_quiet_sec=float(cfg.get("quiet_prompt_threshold_sec", 30)),
+        )
+        return jsonify(profile)
+    except FileNotFoundError:
+        return jsonify({"error": "No audio recording for this session"}), 404
+    except Exception as e:
+        log.error("media", f"audio profile failed for {session_id[:8]}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def _validate_media_range(session_id: str, start_sec: float, end_sec: float) -> tuple[bool, str, float]:
+    wav_path = media_edit.wav_path(session_id)
+    if not wav_path.exists():
+        return False, "No audio recording for this session", 0.0
+    duration = media_edit.get_wav_duration(wav_path)
+    if start_sec < 0 or end_sec <= start_sec or end_sec > duration + 0.05:
+        return False, f"Invalid range. Expected 0 <= start < end <= {duration:.2f}", duration
+    return True, "", duration
+
+
+@app.route("/api/sessions/<session_id>/trim", methods=["POST"])
+def trim_session(session_id: str):
+    with _state_lock:
+        if _state["is_recording"] and _state["session_id"] == session_id:
+            return jsonify({"error": "Cannot trim an active recording"}), 400
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json(silent=True) or {}
+    start_sec = float(data.get("start", 0))
+    end_sec = float(data.get("end", 0))
+    ok, err, _duration = _validate_media_range(session_id, start_sec, end_sec)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    try:
+        ffmpeg_bin = find_ffmpeg()
+        video_offset = float(settings.get(f"video_offset_{session_id}", 0))
+        media_edit.backup_session_snapshot(session_id, sess, video_offset)
+        if media_edit.video_path(session_id).exists() and not ffmpeg_bin:
+            return jsonify({"error": "FFmpeg is required to trim a session with screen recording video"}), 500
+        new_offset = media_edit.trim_video(session_id, start_sec, end_sec, video_offset, ffmpeg_bin)
+        media_edit.trim_wav(session_id, start_sec, end_sec)
+        settings.put(f"video_offset_{session_id}", new_offset)
+        kept = storage.trim_session_segments(session_id, start_sec, end_sec)
+        threading.Thread(target=update_session_embedding, args=(session_id,), daemon=True).start()
+        return jsonify({
+            "ok": True,
+            "session_id": session_id,
+            "duration": end_sec - start_sec,
+            "segments": kept,
+            "video_offset": new_offset,
+        })
+    except Exception as e:
+        log.error("media", f"trim failed for {session_id[:8]}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sessions/<session_id>/restore", methods=["POST"])
+def restore_session(session_id: str):
+    with _state_lock:
+        if _state["is_recording"] and _state["session_id"] == session_id:
+            return jsonify({"error": "Cannot restore an active recording"}), 400
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+    snapshot = media_edit.load_session_snapshot(session_id)
+    if not snapshot:
+        return jsonify({"error": "No trim backup found for this session"}), 404
+
+    try:
+        media_edit.restore_original_media(session_id)
+        storage.restore_session_snapshot(session_id, snapshot.get("session") or {})
+        settings.put(f"video_offset_{session_id}", float(snapshot.get("video_offset") or 0.0))
+        media_edit.clear_trim_backup(session_id)
+        threading.Thread(target=update_session_embedding, args=(session_id,), daemon=True).start()
+        return jsonify({"ok": True, "session_id": session_id})
+    except Exception as e:
+        log.error("media", f"restore failed for {session_id[:8]}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sessions/<session_id>/split", methods=["POST"])
+def split_session(session_id: str):
+    with _state_lock:
+        if _state["is_recording"] and _state["session_id"] == session_id:
+            return jsonify({"error": "Cannot split an active recording"}), 400
+    source = storage.get_session(session_id)
+    if not source:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json(silent=True) or {}
+    ranges = data.get("ranges") or []
+    if not isinstance(ranges, list) or not ranges:
+        return jsonify({"error": "ranges required"}), 400
+
+    source_audio = media_edit.wav_path(session_id)
+    source_video = media_edit.video_path(session_id)
+    source_video_offset = float(settings.get(f"video_offset_{session_id}", 0))
+    ffmpeg_bin = find_ffmpeg()
+    if source_video.exists() and not ffmpeg_bin:
+        return jsonify({"error": "FFmpeg is required to split a session with screen recording video"}), 500
+    created: list[str] = []
+    results: list[dict] = []
+    try:
+        for idx, r in enumerate(ranges, start=1):
+            start_sec = float(r.get("start", 0))
+            end_sec = float(r.get("end", 0))
+            ok, err, _duration = _validate_media_range(session_id, start_sec, end_sec)
+            if not ok:
+                raise ValueError(err)
+            title = (r.get("title") or "").strip() or f"{source['title']} - Part {idx}"
+            new_sid = storage.create_split_session(session_id, start_sec, end_sec, title=title)
+            created.append(new_sid)
+            media_edit.trim_wav_file(source_audio, media_edit.wav_path(new_sid), start_sec, end_sec)
+            if source_video.exists():
+                new_offset = media_edit.trim_video_file(
+                    source_video,
+                    media_edit.video_path(new_sid),
+                    start_sec,
+                    end_sec,
+                    source_video_offset,
+                    ffmpeg_bin,
+                )
+                settings.put(f"video_offset_{new_sid}", new_offset)
+            else:
+                new_offset = 0.0
+            threading.Thread(target=update_session_embedding, args=(new_sid,), daemon=True).start()
+            results.append({
+                "session_id": new_sid,
+                "title": title,
+                "duration": end_sec - start_sec,
+                "video_offset": new_offset,
+            })
+        if data.get("delete_original"):
+            storage.delete_session(session_id)
+        return jsonify({"ok": True, "sessions": results})
+    except Exception as e:
+        for sid in created:
+            try:
+                storage.delete_session(sid)
+                vp = media_edit.video_path(sid)
+                if vp.exists():
+                    vp.unlink()
+            except Exception:
+                pass
+        log.error("media", f"split failed for {session_id[:8]}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
     """Worker: clear DB data, retranscribe the WAV, then regenerate summary."""
     try:
@@ -4200,12 +4444,13 @@ def _handshake_existing_instance(url: str) -> bool:
 
 
 def main() -> None:
-    global _tray
+    global _tray, _server_url
 
     kill_stale_ffmpeg()
 
     port = int(os.getenv("PORT", 6969))
     url = f"http://127.0.0.1:{port}"
+    _server_url = url
 
     if not _handshake_existing_instance(url):
         sys.exit(1)

@@ -395,6 +395,128 @@ def update_session_title(session_id: str, title: str) -> None:
     fts_index_session_title(session_id, title)
 
 
+def update_session_times(session_id: str, started_at: str | None = None, ended_at: str | None = None) -> None:
+    """Update session timestamps.  Pass None to leave a value unchanged."""
+    sets = []
+    vals = []
+    if started_at is not None:
+        sets.append("started_at = ?")
+        vals.append(started_at)
+    if ended_at is not None:
+        sets.append("ended_at = ?")
+        vals.append(ended_at)
+    if not sets:
+        return
+    vals.append(session_id)
+    with _conn() as conn:
+        conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", vals)
+
+
+def rebuild_session_fts(session_id: str) -> None:
+    """Rebuild FTS rows for one session from current title and transcript."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
+        row = conn.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row and row["title"]:
+            conn.execute(
+                "INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, NULL, 'title', ?)",
+                (session_id, row["title"]),
+            )
+        rows = conn.execute(
+            "SELECT id, text FROM transcript_segments WHERE session_id = ? AND text != ''",
+            (session_id,),
+        ).fetchall()
+        for seg in rows:
+            conn.execute(
+                "INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, ?, 'segment', ?)",
+                (session_id, seg["id"], seg["text"]),
+            )
+
+
+def trim_session_segments(session_id: str, start_sec: float, end_sec: float) -> int:
+    """Keep transcript segments overlapping [start_sec, end_sec], shifting to zero."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, start_time, end_time FROM transcript_segments WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        kept = 0
+        for r in rows:
+            s = float(r["start_time"] or 0.0)
+            e = float(r["end_time"] or 0.0)
+            if e <= start_sec or s >= end_sec:
+                conn.execute("DELETE FROM transcript_segments WHERE id = ?", (r["id"],))
+                continue
+            ns = max(0.0, s - start_sec)
+            ne = max(ns, min(e, end_sec) - start_sec)
+            conn.execute(
+                "UPDATE transcript_segments SET start_time = ?, end_time = ? WHERE id = ?",
+                (ns, ne, r["id"]),
+            )
+            kept += 1
+        conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM session_embeddings WHERE session_id = ?", (session_id,))
+    rebuild_session_fts(session_id)
+    return kept
+
+
+def create_split_session(
+    source_session_id: str,
+    start_sec: float,
+    end_sec: float,
+    title: str | None = None,
+) -> str:
+    """Create a new session containing clamped transcript/speaker data from a range."""
+    source = get_session(source_session_id)
+    if not source:
+        raise ValueError("Source session not found")
+
+    sid = create_session(title or f"{source['title']} (split)")
+    used_speakers: set[str] = set()
+    with _conn() as conn:
+        for seg in source.get("segments", []):
+            s = float(seg.get("start_time") or 0.0)
+            e = float(seg.get("end_time") or 0.0)
+            if e <= start_sec or s >= end_sec:
+                continue
+            ns = max(0.0, s - start_sec)
+            ne = max(ns, min(e, end_sec) - start_sec)
+            cur = conn.execute(
+                "INSERT INTO transcript_segments "
+                "(session_id, text, source, start_time, end_time, label_override, source_override, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sid,
+                    seg.get("text", ""),
+                    seg.get("source", "loopback"),
+                    ns,
+                    ne,
+                    seg.get("label_override"),
+                    seg.get("source_override"),
+                    _now(),
+                ),
+            )
+            seg_id = cur.lastrowid
+            if seg.get("text"):
+                conn.execute(
+                    "INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, ?, 'segment', ?)",
+                    (sid, seg_id, seg.get("text", "")),
+                )
+            used_speakers.add(seg.get("source", "loopback"))
+            if seg.get("source_override"):
+                used_speakers.add(seg["source_override"])
+
+        for profile in source.get("speaker_profiles", []):
+            if profile["speaker_key"] in used_speakers:
+                conn.execute(
+                    "INSERT INTO speaker_labels (session_id, speaker_key, name, color) VALUES (?, ?, ?, ?)",
+                    (sid, profile["speaker_key"], profile["name"], profile.get("color")),
+                )
+    rebuild_session_fts(sid)
+    delete_session_embedding(sid)
+    return sid
+
+
 def delete_session(session_id: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
@@ -409,6 +531,12 @@ def delete_session(session_id: str) -> None:
     if wav_path.exists():
         try:
             wav_path.unlink()
+        except OSError:
+            pass
+    video_path = DB_PATH.parent / "video" / f"{session_id}.mp4"
+    if video_path.exists():
+        try:
+            video_path.unlink()
         except OSError:
             pass
 
@@ -586,6 +714,81 @@ def reset_session_transcript(session_id: str) -> None:
         conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+
+
+def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
+    """Replace a session's transcript/speaker/chat/summary state from a snapshot."""
+    session = snapshot or {}
+    segments = session.get("segments", [])
+    speaker_profiles = session.get("speaker_profiles", [])
+    chat_messages = session.get("chat_messages", [])
+    summary = session.get("summary") or ""
+
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET title = ?, started_at = ?, ended_at = ? WHERE id = ?",
+            (
+                session.get("title") or f"Meeting {_now()[:16].replace('T', ' ')}",
+                session.get("started_at"),
+                session.get("ended_at"),
+                session_id,
+            ),
+        )
+        conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM session_embeddings WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM transcript_segments WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+
+        for seg in segments:
+            conn.execute(
+                "INSERT INTO transcript_segments "
+                "(session_id, text, source, start_time, end_time, label_override, source_override, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    seg.get("text", ""),
+                    seg.get("source", "loopback"),
+                    float(seg.get("start_time") or 0.0),
+                    float(seg.get("end_time") or 0.0),
+                    seg.get("label_override"),
+                    seg.get("source_override"),
+                    _now(),
+                ),
+            )
+
+        if summary:
+            conn.execute(
+                "INSERT INTO summaries (session_id, content, created_at) VALUES (?, ?, ?)",
+                (session_id, summary, _now()),
+            )
+
+        for msg in chat_messages:
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content, created_at, attachments, tool_calls) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    msg.get("role", "assistant"),
+                    msg.get("content", ""),
+                    msg.get("created_at") or _now(),
+                    msg.get("attachments"),
+                    msg.get("tool_calls"),
+                ),
+            )
+
+        for profile in speaker_profiles:
+            conn.execute(
+                "INSERT INTO speaker_labels (session_id, speaker_key, name, color) VALUES (?, ?, ?, ?)",
+                (
+                    session_id,
+                    profile.get("speaker_key"),
+                    profile.get("name") or profile.get("speaker_key"),
+                    profile.get("color"),
+                ),
+            )
+    rebuild_session_fts(session_id)
 
 
 def get_session(session_id: str) -> dict | None:

@@ -49,6 +49,13 @@ DEFAULTS: dict = {
     # Screen recording
     "screen_display": 0,
     "screen_preset": "performance",
+
+    # Quiet recording reminder
+    "quiet_prompt_enabled": True,
+    "quiet_prompt_threshold_sec": 30,
+    "quiet_prompt_audio_rms_threshold": 0.006,
+    "quiet_prompt_require_no_transcript": True,
+    "quiet_prompt_cooldown_sec": 120,
 }
 
 
