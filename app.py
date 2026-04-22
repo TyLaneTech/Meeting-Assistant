@@ -257,12 +257,23 @@ def _fmt_time(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 def _fmt_segment(seg: dict, speaker_labels: dict | None = None) -> str:
-    """Format a {text, source} segment dict as a labelled line for AI context."""
-    source = seg["source"]
-    if speaker_labels and source in speaker_labels:
-        label = speaker_labels[source]
+    """Format a {text, source} segment dict as a labelled line for AI context.
+
+    Respects per-segment overrides:
+    - label_override: a display name manually assigned to this segment
+    - source_override: a speaker-key reassignment (look up in speaker_labels)
+    """
+    # Check for per-segment label override first (highest priority)
+    label_override = seg.get("label_override")
+    if label_override:
+        label = label_override
     else:
-        label = _SOURCE_LABELS.get(source, source)
+        # Use source_override if set, otherwise original source
+        source = seg.get("source_override") or seg["source"]
+        if speaker_labels and source in speaker_labels:
+            label = speaker_labels[source]
+        else:
+            label = _SOURCE_LABELS.get(source, source)
     start = seg.get("start_time", 0) or 0
     end = seg.get("end_time", 0) or 0
     if start > 0 or end > 0:
@@ -3722,6 +3733,339 @@ def bulk_sessions():
 
     else:
         return jsonify({"error": f"Unknown action: {action!r}"}), 400
+
+
+# ── Import / Export ────────────────────────────────────────────────────────────
+
+@app.route("/api/sessions/<session_id>/export", methods=["POST"])
+def export_session(session_id: str):
+    """Export a meeting session as a downloadable .zip package."""
+    import io
+    import zipfile
+
+    data = request.get_json(silent=True) or {}
+    include_raw = data.get("include")  # list of category names or None for all
+    include = set(include_raw) if include_raw else None
+
+    # Gather structured data from the database
+    pkg = storage.export_session_data(session_id, include=include)
+    if pkg is None:
+        return jsonify({"error": "Session not found"}), 404
+
+    # Build ZIP in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        # Compact JSON (no whitespace) for smaller manifests
+        zf.writestr("manifest.json", json.dumps(pkg, separators=(",", ":"), default=str))
+
+        # Include media files if requested
+        data_dir = Path(__file__).parent / "data"
+
+        include_audio = include is None or "audio" in (include or set())
+        include_video = include is None or "video" in (include or set())
+
+        if include_audio:
+            wav = data_dir / "audio" / f"{session_id}.wav"
+            if wav.exists():
+                # Compress WAV → Opus for much smaller export (~8x smaller than FLAC)
+                # Opus at 32kbps is excellent for speech; the app converts back to WAV on import
+                ffmpeg_bin = find_ffmpeg()
+                if ffmpeg_bin:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                        tmp_opus = tmp.name
+                    try:
+                        result = subprocess.run(
+                            [ffmpeg_bin, "-y", "-i", str(wav),
+                             "-c:a", "libopus", "-b:a", "32k",
+                             "-vbr", "on", "-application", "voip",
+                             tmp_opus],
+                            capture_output=True, timeout=300,
+                        )
+                        if result.returncode == 0 and os.path.exists(tmp_opus):
+                            # Store pre-compressed audio with ZIP_STORED (Opus is already compressed)
+                            zf.write(tmp_opus, "audio.opus", compress_type=zipfile.ZIP_STORED)
+                        else:
+                            zf.write(str(wav), "audio.wav")  # fallback
+                    finally:
+                        if os.path.exists(tmp_opus):
+                            os.unlink(tmp_opus)
+                else:
+                    zf.write(str(wav), "audio.wav")  # no ffmpeg fallback
+
+        if include_video:
+            mp4 = data_dir / "video" / f"{session_id}.mp4"
+            if mp4.exists():
+                # MP4 is already compressed; store without re-compressing
+                zf.write(str(mp4), "video.mp4", compress_type=zipfile.ZIP_STORED)
+
+        # Include screenshots for this session (chat tool captures)
+        include_chat = include is None or "chat" in (include or set())
+        if include_chat:
+            ss_dir = data_dir / "screenshots" / session_id
+            if ss_dir.is_dir():
+                for img in ss_dir.iterdir():
+                    if img.is_file():
+                        # JPEG is already compressed
+                        zf.write(str(img), f"screenshots/{img.name}", compress_type=zipfile.ZIP_STORED)
+
+            # Include chat attachment files referenced in messages
+            attach_dir = data_dir / "attachments"
+            for msg in pkg.get("chat_messages", []):
+                att_json = msg.get("attachments")
+                if not att_json:
+                    continue
+                try:
+                    atts = json.loads(att_json) if isinstance(att_json, str) else att_json
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                for att in (atts if isinstance(atts, list) else []):
+                    stored = att.get("stored")
+                    if stored and (attach_dir / stored).is_file():
+                        zf.write(str(attach_dir / stored), f"attachments/{stored}")
+
+    buf.seek(0)
+    title = (pkg.get("metadata", {}).get("title") or "meeting").strip()
+    safe_title = re.sub(r'[^\w\s\-]', '', title)[:60].strip().replace(' ', '_') or "meeting"
+    filename = f"{safe_title}.zip"
+
+    return send_file(
+        buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+def _dedup_import_title(pkg: dict) -> None:
+    """If a session with the same title already exists, append (1), (2), etc."""
+    meta = pkg.get("metadata")
+    if not meta or not meta.get("title"):
+        return
+    base_title = meta["title"]
+    existing_titles = {s["title"] for s in storage.list_sessions()}
+    if base_title not in existing_titles:
+        return
+    # Strip existing " (N)" suffix to find the real base
+    stripped = re.sub(r"\s*\(\d+\)$", "", base_title)
+    n = 1
+    while True:
+        candidate = f"{stripped} ({n})"
+        if candidate not in existing_titles:
+            meta["title"] = candidate
+            return
+        n += 1
+
+
+@app.route("/api/sessions/import", methods=["POST"])
+def import_session():
+    """Import a meeting session from an exported .mtga/.zip package."""
+    import io
+    import zipfile
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+    fname_lower = f.filename.lower()
+    if not fname_lower.endswith(".mtga") and not fname_lower.endswith(".zip"):
+        return jsonify({"error": "File must be a .mtga or .zip archive"}), 400
+
+    try:
+        file_bytes = f.read()
+        if len(file_bytes) > 2 * 1024 * 1024 * 1024:  # 2 GB safety limit
+            return jsonify({"error": "File too large (max 2 GB)"}), 400
+
+        bio = io.BytesIO(file_bytes)
+        if not zipfile.is_zipfile(bio):
+            return jsonify({"error": "Invalid archive file"}), 400
+        bio.seek(0)
+
+        with zipfile.ZipFile(bio, "r") as zf:
+            # Validate: must have manifest.json
+            names = zf.namelist()
+            if "manifest.json" not in names:
+                return jsonify({"error": "Invalid export package: missing manifest.json"}), 400
+
+            # Security: reject zips with path traversal
+            for name in names:
+                if name.startswith("/") or ".." in name:
+                    return jsonify({"error": "Invalid archive: suspicious file paths"}), 400
+
+            # Parse manifest
+            manifest_bytes = zf.read("manifest.json")
+            try:
+                pkg = json.loads(manifest_bytes)
+            except (json.JSONDecodeError, ValueError) as e:
+                return jsonify({"error": f"Corrupt manifest: {e}"}), 400
+
+            if not isinstance(pkg, dict) or pkg.get("format_version", 0) < 1:
+                return jsonify({"error": "Unsupported export format version"}), 400
+
+            # Deduplicate title - add (1), (2), etc. if a session with the same title exists
+            _dedup_import_title(pkg)
+
+            # Import into database
+            new_session_id = storage.import_session_data(pkg)
+
+            # Extract media files
+            data_dir = Path(__file__).parent / "data"
+
+            # Audio: support Opus (current), FLAC (legacy v1), and raw WAV
+            _audio_src = next(
+                (n for n in ("audio.opus", "audio.flac", "audio.wav") if n in names),
+                None,
+            )
+            if _audio_src:
+                audio_dir = data_dir / "audio"
+                audio_dir.mkdir(parents=True, exist_ok=True)
+                wav_path = audio_dir / f"{new_session_id}.wav"
+
+                if _audio_src == "audio.wav":
+                    # Raw WAV - just copy
+                    with zf.open(_audio_src) as src, open(str(wav_path), "wb") as dst:
+                        import shutil
+                        shutil.copyfileobj(src, dst)
+                else:
+                    # Compressed audio (Opus/FLAC) → convert back to 16kHz mono WAV
+                    import tempfile
+                    suffix = Path(_audio_src).suffix
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp_path = tmp.name
+                    try:
+                        with zf.open(_audio_src) as src, open(tmp_path, "wb") as dst:
+                            import shutil
+                            shutil.copyfileobj(src, dst)
+                        ffmpeg_bin = find_ffmpeg()
+                        if ffmpeg_bin:
+                            result = subprocess.run(
+                                [ffmpeg_bin, "-y", "-i", tmp_path,
+                                 "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                                 str(wav_path)],
+                                capture_output=True, timeout=300,
+                            )
+                            if result.returncode != 0:
+                                log.warn("import", f"{_audio_src}→WAV conversion failed")
+                        else:
+                            log.warn("import", "FFmpeg not found, cannot convert audio")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+
+            if "video.mp4" in names:
+                video_dir = data_dir / "video"
+                video_dir.mkdir(parents=True, exist_ok=True)
+                mp4_path = video_dir / f"{new_session_id}.mp4"
+                with zf.open("video.mp4") as src, open(str(mp4_path), "wb") as dst:
+                    import shutil
+                    shutil.copyfileobj(src, dst)
+
+            # Extract screenshots
+            old_session_id = pkg.get("session_id", "")
+            ss_prefix = "screenshots/"
+            ss_files = [n for n in names if n.startswith(ss_prefix) and not n.endswith("/")]
+            if ss_files:
+                ss_out = data_dir / "screenshots" / new_session_id
+                ss_out.mkdir(parents=True, exist_ok=True)
+                for name in ss_files:
+                    fname = name[len(ss_prefix):]
+                    if fname and "/" not in fname:
+                        with zf.open(name) as src, open(str(ss_out / fname), "wb") as dst:
+                            import shutil
+                            shutil.copyfileobj(src, dst)
+
+            # Extract chat attachments
+            att_prefix = "attachments/"
+            att_files = [n for n in names if n.startswith(att_prefix) and not n.endswith("/")]
+            if att_files:
+                att_out = data_dir / "attachments"
+                att_out.mkdir(parents=True, exist_ok=True)
+                for name in att_files:
+                    fname = name[len(att_prefix):]
+                    if fname and "/" not in fname:
+                        with zf.open(name) as src, open(str(att_out / fname), "wb") as dst:
+                            import shutil
+                            shutil.copyfileobj(src, dst)
+
+            # Rewrite screenshot URLs in chat messages and summary to point to new session ID
+            if old_session_id and old_session_id != new_session_id:
+                old_url_prefix = f"/api/sessions/{old_session_id}/screenshots/"
+                new_url_prefix = f"/api/sessions/{new_session_id}/screenshots/"
+                with storage._conn() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET content = REPLACE(content, ?, ?) "
+                        "WHERE session_id = ?",
+                        (old_url_prefix, new_url_prefix, new_session_id),
+                    )
+                    conn.execute(
+                        "UPDATE summaries SET content = REPLACE(content, ?, ?) "
+                        "WHERE session_id = ?",
+                        (old_url_prefix, new_url_prefix, new_session_id),
+                    )
+
+            # Ingest speaker embeddings into the voice library if available
+            embs = pkg.get("speaker_embeddings", [])
+            if embs and fingerprint_db.ready:
+                _import_speaker_embeddings(new_session_id, pkg)
+
+    except zipfile.BadZipFile:
+        return jsonify({"error": "Corrupt or invalid zip file"}), 400
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        log.error("import", f"Import failed: {e}")
+        return jsonify({"error": f"Import failed: {e}"}), 500
+
+    session = storage.get_session(new_session_id)
+    return jsonify({
+        "ok": True,
+        "session_id": new_session_id,
+        "title": session["title"] if session else "",
+    }), 201
+
+
+def _import_speaker_embeddings(session_id: str, pkg: dict) -> None:
+    """Ingest exported speaker embeddings into the local voice library."""
+    import base64
+    embs = pkg.get("speaker_embeddings", [])
+    if not embs or not fingerprint_db.ready:
+        return
+
+    for emb_data in embs:
+        try:
+            raw = base64.b64decode(emb_data["embedding_b64"])
+            embedding = np.frombuffer(raw, dtype=np.float32).copy()
+            speaker_key = emb_data["speaker_key"]
+            duration = emb_data.get("duration_sec", 0.0)
+            global_name = emb_data.get("global_name")
+            global_color = emb_data.get("global_color")
+
+            if not global_name:
+                continue
+
+            # Find or create a matching global speaker profile
+            existing = fingerprint_db.find_by_name(global_name)
+            if existing:
+                global_id = existing["id"]
+            else:
+                global_id = fingerprint_db.create_global_speaker(
+                    global_name, global_color
+                )
+
+            fingerprint_db.add_embedding(
+                global_id, session_id, speaker_key, embedding, duration
+            )
+
+            # Link the session speaker label to this global profile
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE speaker_labels SET global_id = ? "
+                    "WHERE session_id = ? AND speaker_key = ?",
+                    (global_id, session_id, speaker_key),
+                )
+        except Exception as e:
+            log.warn("import", f"Failed to import embedding for {emb_data.get('speaker_key')}: {e}")
 
 
 # ── Fingerprint / Voice Library endpoints ─────────────────────────────────────

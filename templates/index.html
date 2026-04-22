@@ -196,6 +196,10 @@
           </button>
           <input type="file" id="upload-audio-input" accept="audio/*,video/*"
                  style="display:none" onchange="handleAudioUpload(this)">
+          <button class="home-nav-item upload-nav-btn" onclick="openImportPicker()"
+                  title="Import meeting package (.zip)">
+            <i class="fa-solid fa-file-import"></i>
+          </button>
         </nav>
       </div>
       <div class="topbar-right">
@@ -1031,6 +1035,104 @@
       <button class="session-editor-secondary" onclick="closeSessionEditor()">Cancel</button>
       <button class="session-editor-primary" id="session-editor-apply" onclick="applySessionEditor()">Apply Trim</button>
     </div>
+  </div>
+</div>
+
+<!-- ── Export modal ────────────────────────────────────────────────────── -->
+<div class="overlay hidden" id="export-overlay" onclick="if(event.target===this)closeExportModal()">
+  <div class="dialog export-dialog">
+    <div class="export-header">
+      <div class="export-header-left">
+        <div class="export-header-icon"><i class="fa-solid fa-file-export"></i></div>
+        <div>
+          <div class="export-title-text">Export Meeting</div>
+          <div class="export-subtitle" id="export-subtitle">Select data to include</div>
+        </div>
+      </div>
+      <button class="icon-btn" onclick="closeExportModal()"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="export-body" id="export-body-options">
+      <div class="export-section">
+        <div class="export-section-label">Data</div>
+        <div class="export-options">
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-metadata" checked disabled>
+            <i class="fa-solid fa-circle-info export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Session metadata</span><span class="export-opt-desc">Title, timestamps, and session info</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-transcription" checked>
+            <i class="fa-solid fa-closed-captioning export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Transcription</span><span class="export-opt-desc">Full transcript with timing data</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-summary" checked>
+            <i class="fa-solid fa-file-lines export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Summary</span><span class="export-opt-desc">AI-generated meeting summary</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-chat" checked>
+            <i class="fa-solid fa-comments export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Chat history</span><span class="export-opt-desc">Q&A messages, screenshots, and attachments</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-speakers" checked>
+            <i class="fa-solid fa-users export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Speaker labels</span><span class="export-opt-desc">Speaker names and color assignments</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-speaker_embeddings" checked>
+            <i class="fa-solid fa-fingerprint export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Voice fingerprints</span><span class="export-opt-desc">Voice recognition data for speaker matching</span></div>
+          </label>
+        </div>
+      </div>
+      <div class="export-section">
+        <div class="export-section-label">Media</div>
+        <div class="export-options">
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-audio">
+            <i class="fa-solid fa-waveform-lines export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Audio recording</span><span class="export-opt-desc">Compressed audio (Opus)</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-video">
+            <i class="fa-solid fa-film export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Video recording</span><span class="export-opt-desc">Screen capture video (MP4)</span></div>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <div class="export-body export-body-progress hidden" id="export-body-progress">
+      <div class="export-steps" id="export-steps"></div>
+      <div class="export-progress-bar"><div class="export-progress-fill" id="export-progress-fill"></div></div>
+      <div class="export-progress-status" id="export-progress-status">Preparing…</div>
+    </div>
+
+    <div class="export-actions" id="export-actions">
+      <button class="btn export-btn-cancel" onclick="closeExportModal()">Cancel</button>
+      <button class="btn export-btn-go" id="export-download-btn" onclick="startExport()">
+        <i class="fa-solid fa-download"></i> Export
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Import drop zone overlay ──────────────────────────────────────── -->
+<div class="import-drop-overlay hidden" id="import-drop-overlay">
+  <div class="import-drop-content">
+    <i class="fa-solid fa-file-import import-drop-icon"></i>
+    <span class="import-drop-text">Drop meeting export to import</span>
+  </div>
+</div>
+
+<!-- ── Import progress toast ─────────────────────────────────────────── -->
+<div class="import-toast hidden" id="import-toast">
+  <div class="import-toast-inner">
+    <i class="fa-solid fa-spinner fa-spin import-toast-icon" id="import-toast-icon"></i>
+    <span id="import-toast-text">Importing meeting…</span>
   </div>
 </div>
 

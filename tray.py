@@ -189,8 +189,6 @@ class MeetingTray:
             SEP,
             # ── Status ────────────────────────────────────────────────────
             S(lambda _: self._status_text(), None, enabled=False),
-            S(lambda _: f"Whisper: {self._get_state().get('model_info', 'loading...')}", None, enabled=False),
-            S(lambda _: self._diarizer_text(), None, enabled=False),
             SEP,
             # ── Actions ───────────────────────────────────────────────────
             S("Open Web Interface", self._open_browser, default=True),
@@ -199,14 +197,11 @@ class MeetingTray:
                 self._toggle_recording,
                 enabled=lambda _: self._get_state().get("recording_ready", False),
             ),
+            S("Settings...", self._open_settings),
             SEP,
-            # ── Keys ─────────────────────────────────────────────────────
-            S("API Keys", pystray.Menu(
-                S(lambda _: self._key_line("ANTHROPIC_API_KEY"), None, enabled=False),
-                S(lambda _: self._key_line("HUGGING_FACE_KEY"), None, enabled=False),
-                SEP,
-                S("Configure Keys...", self._open_settings),
-            )),
+            # ── Server ───────────────────────────────────────────────────
+            S("Check for Updates", self._check_updates),
+            S("Restart Server", self._restart_server),
             SEP,
             S("Quit", self._quit),
         )
@@ -243,7 +238,24 @@ class MeetingTray:
         webbrowser.open(self._url)
 
     def _open_settings(self, icon=None, item=None) -> None:
-        webbrowser.open(f"{self._url}?settings=1")
+        webbrowser.open(f"{self._url}/session?settings=1")
+
+    def _check_updates(self, icon=None, item=None) -> None:
+        """Open the web UI with the settings panel on the System tab to check for updates."""
+        webbrowser.open(f"{self._url}/session?settings=1&section=system")
+
+    def _restart_server(self, icon=None, item=None) -> None:
+        """Restart the server via the API."""
+        try:
+            req = urllib.request.Request(
+                f"{self._url}/api/restart",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # server is restarting, connection will drop
 
     def _toggle_recording(self, icon=None, item=None) -> None:
         """Start or stop recording via the local Flask API."""

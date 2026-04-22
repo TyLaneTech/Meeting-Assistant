@@ -1309,6 +1309,7 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     // Drag start for folder
     header.addEventListener('dragstart', e => {
       e.stopPropagation();
+      _internalDragActive = true;
       _sidebarDragType = 'folder';
       _sidebarDragIds = [folder.id];
       _dragDescendants = _getDescendantIds(folder.id, childMap);
@@ -1317,6 +1318,7 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
       folderEl.classList.add('dragging');
     });
     header.addEventListener('dragend', () => {
+      _internalDragActive = false;
       folderEl.classList.remove('dragging');
       _removeDragIndicator();
       _dragDescendants.clear();
@@ -1334,6 +1336,11 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
     header.addEventListener('click', e => { _toggleFolder(`${folder.id}`); });
     folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
+    header.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      _openFolderMenu(e, folder, { x: e.pageX, y: e.pageY });
+    });
     header.appendChild(folderMenuBtn);
     folderEl.appendChild(header);
 
@@ -1396,6 +1403,7 @@ function _makeSessionEl(s) {
   el.draggable  = true;
 
   el.addEventListener('dragstart', e => {
+    _internalDragActive = true;
     _sidebarDragType = 'session';
     _sidebarDragIds = isSelected && _sidebarSelected.size > 1
       ? [..._sidebarSelected]
@@ -1404,7 +1412,7 @@ function _makeSessionEl(s) {
     e.dataTransfer.setData('text/plain', JSON.stringify(_sidebarDragIds));
     el.classList.add('dragging');
   });
-  el.addEventListener('dragend', () => { el.classList.remove('dragging'); _removeDragIndicator(); });
+  el.addEventListener('dragend', () => { _internalDragActive = false; el.classList.remove('dragging'); _removeDragIndicator(); });
 
   el.addEventListener('click', e => {
     if (e.ctrlKey || e.metaKey || _sidebarMultiselect) {
@@ -1445,6 +1453,13 @@ function _makeSessionEl(s) {
   menuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
   menuBtn.addEventListener('click', e => { e.stopPropagation(); _openSessionMenu(e, s); });
   el.appendChild(menuBtn);
+
+  // Right-click context menu
+  el.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    _openSessionMenu(e, s, { x: e.pageX, y: e.pageY });
+  });
 
   return el;
 }
@@ -1490,8 +1505,9 @@ function _updateBulkBar() {
 
 // ── Session context menu ───────────────────────────────────────────────────────
 
-function _openSessionMenu(e, s) {
+function _openSessionMenu(e, s, pos) {
   _closeSessionMenu();
+  _closeFolderMenu();
 
   const menu = document.createElement('div');
   menu.className = 'session-menu';
@@ -1504,6 +1520,18 @@ function _openSessionMenu(e, s) {
     rea.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); reanalyzeSession(ev, s.id); });
     menu.appendChild(rea);
   }
+
+  const exp = document.createElement('div');
+  exp.className = 'session-menu-item';
+  exp.innerHTML = '<i class="fa-duotone fa-file-export"></i>  Export';
+  exp.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeSessionMenu();
+    // Load the session first if not already active, then open export
+    if (state.sessionId !== s.id) loadSession(s.id);
+    // Brief delay to let session load before opening modal
+    setTimeout(() => openExportModal(s.id), state.sessionId === s.id ? 0 : 300);
+  });
+  menu.appendChild(exp);
 
   const ren = document.createElement('div');
   ren.className = 'session-menu-item';
@@ -1519,12 +1547,22 @@ function _openSessionMenu(e, s) {
 
   document.body.appendChild(menu);
 
-  // Position below the ⋮ button, clamp to viewport
-  const rect = e.currentTarget.getBoundingClientRect();
-  const menuH = 120; // rough estimate
-  const top = rect.bottom + window.scrollY;
-  let left = rect.left + window.scrollX;
+  // Position: use explicit pos (right-click) or fall back to button rect
+  let top, left;
+  if (pos) {
+    top = pos.y;
+    left = pos.x;
+  } else {
+    const rect = e.currentTarget.getBoundingClientRect();
+    top = rect.bottom + window.scrollY;
+    left = rect.left + window.scrollX;
+  }
   if (left + 160 > window.innerWidth) left = window.innerWidth - 164;
+  // Clamp vertically so menu doesn't overflow bottom
+  const menuRect = menu.getBoundingClientRect();
+  if (top + menuRect.height > window.innerHeight + window.scrollY) {
+    top = window.innerHeight + window.scrollY - menuRect.height - 8;
+  }
   menu.style.top  = top  + 'px';
   menu.style.left = left + 'px';
 
@@ -1538,7 +1576,7 @@ function _closeSessionMenu() {
 
 // ── Folder context menu ───────────────────────────────────────────────────────
 
-function _openFolderMenu(e, folder) {
+function _openFolderMenu(e, folder, pos) {
   _closeFolderMenu();
   _closeSessionMenu();
 
@@ -1575,11 +1613,22 @@ function _openFolderMenu(e, folder) {
 
   document.body.appendChild(menu);
 
-  // Position below the ⋮ button, clamp to viewport
-  const rect = e.currentTarget.getBoundingClientRect();
-  let left = rect.left + window.scrollX;
+  // Position: use explicit pos (right-click) or fall back to button rect
+  let top, left;
+  if (pos) {
+    top = pos.y;
+    left = pos.x;
+  } else {
+    const rect = e.currentTarget.getBoundingClientRect();
+    top = rect.bottom + window.scrollY;
+    left = rect.left + window.scrollX;
+  }
   if (left + 160 > window.innerWidth) left = window.innerWidth - 164;
-  menu.style.top  = (rect.bottom + window.scrollY) + 'px';
+  const menuRect = menu.getBoundingClientRect();
+  if (top + menuRect.height > window.innerHeight + window.scrollY) {
+    top = window.innerHeight + window.scrollY - menuRect.height - 8;
+  }
+  menu.style.top  = top  + 'px';
   menu.style.left = left + 'px';
 
   setTimeout(() => document.addEventListener('click', _closeFolderMenu, { once: true }), 0);
@@ -4147,6 +4196,7 @@ function _updateTranscriptSelectionUI() {
   const count = _transcriptSelectedSegs.size;
   if (count > 0) {
     bar.classList.remove('hidden');
+    _tsbEnsureVoiceLibrary();
     const countEl = document.getElementById('tsb-count');
     if (countEl) countEl.textContent = `${count} segment${count === 1 ? '' : 's'} selected`;
     const input = document.getElementById('tsb-input');
@@ -4158,19 +4208,54 @@ function _updateTranscriptSelectionUI() {
   _syncPanelBottomRadius();
 }
 
+let _tsbVoiceLibraryCache = null;
+let _tsbVoiceLibraryFetching = false;
+
+function _tsbEnsureVoiceLibrary() {
+  if (_tsbVoiceLibraryCache !== null || _tsbVoiceLibraryFetching) return;
+  _tsbVoiceLibraryFetching = true;
+  fetch('/api/fingerprint/speakers')
+    .then(r => r.json())
+    .then(speakers => {
+      _tsbVoiceLibraryCache = (speakers || []).map(sp => ({
+        name: (sp.name || '').trim(),
+        color: sp.color || 'var(--fg-muted)',
+        isVoiceLib: true,
+      })).filter(s => s.name);
+      // Re-trigger autocomplete if input is focused
+      if (document.activeElement === document.getElementById('tsb-input')) {
+        _tsbFilterAutocomplete();
+      }
+    })
+    .catch(() => { _tsbVoiceLibraryCache = []; })
+    .finally(() => { _tsbVoiceLibraryFetching = false; });
+}
+
 function _tsbGetSpeakerNames() {
-  const names = [];
+  // Session speakers (highest priority)
+  const meeting = [];
   const seen = new Set();
   _getSortedSpeakerProfiles().forEach(p => {
     const name = (p.name || '').trim();
-    if (!name || seen.has(name)) return;
+    if (!name || seen.has(name.toLowerCase())) return;
     if (!p.custom && _isDefaultName(name)) return;
-    seen.add(name);
+    seen.add(name.toLowerCase());
     const color = p.color || _speakerColors[p.speaker_key] || speakerColor(p.speaker_key);
-    names.push({ name, color });
+    meeting.push({ name, color, section: 'meeting' });
   });
-  names.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-  return names;
+  meeting.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+  // Voice Library speakers (not already in meeting)
+  const voiceLib = [];
+  if (_tsbVoiceLibraryCache) {
+    _tsbVoiceLibraryCache.forEach(sp => {
+      if (seen.has(sp.name.toLowerCase())) return;
+      voiceLib.push({ name: sp.name, color: sp.color, section: 'voicelib' });
+    });
+    voiceLib.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  }
+
+  return { meeting, voiceLib };
 }
 
 function _tsbFilterAutocomplete() {
@@ -4179,30 +4264,73 @@ function _tsbFilterAutocomplete() {
   if (!input || !list) return;
 
   const query = input.value.trim().toLowerCase();
-  const names = _tsbGetSpeakerNames();
-  const filtered = query
-    ? names.filter(n => n.name.toLowerCase().includes(query))
-    : names;
+  const { meeting, voiceLib } = _tsbGetSpeakerNames();
+
+  const filterFn = n => !query || n.name.toLowerCase().includes(query);
+  const filteredMeeting = meeting.filter(filterFn);
+  const filteredVL = voiceLib.filter(filterFn);
+  const noiseMatch = !query || 'noise'.includes(query);
 
   list.innerHTML = '';
-  if (filtered.length === 0) {
+  if (filteredMeeting.length === 0 && filteredVL.length === 0 && !noiseMatch) {
     list.classList.add('hidden');
     return;
   }
 
-  filtered.forEach(entry => {
-    const opt = document.createElement('button');
-    opt.className = 'tsb-ac-opt';
-    opt.innerHTML = `<span class="tsb-ac-dot" style="background:${entry.color}"></span>${escapeHtml(entry.name)}`;
-    opt.style.color = entry.color;
-    opt.addEventListener('mousedown', e => {
+  // Meeting speakers section
+  if (filteredMeeting.length > 0) {
+    const header = document.createElement('div');
+    header.className = 'tsb-ac-section';
+    header.textContent = 'Meeting Speakers';
+    list.appendChild(header);
+    filteredMeeting.forEach(entry => {
+      list.appendChild(_tsbCreateOpt(entry, input, list));
+    });
+  }
+
+  // Voice Library section
+  if (filteredVL.length > 0) {
+    const header = document.createElement('div');
+    header.className = 'tsb-ac-section';
+    header.textContent = 'Voice Library';
+    list.appendChild(header);
+    filteredVL.forEach(entry => {
+      list.appendChild(_tsbCreateOpt(entry, input, list));
+    });
+  }
+
+  // Noise option
+  if (noiseMatch) {
+    if (filteredMeeting.length > 0 || filteredVL.length > 0) {
+      const sep = document.createElement('div');
+      sep.className = 'tsb-ac-sep';
+      list.appendChild(sep);
+    }
+    const noiseOpt = document.createElement('button');
+    noiseOpt.className = 'tsb-ac-opt tsb-ac-noise';
+    noiseOpt.innerHTML = `<i class="fa-solid fa-volume-xmark tsb-ac-noise-icon"></i>Mark as Noise`;
+    noiseOpt.addEventListener('mousedown', e => {
       e.preventDefault();
-      input.value = entry.name;
+      input.value = _NOISE_LABEL;
       list.classList.add('hidden');
     });
-    list.appendChild(opt);
-  });
+    list.appendChild(noiseOpt);
+  }
+
   list.classList.remove('hidden');
+}
+
+function _tsbCreateOpt(entry, input, list) {
+  const opt = document.createElement('button');
+  opt.className = 'tsb-ac-opt';
+  opt.innerHTML = `<span class="tsb-ac-dot" style="background:${entry.color}"></span>${escapeHtml(entry.name)}`;
+  opt.style.color = entry.color;
+  opt.addEventListener('mousedown', e => {
+    e.preventDefault();
+    input.value = entry.name;
+    list.classList.add('hidden');
+  });
+  return opt;
 }
 
 // Wire up autocomplete events (called once on page load)
@@ -11334,6 +11462,277 @@ async function saveApiKeys() {
   }
 }
 
+/* ── Import / Export ──────────────────────────────────────────────────────── */
+
+let _exportSessionId = null;
+
+const _EXPORT_STEP_LABELS = {
+  metadata:           'Session metadata',
+  transcription:      'Transcription',
+  summary:            'Summary',
+  chat:               'Chat & screenshots',
+  speakers:           'Speaker labels',
+  speaker_embeddings: 'Voice fingerprints',
+  audio:              'Audio (Opus compression)',
+  video:              'Video recording',
+};
+
+function openExportModal(sessionId) {
+  _exportSessionId = sessionId || state.sessionId;
+  if (!_exportSessionId) return;
+  document.getElementById('export-overlay').classList.remove('hidden');
+  document.getElementById('export-body-options').classList.remove('hidden');
+  document.getElementById('export-body-progress').classList.add('hidden');
+  document.getElementById('export-actions').classList.remove('hidden');
+  document.getElementById('export-download-btn').disabled = false;
+  document.getElementById('export-subtitle').textContent = 'Select data to include';
+}
+
+function closeExportModal() {
+  document.getElementById('export-overlay').classList.add('hidden');
+}
+
+function _exportBuildSteps(cats) {
+  const container = document.getElementById('export-steps');
+  container.innerHTML = '';
+  for (const cat of cats) {
+    const label = _EXPORT_STEP_LABELS[cat] || cat;
+    const step = document.createElement('div');
+    step.className = 'export-step';
+    step.id = 'export-step-' + cat;
+    step.innerHTML = `<i class="fa-solid fa-circle export-step-dot"></i><span>${label}</span>`;
+    container.appendChild(step);
+  }
+  // Final download step
+  const dl = document.createElement('div');
+  dl.className = 'export-step';
+  dl.id = 'export-step-download';
+  dl.innerHTML = '<i class="fa-solid fa-circle export-step-dot"></i><span>Download</span>';
+  container.appendChild(dl);
+}
+
+function _exportSetStep(stepId, status) {
+  // status: 'active' | 'done' | 'error'
+  const el = document.getElementById('export-step-' + stepId);
+  if (!el) return;
+  el.classList.remove('active', 'done', 'error');
+  el.classList.add(status);
+  const dot = el.querySelector('.export-step-dot');
+  if (!dot) return;
+  if (status === 'active')  dot.className = 'fa-solid fa-spinner fa-spin export-step-dot';
+  else if (status === 'done') dot.className = 'fa-solid fa-circle-check export-step-dot';
+  else if (status === 'error') dot.className = 'fa-solid fa-circle-xmark export-step-dot';
+}
+
+async function startExport() {
+  const sid = _exportSessionId || state.sessionId;
+  if (!sid) return;
+
+  const cats = [];
+  ['metadata', 'transcription', 'summary', 'chat', 'speakers', 'speaker_embeddings', 'audio', 'video']
+    .forEach(cat => {
+      const cb = document.getElementById('export-opt-' + cat);
+      if (cb && cb.checked) cats.push(cat);
+    });
+
+  // Switch to progress view
+  document.getElementById('export-body-options').classList.add('hidden');
+  document.getElementById('export-actions').classList.add('hidden');
+  document.getElementById('export-body-progress').classList.remove('hidden');
+  document.getElementById('export-subtitle').textContent = 'Exporting…';
+
+  const fillEl = document.getElementById('export-progress-fill');
+  const statusEl = document.getElementById('export-progress-status');
+  fillEl.style.width = '0%';
+  fillEl.style.background = '';
+
+  _exportBuildSteps(cats);
+
+  const totalSteps = cats.length + 1; // +1 for download
+  let currentStep = 0;
+
+  const advanceStep = (cat, label) => {
+    // Mark previous as done
+    if (currentStep > 0) _exportSetStep(cats[currentStep - 1] || 'download', 'done');
+    _exportSetStep(cat, 'active');
+    statusEl.textContent = label;
+    currentStep++;
+    fillEl.style.width = Math.round((currentStep / totalSteps) * 90) + '%';
+  };
+
+  try {
+    // Animate through data collection steps quickly
+    for (let i = 0; i < cats.length; i++) {
+      advanceStep(cats[i], 'Collecting ' + (_EXPORT_STEP_LABELS[cats[i]] || cats[i]).toLowerCase() + '…');
+      await new Promise(r => setTimeout(r, 120));
+    }
+
+    // Mark last data step done, start download
+    if (cats.length > 0) _exportSetStep(cats[cats.length - 1], 'done');
+    _exportSetStep('download', 'active');
+    statusEl.textContent = 'Building package…';
+    fillEl.style.width = '85%';
+
+    const resp = await fetch('/api/sessions/' + sid + '/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ include: cats }),
+    });
+
+    statusEl.textContent = 'Downloading…';
+    fillEl.style.width = '92%';
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Export failed');
+    }
+
+    const blob = await resp.blob();
+    _exportSetStep('download', 'done');
+    fillEl.style.width = '100%';
+
+    // Show size
+    const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
+    statusEl.textContent = `Complete — ${sizeMB} MB`;
+    document.getElementById('export-subtitle').textContent = 'Export complete';
+
+    // Trigger download
+    const cd = resp.headers.get('Content-Disposition') || '';
+    const fnMatch = cd.match(/filename="?([^"]+)"?/);
+    const filename = fnMatch ? fnMatch[1] : 'meeting.zip';
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    setTimeout(() => closeExportModal(), 1200);
+  } catch (e) {
+    _exportSetStep('download', 'error');
+    statusEl.textContent = e.message;
+    fillEl.style.width = '100%';
+    fillEl.style.background = 'var(--danger, #e5534b)';
+    document.getElementById('export-subtitle').textContent = 'Export failed';
+
+    // Show a retry button
+    const actions = document.getElementById('export-actions');
+    actions.classList.remove('hidden');
+    actions.innerHTML = `
+      <button class="btn export-btn-cancel" onclick="closeExportModal()">Close</button>
+      <button class="btn export-btn-go" onclick="openExportModal(_exportSessionId)">
+        <i class="fa-solid fa-rotate-right"></i> Retry
+      </button>`;
+  }
+}
+
+// ── Import ────────────────────────────────────────────────────────────────
+let _importDragCount = 0;
+let _internalDragActive = false;  // set by sidebar drag-start, cleared on dragend
+
+function _initImportDragDrop() {
+  const overlay = document.getElementById('import-drop-overlay');
+  if (!overlay) return;
+
+  document.addEventListener('dragenter', e => {
+    // Ignore internal sidebar reorder drags
+    if (_internalDragActive) return;
+    if (!e.dataTransfer?.types?.includes('Files')) return;
+    _importDragCount++;
+    if (_importDragCount === 1) overlay.classList.remove('hidden');
+  });
+
+  document.addEventListener('dragleave', e => {
+    if (_internalDragActive) return;
+    _importDragCount--;
+    if (_importDragCount <= 0) {
+      _importDragCount = 0;
+      overlay.classList.add('hidden');
+    }
+  });
+
+  document.addEventListener('drop', e => {
+    _importDragCount = 0;
+    overlay.classList.add('hidden');
+  });
+
+  overlay.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+
+  overlay.addEventListener('drop', e => {
+    e.preventDefault();
+    _importDragCount = 0;
+    overlay.classList.add('hidden');
+    const file = e.dataTransfer?.files?.[0];
+    const fn = (file?.name || '').toLowerCase();
+    if (file && (fn.endsWith('.mtga') || fn.endsWith('.zip'))) {
+      _doImport(file);
+    }
+  });
+}
+
+async function _doImport(file) {
+  const toast = document.getElementById('import-toast');
+  const icon = document.getElementById('import-toast-icon');
+  const text = document.getElementById('import-toast-text');
+
+  toast.classList.remove('hidden');
+  icon.className = 'fa-solid fa-spinner fa-spin import-toast-icon';
+  text.textContent = 'Importing meeting…';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const resp = await fetch('/api/sessions/import', { method: 'POST', body: form });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      icon.className = 'fa-solid fa-circle-exclamation import-toast-icon';
+      text.textContent = data.error || 'Import failed';
+      setTimeout(() => toast.classList.add('hidden'), 4000);
+      return;
+    }
+
+    icon.className = 'fa-solid fa-circle-check import-toast-icon';
+    text.textContent = 'Imported: ' + (data.title || 'Meeting');
+
+    // Refresh sidebar and navigate to the imported session
+    refreshSidebar();
+    if (data.session_id) {
+      setTimeout(() => {
+        if (_isHomePage) {
+          window.location.href = '/session?id=' + data.session_id;
+        } else {
+          history.pushState({}, '', '/session?id=' + data.session_id);
+          loadSession(data.session_id);
+        }
+      }, 600);
+    }
+
+    setTimeout(() => toast.classList.add('hidden'), 3000);
+  } catch (e) {
+    icon.className = 'fa-solid fa-circle-exclamation import-toast-icon';
+    text.textContent = 'Import failed: ' + e.message;
+    setTimeout(() => toast.classList.add('hidden'), 4000);
+  }
+}
+
+function openImportPicker() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.mtga,.zip';
+  input.onchange = () => {
+    if (input.files?.[0]) _doImport(input.files[0]);
+  };
+  input.click();
+}
+
 /* ── Init ────────────────────────────────────────────────────────────────── */
 
 const _isHomePage = !!window._isHomePage;
@@ -11364,6 +11763,9 @@ if (!_isHomePage) {
     }
   });
 }
+
+// Import drag-and-drop init
+_initImportDragDrop();
 
 // Shared init (sidebar, SSE, status, devices, models)
 connectSSE();
@@ -11433,6 +11835,11 @@ if (!_isHomePage) {
     if (params.has('quiet_prompt')) _quietPromptLanding = params.get('id');
     if (params.has('settings') || params.has('setup')) {
       openSettings();
+      const section = params.get('section');
+      if (section) {
+        const navBtn = document.querySelector(`.settings-nav-item[data-target="section-${section}"]`);
+        if (navBtn) switchSettingsSection(navBtn);
+      }
       history.replaceState(null, '', location.pathname);
     } else if (params.has('fingerprint')) {
       openFingerprintPanel();

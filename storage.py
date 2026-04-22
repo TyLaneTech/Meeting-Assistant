@@ -1,4 +1,5 @@
 """SQLite persistence for meeting sessions, transcripts, summaries, and chat."""
+import base64
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -1184,3 +1185,186 @@ def get_dashboard_analytics() -> dict:
         "top_speakers": [dict(r) for r in top_speakers],
         "recent_sessions": [dict(r) for r in recent_sessions],
     }
+
+
+# ── Import / Export ─────────────────────────────────────────────────────────
+
+EXPORT_FORMAT_VERSION = 1
+
+
+def export_session_data(session_id: str, include: set[str] | None = None) -> dict | None:
+    """Export a session's data as a JSON-serializable dict.
+
+    *include* is a set of data categories to export.  If None, all categories
+    are included.  Recognised keys:
+
+        metadata, transcription, summary, chat, speakers, speaker_embeddings
+
+    Media files (audio/video) are handled by the caller since they are large
+    binary files that go straight into the zip.
+    """
+    all_cats = {"metadata", "transcription", "summary", "chat", "speakers", "speaker_embeddings"}
+    cats = all_cats if include is None else (include & all_cats)
+
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, title, started_at, ended_at, folder_id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+
+        pkg: dict = {
+            "format_version": EXPORT_FORMAT_VERSION,
+            "exported_at": _now(),
+            "session_id": session_id,
+        }
+
+        if "metadata" in cats:
+            pkg["metadata"] = {
+                "title": row["title"],
+                "started_at": row["started_at"],
+                "ended_at": row["ended_at"],
+            }
+
+        if "transcription" in cats:
+            segments = conn.execute(
+                "SELECT text, source, start_time, end_time, label_override, source_override "
+                "FROM transcript_segments WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            pkg["segments"] = [dict(s) for s in segments]
+
+        if "summary" in cats:
+            srow = conn.execute(
+                "SELECT content FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            pkg["summary"] = srow["content"] if srow else ""
+
+        if "chat" in cats:
+            msgs = conn.execute(
+                "SELECT role, content, created_at, attachments, tool_calls "
+                "FROM chat_messages WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            pkg["chat_messages"] = [dict(m) for m in msgs]
+
+        if "speakers" in cats:
+            labels = conn.execute(
+                "SELECT speaker_key, name, color, global_id "
+                "FROM speaker_labels WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            pkg["speaker_labels"] = [dict(l) for l in labels]
+
+        if "speaker_embeddings" in cats:
+            embs = conn.execute(
+                "SELECT se.speaker_key, se.embedding, se.duration_sec, "
+                "       gs.name AS global_name, gs.color AS global_color "
+                "FROM speaker_embeddings se "
+                "LEFT JOIN global_speakers gs ON gs.id = se.global_id "
+                "WHERE se.session_id = ?",
+                (session_id,),
+            ).fetchall()
+            pkg["speaker_embeddings"] = [
+                {
+                    "speaker_key": e["speaker_key"],
+                    "embedding_b64": base64.b64encode(bytes(e["embedding"])).decode(),
+                    "duration_sec": e["duration_sec"],
+                    "global_name": e["global_name"],
+                    "global_color": e["global_color"],
+                }
+                for e in embs
+            ]
+
+    return pkg
+
+
+def import_session_data(pkg: dict) -> str:
+    """Import a session from an exported package dict.  Returns the new session ID.
+
+    Speaker embeddings are handled separately by the caller (needs the
+    fingerprint DB which lives outside storage).
+    """
+    version = pkg.get("format_version", 0)
+    if version < 1:
+        raise ValueError("Unsupported or missing format_version")
+
+    sid = str(uuid.uuid4())
+    now = _now()
+
+    meta = pkg.get("metadata", {})
+    title = meta.get("title") or f"Imported Meeting {now[:16].replace('T', ' ')}"
+    started_at = meta.get("started_at") or now
+    ended_at = meta.get("ended_at")
+
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO sessions (id, title, started_at, ended_at) VALUES (?, ?, ?, ?)",
+            (sid, title, started_at, ended_at),
+        )
+
+        # Transcript segments
+        for seg in pkg.get("segments", []):
+            cur = conn.execute(
+                "INSERT INTO transcript_segments "
+                "(session_id, text, source, start_time, end_time, label_override, source_override, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sid,
+                    seg.get("text", ""),
+                    seg.get("source", "loopback"),
+                    float(seg.get("start_time") or 0.0),
+                    float(seg.get("end_time") or 0.0),
+                    seg.get("label_override"),
+                    seg.get("source_override"),
+                    now,
+                ),
+            )
+            seg_id = cur.lastrowid
+            if seg.get("text", "").strip():
+                conn.execute(
+                    "INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, ?, 'segment', ?)",
+                    (sid, seg_id, seg["text"]),
+                )
+
+        # Summary
+        summary = pkg.get("summary", "")
+        if summary:
+            conn.execute(
+                "INSERT INTO summaries (session_id, content, created_at) VALUES (?, ?, ?)",
+                (sid, summary, now),
+            )
+
+        # Chat messages
+        for msg in pkg.get("chat_messages", []):
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content, created_at, attachments, tool_calls) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    sid,
+                    msg.get("role", "assistant"),
+                    msg.get("content", ""),
+                    msg.get("created_at") or now,
+                    msg.get("attachments"),
+                    msg.get("tool_calls"),
+                ),
+            )
+
+        # Speaker labels (import without global_id links - they'll be re-linked
+        # by the fingerprint system on the importing instance)
+        for label in pkg.get("speaker_labels", []):
+            conn.execute(
+                "INSERT INTO speaker_labels (session_id, speaker_key, name, color) VALUES (?, ?, ?, ?)",
+                (sid, label["speaker_key"], label.get("name", label["speaker_key"]), label.get("color")),
+            )
+
+        # FTS: index title
+        if title and title.strip():
+            conn.execute(
+                "INSERT INTO search_fts (session_id, source_id, kind, text) VALUES (?, NULL, 'title', ?)",
+                (sid, title),
+            )
+
+    return sid
