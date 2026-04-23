@@ -455,7 +455,7 @@ html, body {height: 100%;background: var(--bg);color: var(--fg);font-family: var
 
 .sidebar-body::-webkit-scrollbar { width: 4px; }
 .sidebar-body::-webkit-scrollbar-track { background: transparent; }
-.sidebar-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.sidebar-body::-webkit-scrollbar-thumb {background: transparent;border-radius: 2px;}
 
 textarea::-webkit-scrollbar { width: 6px; }
 textarea::-webkit-scrollbar-track { background: transparent; }
@@ -484,7 +484,7 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   display: flex;
   align-items: flex-start;
   gap: 6px;
-  padding: 5px 12px 5px 14px;
+  padding: 5px 0px 5px 14px;
   cursor: pointer;
   border-radius: 0;
   transition: background .12s;
@@ -674,8 +674,12 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
   color: var(--fg-muted);
   margin-top: 2px;
   white-space: nowrap;
-  overflow: hidden;
+  overflow: visible;
+  display: flex;
   text-overflow: ellipsis;
+  flex-direction: row;
+  align-items: end;
+  gap: 3px;
 }
 
 .session-menu-btn {
@@ -3353,6 +3357,7 @@ body.video-fullscreen .playback-bar {
   position: relative;
   display: flex;
   align-items: center;
+  padding-left: 10px;
   background: var(--bg);
   border: 1px solid var(--bg);
   border-radius: 12px;
@@ -3374,7 +3379,6 @@ body.video-fullscreen .playback-bar {
   line-height: 1.5;
   overflow-y: hidden;
 }
-#global-chat-input { padding-left: 14px; }
 #chat-input:focus, #global-chat-input:focus { outline: none; }
 #chat-input::placeholder, #global-chat-input::placeholder { color: var(--fg-muted); }
 
@@ -3400,9 +3404,16 @@ body.video-fullscreen .playback-bar {
 
 /* ── Attach button ────────────────────────────────────────────────────────── */
 .chat-attach-btn {
-  background: none; border: none; color: var(--fg-muted); cursor: pointer;
-  font-size: 15px; padding: 0 4px 0 12px; display: flex; align-items: center;
-  flex-shrink: 0; transition: color .12s;
+  background: none;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 15px;
+  padding: 0 4px 0 0px;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  transition: color .12s;
 }
 .chat-attach-btn:hover { color: var(--fg); }
 
@@ -4203,7 +4214,7 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
   border: none;
   color: var(--fg-muted);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 15px;
   padding: 0 6px 0 2px;
   display: flex;
   align-items: center;
@@ -6917,10 +6928,15 @@ button.icon-btn.fingerprint-btn {
 .home-chat-title {
   font-size: 14px;
   font-weight: 500;
-  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.home-chat-title-wrap {
+  flex: 1;
+  align-items: baseline;
+  overflow: hidden;
 }
 
 .home-chat-actions {
@@ -7450,19 +7466,21 @@ span.session-meta-sep {
 .session-speaker-icons {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  margin-left: 2px;
+  gap: 2px;
   vertical-align: middle;
+  /* overflow: visible; */
 }
 
 .session-speaker-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 17px;
-  height: 17px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   font-size: 8px;
+  transition-delay: 0.25s;
+  transition: 0.15s;
   font-weight: 600;
   letter-spacing: -0.3px;
   line-height: 1;
@@ -7853,4 +7871,14 @@ button#viz-autodetect-btn:hover {
 
 .import-toast.hidden {
     display: none;
+}
+
+span.session-speaker-icon:hover {
+    transform: scale(1.25);
+    transition-delay: 0s;
+    margin-inline: 3px;
+}
+
+button#upload-audio-btn {
+    margin-right: -7px;
 }

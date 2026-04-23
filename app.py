@@ -1122,17 +1122,22 @@ def auto_detect_audio():
 
 @app.route("/api/audio/gain", methods=["POST"])
 def set_audio_gain():
-    """Set loopback and/or mic gain on the active (or test) audio capture."""
+    """Set loopback and/or mic gain on the active (or test) audio capture.
+
+    No capture yet (e.g. the home page pushing stored gain values on load) is
+    a normal idle state, not an error — we just report ``applied: False`` so
+    the browser console stays clean.
+    """
     data = request.get_json(silent=True) or {}
     with _state_lock:
         capture = _state["audio_capture"] or _state["test_capture"]
     if capture is None:
-        return jsonify({"ok": False, "error": "No active capture"}), 400
+        return jsonify({"ok": False, "applied": False})
     if "lb_gain" in data:
         capture.loopback_gain = float(max(0.0, min(16.0, data["lb_gain"])))
     if "mic_gain" in data:
         capture.mic_gain = float(max(0.0, min(16.0, data["mic_gain"])))
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "applied": True})
 
 
 @app.route("/api/sessions")
@@ -1750,9 +1755,9 @@ def settings_status():
 # authoritative source; keep these minimal and reasonably current.
 _AI_MODELS = {
     "anthropic": [
-        {"id": "claude-opus-4-6",            "label": "Claude Opus 4.6"},
-        {"id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4.6"},
-        {"id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4.5"},
+        {"id": "claude-opus-4-6",            "label": "Opus 4.6"},
+        {"id": "claude-sonnet-4-6",          "label": "Sonnet 4.6"},
+        {"id": "claude-haiku-4-5-20251001",  "label": "Haiku 4.5"},
     ],
     "openai": [
         {"id": "gpt-5.4",              "label": "GPT-5.4"},
@@ -1850,7 +1855,10 @@ def _normalize_ai_selection(
 # When "claude-opus-4-7" is released it cleanly replaces 4-6 in the opus slot.
 
 _ANTHROPIC_CLASS_RE = re.compile(
-    r"^claude-([a-z]+(?:-\d+)?)-(\d+(?:-\d+)*)(?:-(\d{8}))?(?:-latest)?$"
+    # Class group is letters only ("opus"/"sonnet"/"haiku"); the version group
+    # is lazy so a trailing 8-digit date like -20251001 gets captured by the
+    # dedicated date group instead of being swallowed as part of the version.
+    r"^claude-([a-z]+)-(\d+(?:-\d+)*?)(?:-(\d{8}))?(?:-latest)?$"
 )
 _ANTHROPIC_CLASS_ORDER = ["opus", "sonnet", "haiku"]  # display order
 
@@ -2181,12 +2189,22 @@ def set_ai_settings():
         updates["ai_provider"] = target_provider
     if target_model != ai.model:
         updates["ai_model"] = target_model
+
+    # Clear per-tool overrides so Summary / Session-Chat / Global-Chat pickers
+    # all act as a single global choice — a later global pick should beat any
+    # stale per-tool override saved in earlier versions.
+    for k in ("summary_provider", "summary_model",
+             "chat_provider", "chat_model"):
+        if settings.get(k) is not None:
+            updates[k] = None
+
     if updates:
         settings.update(updates)
-        ai.reload_client(
-            provider=target_provider,
-            model=target_model,
-        )
+        if "ai_provider" in updates or "ai_model" in updates:
+            ai.reload_client(
+                provider=target_provider,
+                model=target_model,
+            )
 
     return jsonify({"ok": True, "provider": ai.provider, "model": ai.model})
 

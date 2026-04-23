@@ -764,10 +764,11 @@ function _initSearch() {
   });
 
   document.addEventListener('click', e => {
-    const wrap = document.querySelector('.home-topbar-right');
-    if (!wrap.contains(e.target)) {
-      document.getElementById('home-search-results').classList.add('hidden');
-    }
+    const results = document.getElementById('home-search-results');
+    const searchWrap = document.querySelector('.home-search-wrap');
+    if (!results) return;
+    if (searchWrap?.contains(e.target) || results.contains(e.target)) return;
+    results.classList.add('hidden');
   });
 
   // Check if semantic search is available
@@ -777,7 +778,7 @@ function _initSearch() {
 async function _checkHomeSemanticReady() {
   const badge = document.getElementById('home-search-ai');
   try {
-    const res = await fetch('/api/search/semantic/ready');
+    const res = await fetch('/api/search/semantic/status');
     const data = await res.json();
     _homeSemanticReady = !!data.ready;
     if (badge) badge.classList.toggle('ready', _homeSemanticReady);

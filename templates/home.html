@@ -280,7 +280,10 @@
                       onclick="toggleConvSidebar()" title="Toggle chat list">
                 <i class="fa-solid fa-sidebar"></i>
               </button>
-              <span class="home-chat-title" id="home-chat-title">Global Chat</span>
+              <div class="col-title-wrap home-chat-title-wrap">
+                <span class="home-chat-title" id="home-chat-title">Global Chat</span>
+                <span class="col-subtitle" id="global-chat-model-label"></span>
+              </div>
               <div class="home-chat-actions">
                 <button class="icon-btn" title="Clear chat" onclick="clearGlobalChat()">
                   <i class="fa-solid fa-xmark"></i>
@@ -303,6 +306,13 @@
             </div>
             <div class="chat-input-area">
               <div class="chat-input-wrap">
+                <div class="model-picker-wrap model-picker-chat-wrap">
+                  <button class="chat-model-picker-btn" id="global-chat-model-btn"
+                          title="Global chat model" onclick="toggleModelPicker('global_chat')">
+                    <i class="fa-solid fa-microchip"></i>
+                  </button>
+                  <div class="model-picker-panel model-picker-panel-up hidden" id="global-chat-model-picker"></div>
+                </div>
                 <textarea
                   id="global-chat-input"
                   placeholder="Ask about all your meetings..."
@@ -704,6 +714,77 @@
           </div>
         </div>
         <div class="settings-panel" id="section-system">
+          <div class="settings-group-title">App Theme</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Appearance</div>
+                <div class="settings-row-desc">Match the system theme, or force light/dark</div>
+              </div>
+              <div class="theme-mode-seg" role="radiogroup" aria-label="Appearance mode">
+                <button class="theme-mode-btn" data-mode="system" onclick="setThemeMode('system')" title="Match system"><i class="fa-solid fa-desktop"></i>System</button>
+                <button class="theme-mode-btn" data-mode="light" onclick="setThemeMode('light')" title="Light mode"><i class="fa-solid fa-sun"></i>Light</button>
+                <button class="theme-mode-btn" data-mode="dark" onclick="setThemeMode('dark')" title="Dark mode"><i class="fa-solid fa-moon"></i>Dark</button>
+              </div>
+            </div>
+            <div class="settings-row theme-accent-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Accent Color</div>
+                <div class="settings-row-desc">Applied to buttons, links, selections, and highlights</div>
+              </div>
+              <div class="theme-accent-grid" id="theme-accent-grid">
+                <button class="theme-accent-btn" data-accent="blue" onclick="setThemeAccent('blue')" style="--swatch:#58a6ff;--swatch-a:#58a6ff;--swatch-b:#1f6feb;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Blue</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="ocean" onclick="setThemeAccent('ocean')" style="--swatch:#39c5cf;--swatch-a:#39c5cf;--swatch-b:#1b8f97;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Ocean</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="forest" onclick="setThemeAccent('forest')" style="--swatch:#3fb950;--swatch-a:#3fb950;--swatch-b:#238636;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Forest</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="sunset" onclick="setThemeAccent('sunset')" style="--swatch:#ff9f4e;--swatch-a:#ff9f4e;--swatch-b:#c56a18;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Sunset</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="rose" onclick="setThemeAccent('rose')" style="--swatch:#f778ba;--swatch-a:#f778ba;--swatch-b:#bf4b8a;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Rose</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="violet" onclick="setThemeAccent('violet')" style="--swatch:#bc8cff;--swatch-a:#bc8cff;--swatch-b:#8957e5;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Violet</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="amber" onclick="setThemeAccent('amber')" style="--swatch:#e3b341;--swatch-a:#e3b341;--swatch-b:#bb8009;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Amber</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="crimson" onclick="setThemeAccent('crimson')" style="--swatch:#ff7b72;--swatch-a:#ff7b72;--swatch-b:#c53d34;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Crimson</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="mono" onclick="setThemeAccent('mono')" style="--swatch:#8b949e;--swatch-a:#e6edf3;--swatch-b:#484f58;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Mono</span>
+                </button>
+                <button class="theme-accent-btn theme-accent-custom" data-accent="custom" onclick="setThemeAccent('custom')">
+                  <span class="theme-accent-swatch theme-accent-swatch-rainbow"></span><span class="theme-accent-name">Custom</span>
+                </button>
+              </div>
+
+              <!-- Custom picker panel (revealed when Custom is active) -->
+              <div class="theme-custom-panel hidden" id="theme-custom-panel">
+                <div class="theme-custom-row">
+                  <label class="theme-custom-label">Accent color</label>
+                  <div class="theme-custom-color-row">
+                    <input type="color" class="theme-custom-color" id="theme-custom-accent-picker" value="#58a6ff" oninput="updateCustomAccent(this.value)">
+                    <input type="text" class="theme-custom-hex" id="theme-custom-accent-hex" value="#58a6ff" maxlength="7" oninput="updateCustomAccentFromHex(this.value)" spellcheck="false">
+                    <button class="theme-custom-reset" onclick="resetCustomTheme()" title="Reset to defaults"><i class="fa-solid fa-rotate-left"></i></button>
+                  </div>
+                </div>
+                <div class="theme-custom-row">
+                  <label class="theme-custom-label">Surface tint <span class="theme-custom-val" id="theme-custom-strength-val">30%</span></label>
+                  <input type="range" class="theme-custom-slider" id="theme-custom-strength" min="0" max="100" step="5" value="30" oninput="updateCustomStrength(this.value)">
+                </div>
+                <div class="theme-custom-hint">Derived automatically: darker accent for hovers, accent tint on backgrounds, matching borders.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-group-title">Hardware &amp; Startup</div>
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">
@@ -723,6 +804,7 @@
               </label>
             </div>
           </div>
+          <div class="settings-group-title">Updates</div>
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">

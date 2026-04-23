@@ -1592,18 +1592,18 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
       <span class="folder-name">${escapeHtml(folder.name)}</span>
       <span class="folder-count">${totalCount}</span>`;
 
-    const folderMenuBtn = document.createElement('button');
-    folderMenuBtn.className = 'folder-menu-btn';
-    folderMenuBtn.title = 'More options';
-    folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+    //const folderMenuBtn = document.createElement('button');
+    //folderMenuBtn.className = 'folder-menu-btn';
+    //folderMenuBtn.title = 'More options';
+    //folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
     header.addEventListener('click', e => { _toggleFolder(`${folder.id}`); });
-    folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
+    //folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
     header.addEventListener('contextmenu', e => {
       e.preventDefault();
       e.stopPropagation();
       _openFolderMenu(e, folder, { x: e.pageX, y: e.pageY });
     });
-    header.appendChild(folderMenuBtn);
+    //header.appendChild(folderMenuBtn);
     folderEl.appendChild(header);
 
     _attachFolderDragHandlers(header, folderEl, folder);
@@ -1743,12 +1743,12 @@ function _makeSessionEl(s) {
   el.appendChild(dot);
   el.appendChild(info);
 
-  const menuBtn = document.createElement('button');
-  menuBtn.className = 'session-menu-btn';
-  menuBtn.title = 'More options';
-  menuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
-  menuBtn.addEventListener('click', e => { e.stopPropagation(); _openSessionMenu(e, s); });
-  el.appendChild(menuBtn);
+  //const menuBtn = document.createElement('button');
+  //menuBtn.className = 'session-menu-btn';
+  //menuBtn.title = 'More options';
+  //menuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+  //menuBtn.addEventListener('click', e => { e.stopPropagation(); _openSessionMenu(e, s); });
+  //el.appendChild(menuBtn);
 
   // Right-click context menu
   el.addEventListener('contextmenu', e => {
@@ -11079,9 +11079,9 @@ function toggleAutoScroll() {
 // new versions; new Claude / GPT releases appear here without any code change.
 const AI_MODELS = {
   anthropic: [
-    { id: 'claude-opus-4-6',           label: 'Claude Opus 4.6' },
-    { id: 'claude-sonnet-4-6',         label: 'Claude Sonnet 4.6' },
-    { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
+    { id: 'claude-opus-4-6',           label: 'Opus 4.6' },
+    { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6' },
+    { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
   ],
   openai: [
     { id: 'gpt-5.4',              label: 'GPT-5.4' },
@@ -11316,9 +11316,18 @@ let _toolOverrides = {
 let _bothKeysSet = false;
 
 function _effectiveProvider(tool) {
+  // Inline pickers (Summary / Session-Chat / Global-Chat) all track the single
+  // global model — any per-tool override set via Settings still applies to the
+  // backend resolver, but the inline labels reflect the global choice.
+  if (tool === 'summary' || tool === 'chat' || tool === 'global_chat') {
+    return _currentAiProvider;
+  }
   return _toolOverrides[tool + '_provider'] || _currentAiProvider;
 }
 function _effectiveModel(tool) {
+  if (tool === 'summary' || tool === 'chat' || tool === 'global_chat') {
+    return _currentAiModel;
+  }
   const p = _effectiveProvider(tool);
   const m = _toolOverrides[tool + '_model'];
   if (m) {
@@ -11428,21 +11437,47 @@ function _updateSessionModelLabels() {
   const cp = _effectiveProvider('chat');
   const cm = _effectiveModel('chat');
   updateChatModelLabel(cp, cm, currentAiModels);
+
+  const gLabel = document.getElementById('global-chat-model-label');
+  if (gLabel) {
+    const gp = _effectiveProvider('global_chat');
+    const gm = _effectiveModel('global_chat');
+    const modelText = _modelLabel(gp, gm, currentAiModels);
+    gLabel.textContent = modelText
+      ? `${_providerLabel(gp)} - ${modelText}`
+      : _providerLabel(gp);
+  }
 }
 
 /* ── Model picker popout (session page) ────────────────────────────── */
 
+function _modelPickerIds(tool) {
+  if (tool === 'global_chat') {
+    return { btn: 'global-chat-model-btn', panel: 'global-chat-model-picker' };
+  }
+  return { btn: `${tool}-model-btn`, panel: `${tool}-model-picker` };
+}
+
 function toggleModelPicker(tool) {
-  const panel = document.getElementById(tool + '-model-picker');
+  const { btn: btnId, panel: panelId } = _modelPickerIds(tool);
+  const panel = document.getElementById(panelId);
   if (!panel) return;
   const wasHidden = panel.classList.contains('hidden');
   document.querySelectorAll('.model-picker-panel').forEach(p => p.classList.add('hidden'));
   if (wasHidden) {
     _buildModelPickerPanel(tool);
+    // Reparent to <body> so ``position: fixed`` always resolves against the
+    // viewport. Some ancestors (e.g. ``.home-chat-panel``) use ``transform``
+    // for animations, which promotes them to the containing block for fixed
+    // descendants — that shifts our coordinates and the panel lands in the
+    // wrong place.
+    if (panel.parentElement !== document.body) {
+      document.body.appendChild(panel);
+    }
     panel.classList.remove('hidden');
     _positionModelPicker(tool, panel);
     const close = (e) => {
-      if (!panel.contains(e.target) && !e.target.closest('#' + tool + '-model-btn')) {
+      if (!panel.contains(e.target) && !e.target.closest('#' + btnId)) {
         panel.classList.add('hidden');
         document.removeEventListener('pointerdown', close);
       }
@@ -11452,25 +11487,42 @@ function toggleModelPicker(tool) {
 }
 
 function _positionModelPicker(tool, panel) {
-  const btn = document.getElementById(tool + '-model-btn');
+  const { btn: btnId } = _modelPickerIds(tool);
+  const btn = document.getElementById(btnId);
   if (!btn) return;
   const r = btn.getBoundingClientRect();
-  const ph = panel.offsetHeight;
-  const pw = panel.offsetWidth;
-  if (tool === 'chat') {
-    panel.style.bottom = (window.innerHeight - r.top + 4) + 'px';
-    panel.style.top = 'auto';
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const pw = panel.offsetWidth || 220;
+  const ph = panel.offsetHeight || 220;
+
+  // Vertical: chat-style pickers open upward from the button; the Summary
+  // picker opens downward since it lives in the top of its column.
+  let top;
+  if (tool === 'chat' || tool === 'global_chat') {
+    top = r.top - ph - 4;
   } else {
-    panel.style.top = (r.bottom + 4) + 'px';
-    panel.style.bottom = 'auto';
+    top = r.bottom + 4;
   }
-  const right = window.innerWidth - r.right;
-  panel.style.left = 'auto';
-  panel.style.right = Math.max(4, right) + 'px';
+
+  // Horizontal: prefer right-aligning the panel with the button, then clamp
+  // so it can't escape the viewport. Clamping matters when the button sits
+  // near the left edge — e.g. Global Chat on the home page — where naive
+  // right-anchoring would push the panel far off-screen.
+  let left = r.right - pw;
+
+  top  = Math.max(4, Math.min(top,  vh - ph - 4));
+  left = Math.max(4, Math.min(left, vw - pw - 4));
+
+  panel.style.top = top + 'px';
+  panel.style.left = left + 'px';
+  panel.style.right = 'auto';
+  panel.style.bottom = 'auto';
 }
 
 function _buildModelPickerPanel(tool) {
-  const panel = document.getElementById(tool + '-model-picker');
+  const { panel: panelId } = _modelPickerIds(tool);
+  const panel = document.getElementById(panelId);
   if (!panel) return;
   panel.innerHTML = '';
 
@@ -11506,21 +11558,25 @@ function _buildModelPickerPanel(tool) {
 
 async function _selectModelFromPicker(tool, provider, model) {
   try {
-    // Set provider first, then model
-    await fetch('/api/ai_settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool, provider }),
-    });
+    // Inline pickers on Summary / Session-Chat / Global-Chat all drive the
+    // single global provider/model, so selection persists across pages and
+    // interfaces. Per-tool overrides are cleared server-side.
     const data = await fetch('/api/ai_settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool, model }),
+      body: JSON.stringify({ provider, model }),
     }).then(r => r.json());
-    _toolOverrides.summary_provider = data.summary_provider;
-    _toolOverrides.summary_model = data.summary_model;
-    _toolOverrides.chat_provider = data.chat_provider;
-    _toolOverrides.chat_model = data.chat_model;
+    _currentAiProvider = data.provider;
+    _currentAiModel = data.model;
+    _toolOverrides.summary_provider = null;
+    _toolOverrides.summary_model = null;
+    _toolOverrides.chat_provider = null;
+    _toolOverrides.chat_model = null;
+    if (typeof _applyAiConfig === 'function'
+        && document.getElementById('provider-btn-anthropic')) {
+      _applyAiConfig(data.provider, data.model, currentAiModels);
+    }
+    if (typeof _applyToolOverrides === 'function') _applyToolOverrides();
     _updateSessionModelLabels();
   } catch (_) {}
 }
@@ -12840,21 +12896,19 @@ fetch('/api/status').then(r => r.json()).then(d => {
   onStatus(d);
 });
 
-if (!_isHomePage) {
-  fetch('/api/ai_settings')
-    .then(r => r.json())
-    .then(aiCfg => {
-      currentAiModels = { ...AI_MODELS, ..._getAiModels(aiCfg.models) };
-      _currentAiProvider = aiCfg.provider;
-      _currentAiModel = aiCfg.model;
-      _toolOverrides.summary_provider = aiCfg.summary_provider || null;
-      _toolOverrides.summary_model = aiCfg.summary_model || null;
-      _toolOverrides.chat_provider = aiCfg.chat_provider || null;
-      _toolOverrides.chat_model = aiCfg.chat_model || null;
-      _updateSessionModelLabels();
-    })
-    .catch(() => {});
-}
+fetch('/api/ai_settings')
+  .then(r => r.json())
+  .then(aiCfg => {
+    currentAiModels = { ...AI_MODELS, ..._getAiModels(aiCfg.models) };
+    _currentAiProvider = aiCfg.provider;
+    _currentAiModel = aiCfg.model;
+    _toolOverrides.summary_provider = aiCfg.summary_provider || null;
+    _toolOverrides.summary_model = aiCfg.summary_model || null;
+    _toolOverrides.chat_provider = aiCfg.chat_provider || null;
+    _toolOverrides.chat_model = aiCfg.chat_model || null;
+    _updateSessionModelLabels();
+  })
+  .catch(() => {});
 
 startVizLoop();
 if (!_isHomePage) startBrandVizLoop();
