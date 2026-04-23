@@ -7,10 +7,37 @@
   <link rel="icon" id="favicon" href="/static/images/logo.png" type="image/png">
   <link rel="stylesheet" href="/static/fontAwesome/css/all.min.css">
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <link rel="stylesheet" id="hljs-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/morphdom@2/dist/morphdom-umd.min.js"></script>
+  <script>
+    // Apply saved theme synchronously (pre-paint) to avoid flash-of-wrong-theme.
+    (function () {
+      try {
+        var c = JSON.parse(localStorage.getItem('ma-layout') || '{}');
+        var mode = c.theme_mode || 'system';
+        var accent = c.theme_accent || 'blue';
+        var effective = mode;
+        if (mode === 'system') {
+          effective = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        }
+        document.documentElement.dataset.themeMode = effective;
+        if (accent && accent !== 'blue') document.documentElement.dataset.accent = accent;
+        if (effective === 'light') {
+          var link = document.getElementById('hljs-theme');
+          if (link) link.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
+        }
+        if (accent === 'custom') {
+          var palette = c['theme_custom_' + effective];
+          if (palette && typeof palette === 'object') {
+            var root = document.documentElement;
+            for (var k in palette) { if (palette.hasOwnProperty(k)) root.style.setProperty(k, palette[k]); }
+          }
+        }
+      } catch (_) {}
+    })();
+  </script>
 </head>
 <body>
 

@@ -391,6 +391,7 @@ class AIAssistant:
         on_tool_event: ToolEventCallback | None = None,
         provider: str | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         """Stream an answer to the latest question in chat_history.
 
@@ -406,7 +407,10 @@ class AIAssistant:
                 f"{meta['current_summary']}\n---"
             )
 
-        system = self._SYSTEM_QA
+        # User-supplied override (per-session or global) takes precedence over
+        # the built-in QA prompt. The transcript/meta/screen-recording blocks
+        # are still appended below so the model always gets meeting context.
+        system = (system_prompt.strip() if system_prompt and system_prompt.strip() else self._SYSTEM_QA)
         if frame_extractor:
             system += (
                 "\n\n## Screen recording\n"
@@ -641,22 +645,100 @@ class AIAssistant:
             provider=provider, model=model,
         )
 
-    def generate_title(self, transcript: str) -> str:
-        """Return a 2-3 word title for the meeting, or '' on failure/no content."""
+    def generate_title(self, transcript: str, *, context: dict | None = None) -> str:
+        """Return a short title for the meeting, or '' on failure/no content.
+
+        ``context`` (optional) may include:
+          - ``started_at``: ISO timestamp for the current meeting.
+          - ``participants``: ``[{'name': str, 'global_id': str|None}, ...]``
+          - ``similar_past_meetings``: list of dicts with ``title``,
+            ``shared_speakers``, ``same_dow``, ``hour_delta``. Already sorted
+            by relevance (most-similar first).
+
+        When context is supplied the model is steered to match existing naming
+        conventions for recurring meetings with the same participants / time.
+        """
         if not transcript.strip():
             return ""
-        snippet = transcript[:600].strip()
+        snippet = transcript[:1000].strip()
+
+        # ── Build the context block ─────────────────────────────────────────
+        ctx_lines: list[str] = []
+        if context:
+            started_at = context.get("started_at")
+            if started_at:
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.fromisoformat(started_at)
+                    ctx_lines.append(
+                        f"Meeting date: {dt.strftime('%A, %b %d %Y at %I:%M %p').lstrip('0')}"
+                    )
+                except Exception:
+                    pass
+            participants = context.get("participants") or []
+            names = [p["name"] for p in participants if p.get("name")]
+            if names:
+                preview = ", ".join(names[:10])
+                extra = f" (+{len(names) - 10} more)" if len(names) > 10 else ""
+                ctx_lines.append(f"Participants: {preview}{extra}")
+
+            past = context.get("similar_past_meetings") or []
+            if past:
+                ctx_lines.append("")
+                ctx_lines.append(
+                    "Past meeting titles from this user, most similar first "
+                    "(similarity based on shared participants, same day-of-week, "
+                    "and similar time-of-day):"
+                )
+                for m in past[:8]:
+                    sig_parts = []
+                    ss = int(m.get("shared_speakers") or 0)
+                    if ss:
+                        sig_parts.append(f"{ss} shared participant{'s' if ss != 1 else ''}")
+                    if m.get("same_dow"):
+                        sig_parts.append("same day-of-week")
+                    hd = m.get("hour_delta")
+                    if hd is not None:
+                        if hd < 0.25:
+                            sig_parts.append("same time-of-day")
+                        else:
+                            sig_parts.append(f"~{hd:.1f}h time offset")
+                    tag = f"  [{'; '.join(sig_parts)}]" if sig_parts else ""
+                    ctx_lines.append(f'- "{m["title"]}"{tag}')
+
+        context_block = "\n".join(ctx_lines)
+
+        # ── System + user messages ─────────────────────────────────────────
+        system = (
+            "You generate ultra-short meeting titles. "
+            "Reply with ONLY 2-4 words in Title Case. "
+            "No punctuation, no quotes, no explanation.\n\n"
+            "Guidance:\n"
+            "- The transcript is the primary signal for what the meeting was about.\n"
+            "- If past meeting titles are provided, infer the user's naming style "
+            "(e.g. \"Product Standup\", \"Design Review\", \"1:1 with Alice\") and "
+            "match it when the signals indicate a recurring series.\n"
+            "- Meetings with the same participants AND similar day/time are "
+            "almost certainly the same recurring meeting — reuse or closely "
+            "mirror the existing title.\n"
+            "- One-off meetings with unfamiliar participants should get a fresh, "
+            "content-specific title.\n"
+            "- Prefer specificity over generic words like \"Meeting\" or \"Call\"."
+        )
+        user_parts = []
+        if context_block:
+            user_parts.append(context_block)
+            user_parts.append("")
+        user_parts.append(f"Transcript excerpt:\n{snippet}")
+        user_parts.append("")
+        user_parts.append("Title:")
+        user_msg = "\n".join(user_parts)
+
         try:
-            raw = self._complete(
-                (
-                    "You generate ultra-short meeting titles. "
-                    "Reply with ONLY 2-3 words in title case. "
-                    "No punctuation, no explanation, nothing else."
-                ),
-                f"Transcript excerpt:\n{snippet}\n\nTitle:",
-                #max_tokens=16,
-            )
-            words = raw.split()[:3]
+            raw = self._complete(system, user_msg)
+            # Strip quotes / punctuation the model sometimes emits despite instructions
+            cleaned = raw.strip().strip('"\'`').rstrip(".!?,:;")
+            words = cleaned.split()[:4]
             return " ".join(words)
         except Exception:
             return ""

@@ -3,7 +3,7 @@ import base64
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "data" / "meetings.db"
@@ -102,6 +102,13 @@ def init_db() -> None:
             "ALTER TABLE folders ADD COLUMN parent_id TEXT DEFAULT NULL",
             "ALTER TABLE chat_messages ADD COLUMN attachments TEXT DEFAULT NULL",
             "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
+            # Per-session chat system prompt override (NULL = use global/default)
+            "ALTER TABLE sessions ADD COLUMN chat_system_prompt TEXT DEFAULT NULL",
+            # Title lock: 1 = user manually set the title, auto-gen must skip this row
+            "ALTER TABLE sessions ADD COLUMN title_user_set INTEGER NOT NULL DEFAULT 0",
+            # Split rollback: sessions created from the same split share a group id
+            "ALTER TABLE sessions ADD COLUMN split_group_id TEXT DEFAULT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_split_group ON sessions(split_group_id)",
             # Full-text search on session titles and transcript segments
             """CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
                 session_id UNINDEXED,
@@ -359,15 +366,80 @@ def _now() -> str:
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
-def create_session(title: str | None = None) -> str:
-    sid = str(uuid.uuid4())
+def create_session(
+    title: str | None = None,
+    *,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    split_group_id: str | None = None,
+    session_id: str | None = None,
+) -> str:
+    """Create a new session row.
+
+    ``started_at`` / ``ended_at`` are ISO timestamps. Both default to ``None``,
+    in which case ``started_at`` becomes "now" and the session is treated as
+    in-progress until ``end_session`` is called. Pass both when creating a
+    derived session (e.g. a split) whose timeline lives inside another
+    session's recording window. ``split_group_id`` tags this row as a member
+    of a split-rollback group. ``session_id`` pins a specific UUID (used by
+    split-restore to reuse a deterministic id when appropriate).
+    """
+    sid = session_id or str(uuid.uuid4())
     now = _now()
+    actual_started = started_at or now
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO sessions (id, title, started_at) VALUES (?, ?, ?)",
-            (sid, title or f"Meeting {now[:16].replace('T', ' ')}", now),
+            "INSERT INTO sessions (id, title, started_at, ended_at, split_group_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (sid, title or f"Meeting {actual_started[:16].replace('T', ' ')}",
+             actual_started, ended_at, split_group_id),
         )
     return sid
+
+
+def get_session_split_group_id(session_id: str) -> str | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT split_group_id FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return (row and row["split_group_id"]) or None
+
+
+def list_split_group_members(group_id: str) -> list[dict]:
+    """Return `{id, title, started_at, ended_at}` for every session in a split
+    group, ordered by their original position on the source timeline."""
+    if not group_id:
+        return []
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, title, started_at, ended_at, title_user_set "
+            "FROM sessions WHERE split_group_id = ? ORDER BY started_at ASC",
+            (group_id,),
+        ).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "started_at": r["started_at"],
+            "ended_at": r["ended_at"],
+            "title_user_set": bool(r["title_user_set"]),
+        }
+        for r in rows
+    ]
+
+
+def clear_split_group_for_sessions(session_ids: list[str]) -> None:
+    """Detach the given sessions from their split group (used after restore
+    when the user chose to keep some parts — they become standalone)."""
+    if not session_ids:
+        return
+    with _conn() as conn:
+        placeholders = ",".join("?" * len(session_ids))
+        conn.execute(
+            f"UPDATE sessions SET split_group_id = NULL WHERE id IN ({placeholders})",
+            session_ids,
+        )
 
 
 def end_session(session_id: str) -> None:
@@ -387,13 +459,149 @@ def resume_session(session_id: str) -> None:
         )
 
 
-def update_session_title(session_id: str, title: str) -> None:
+def update_session_title(session_id: str, title: str, *, user_set: bool = False) -> None:
+    """Update a session's title.
+
+    Pass ``user_set=True`` when the change originates from a user edit; that
+    sets the title-lock flag so future auto-title generation skips this
+    session. Pass ``user_set=False`` (default) for AI-generated titles; the
+    lock flag is cleared so subsequent auto-gens can run freely.
+    """
     with _conn() as conn:
         conn.execute(
-            "UPDATE sessions SET title = ? WHERE id = ?",
-            (title, session_id),
+            "UPDATE sessions SET title = ?, title_user_set = ? WHERE id = ?",
+            (title, 1 if user_set else 0, session_id),
         )
     fts_index_session_title(session_id, title)
+
+
+def is_title_user_set(session_id: str) -> bool:
+    """Return True if the session's title was manually set by the user."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT title_user_set FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return bool(row["title_user_set"]) if row else False
+
+
+def get_title_generation_context(session_id: str, limit: int = 8) -> dict:
+    """Gather context for auto-title generation.
+
+    Returns a dict with:
+      - started_at:   ISO timestamp of the current session (for day/time hints)
+      - participants: list of {name, global_id} for labelled speakers
+      - similar_past_meetings: past titles scored by speaker-overlap,
+        day-of-week match, and time-of-day proximity. Highest-scoring first.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT started_at FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not row:
+            return {"started_at": None, "participants": [], "similar_past_meetings": []}
+        started_at = row["started_at"]
+
+        # Current-session participants (only labelled ones matter for naming)
+        part_rows = conn.execute(
+            "SELECT name, global_id FROM speaker_labels "
+            "WHERE session_id = ? AND name IS NOT NULL AND name != ''",
+            (session_id,),
+        ).fetchall()
+        participants = [
+            {"name": r["name"], "global_id": r["global_id"]}
+            for r in part_rows
+        ]
+        participant_global_ids = [p["global_id"] for p in participants if p["global_id"]]
+
+        # Parse current start for day-of-week / time comparisons
+        try:
+            cur_dt = datetime.fromisoformat(started_at)
+            cur_dow = cur_dt.weekday()
+            cur_hour = cur_dt.hour + cur_dt.minute / 60.0
+        except Exception:
+            cur_dt, cur_dow, cur_hour = None, None, None
+
+        # Candidate past sessions: the most recent completed ones with a title
+        past = conn.execute(
+            "SELECT id, title, started_at FROM sessions "
+            "WHERE id != ? AND title IS NOT NULL AND title != '' "
+            "ORDER BY started_at DESC LIMIT 50",
+            (session_id,),
+        ).fetchall()
+
+        scored = []
+        for p in past:
+            pid = p["id"]
+            shared_speakers = 0
+            same_dow = False
+            hour_delta = None
+            score = 0.0
+
+            # Speaker overlap weighted heavily (people → recurring meeting pattern)
+            if participant_global_ids:
+                placeholders = ",".join("?" * len(participant_global_ids))
+                r = conn.execute(
+                    f"SELECT COUNT(DISTINCT global_id) AS c FROM speaker_labels "
+                    f"WHERE session_id = ? AND global_id IN ({placeholders})",
+                    [pid, *participant_global_ids],
+                ).fetchone()
+                shared_speakers = int(r["c"] or 0)
+                score += shared_speakers * 3.0
+
+            # Day-of-week and time-of-day match → weekly cadence signal
+            if cur_dt is not None:
+                try:
+                    p_dt = datetime.fromisoformat(p["started_at"])
+                    if p_dt.weekday() == cur_dow:
+                        score += 1.0
+                        same_dow = True
+                    p_hour = p_dt.hour + p_dt.minute / 60.0
+                    delta = abs(cur_hour - p_hour)
+                    delta = min(delta, 24 - delta)  # wrap across midnight
+                    if delta < 2.0:
+                        score += (2.0 - delta) * 0.5
+                        hour_delta = delta
+                except Exception:
+                    pass
+
+            if score > 0:
+                scored.append({
+                    "id": pid,
+                    "title": p["title"],
+                    "started_at": p["started_at"],
+                    "shared_speakers": shared_speakers,
+                    "same_dow": same_dow,
+                    "hour_delta": hour_delta,
+                    "score": round(score, 2),
+                })
+
+        scored.sort(key=lambda x: -x["score"])
+
+    return {
+        "started_at": started_at,
+        "participants": participants,
+        "similar_past_meetings": scored[:limit],
+    }
+
+
+def get_session_chat_prompt(session_id: str) -> str | None:
+    """Return the per-session chat system prompt override, or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT chat_system_prompt FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return row["chat_system_prompt"] if row else None
+
+
+def set_session_chat_prompt(session_id: str, prompt: str | None) -> None:
+    """Store a per-session chat system prompt override. Pass None to clear."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET chat_system_prompt = ? WHERE id = ?",
+            (prompt, session_id),
+        )
 
 
 def update_session_times(session_id: str, started_at: str | None = None, ended_at: str | None = None) -> None:
@@ -466,13 +674,41 @@ def create_split_session(
     start_sec: float,
     end_sec: float,
     title: str | None = None,
+    *,
+    split_group_id: str | None = None,
 ) -> str:
-    """Create a new session containing clamped transcript/speaker data from a range."""
+    """Create a new session containing clamped transcript/speaker data from a range.
+
+    The new session's ``started_at`` / ``ended_at`` are derived from the
+    source's ``started_at`` plus the offsets, so each split part keeps its
+    correct position on the original timeline (instead of being stamped with
+    "now"). The new session is also marked complete (``ended_at`` populated)
+    so the sidebar shows a duration rather than "In progress".
+    """
     source = get_session(source_session_id)
     if not source:
         raise ValueError("Source session not found")
 
-    sid = create_session(title or f"{source['title']} (split)")
+    # Derive timestamps from the source so split parts sit at the correct
+    # absolute time on the user's history. Falls back to "now" if the source
+    # somehow lacks a started_at (shouldn't happen, but be defensive).
+    new_started_at = None
+    new_ended_at = None
+    src_started = source.get("started_at")
+    if src_started:
+        try:
+            base = datetime.fromisoformat(src_started)
+            new_started_at = (base + timedelta(seconds=start_sec)).isoformat()
+            new_ended_at   = (base + timedelta(seconds=end_sec)).isoformat()
+        except Exception:
+            pass
+
+    sid = create_session(
+        title or f"{source['title']} (split)",
+        started_at=new_started_at,
+        ended_at=new_ended_at,
+        split_group_id=split_group_id,
+    )
     used_speakers: set[str] = set()
     with _conn() as conn:
         for seg in source.get("segments", []):
@@ -518,6 +754,43 @@ def create_split_session(
     return sid
 
 
+def list_session_ids_in_folder(folder_id: str, *, recursive: bool = True) -> list[str]:
+    """Return all session IDs under a folder. Walks subfolders when ``recursive``.
+
+    Used by bulk operations (e.g. "Update titles in folder") so the server is
+    the single source of truth about folder membership instead of the client
+    snapshot, which can drift.
+    """
+    with _conn() as conn:
+        # Collect all relevant folder IDs (BFS through parent_id graph)
+        folder_ids = [folder_id]
+        if recursive:
+            seen = {folder_id}
+            queue = [folder_id]
+            while queue:
+                next_round = []
+                placeholders = ",".join("?" * len(queue))
+                rows = conn.execute(
+                    f"SELECT id FROM folders WHERE parent_id IN ({placeholders})",
+                    queue,
+                ).fetchall()
+                for r in rows:
+                    fid = r["id"]
+                    if fid not in seen:
+                        seen.add(fid)
+                        next_round.append(fid)
+                folder_ids.extend(next_round)
+                queue = next_round
+
+        placeholders = ",".join("?" * len(folder_ids))
+        rows = conn.execute(
+            f"SELECT id FROM sessions WHERE folder_id IN ({placeholders}) "
+            f"ORDER BY started_at DESC",
+            folder_ids,
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
 def delete_session(session_id: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
@@ -547,13 +820,31 @@ def list_sessions() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
             "SELECT s.id, s.title, s.started_at, s.ended_at,"
-            "       s.folder_id, s.sort_order,"
+            "       s.folder_id, s.sort_order, s.split_group_id,"
             "       (SELECT MAX(ts.end_time) FROM transcript_segments ts"
             "        WHERE ts.session_id = s.id) AS last_segment_time"
             " FROM sessions s ORDER BY s.started_at DESC"
         ).fetchall()
+        # Batch-fetch speaker labels with voice-library color fallback (deduplicated by name)
+        speaker_rows = conn.execute(
+            "SELECT sl.session_id, sl.name, "
+            "       COALESCE(gs.color, sl.color) AS color"
+            " FROM speaker_labels sl"
+            " LEFT JOIN global_speakers gs ON gs.id = sl.global_id"
+            " GROUP BY sl.session_id, lower(sl.name)"
+            " ORDER BY sl.session_id, lower(sl.name)"
+        ).fetchall()
+    # Group speakers by session_id
+    speakers_by_session: dict[str, list[dict]] = {}
+    for sr in speaker_rows:
+        sid = sr["session_id"]
+        speakers_by_session.setdefault(sid, []).append(
+            {"name": sr["name"], "color": sr["color"]}
+        )
     return [
-        {**dict(r), "has_audio": (audio_dir / f"{r['id']}.wav").exists()}
+        {**dict(r),
+         "has_audio": (audio_dir / f"{r['id']}.wav").exists(),
+         "speakers": speakers_by_session.get(r["id"], [])}
         for r in rows
     ]
 

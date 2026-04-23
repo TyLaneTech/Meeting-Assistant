@@ -718,6 +718,29 @@ async function loadPreferences() {
     const enabled = _prefs.auto_summary !== false;
     autoBtn.classList.toggle('active', enabled);
   }
+  // Reconcile server-authoritative theme with what we applied pre-paint from
+  // localStorage. If the server has values, apply them (may differ if changed
+  // on another device). Otherwise fall back to the local cache so the UI
+  // still reflects the user's last choice even if a save hadn't flushed yet.
+  if (_prefs.theme_mode || _prefs.theme_accent || _prefs.theme_custom) {
+    applyTheme(_prefs.theme_mode || 'system', _prefs.theme_accent || 'blue');
+    const cache = {
+      theme_mode:   _prefs.theme_mode   || 'system',
+      theme_accent: _prefs.theme_accent || 'blue',
+    };
+    if (_prefs.theme_custom) cache.theme_custom = _prefs.theme_custom;
+    _saveLayoutCache(cache);
+  } else {
+    const lc = _getLayoutCache();
+    if (lc.theme_mode)    _prefs.theme_mode    = lc.theme_mode;
+    if (lc.theme_accent)  _prefs.theme_accent  = lc.theme_accent;
+    if (lc.theme_custom)  _prefs.theme_custom  = lc.theme_custom;
+  }
+  _syncThemeUI();
+  // Populate the global chat-system-prompt textarea (if on the session page)
+  _syncGlobalChatPromptUI();
+  // Refresh session-override badge (no-op on home page)
+  if (state.sessionId) refreshSessionChatPromptBadge();
 }
 
 function savePref(key, value) {
@@ -731,6 +754,245 @@ function savePref(key, value) {
       body: JSON.stringify(_prefs),
     }).catch(() => {});
   }, 400);
+}
+
+/* ── Theme (light/dark + accent) ──────────────────────────────────────────── */
+const THEME_MODES   = ['system', 'light', 'dark'];
+const THEME_ACCENTS = ['blue', 'ocean', 'forest', 'sunset', 'rose', 'violet', 'amber', 'crimson', 'mono', 'custom'];
+const HLJS_DARK  = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
+const HLJS_LIGHT = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
+const THEME_CUSTOM_DEFAULT = { accent: '#58a6ff', strength: 30 };
+
+// Base surface palettes used as the starting point for custom theme blending
+const THEME_BASE = {
+  dark: {
+    bg: '#0d1117', surface: '#161b22', surface2: '#21262d', surface3: '#2d333b',
+    surface4: '#0a0d10', sub_panel_bg: '#0c0e10', border: '#484f58',
+  },
+  light: {
+    bg: '#ffffff', surface: '#f6f8fa', surface2: '#eaeef2', surface3: '#d8dee4',
+    surface4: '#ffffff', sub_panel_bg: '#f6f8fa', border: '#d0d7de',
+  },
+};
+const THEME_CUSTOM_VARS = [
+  '--accent', '--accent-dim', '--accent-dim2', '--vertical-sep-color',
+  '--bg', '--surface', '--surface2', '--surface3', '--surface4',
+  '--sub-panel-bg', '--sub-panel-bg-trans', '--border', '--border-sub',
+];
+
+function _effectiveThemeMode(mode) {
+  if (mode === 'system') {
+    return (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  }
+  return mode === 'light' ? 'light' : 'dark';
+}
+
+// Small color utils — all work in sRGB space, good enough for UI tinting.
+function _hexToRgb(hex) {
+  hex = (hex || '').trim().replace(/^#/, '');
+  if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+  if (!/^[0-9a-fA-F]{6}$/.test(hex)) return null;
+  return { r: parseInt(hex.slice(0,2),16), g: parseInt(hex.slice(2,4),16), b: parseInt(hex.slice(4,6),16) };
+}
+function _rgbToHex(r, g, b) {
+  const c = n => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+  return '#' + c(r) + c(g) + c(b);
+}
+function _blendHex(a, b, t) {
+  const A = _hexToRgb(a), B = _hexToRgb(b);
+  if (!A || !B) return a;
+  return _rgbToHex(A.r + (B.r - A.r) * t, A.g + (B.g - A.g) * t, A.b + (B.b - A.b) * t);
+}
+function _normalizeHex(s) {
+  s = (s || '').trim();
+  if (!s.startsWith('#')) s = '#' + s;
+  if (s.length === 4) s = '#' + s.slice(1).split('').map(c => c + c).join('');
+  return /^#[0-9a-fA-F]{6}$/.test(s) ? s.toLowerCase() : null;
+}
+
+// Derive the full custom palette (returns a dict of CSS var name → value).
+function _deriveCustomPalette(hex, strength, mode) {
+  hex = _normalizeHex(hex) || THEME_CUSTOM_DEFAULT.accent;
+  const t = Math.max(0, Math.min(1, (strength == null ? 30 : strength) / 100));
+  const base = THEME_BASE[mode === 'light' ? 'light' : 'dark'];
+  const isDark = mode !== 'light';
+  const mixAmt = t * 0.13;  // cap surface blending at ~13% (very subtle at max)
+  // Accent derivatives
+  const accent     = hex;
+  const accentDim  = _blendHex(hex, '#000000', 0.28);
+  const accentDim2 = isDark ? _blendHex(hex, '#000000', 0.82) : _blendHex(hex, '#ffffff', 0.88);
+  const out = {
+    '--accent': accent,
+    '--accent-dim': accentDim,
+    '--accent-dim2': accentDim2,
+    '--vertical-sep-color': hex + (isDark ? 'ad' : '73'),
+    '--bg':           _blendHex(base.bg,           hex, mixAmt),
+    '--surface':      _blendHex(base.surface,      hex, mixAmt),
+    '--surface2':     _blendHex(base.surface2,     hex, mixAmt),
+    '--surface3':     _blendHex(base.surface3,     hex, mixAmt),
+    '--surface4':     _blendHex(base.surface4,     hex, mixAmt),
+    '--sub-panel-bg': _blendHex(base.sub_panel_bg, hex, mixAmt),
+    '--border-sub':   _blendHex(base.surface2,     hex, mixAmt),
+  };
+  // Border keeps the base 36% alpha (5c) in dark, solid in light
+  const borderHex = _blendHex(base.border, hex, mixAmt);
+  out['--border'] = isDark ? borderHex + '5c' : borderHex;
+  // Semi-transparent sub-panel (bd in dark = ~74% alpha, d9 in light = ~85%)
+  out['--sub-panel-bg-trans'] = out['--sub-panel-bg'] + (isDark ? 'bd' : 'd9');
+  return out;
+}
+
+function _applyCustomPalette(vars) {
+  const root = document.documentElement;
+  for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
+}
+function _clearCustomPalette() {
+  const root = document.documentElement;
+  for (const k of THEME_CUSTOM_VARS) root.style.removeProperty(k);
+}
+
+function applyTheme(mode, accent) {
+  if (!THEME_MODES.includes(mode))   mode   = 'system';
+  if (!THEME_ACCENTS.includes(accent)) accent = 'blue';
+  const effective = _effectiveThemeMode(mode);
+  document.documentElement.dataset.themeMode = effective;
+  if (accent === 'blue') {
+    delete document.documentElement.dataset.accent;
+  } else {
+    document.documentElement.dataset.accent = accent;
+  }
+  // Clear any prior inline custom vars unless we're about to re-apply them
+  if (accent !== 'custom') _clearCustomPalette();
+  // Swap hljs stylesheet to match
+  const link = document.getElementById('hljs-theme');
+  if (link) {
+    const target = effective === 'light' ? HLJS_LIGHT : HLJS_DARK;
+    if (link.href !== target) link.href = target;
+  }
+  // If custom, re-derive and apply (mode-sensitive)
+  if (accent === 'custom') {
+    const cfg = _prefs.theme_custom || THEME_CUSTOM_DEFAULT;
+    const palette = _deriveCustomPalette(cfg.accent, cfg.strength, effective);
+    _applyCustomPalette(palette);
+    // Cache computed palette per-mode so pre-paint has zero flash next load
+    _saveLayoutCache({ ['theme_custom_' + effective]: palette });
+  }
+}
+
+function setThemeMode(mode) {
+  if (!THEME_MODES.includes(mode)) return;
+  const accent = _prefs.theme_accent || 'blue';
+  applyTheme(mode, accent);
+  _saveLayoutCache({ theme_mode: mode });
+  savePref('theme_mode', mode);
+  _syncThemeUI();
+}
+
+function setThemeAccent(accent) {
+  if (!THEME_ACCENTS.includes(accent)) return;
+  const mode = _prefs.theme_mode || 'system';
+  applyTheme(mode, accent);
+  _saveLayoutCache({ theme_accent: accent });
+  savePref('theme_accent', accent);
+  _syncThemeUI();
+}
+
+/* ── Custom accent picker handlers ────────────────────────────────────────── */
+function _getCustomCfg() {
+  return { ...THEME_CUSTOM_DEFAULT, ...(_prefs.theme_custom || {}) };
+}
+
+function updateCustomAccent(hex) {
+  const clean = _normalizeHex(hex);
+  if (!clean) return;
+  const cfg = _getCustomCfg();
+  cfg.accent = clean;
+  _prefs.theme_custom = cfg;
+  const hexInput = document.getElementById('theme-custom-accent-hex');
+  if (hexInput && hexInput.value.toLowerCase() !== clean) hexInput.value = clean;
+  // If custom isn't the active accent yet, switching to it applies automatically
+  if (_prefs.theme_accent !== 'custom') {
+    setThemeAccent('custom');
+  } else {
+    applyTheme(_prefs.theme_mode || 'system', 'custom');
+  }
+  _saveLayoutCache({ theme_custom: cfg });
+  savePref('theme_custom', cfg);
+}
+
+function updateCustomAccentFromHex(value) {
+  const clean = _normalizeHex(value);
+  if (!clean) return;  // wait for a valid 6-digit hex
+  const picker = document.getElementById('theme-custom-accent-picker');
+  if (picker) picker.value = clean;
+  updateCustomAccent(clean);
+}
+
+function updateCustomStrength(value) {
+  const n = Math.max(0, Math.min(100, parseInt(value, 10) || 0));
+  const cfg = _getCustomCfg();
+  cfg.strength = n;
+  _prefs.theme_custom = cfg;
+  const lbl = document.getElementById('theme-custom-strength-val');
+  if (lbl) lbl.textContent = n + '%';
+  if (_prefs.theme_accent === 'custom') {
+    applyTheme(_prefs.theme_mode || 'system', 'custom');
+  }
+  _saveLayoutCache({ theme_custom: cfg });
+  savePref('theme_custom', cfg);
+}
+
+function resetCustomTheme() {
+  const cfg = { ...THEME_CUSTOM_DEFAULT };
+  _prefs.theme_custom = cfg;
+  const picker = document.getElementById('theme-custom-accent-picker');
+  const hexIn  = document.getElementById('theme-custom-accent-hex');
+  const slider = document.getElementById('theme-custom-strength');
+  const lbl    = document.getElementById('theme-custom-strength-val');
+  if (picker) picker.value = cfg.accent;
+  if (hexIn)  hexIn.value  = cfg.accent;
+  if (slider) slider.value = cfg.strength;
+  if (lbl)    lbl.textContent = cfg.strength + '%';
+  if (_prefs.theme_accent === 'custom') {
+    applyTheme(_prefs.theme_mode || 'system', 'custom');
+  }
+  _saveLayoutCache({ theme_custom: cfg });
+  savePref('theme_custom', cfg);
+}
+
+function _syncThemeUI() {
+  const mode   = _prefs.theme_mode   || 'system';
+  const accent = _prefs.theme_accent || 'blue';
+  document.querySelectorAll('.theme-mode-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+  document.querySelectorAll('.theme-accent-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.accent === accent);
+  });
+  // Show/hide custom picker panel
+  const panel = document.getElementById('theme-custom-panel');
+  if (panel) panel.classList.toggle('hidden', accent !== 'custom');
+  // Seed picker inputs with current custom config
+  const cfg = _getCustomCfg();
+  const picker = document.getElementById('theme-custom-accent-picker');
+  const hexIn  = document.getElementById('theme-custom-accent-hex');
+  const slider = document.getElementById('theme-custom-strength');
+  const lbl    = document.getElementById('theme-custom-strength-val');
+  if (picker && picker.value !== cfg.accent) picker.value = cfg.accent;
+  if (hexIn  && hexIn.value  !== cfg.accent) hexIn.value  = cfg.accent;
+  if (slider && +slider.value !== cfg.strength) slider.value = cfg.strength;
+  if (lbl) lbl.textContent = cfg.strength + '%';
+}
+
+// React to OS-level light/dark changes while in "system" mode
+if (window.matchMedia) {
+  try {
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      if ((_prefs.theme_mode || 'system') === 'system') {
+        applyTheme('system', _prefs.theme_accent || 'blue');
+      }
+    });
+  } catch (_) { /* Safari <14 lacks addEventListener on MQL; non-critical */ }
 }
 
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
@@ -1437,9 +1699,43 @@ function _makeSessionEl(s) {
   const nameEl = document.createElement('div');
   nameEl.className = 'session-name';
   nameEl.textContent = s.title;
+  // Subtle spinner suffix while an AI title regeneration is in flight
+  if (_retitleInFlight && _retitleInFlight.has(s.id)) {
+    const spin = document.createElement('i');
+    spin.className = 'fa-solid fa-wand-magic-sparkles fa-fade session-name-retitle';
+    spin.title = 'Regenerating title…';
+    nameEl.appendChild(document.createTextNode(' '));
+    nameEl.appendChild(spin);
+  }
   const metaEl = document.createElement('div');
   metaEl.className = 'session-meta';
   metaEl.innerHTML = formatSessionMeta(s);
+  // Speaker initial icons after duration
+  if (s.speakers?.length) {
+    const filtered = s.speakers.filter(sp => sp.name && !/^Speaker \d+$/i.test(sp.name));
+    if (filtered.length) {
+      const sep = document.createElement('span');
+      sep.className = 'session-meta-sep';
+      sep.textContent = '|';
+      metaEl.appendChild(sep);
+      const wrap = document.createElement('span');
+      wrap.className = 'session-speaker-icons';
+      for (const sp of filtered) {
+        const initials = sp.name.split(/\s+/).map(w => w[0]).join('').toUpperCase().slice(0, 2);
+        const icon = document.createElement('span');
+        icon.className = 'session-speaker-icon';
+        icon.textContent = initials;
+        icon.title = sp.name;
+        if (sp.color) {
+          icon.style.backgroundColor = sp.color + '30';
+          icon.style.color = sp.color;
+          icon.style.borderColor = sp.color + '50';
+        }
+        wrap.appendChild(icon);
+      }
+      metaEl.appendChild(wrap);
+    }
+  }
   info.appendChild(nameEl);
   info.appendChild(metaEl);
 
@@ -1539,6 +1835,29 @@ function _openSessionMenu(e, s, pos) {
   ren.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); startEditTitle(ev, s.id, s.title); });
   menu.appendChild(ren);
 
+  const wand = document.createElement('div');
+  wand.className = 'session-menu-item';
+  wand.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i>  Update Title';
+  wand.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeSessionMenu();
+    retitleSessions([s.id], { label: 'title' });
+  });
+  menu.appendChild(wand);
+
+  // Only surface "Undo Split" when this row is part of a split group whose
+  // backup is still available. We ask the server on click (cheap) instead of
+  // decorating every session with the flag up front.
+  if (s.split_group_id) {
+    const undo = document.createElement('div');
+    undo.className = 'session-menu-item';
+    undo.innerHTML = '<i class="fa-solid fa-rotate-left"></i>  Undo Split…';
+    undo.addEventListener('click', ev => {
+      ev.stopPropagation(); _closeSessionMenu();
+      openSplitRestoreDialog(s.id);
+    });
+    menu.appendChild(undo);
+  }
+
   const del = document.createElement('div');
   del.className = 'session-menu-item session-menu-item-danger';
   del.innerHTML = '<i class="fa-solid fa-trash"></i>  Delete';
@@ -1601,6 +1920,15 @@ function _openFolderMenu(e, folder, pos) {
     renameFolderInline(ev, folder.id, folder.name);
   });
   menu.appendChild(ren);
+
+  const wand = document.createElement('div');
+  wand.className = 'session-menu-item';
+  wand.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i>  Update Titles';
+  wand.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeFolderMenu();
+    retitleFolder(folder.id, folder.name);
+  });
+  menu.appendChild(wand);
 
   const del = document.createElement('div');
   del.className = 'session-menu-item session-menu-item-danger';
@@ -1915,13 +2243,86 @@ async function bulkRetitle() {
   if (!ids.length) return;
   const btn = document.getElementById('sidebar-bulk-retitle');
   if (btn) { btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> …'; btn.disabled = true; }
-  await fetch('/api/sessions/bulk', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'retitle', session_ids: ids }),
-  });
-  if (btn) { btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Titles'; btn.disabled = false; }
-  refreshSidebar();
+  try {
+    await retitleSessions(ids, { label: ids.length === 1 ? 'title' : 'titles', silent: true });
+  } finally {
+    if (btn) { btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Titles'; btn.disabled = false; }
+    refreshSidebar();
+  }
+}
+
+/* ── Generic retitle helpers (used by sidebar context menus) ──────────────── */
+
+// Tracks active retitle batches so the sidebar can show per-row spinners
+// while workers are still processing. Set is cleared on retitle_done.
+const _retitleInFlight = new Set();
+
+async function retitleSessions(sessionIds, opts = {}) {
+  const ids = (sessionIds || []).filter(Boolean);
+  if (!ids.length) return { updated: [] };
+  const label = opts.label || 'titles';
+  // Mark them as in-flight for sidebar visual feedback
+  ids.forEach(id => _retitleInFlight.add(id));
+  _renderSidebar();
+  const startMsg = ids.length === 1 ? `Updating ${label}…` : `Updating ${ids.length} ${label}…`;
+  if (!opts.silent) flashStatus(startMsg);
+  try {
+    const r = await fetch('/api/sessions/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'retitle',
+        session_ids: opts.folderId ? undefined : ids,
+        folder_id:   opts.folderId,
+      }),
+    }).then(r => r.json());
+    if (r.error) throw new Error(r.error);
+    if (!opts.silent) {
+      const n = (r.updated || []).length;
+      flashStatus(n === 1 ? 'Title updated' : `${n} titles updated`);
+    }
+    return r;
+  } catch (e) {
+    flashStatus(`Update failed: ${e.message || e}`);
+    throw e;
+  } finally {
+    ids.forEach(id => _retitleInFlight.delete(id));
+    _renderSidebar();
+  }
+}
+
+async function retitleFolder(folderId, folderName) {
+  // Probe count via a quick session-list filter on the cached sidebar state.
+  // (A folder may also contain sub-folders; we surface the local count for
+  // the confirm dialog but defer authoritative recursion to the server.)
+  const directCount = _sidebarAllSessions.filter(s => s.folder_id === folderId).length;
+  const fname = folderName || 'this folder';
+  const msg = directCount > 0
+    ? `Regenerate AI titles for all sessions in "${fname}" (and any subfolders)?\n\n` +
+      `At least ${directCount} session${directCount === 1 ? '' : 's'} in this folder will be re-named.`
+    : `Regenerate AI titles for all sessions in "${fname}" and its subfolders?`;
+  if (!confirm(msg)) return;
+  // For folder mode the server resolves the IDs (recursive walk); we still
+  // pass folderId through to retitleSessions so it bypasses the in-flight
+  // visual cache (we don't have the IDs upfront).
+  const fakeIds = [`__folder:${folderId}`];
+  // Use a dedicated path so the in-flight set isn't polluted with a fake id
+  flashStatus(`Updating titles in "${fname}"…`);
+  try {
+    const r = await fetch('/api/sessions/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'retitle', folder_id: folderId }),
+    }).then(r => r.json());
+    if (r.error) throw new Error(r.error);
+    const n = (r.updated || []).length;
+    const req = r.requested || n;
+    if (req === 0) flashStatus('No sessions to retitle');
+    else if (n === req) flashStatus(`${n} title${n === 1 ? '' : 's'} updated`);
+    else flashStatus(`${n}/${req} title${req === 1 ? '' : 's'} updated`);
+  } catch (e) {
+    flashStatus(`Update failed: ${e.message || e}`);
+  }
 }
 
 function groupByDate(sessions) {
@@ -2442,14 +2843,43 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     // Update in-memory cache so re-render is instant, then refresh once
     const entry = _sidebarAllSessions.find(s => s.id === d.session_id);
-    if (entry) { entry.title = d.title; _renderSidebar(); }
+    if (entry) { entry.title = d.title; }
+    // Worker finished for this session → drop its in-flight badge
+    _retitleInFlight.delete(d.session_id);
+    if (entry) _renderSidebar();
     else refreshSidebar();
     if (d.session_id === state.sessionId) updateTopbarSessionTitle();
+  });
+
+  // Folder-mode retitle: server resolves the IDs, then announces them up-front
+  // so the sidebar can show per-row spinners during the parallel batch.
+  src.addEventListener('retitle_start', e => {
+    const d = JSON.parse(e.data);
+    (d.session_ids || []).forEach(id => _retitleInFlight.add(id));
+    _renderSidebar();
+  });
+  src.addEventListener('retitle_done', e => {
+    // Defensive sweep — clear anything still flagged so a stuck row can't
+    // spin forever if a worker crashed before emitting session_title.
+    if (_retitleInFlight.size) {
+      _retitleInFlight.clear();
+      _renderSidebar();
+    }
   });
 
   src.addEventListener('speaker_label', e => {
     const d = JSON.parse(e.data);
     if (d.session_id === state.sessionId) applySpeakerProfileUpdate(d);
+    // Update sidebar speaker icons
+    const entry = _sidebarAllSessions.find(s => s.id === d.session_id);
+    if (entry && d.name && !/^Speaker \d+$/i.test(d.name)) {
+      if (!entry.speakers) entry.speakers = [];
+      const existing = entry.speakers.find(sp => sp.name.toLowerCase() === d.name.toLowerCase());
+      if (!existing) {
+        entry.speakers.push({ name: d.name, color: d.color || null });
+        _renderSidebar();
+      }
+    }
   });
 
   src.addEventListener('fingerprint_match', e => {
@@ -2639,6 +3069,7 @@ function onStatus(d) {
       dot.className       = 'status-dot recording';
       text.textContent    = 'Recording…';
       _loadPaneVisible(d.session_id);
+      refreshSessionChatPromptBadge();
       destroyPlayback();
       if (!_durationInterval) {
         startDurationCounter();
@@ -5307,6 +5738,28 @@ function applySpeakerProfileUpdate(update) {
   if (!speakerKey) return;
 
   const nextName = update.name || _speakerDisplayName(speakerKey) || speakerKey;
+
+  // Auto-clear speaker suggestion when the speaker gets a real name
+  // (manual labeling, SSE label event, merge, etc.)
+  if (!_isDefaultName(nextName) && nextName !== speakerKey) {
+    const pending = _fpGetSuggestion(speakerKey);
+    if (pending) {
+      _fpRemoveFromQueue(speakerKey);
+      // Dismiss on server so it doesn't reappear on reload
+      fetch('/api/fingerprint/dismiss', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id:  pending.session_id,
+          speaker_key: speakerKey,
+          global_id:   pending.matches[0]?.global_id || '',
+        }),
+      }).catch(() => {});
+      // If this was the active toast, hide it
+      if (_fpToastActive?.speaker_key === speakerKey) _fpHideToast();
+    }
+  }
+
   const existingKey = _speakerNameKey(nextName, speakerKey);
   if (existingKey && _speakerColors[existingKey]) {
     _speakerColors[speakerKey] = _speakerColors[existingKey];
@@ -6749,14 +7202,21 @@ function clearPlayingHighlight() {
 let _sessionEditor = null;
 let _sessionEditorDrag = null;
 let _sessionEditorSuppressClick = false;
-let _sessionHasTrimBackup = false;
+let _sessionHasTrimBackup  = false;
+let _sessionHasSplitBackup = false;
+let _sessionSplitGroupId   = null;
 
 async function openSessionEditor() {
   if (!state.sessionId || state.isRecording || !_playbackActive) return;
   const overlay = document.getElementById('session-editor-overlay');
   overlay.classList.remove('hidden');
+  // Pull the current title from the active sidebar row so split parts can
+  // default Part 1 to the original title and Part 2+ to "<title> Part N".
+  const _activeRow = document.querySelector(`.session-item[data-id="${state.sessionId}"] .session-name`);
+  const _sourceTitle = (_activeRow?.textContent || '').trim() || 'Meeting';
   _sessionEditor = {
     sessionId: state.sessionId,
+    sourceTitle: _sourceTitle,
     mode: 'trim',
     profile: null,
     start: 0,
@@ -6767,7 +7227,9 @@ async function openSessionEditor() {
     viewEnd: 0,
     speakerFilter: new Set(),
     speakerFilterCollapsed: false,
-    hasTrimBackup: _sessionHasTrimBackup,
+    hasTrimBackup:  _sessionHasTrimBackup,
+    hasSplitBackup: _sessionHasSplitBackup,
+    splitGroupId:   _sessionSplitGroupId,
   };
   document.getElementById('session-editor-subtitle').textContent = 'Loading audio profile...';
   document.getElementById('session-editor-hint').textContent = 'Loading audio profile...';
@@ -6802,7 +7264,18 @@ function closeSessionEditor() {
 
 function _setPlaybackEditTrimmed(isTrimmed) {
   _sessionHasTrimBackup = !!isTrimmed;
-  document.getElementById('playback-edit-btn')?.classList.toggle('trimmed', _sessionHasTrimBackup);
+  _updatePlaybackEditIndicator();
+}
+function _setSessionSplitBackup(hasBackup, groupId) {
+  _sessionHasSplitBackup = !!hasBackup;
+  _sessionSplitGroupId   = groupId || null;
+  _updatePlaybackEditIndicator();
+}
+function _updatePlaybackEditIndicator() {
+  const btn = document.getElementById('playback-edit-btn');
+  if (!btn) return;
+  btn.classList.toggle('trimmed',       _sessionHasTrimBackup || _sessionHasSplitBackup);
+  btn.classList.toggle('has-split-undo', _sessionHasSplitBackup);
 }
 
 async function reloadSession(sessionId) {
@@ -6967,10 +7440,13 @@ function sessionEditorRanges() {
     return [{ start: _sessionEditor.start, end: _sessionEditor.end, title: '' }];
   }
   const pts = [0, ..._sessionEditor.splitPoints, dur];
+  const src = _sessionEditor.sourceTitle || 'Meeting';
   const ranges = [];
   for (let i = 0; i < pts.length - 1; i++) {
     if (pts[i + 1] - pts[i] > 1) {
-      ranges.push({ start: pts[i], end: pts[i + 1], title: _sessionEditor.titles[i] || `Part ${i + 1}` });
+      // Part 1 inherits the source title; Part 2+ get "<title> Part N".
+      const fallback = i === 0 ? src : `${src} Part ${i + 1}`;
+      ranges.push({ start: pts[i], end: pts[i + 1], title: _sessionEditor.titles[i] || fallback });
     }
   }
   return ranges;
@@ -7105,9 +7581,19 @@ function sessionEditorToggleSpeakerPanel() {
 function sessionEditorUpdateRestoreButton() {
   const btn = document.getElementById('session-editor-restore');
   if (!btn) return;
-  const show = _sessionEditor?.mode === 'trim' && _sessionEditor?.hasTrimBackup;
-  btn.classList.toggle('hidden', !show);
-  btn.disabled = !show;
+  // Trim backup only matters in trim mode. Split backup is a session-level
+  // property — offer it in either mode so users can always find the undo.
+  const ed = _sessionEditor;
+  if (!ed) { btn.classList.add('hidden'); btn.disabled = true; return; }
+  const hasTrim  = ed.mode === 'trim' && ed.hasTrimBackup;
+  const hasSplit = !!ed.hasSplitBackup;
+  btn.classList.toggle('hidden', !(hasTrim || hasSplit));
+  btn.disabled = !(hasTrim || hasSplit);
+  // Label reflects which restore will be offered. Split wins if both are
+  // somehow true (shouldn't normally happen — the original session was
+  // deleted during the split, taking its trim backup with it).
+  if (hasSplit) btn.textContent = 'Undo Split…';
+  else if (hasTrim) btn.textContent = 'Restore Original';
 }
 
 function renderSessionEditor() {
@@ -7130,7 +7616,8 @@ function renderSessionEditorRanges() {
     if (_sessionEditor.mode === 'split') {
       const input = document.createElement('input');
       input.value = range.title;
-      input.placeholder = `Part ${i + 1}`;
+      const src = _sessionEditor.sourceTitle || 'Meeting';
+      input.placeholder = i === 0 ? src : `${src} Part ${i + 1}`;
       input.oninput = () => { _sessionEditor.titles[i] = input.value; };
       row.appendChild(input);
       if (i > 0) {
@@ -7498,7 +7985,9 @@ async function applySessionEditor() {
       data = await fetch(`/api/sessions/${ed.sessionId}/split`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ranges, delete_original: false }),
+        // Splitting one meeting into N parts produces N sessions, not N+1.
+        // The source row + media is replaced by its split parts.
+        body: JSON.stringify({ ranges, delete_original: true }),
       }).then(r => r.json());
       if (data.error) throw new Error(data.error);
       closeSessionEditor();
@@ -7517,7 +8006,15 @@ async function applySessionEditor() {
 
 async function restoreSessionEditorOriginal() {
   const ed = _sessionEditor;
-  if (!ed?.hasTrimBackup) return;
+  if (!ed) return;
+  // Split rollback takes priority — the original session was deleted at split
+  // time, so the only thing to restore is the pre-split snapshot. The split
+  // restore has its own modal (lets the user choose which parts to delete).
+  if (ed.hasSplitBackup) {
+    openSplitRestoreDialog(ed.sessionId);
+    return;
+  }
+  if (!ed.hasTrimBackup) return;
   if (!confirm('Restore the original audio, video, transcript, and speaker labels for this session?')) return;
   const btn = document.getElementById('session-editor-restore');
   const applyBtn = document.getElementById('session-editor-apply');
@@ -7542,6 +8039,152 @@ async function restoreSessionEditorOriginal() {
       btn.disabled = false;
     }
     if (applyBtn) applyBtn.disabled = false;
+  }
+}
+
+/* ── Split rollback (Undo Split) ─────────────────────────────────────────── */
+
+async function openSplitRestoreDialog(sessionId) {
+  const sid = sessionId || state.sessionId;
+  if (!sid) return;
+  let info;
+  try {
+    info = await fetch(`/api/sessions/${sid}/split-info`).then(r => r.json());
+  } catch (e) {
+    alert('Could not load split info: ' + (e.message || e));
+    return;
+  }
+  if (!info.has_backup) {
+    alert('No split backup available for this session.');
+    return;
+  }
+
+  // Build the modal DOM on demand (one per page; reused across opens)
+  let overlay = document.getElementById('split-restore-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.className = 'overlay hidden';
+    overlay.id = 'split-restore-overlay';
+    overlay.innerHTML = `
+      <div class="dialog split-restore-dialog">
+        <div class="split-restore-header">
+          <div class="split-restore-header-left">
+            <div class="split-restore-icon"><i class="fa-solid fa-rotate-left"></i></div>
+            <div>
+              <div class="split-restore-title">Undo Split</div>
+              <div class="split-restore-subtitle" id="split-restore-subtitle"></div>
+            </div>
+          </div>
+          <button class="icon-btn" onclick="closeSplitRestoreDialog()"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="split-restore-body">
+          <p class="split-restore-desc">
+            Recreates the original meeting from its pre-split backup.
+            Choose which split parts to delete along with the restore.
+            <b>Unchecked parts will be kept as standalone sessions.</b>
+          </p>
+          <div class="split-restore-parts" id="split-restore-parts"></div>
+        </div>
+        <div class="split-restore-actions">
+          <button class="split-restore-secondary" onclick="closeSplitRestoreDialog()">Cancel</button>
+          <button class="split-restore-primary" id="split-restore-confirm">Restore Original</button>
+        </div>
+      </div>`;
+    overlay.addEventListener('click', ev => { if (ev.target === overlay) closeSplitRestoreDialog(); });
+    document.body.appendChild(overlay);
+  }
+
+  // Populate the header and member checkboxes
+  const orig = info.original || {};
+  const subtitle = document.getElementById('split-restore-subtitle');
+  const whenTxt = orig.started_at ? _formatSplitRestoreDate(orig.started_at) : '';
+  subtitle.textContent = orig.title ? `"${orig.title}"${whenTxt ? ' · ' + whenTxt : ''}` : (whenTxt || '');
+
+  const list = document.getElementById('split-restore-parts');
+  list.innerHTML = '';
+  const members = info.members || [];
+  if (!members.length) {
+    list.innerHTML = '<p class="empty-hint">No split parts remain — restore will simply recreate the original.</p>';
+  } else {
+    members.forEach(m => {
+      const row = document.createElement('label');
+      row.className = 'split-restore-part' + (m.id === sid ? ' split-restore-part--self' : '');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.dataset.partId = m.id;
+      const title = document.createElement('span');
+      title.className = 'split-restore-part-title';
+      title.textContent = m.title || 'Untitled';
+      const meta = document.createElement('span');
+      meta.className = 'split-restore-part-meta';
+      const parts = [];
+      if (m.started_at) parts.push(_formatSplitRestoreDate(m.started_at));
+      if (m.id === sid) parts.push('current');
+      if (m.title_user_set) parts.push('renamed');
+      meta.textContent = parts.join(' · ');
+      row.appendChild(cb);
+      row.appendChild(title);
+      row.appendChild(meta);
+      list.appendChild(row);
+    });
+  }
+
+  // Wire the primary button fresh each open so `sid` is captured correctly
+  const confirm = document.getElementById('split-restore-confirm');
+  confirm.onclick = () => _doSplitRestore(sid);
+
+  overlay.classList.remove('hidden');
+}
+
+function closeSplitRestoreDialog() {
+  document.getElementById('split-restore-overlay')?.classList.add('hidden');
+}
+
+// Esc closes the split-restore dialog (registered once)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const ov = document.getElementById('split-restore-overlay');
+    if (ov && !ov.classList.contains('hidden')) closeSplitRestoreDialog();
+  }
+});
+
+function _formatSplitRestoreDate(iso) {
+  try {
+    const d = new Date(iso + 'Z');
+    return d.toLocaleString(undefined, {
+      month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    });
+  } catch { return iso || ''; }
+}
+
+async function _doSplitRestore(sessionId) {
+  const confirmBtn = document.getElementById('split-restore-confirm');
+  const deleteIds = [...document.querySelectorAll('#split-restore-parts input[type=checkbox]')]
+    .filter(cb => cb.checked)
+    .map(cb => cb.dataset.partId);
+
+  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = 'Restoring…'; }
+  try {
+    const r = await fetch(`/api/sessions/${sessionId}/restore-split`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delete_session_ids: deleteIds }),
+    }).then(r => r.json());
+    if (r.error) throw new Error(r.error);
+    closeSplitRestoreDialog();
+    // Close the session editor if open — the session it was editing may no
+    // longer exist (e.g. user checked "delete this part")
+    const ed = document.getElementById('session-editor-overlay');
+    if (ed && !ed.classList.contains('hidden')) closeSessionEditor();
+    await refreshSidebar();
+    if (r.restored_session_id) await loadSession(r.restored_session_id);
+    flashStatus('Original meeting restored');
+  } catch (e) {
+    alert('Restore failed: ' + (e.message || e));
+  } finally {
+    if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = 'Restore Original'; }
   }
 }
 
@@ -7589,6 +8232,9 @@ function destroyVideo() {
   _videoAvailable = false;
   _videoVisible = false;
   _videoOffset = 0;
+  // Exit fullscreen if we were in it
+  if (_videoMode === 'fullscreen') setVideoMode('compact');
+  resetVideoZoom();
   document.getElementById('video-viewer').classList.add('hidden');
   document.getElementById('playback-video-toggle').classList.add('hidden');
   const btn = document.getElementById('playback-video-toggle');
@@ -7609,7 +8255,199 @@ function toggleVideoViewer() {
     if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
   } else {
     _playbackVideo.pause();
+    // If we were in fullscreen, leave that mode too
+    if (_videoMode === 'fullscreen') setVideoMode('compact');
   }
+}
+
+/* ── Video mode (compact / fill / fullscreen) ─────────────────────────────── */
+let _videoMode = 'compact';   // 'compact' | 'fill' | 'fullscreen'
+const _VIDEO_MODE_CLASSES = {
+  compact:    '',
+  fill:       'video-viewer--fill',
+  fullscreen: 'video-viewer--fullscreen',
+};
+
+function setVideoMode(mode) {
+  if (!_VIDEO_MODE_CLASSES.hasOwnProperty(mode)) return;
+  const viewer = document.getElementById('video-viewer');
+  if (!viewer) return;
+  // If the viewer was hidden and user activated fill/fullscreen, open it first
+  if (viewer.classList.contains('hidden') && mode !== 'compact') {
+    if (_videoAvailable) {
+      _videoVisible = true;
+      viewer.classList.remove('hidden');
+      document.getElementById('playback-video-toggle')?.classList.add('active');
+      savePref('video_viewer_open', true);
+      _syncVideoToAudio();
+      if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
+    } else {
+      return;
+    }
+  }
+  // Toggle off if clicking the already-active non-compact mode
+  if (mode === _videoMode && mode !== 'compact') mode = 'compact';
+
+  _videoMode = mode;
+  viewer.dataset.videoMode = mode;
+  // Apply mode class
+  for (const [m, cls] of Object.entries(_VIDEO_MODE_CLASSES)) {
+    if (cls) viewer.classList.toggle(cls, m === mode);
+  }
+  // Body flag for fullscreen (used to float playback-bar over video)
+  document.body.classList.toggle('video-fullscreen', mode === 'fullscreen');
+
+  // Sync toolbar active state
+  const btnMap = { compact: 'video-btn-compact', fill: 'video-btn-fill', fullscreen: 'video-btn-fullscreen' };
+  for (const [m, id] of Object.entries(btnMap)) {
+    document.getElementById(id)?.classList.toggle('active', m === mode);
+  }
+  // Reset zoom on mode change (geometry changed, old translate is meaningless)
+  resetVideoZoom();
+  _syncPanelBottomRadius();
+  savePref('video_mode', mode);
+}
+
+/* ── Zoom / pan (wheel to zoom at cursor, drag to pan when zoomed) ────────── */
+let _videoZoom = { scale: 1, tx: 0, ty: 0 };
+let _videoZoomHintTimer = 0;
+
+function _videoClampTranslate() {
+  // Keep the video element within its viewport (don't allow scrolling past edges)
+  const vp = document.getElementById('video-viewport');
+  if (!vp) return;
+  const vpRect = vp.getBoundingClientRect();
+  const s = _videoZoom.scale;
+  const vidW = vpRect.width;   // video element is width:100% of viewport
+  const vidH = _playbackVideo.clientHeight || vpRect.height;
+  const scaledW = vidW * s;
+  const scaledH = vidH * s;
+  const minTx = Math.min(0, vpRect.width  - scaledW);
+  const minTy = Math.min(0, vpRect.height - scaledH);
+  _videoZoom.tx = Math.max(minTx, Math.min(0, _videoZoom.tx));
+  _videoZoom.ty = Math.max(minTy, Math.min(0, _videoZoom.ty));
+}
+
+function _videoApplyZoom() {
+  const v = _playbackVideo;
+  if (!v) return;
+  v.style.setProperty('--vz-scale', _videoZoom.scale.toFixed(4));
+  v.style.setProperty('--vz-tx', _videoZoom.tx.toFixed(2) + 'px');
+  v.style.setProperty('--vz-ty', _videoZoom.ty.toFixed(2) + 'px');
+  const vp = document.getElementById('video-viewport');
+  if (vp) vp.classList.toggle('zoomed', _videoZoom.scale > 1.001);
+  // Update hint
+  const hint = document.getElementById('video-zoom-hint');
+  if (hint) {
+    hint.textContent = Math.round(_videoZoom.scale * 100) + '%';
+    hint.classList.remove('hidden');
+    clearTimeout(_videoZoomHintTimer);
+    // Only auto-hide when back at 100%
+    if (_videoZoom.scale <= 1.001) {
+      _videoZoomHintTimer = setTimeout(() => hint.classList.add('hidden'), 900);
+    }
+  }
+}
+
+function resetVideoZoom() {
+  _videoZoom = { scale: 1, tx: 0, ty: 0 };
+  _videoApplyZoom();
+}
+
+function _videoZoomAt(viewportX, viewportY, factor) {
+  const oldScale = _videoZoom.scale;
+  let newScale = oldScale * factor;
+  newScale = Math.max(1, Math.min(8, newScale));
+  if (Math.abs(newScale - oldScale) < 1e-4) return;
+  // Keep the content point under the cursor fixed: tx' = mx - (mx - tx) * (newScale / oldScale)
+  const ratio = newScale / oldScale;
+  _videoZoom.tx = viewportX - (viewportX - _videoZoom.tx) * ratio;
+  _videoZoom.ty = viewportY - (viewportY - _videoZoom.ty) * ratio;
+  _videoZoom.scale = newScale;
+  _videoClampTranslate();
+  _videoApplyZoom();
+}
+
+function _initVideoZoomControls() {
+  const vp = document.getElementById('video-viewport');
+  if (!vp || vp._zoomWired) return;
+  vp._zoomWired = true;
+
+  // Wheel → zoom at cursor
+  vp.addEventListener('wheel', (e) => {
+    // Only intercept when viewer is visible
+    const viewer = document.getElementById('video-viewer');
+    if (!viewer || viewer.classList.contains('hidden')) return;
+    e.preventDefault();
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    // Exponential zoom feels natural; tune sensitivity via 0.0015
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    _videoZoomAt(mx, my, factor);
+  }, { passive: false });
+
+  // Double-click → reset
+  vp.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    resetVideoZoom();
+  });
+
+  // Drag → pan (only when zoomed)
+  let dragging = false;
+  let lastX = 0, lastY = 0;
+  vp.addEventListener('pointerdown', (e) => {
+    if (_videoZoom.scale <= 1.001) return;
+    // Don't start pan from the toolbar
+    if (e.target.closest('.video-toolbar')) return;
+    dragging = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    vp.classList.add('panning');
+    vp.setPointerCapture?.(e.pointerId);
+  });
+  vp.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX;
+    const dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    _videoZoom.tx += dx;
+    _videoZoom.ty += dy;
+    _videoClampTranslate();
+    _videoApplyZoom();
+  });
+  const endPan = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    vp.classList.remove('panning');
+    try { vp.releasePointerCapture?.(e.pointerId); } catch {}
+  };
+  vp.addEventListener('pointerup', endPan);
+  vp.addEventListener('pointercancel', endPan);
+  vp.addEventListener('pointerleave', endPan);
+
+  // Esc exits fullscreen
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && _videoMode === 'fullscreen') {
+      setVideoMode('compact');
+    }
+  });
+
+  // Re-clamp translate on resize (viewport dimensions changed)
+  window.addEventListener('resize', () => {
+    if (_videoZoom.scale > 1.001) {
+      _videoClampTranslate();
+      _videoApplyZoom();
+    }
+  });
+}
+
+// Wire up zoom controls as soon as the DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _initVideoZoomControls);
+} else {
+  _initVideoZoomControls();
 }
 
 function _audioToVideoTime(audioTime) {
@@ -8557,6 +9395,181 @@ async function clearChat() {
   }).catch(() => {});
 }
 
+/* ── Chat system prompt (global default + per-session override) ───────────── */
+let _builtinChatPrompt = '';        // fetched once; used for "Load built-in"
+let _sessionChatPrompt = null;      // current session's override (null when none)
+let _globalChatPromptSaveTimer = 0;
+
+async function _fetchBuiltinChatPrompt() {
+  if (_builtinChatPrompt) return _builtinChatPrompt;
+  try {
+    const r = await fetch('/api/chat/default-prompt').then(r => r.json());
+    _builtinChatPrompt = r.prompt || '';
+  } catch { _builtinChatPrompt = ''; }
+  return _builtinChatPrompt;
+}
+
+function _syncGlobalChatPromptUI() {
+  const ta  = document.getElementById('global-chat-prompt');
+  const st  = document.getElementById('global-chat-prompt-status');
+  if (!ta) return;
+  const val = (_prefs.chat_system_prompt || '').trim();
+  if (ta.value !== (_prefs.chat_system_prompt || '')) {
+    ta.value = _prefs.chat_system_prompt || '';
+  }
+  if (st) {
+    if (val) { st.textContent = 'Custom global prompt active'; st.classList.add('custom'); }
+    else     { st.textContent = 'Using built-in default';     st.classList.remove('custom'); }
+  }
+}
+
+function _globalChatPromptChanged(value) {
+  _prefs.chat_system_prompt = value;
+  clearTimeout(_globalChatPromptSaveTimer);
+  _globalChatPromptSaveTimer = setTimeout(() => {
+    savePref('chat_system_prompt', value);
+    _syncGlobalChatPromptUI();
+  }, 500);
+}
+
+function resetGlobalChatPrompt() {
+  const ta = document.getElementById('global-chat-prompt');
+  if (ta) ta.value = '';
+  _prefs.chat_system_prompt = '';
+  savePref('chat_system_prompt', '');
+  _syncGlobalChatPromptUI();
+}
+
+async function loadBuiltinIntoGlobal() {
+  const text = await _fetchBuiltinChatPrompt();
+  const ta = document.getElementById('global-chat-prompt');
+  if (!ta) return;
+  ta.value = text;
+  _globalChatPromptChanged(text);
+}
+
+/* ── Session-level override: chat-header gear icon + dialog ──────────────── */
+
+async function refreshSessionChatPromptBadge() {
+  // Keep the gear icon highlighted when an override is active.
+  const btn = document.getElementById('chat-prompt-btn');
+  if (!btn || !state.sessionId) { if (btn) btn.classList.remove('has-override'); _sessionChatPrompt = null; return; }
+  try {
+    const r = await fetch(`/api/sessions/${state.sessionId}/chat-prompt`).then(r => r.json());
+    _sessionChatPrompt = r.session_prompt || null;
+    btn.classList.toggle('has-override', !!_sessionChatPrompt);
+    btn.title = _sessionChatPrompt ? 'Session system prompt (custom)' : 'Session system prompt';
+  } catch {
+    btn.classList.remove('has-override');
+    _sessionChatPrompt = null;
+  }
+}
+
+async function openChatPromptDialog() {
+  if (!state.sessionId) return;
+  const overlay = document.getElementById('chat-prompt-overlay');
+  const ta      = document.getElementById('session-chat-prompt');
+  const chip    = document.getElementById('chat-prompt-source-chip');
+  const loadGlobalBtn = document.getElementById('chat-prompt-load-global-btn');
+  if (!overlay || !ta) return;
+
+  // Fetch all three layers in parallel
+  await _fetchBuiltinChatPrompt();
+  let r;
+  try {
+    r = await fetch(`/api/sessions/${state.sessionId}/chat-prompt`).then(r => r.json());
+  } catch {
+    r = { session_prompt: null, global_prompt: '', default_prompt: _builtinChatPrompt };
+  }
+  _sessionChatPrompt = r.session_prompt || null;
+
+  // Seed the textarea with the active prompt (or blank if falling back)
+  ta.value = _sessionChatPrompt || '';
+
+  // Source indicator: session / global / built-in
+  if (chip) {
+    if (_sessionChatPrompt) {
+      chip.textContent = 'Session override';
+      chip.classList.add('custom');
+    } else if ((r.global_prompt || '').trim()) {
+      chip.textContent = 'Global default';
+      chip.classList.remove('custom');
+    } else {
+      chip.textContent = 'Built-in default';
+      chip.classList.remove('custom');
+    }
+  }
+  // Disable the "Load global" button when there's no global to load
+  if (loadGlobalBtn) {
+    loadGlobalBtn.disabled = !(r.global_prompt || '').trim();
+    loadGlobalBtn._cachedGlobal = r.global_prompt || '';
+  }
+
+  overlay.classList.remove('hidden');
+  setTimeout(() => ta.focus(), 50);
+}
+
+function closeChatPromptDialog() {
+  document.getElementById('chat-prompt-overlay')?.classList.add('hidden');
+}
+
+function loadBuiltinIntoSession() {
+  const ta = document.getElementById('session-chat-prompt');
+  if (ta) ta.value = _builtinChatPrompt || '';
+}
+
+function loadGlobalIntoSession() {
+  const ta = document.getElementById('session-chat-prompt');
+  const btn = document.getElementById('chat-prompt-load-global-btn');
+  if (!ta) return;
+  const txt = (btn && btn._cachedGlobal) || _prefs.chat_system_prompt || '';
+  ta.value = txt;
+}
+
+async function saveSessionChatPrompt() {
+  if (!state.sessionId) return;
+  const ta = document.getElementById('session-chat-prompt');
+  const value = ta ? ta.value : '';
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/chat-prompt`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: value }),
+    });
+    _sessionChatPrompt = value.trim() ? value : null;
+    closeChatPromptDialog();
+    refreshSessionChatPromptBadge();
+  } catch (e) {
+    console.error('Failed to save session chat prompt', e);
+  }
+}
+
+async function clearSessionChatPrompt() {
+  if (!state.sessionId) return;
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/chat-prompt`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: null }),
+    });
+    _sessionChatPrompt = null;
+    const ta = document.getElementById('session-chat-prompt');
+    if (ta) ta.value = '';
+    closeChatPromptDialog();
+    refreshSessionChatPromptBadge();
+  } catch (e) {
+    console.error('Failed to clear session chat prompt', e);
+  }
+}
+
+// Esc closes the dialog
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const ov = document.getElementById('chat-prompt-overlay');
+    if (ov && !ov.classList.contains('hidden')) closeChatPromptDialog();
+  }
+});
+
 let _chatRequestId = null;  // tracks the active chat request for cancellation
 
 async function sendMessage() {
@@ -8882,11 +9895,13 @@ async function loadSession(sessionId) {
 
   clearAll();
   _setPlaybackEditTrimmed(!!data.has_trim_backup);
+  _setSessionSplitBackup(!!data.has_split_backup, data.split_group_id || null);
   state.sessionId     = sessionId;
   state.isViewingPast = true;
   history.pushState({}, '', '/session?id=' + sessionId);
   updateRecordBtn();
   _loadPaneVisible(sessionId);
+  refreshSessionChatPromptBadge();
 
   if (data.speaker_profiles?.length) {
     data.speaker_profiles.forEach(profile => applySpeakerProfileUpdate(profile));
@@ -9296,6 +10311,7 @@ function clearAll() {
   _manualNoiseKeys = new Set();
   _showOriginalKeys = false;
   _setPlaybackEditTrimmed(false);
+  _setSessionSplitBackup(false, null);
   const keysToggleBtn = document.getElementById('tn-pill-keys-toggle');
   if (keysToggleBtn) keysToggleBtn.classList.remove('active');
   _navState = { matches: [], currentIdx: -1 };
@@ -10057,19 +11073,21 @@ function toggleAutoScroll() {
 
 /* ── Settings modal ──────────────────────────────────────────────────────── */
 
+// Fallback model lists — used only if the backend hasn't returned its live
+// /models fetch yet (first paint before /api/ai_settings resolves). The
+// authoritative list lives on the server and auto-updates as providers ship
+// new versions; new Claude / GPT releases appear here without any code change.
 const AI_MODELS = {
   anthropic: [
-    { id: 'claude-opus-4-6',          label: 'Claude Opus 4.6 - most capable' },
-    { id: 'claude-sonnet-4-6',         label: 'Claude Sonnet 4.6 - recommended' },
-    { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 - fastest' },
+    { id: 'claude-opus-4-6',           label: 'Claude Opus 4.6' },
+    { id: 'claude-sonnet-4-6',         label: 'Claude Sonnet 4.6' },
+    { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
   ],
   openai: [
-    { id: 'gpt-5.4',              label: 'GPT-5.4 - most capable' },
-    { id: 'gpt-5.3-chat-latest',  label: 'GPT-5.3 - balance speed & smarts' },
-    { id: 'gpt-4.1',              label: 'GPT-4.1 - strong fallback' },
-    { id: 'gpt-4o',               label: 'GPT-4o - recommended' },
-    { id: 'gpt-4o-mini',          label: 'GPT-4o mini - fastest' },
-    { id: 'o4-mini',              label: 'o4-mini - reasoning' },
+    { id: 'gpt-5.4',              label: 'GPT-5.4' },
+    { id: 'gpt-5.3-chat-latest',  label: 'GPT-5.3 chat (latest)' },
+    { id: 'gpt-4o',               label: 'GPT-4o' },
+    { id: 'gpt-4o-mini',          label: 'GPT-4o mini' },
   ],
 };
 let currentAiModels = { ...AI_MODELS };
@@ -10251,6 +11269,42 @@ async function setAiModel(model) {
     _applyToolOverrides();
     _updateSessionModelLabels();
   } catch (_) {}
+}
+
+async function refreshAiModels() {
+  // Force the backend to drop its /models cache and re-fetch both providers.
+  // Shows a spinner on the refresh button while we wait.
+  const btn = document.getElementById('ai-model-refresh-btn');
+  const icon = btn?.querySelector('i');
+  const prevClass = icon?.className;
+  if (btn) btn.disabled = true;
+  if (icon) icon.className = 'fa-solid fa-rotate fa-spin';
+  try {
+    const r = await fetch('/api/ai_settings/models/refresh', { method: 'POST' })
+      .then(r => r.json());
+    if (r.models) {
+      currentAiModels = { ...AI_MODELS, ...r.models };
+      // Re-render the model dropdown. If the user's current pick has been
+      // replaced by a newer alias (e.g. 4-6 → 4-7), we persist the new one.
+      const provider = _currentAiProvider;
+      const validIds = (currentAiModels[provider] || []).map(m => m.id);
+      let model = _currentAiModel;
+      if (!validIds.includes(model) && validIds.length) model = validIds[0];
+      _applyAiConfig(provider, model, currentAiModels);
+      if (model !== _currentAiModel) {
+        // Persist the new default to the server
+        await setAiModel(model);
+      }
+      _applyToolOverrides();
+      _updateSessionModelLabels();
+      flashStatus('Model list refreshed');
+    }
+  } catch (e) {
+    flashStatus('Refresh failed: ' + (e.message || e));
+  } finally {
+    if (btn) btn.disabled = false;
+    if (icon) icon.className = prevClass || 'fa-solid fa-rotate';
+  }
 }
 
 /* ── Per-tool provider/model overrides ──────────────────────────────── */

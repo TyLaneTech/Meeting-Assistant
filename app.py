@@ -142,6 +142,9 @@ _recording_cleanup_done.set()                 # initially "done" (no cleanup pen
 _screen_recorder = ScreenRecorder()
 _chat_cancel: dict[str, threading.Event] = {}  # request_id → cancel event
 _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
+# Thread pool for bulk auto-title regeneration. AI calls are network-bound so
+# concurrency >> CPU count is fine; capped at 4 to avoid hammering the LLM API.
+_retitle_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retitle")
 _tray = None  # MeetingTray instance (set in main(), None if no tray)
 _server_url = f"http://127.0.0.1:{int(os.getenv('PORT', 6969))}"
 _quiet_audio_rms_threshold = float(settings.get("quiet_prompt_audio_rms_threshold", 0.006))
@@ -822,6 +825,10 @@ def _start_background_initializers() -> None:
     threading.Thread(target=_load_diarizer, daemon=True).start()
     threading.Thread(target=_load_fingerprint_db, daemon=True).start()
     threading.Thread(target=_load_text_embeddings, daemon=True).start()
+    # Warm the AI /models cache so the settings pane opens instantly on first
+    # visit. Non-blocking; if the network is slow/unreachable the fallback
+    # static lists are used until the fetch completes.
+    threading.Thread(target=_get_all_models_live, daemon=True).start()
 
 
 def _level_push_loop() -> None:
@@ -1215,6 +1222,12 @@ def get_session(session_id: str):
     data["has_video"] = video_path.exists()
     data["video_offset"] = float(settings.get(f"video_offset_{session_id}", 0))
     data["has_trim_backup"] = media_edit.has_trim_backup(session_id)
+    # Split rollback: true when this session is part of a split group whose
+    # pre-split backup is still on disk. The editor uses this to surface an
+    # "Undo Split" action.
+    group_id = data.get("split_group_id") or storage.get_session_split_group_id(session_id)
+    data["split_group_id"]  = group_id
+    data["has_split_backup"] = bool(group_id) and media_edit.has_split_backup(group_id)
     return jsonify(data)
 
 
@@ -1531,12 +1544,17 @@ def stop_recording():
                 seg_count = len(_state.get("segments", []))
                 log.info("recording", f"Stopped - session {sid} ({seg_count} segments)")
             _push_status({"recording": False, "session_id": sid})
-            # Auto-title: use full formatted transcript (with speaker labels) for better context
+            # Auto-title: use full formatted transcript (with speaker labels) for better context.
+            # Skip entirely if the user has manually renamed the session — their title wins.
             if sid and (transcript_snapshot or plain_snapshot).strip():
-                title = ai.generate_title(transcript_snapshot or plain_snapshot)
-                if title:
-                    storage.update_session_title(sid, title)
-                    _push("session_title", {"session_id": sid, "title": title})
+                if storage.is_title_user_set(sid):
+                    log.info("recording", f"Skipping auto-title for {sid}: user-set title is locked")
+                else:
+                    ctx = storage.get_title_generation_context(sid)
+                    title = ai.generate_title(transcript_snapshot or plain_snapshot, context=ctx)
+                    if title:
+                        storage.update_session_title(sid, title, user_set=False)
+                        _push("session_title", {"session_id": sid, "title": title})
         finally:
             _recording_cleanup_done.set()
 
@@ -1727,18 +1745,20 @@ def settings_status():
 
 # ── AI provider / model settings ──────────────────────────────────────────────
 
-# Available models per provider (ordered: most capable first)
+# Fallback model lists — used only when the provider's /models endpoint is
+# unreachable (no key, offline, rate-limited). The auto-discovery below is the
+# authoritative source; keep these minimal and reasonably current.
 _AI_MODELS = {
     "anthropic": [
-        {"id": "claude-opus-4-6",           "label": "Claude Opus 4.6"},
+        {"id": "claude-opus-4-6",            "label": "Claude Opus 4.6"},
         {"id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4.6"},
         {"id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4.5"},
     ],
     "openai": [
         {"id": "gpt-5.4",              "label": "GPT-5.4"},
-        {"id": "gpt-5.3-chat-latest",  "label": "GPT-5.3"},
-        {"id": "gpt-4o",       "label": "GPT-4o"},
-        {"id": "gpt-4o-mini",  "label": "GPT-4o mini"},
+        {"id": "gpt-5.3-chat-latest",  "label": "GPT-5.3 chat"},
+        {"id": "gpt-4o",               "label": "GPT-4o"},
+        {"id": "gpt-4o-mini",          "label": "GPT-4o mini"},
     ],
 }
 
@@ -1748,16 +1768,31 @@ _DEFAULT_MODEL = {
 }
 
 # OpenAI model filtering
-_OPENAI_CHAT_PREFIXES = ("gpt-5", "gpt-4", "gpt-3.5-turbo", "o1", "o3", "o4", "chatgpt-4o")
+_OPENAI_CHAT_PREFIXES = ("gpt-5", "gpt-4", "gpt-3.5-turbo", "o1", "o3", "o4", "o5",
+                         "chatgpt-4o")
 _OPENAI_EXCLUDE = (
     "realtime", "-audio-", "-transcribe", "-tts", "whisper", "dall-e",
     "embedding", "davinci", "babbage", "curie", "ada", "-search-",
-    "instruct", "moderation",
+    "instruct", "moderation", "-image-", "-preview-", "omni-moderation",
 )
 
+# Models cache (keyed by provider) — keeps the UI snappy and avoids hammering
+# provider APIs on every page load. Short TTL so a newly-released model shows
+# up within ~half an hour without a manual refresh.
+_AI_MODELS_CACHE: dict[str, dict] = {"anthropic": {}, "openai": {}}
+_AI_MODELS_TTL_SEC = 30 * 60
+_AI_MODELS_CACHE_LOCK = threading.Lock()
 
-def _models_for_provider(provider: str) -> list[dict]:
-    """Return the configured model list for a provider."""
+
+def _models_for_provider(provider: str, live_models: dict | None = None) -> list[dict]:
+    """Return the configured model list for a provider.
+
+    If ``live_models`` is supplied, it's the live, cached fetch result and is
+    preferred over the static fallback. That way normalization and selection
+    always see the freshest set of models.
+    """
+    if live_models and live_models.get(provider):
+        return live_models[provider]
     return _AI_MODELS.get(provider, _AI_MODELS["openai"])
 
 
@@ -1768,40 +1803,103 @@ def _resolve_tool_ai(tool: str) -> tuple[str | None, str | None]:
     return (p, m)
 
 
-def _normalize_ai_selection(provider: str, model: str | None) -> tuple[str, str]:
-    """Ensure provider/model are valid and aligned with each other."""
+def _normalize_ai_selection(
+    provider: str,
+    model: str | None,
+    live_models: dict | None = None,
+) -> tuple[str, str]:
+    """Ensure provider/model are valid and aligned with each other.
+
+    When ``live_models`` is provided, the model must be in the live fetched
+    list for that provider. This keeps auto-upgrades clean: if a stored model
+    id no longer exists (because its moving alias was replaced or deprecated),
+    we fall back to the provider's declared default.
+    """
     provider = provider if provider in _AI_MODELS else "openai"
-    valid_ids = {m["id"] for m in _models_for_provider(provider)}
+    models = _models_for_provider(provider, live_models)
+    valid_ids = {m["id"] for m in models}
     if model in valid_ids:
         return provider, model
-    return provider, _DEFAULT_MODEL.get(provider, next(iter(valid_ids), ""))
+    # Auto-upgrade within the same class for Anthropic — preserves the user's
+    # intent across version bumps. If they had ``claude-opus-4-6`` saved and
+    # the live list now only contains ``claude-opus-4-7``, we hand them 4-7
+    # instead of silently falling through to Sonnet (the default).
+    if provider == "anthropic" and model:
+        prev_match = _ANTHROPIC_CLASS_RE.match(model)
+        if prev_match:
+            prev_cls = prev_match.group(1)
+            for candidate in models:
+                cm = _ANTHROPIC_CLASS_RE.match(candidate["id"])
+                if cm and cm.group(1) == prev_cls:
+                    return provider, candidate["id"]
+    # Prefer declared default if it's still valid; otherwise pick the first
+    # (most-capable / newest-first) entry from the provider's model list.
+    fallback = _DEFAULT_MODEL.get(provider)
+    if fallback in valid_ids:
+        return provider, fallback
+    if valid_ids:
+        return provider, models[0]["id"]
+    return provider, ""
 
+
+# ── Anthropic auto-discovery ──────────────────────────────────────────────────
+# Anthropic's model ids are systematically structured:
+#   claude-<class>-<version>[-<date>]   e.g. claude-opus-4-6-20260101
+# We parse class (opus / sonnet / haiku / …), version (tuple like (4, 6)), and
+# date suffix so we can pick the latest version of each class automatically.
+# When "claude-opus-4-7" is released it cleanly replaces 4-6 in the opus slot.
 
 _ANTHROPIC_CLASS_RE = re.compile(
-    r"^claude-(\w+)-(\d+(?:-\d+)*)(?:-(\d{8}))?(?:-latest)?$"
+    r"^claude-([a-z]+(?:-\d+)?)-(\d+(?:-\d+)*)(?:-(\d{8}))?(?:-latest)?$"
 )
+_ANTHROPIC_CLASS_ORDER = ["opus", "sonnet", "haiku"]  # display order
+
+def _anthropic_label_from_id(mid: str, fallback: str = "") -> str:
+    """Build a clean picker label like "Opus 4.7" from an Anthropic model id.
+
+    The Anthropic API's ``display_name`` strips the minor version (returning
+    just "Claude Opus 4" for ``claude-opus-4-7``), which is ambiguous when
+    multiple minor revisions exist — we parse the id ourselves instead.
+    Falls back to ``fallback`` (or the id) if the regex doesn't match.
+    """
+    match = _ANTHROPIC_CLASS_RE.match(mid)
+    if not match:
+        return fallback or mid
+    cls = match.group(1).replace("-", " ").title()   # "opus" → "Opus"
+    ver = match.group(2).replace("-", ".")           # "4-7"  → "4.7"
+    return f"{cls} {ver}"
+
 
 def _anthropic_latest_only(models: list[dict]) -> list[dict]:
-    """Keep only the latest version of each Anthropic model class."""
+    """Keep only the latest version per Anthropic class (opus/sonnet/haiku).
+
+    Also rewrites each surviving row's ``label`` to the clean ``Opus 4.7``
+    format derived from its id, regardless of what the API returned.
+    """
     best: dict[str, dict] = {}
     for m in models:
-        match = _ANTHROPIC_CLASS_RE.match(m["id"])
+        mid = m.get("id", "")
+        match = _ANTHROPIC_CLASS_RE.match(mid)
         if not match:
             continue
-        cls = match.group(1)           # e.g. "opus", "sonnet", "haiku"
-        ver = tuple(int(x) for x in match.group(2).split("-"))  # (4, 6)
-        date = match.group(3) or ""    # e.g. "20251001" or ""
-        key = (ver, date)
+        cls = match.group(1)
+        ver = tuple(int(x) for x in match.group(2).split("-"))
+        date = match.group(3) or ""
+        # Prefer versioned aliases ("claude-opus-4-7") over dated snapshots
+        # ("claude-opus-4-7-20260101") so the picker stores the moving alias
+        # rather than a pinned snapshot — that's what makes auto-upgrade work.
+        alias_preference = 0 if date else 1
+        key = (ver, alias_preference, date)
         prev = best.get(cls)
         if prev is None or key > prev["_sort"]:
             best[cls] = {**m, "_sort": key}
-    order = ["opus", "sonnet", "haiku"]
-    ordered = [best[c] for c in order if c in best]
+    ordered = [best[c] for c in _ANTHROPIC_CLASS_ORDER if c in best]
     for cls in sorted(best.keys()):
-        if cls not in order:
+        if cls not in _ANTHROPIC_CLASS_ORDER:
             ordered.append(best[cls])
     for m in ordered:
         m.pop("_sort", None)
+        m["label"] = _anthropic_label_from_id(m.get("id", ""), m.get("label", ""))
     return ordered or models
 
 
@@ -1809,26 +1907,123 @@ def _fetch_anthropic_models() -> list[dict]:
     """Fetch Claude models from the Anthropic API. Falls back to static list."""
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key:
-        return _AI_MODELS["anthropic"]
+        return list(_AI_MODELS["anthropic"])
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=key)
         page = client.models.list()
         result = [
-            {"id": m.id, "label": getattr(m, "display_name", m.id)}
+            {"id": m.id, "label": getattr(m, "display_name", None) or m.id}
             for m in page.data
         ]
-        return _anthropic_latest_only(result) if result else _AI_MODELS["anthropic"]
+        return _anthropic_latest_only(result) if result else list(_AI_MODELS["anthropic"])
     except Exception as e:
         log.warn("ai", f"Failed to fetch Anthropic models: {e}")
-        return _AI_MODELS["anthropic"]
+        return list(_AI_MODELS["anthropic"])
+
+
+# ── OpenAI auto-discovery ─────────────────────────────────────────────────────
+# OpenAI's naming is NOT monotonically versioned (e.g. gpt-5.4 may be a
+# reasoning model distinct from the chat-tuned gpt-5.3), so we do NOT collapse
+# to "latest per family" the way Anthropic does. Instead we expose every
+# chat-capable text model from /models — the user picks what they want. New
+# releases show up automatically in the picker without any code changes.
+
+def _prettify_openai_label(mid: str) -> str:
+    """Turn a raw OpenAI model id into a human-friendly picker label.
+
+    Examples:
+      gpt-5.4                  → "GPT-5.4"
+      gpt-5.3-chat-latest      → "GPT-5.3 chat (latest)"
+      gpt-5-mini               → "GPT-5 mini"
+      gpt-4o                   → "GPT-4o"
+      gpt-4o-mini              → "GPT-4o mini"
+      chatgpt-4o-latest        → "ChatGPT-4o (latest)"
+      o3                       → "o3 reasoning"
+      o4-mini                  → "o4 mini reasoning"
+      gpt-5.3-2026-02-15       → "GPT-5.3 (2026-02-15)"
+    """
+    s = mid
+    # Split off YYYY-MM-DD date stamp
+    date_suffix = ""
+    date_match = re.search(r"-(20\d{2}-\d{2}-\d{2})$", s)
+    if date_match:
+        date_suffix = f" ({date_match.group(1)})"
+        s = s[: date_match.start()]
+
+    # Specific tails we want to format nicely
+    latest = ""
+    if s.endswith("-latest"):
+        latest = " (latest)"
+        s = s[: -len("-latest")]
+
+    # Tier suffixes we surface inline
+    tier = ""
+    for t in ("-mini", "-nano", "-turbo", "-pro", "-chat", "-preview"):
+        if s.endswith(t):
+            tier = " " + t[1:]  # drop the leading hyphen
+            s = s[: -len(t)]
+            break
+
+    # Base family: GPT-{ver}, ChatGPT-{...}, o-series, etc.
+    base = s
+    if s.startswith("gpt-"):
+        base = "GPT-" + s[len("gpt-"):]
+    elif s.startswith("chatgpt-"):
+        base = "ChatGPT-" + s[len("chatgpt-"):]
+    elif re.match(r"^o\d+$", s):
+        # o1 / o3 / o4 — brand this as "reasoning" only at the tail so the
+        # user can tell them apart from chat models at a glance.
+        return f"{s}{tier if tier else ''} reasoning{date_suffix}"
+
+    return f"{base}{tier}{latest}{date_suffix}"
+
+
+_OPENAI_DATE_SUFFIX_RE = re.compile(r"-20\d{2}-\d{2}-\d{2}$")
+
+def _collapse_openai_snapshots(entries: list[dict]) -> list[dict]:
+    """Drop dated OpenAI snapshots when an undated alias exists.
+
+    OpenAI publishes both moving aliases (``gpt-5.4-mini``) and pinned
+    snapshots (``gpt-5.4-mini-2026-03-17``) — each referring to the same
+    family. The alias auto-upgrades; the snapshot is frozen. We show only the
+    alias when both are present, which is what "always the latest" means
+    within a given family. If a family happens to exist ONLY as a snapshot
+    (no alias), we keep the most recent snapshot so the family isn't lost.
+    """
+    by_base: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for e in entries:
+        base = _OPENAI_DATE_SUFFIX_RE.sub("", e.get("id", ""))
+        if base not in by_base:
+            order.append(base)
+            by_base[base] = []
+        by_base[base].append(e)
+    kept: list[dict] = []
+    for base in order:
+        family = by_base[base]
+        # If the undated alias ("base" itself) exists in the family, use it.
+        alias = next((m for m in family if m.get("id") == base), None)
+        if alias:
+            kept.append(alias)
+        else:
+            # No moving pointer — keep the newest dated snapshot so the
+            # family still appears, but rewrite its label to the clean
+            # base-id form so the picker never shows a "(YYYY-MM-DD)" tag.
+            kept.append(family[0])
+    # Uniformly rewrite labels from the date-stripped base id so the picker
+    # looks the same whether an entry is an alias or the newest snapshot.
+    for e in kept:
+        base = _OPENAI_DATE_SUFFIX_RE.sub("", e.get("id", ""))
+        e["label"] = _prettify_openai_label(base)
+    return kept
 
 
 def _fetch_openai_models() -> list[dict]:
     """Fetch chat-capable models from the OpenAI API. Falls back to static list."""
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        return _AI_MODELS["openai"]
+        return list(_AI_MODELS["openai"])
     try:
         from openai import OpenAI
         client = OpenAI(api_key=key)
@@ -1841,33 +2036,102 @@ def _fetch_openai_models() -> list[dict]:
             return any(m.startswith(p) for p in _OPENAI_CHAT_PREFIXES)
 
         filtered = [m for m in all_models if _is_chat(m.id)]
+        # Sort newest-first so within each family the aliased (undated) id is
+        # encountered first where it exists, and so snapshot-only families
+        # come out with their most recent dated release at index 0.
         filtered.sort(key=lambda m: (-m.created, m.id))
-        result = [{"id": m.id, "label": m.id} for m in filtered]
-        return result or _AI_MODELS["openai"]
+        staged = [
+            {"id": m.id, "label": _prettify_openai_label(m.id)}
+            for m in filtered
+        ]
+        collapsed = _collapse_openai_snapshots(staged)
+        return collapsed or list(_AI_MODELS["openai"])
     except Exception as e:
         log.warn("ai", f"Failed to fetch OpenAI models: {e}")
-        return _AI_MODELS["openai"]
+        return list(_AI_MODELS["openai"])
+
+
+# ── Cached lookup with TTL + parallel prefetch ───────────────────────────────
+
+_AI_MODELS_FETCHERS = {
+    "anthropic": _fetch_anthropic_models,
+    "openai":    _fetch_openai_models,
+}
+
+def _get_models_cached(provider: str, *, force_refresh: bool = False) -> list[dict]:
+    """Return the model list for a provider, re-fetching if stale.
+
+    Thread-safe: workers racing to refresh a provider's list will coalesce on
+    a single lock (so we never fire two /models requests at once for the same
+    provider).
+    """
+    fetcher = _AI_MODELS_FETCHERS.get(provider, _fetch_openai_models)
+    now = time.time()
+    with _AI_MODELS_CACHE_LOCK:
+        entry = _AI_MODELS_CACHE.get(provider) or {}
+        cached = entry.get("data")
+        expires = entry.get("expires", 0)
+        if not force_refresh and cached and expires > now:
+            return cached
+    # Fetch outside the lock — it's a network call and may take a second.
+    fresh = fetcher()
+    with _AI_MODELS_CACHE_LOCK:
+        _AI_MODELS_CACHE[provider] = {
+            "data": fresh,
+            "expires": time.time() + _AI_MODELS_TTL_SEC,
+        }
+    return fresh
+
+
+def _get_all_models_live(*, force_refresh: bool = False) -> dict[str, list[dict]]:
+    """Prefetch both providers' model lists in parallel and return as a dict
+    suitable for the ``models`` field of /api/ai_settings responses."""
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="models-fetch") as ex:
+        futs = {
+            p: ex.submit(_get_models_cached, p, force_refresh=force_refresh)
+            for p in _AI_MODELS_FETCHERS
+        }
+        out = {}
+        for p, fut in futs.items():
+            try:
+                out[p] = fut.result(timeout=8)
+            except Exception as e:
+                log.warn("ai", f"live model fetch for {p} timed out: {e}")
+                out[p] = list(_AI_MODELS.get(p, []))
+    return out
 
 
 @app.route("/api/ai_settings/models")
 def get_ai_settings_models():
-    """Return available models for a provider, fetched live from the API."""
+    """Return available models for a provider, fetched live (cached)."""
     provider = request.args.get("provider", ai.provider)
-    if provider == "openai":
-        models = _fetch_openai_models()
-    else:
-        models = _fetch_anthropic_models()
+    force = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    models = _get_models_cached(provider, force_refresh=force)
     return jsonify({"provider": provider, "models": models})
+
+
+@app.route("/api/ai_settings/models/refresh", methods=["POST"])
+def refresh_ai_models():
+    """Drop caches and re-fetch both providers' model lists."""
+    models = _get_all_models_live(force_refresh=True)
+    return jsonify({"ok": True, "models": models})
 
 
 @app.route("/api/ai_settings", methods=["GET"])
 def get_ai_settings():
-    """Return current AI provider, model, per-tool overrides, and available options."""
-    provider, model = _normalize_ai_selection(ai.provider, ai.model)
+    """Return current AI provider, model, per-tool overrides, and available options.
+
+    The ``models`` dict reflects the live, cached /models listing from each
+    provider — so a freshly-released Claude Opus 4.7 appears automatically
+    within one cache window (~30 min) or immediately after hitting the
+    "Refresh models" action.
+    """
+    live_models = _get_all_models_live()
+    provider, model = _normalize_ai_selection(ai.provider, ai.model, live_models)
     return jsonify({
         "provider": provider,
         "model": model,
-        "models": _AI_MODELS,
+        "models": live_models,
         "summary_provider": settings.get("summary_provider"),
         "summary_model": settings.get("summary_model"),
         "chat_provider": settings.get("chat_provider"),
@@ -2685,10 +2949,16 @@ def chat():
             fe = _saving_extractor
 
         cp, cm = _resolve_tool_ai("chat")
+        # Resolve effective system prompt: session override > global preference
+        # > built-in default (handled inside ai.ask when system_prompt is None).
+        session_prompt = storage.get_session_chat_prompt(session_id)
+        global_prompt = settings.get("chat_system_prompt") or None
+        effective_prompt = session_prompt or global_prompt
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
                cancel=cancel_event, frame_extractor=fe,
                on_tool_event=on_tool_event,
-               provider=cp, model=cm)
+               provider=cp, model=cm,
+               system_prompt=effective_prompt)
 
     threading.Thread(target=run_chat, daemon=True).start()
     return jsonify({"request_id": request_id})
@@ -2720,6 +2990,37 @@ def chat_clear():
         if _state["session_id"] == sid:
             _state["chat_history"] = []
     return jsonify({"ok": True})
+
+
+# ── Chat system prompt (built-in default, global override, per-session override)
+
+@app.route("/api/chat/default-prompt", methods=["GET"])
+def api_chat_default_prompt():
+    """Return the built-in default chat system prompt (read-only)."""
+    return jsonify({"prompt": AIAssistant._SYSTEM_QA})
+
+
+@app.route("/api/sessions/<sid>/chat-prompt", methods=["GET"])
+def api_get_session_chat_prompt(sid):
+    """Return all three prompt layers so the UI can show what's in effect."""
+    return jsonify({
+        "session_prompt": storage.get_session_chat_prompt(sid),
+        "global_prompt":  settings.get("chat_system_prompt") or "",
+        "default_prompt": AIAssistant._SYSTEM_QA,
+    })
+
+
+@app.route("/api/sessions/<sid>/chat-prompt", methods=["PUT"])
+def api_set_session_chat_prompt(sid):
+    """Store a per-session chat prompt override. Empty string or null clears."""
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt")
+    if isinstance(prompt, str) and prompt.strip() == "":
+        prompt = None
+    if prompt is not None and not isinstance(prompt, str):
+        return jsonify({"error": "prompt must be a string or null"}), 400
+    storage.set_session_chat_prompt(sid, prompt)
+    return jsonify({"ok": True, "session_prompt": prompt})
 
 
 # ── Global Chat ──────────────────────────────────────────────────────────────
@@ -3030,7 +3331,17 @@ def get_analytics():
 
 @app.route("/api/sessions/<session_id>", methods=["DELETE"])
 def delete_session(session_id: str):
+    # If this is the last surviving member of a split group, the rollback
+    # backup is now orphaned — clean it up to reclaim disk space.
+    group_id = storage.get_session_split_group_id(session_id)
     storage.delete_session(session_id)
+    if group_id:
+        try:
+            remaining = storage.list_split_group_members(group_id)
+            if not remaining:
+                media_edit.clear_split_backup(group_id)
+        except Exception:
+            pass  # best-effort
     return jsonify({"ok": True})
 
 
@@ -3385,6 +3696,13 @@ def split_session(session_id: str):
         return jsonify({"error": "FFmpeg is required to split a session with screen recording video"}), 500
     created: list[str] = []
     results: list[dict] = []
+    src_title = source.get("title") or "Meeting"
+    # Every part produced by this split shares one group id. Writing it into
+    # the sessions table lets any part look up its siblings later (restore UI)
+    # and lets the backup directory be keyed by the group rather than by the
+    # about-to-be-deleted source session id.
+    group_id = str(uuid.uuid4())
+    should_delete_original = data.get("delete_original", True)
     try:
         for idx, r in enumerate(ranges, start=1):
             start_sec = float(r.get("start", 0))
@@ -3392,8 +3710,23 @@ def split_session(session_id: str):
             ok, err, _duration = _validate_media_range(session_id, start_sec, end_sec)
             if not ok:
                 raise ValueError(err)
-            title = (r.get("title") or "").strip() or f"{source['title']} - Part {idx}"
-            new_sid = storage.create_split_session(session_id, start_sec, end_sec, title=title)
+            # Default titling: Part 1 inherits the original title verbatim,
+            # subsequent parts get "<title> Part N". User-supplied titles win.
+            user_title = (r.get("title") or "").strip()
+            if user_title:
+                title = user_title
+            elif idx == 1:
+                title = src_title
+            else:
+                title = f"{src_title} Part {idx}"
+            # Only tag parts with the split group id if the original will be
+            # deleted (i.e. a real, undoable split). If the caller chooses to
+            # keep the original, the "parts" are more like clips — no rollback
+            # is needed and the group link would be misleading.
+            new_sid = storage.create_split_session(
+                session_id, start_sec, end_sec, title=title,
+                split_group_id=group_id if should_delete_original else None,
+            )
             created.append(new_sid)
             media_edit.trim_wav_file(source_audio, media_edit.wav_path(new_sid), start_sec, end_sec)
             if source_video.exists():
@@ -3415,10 +3748,34 @@ def split_session(session_id: str):
                 "duration": end_sec - start_sec,
                 "video_offset": new_offset,
             })
-        if data.get("delete_original"):
+
+        # Splitting one meeting into N parts produces N sessions, not N+1 —
+        # the source is replaced by its parts. Default to True; clients can
+        # opt out by sending {"delete_original": false}.
+        if should_delete_original:
+            # MUST snapshot the source before deleting it — this is the sole
+            # rollback path for splits. Raise if it fails so we don't lose the
+            # ability to undo.
+            try:
+                media_edit.create_split_backup(
+                    group_id=group_id,
+                    source_session_id=session_id,
+                    source_session=source,
+                    video_offset=source_video_offset,
+                    part_session_ids=list(created),
+                )
+            except Exception as e:
+                # Abort: undo everything and fail the request. Safer than
+                # leaving the user with split parts and no rollback.
+                raise RuntimeError(f"Could not snapshot original for rollback: {e}")
             storage.delete_session(session_id)
-        return jsonify({"ok": True, "sessions": results})
+        return jsonify({
+            "ok": True,
+            "sessions": results,
+            "split_group_id": group_id if should_delete_original else None,
+        })
     except Exception as e:
+        # Roll back every new part and any split backup we managed to write
         for sid in created:
             try:
                 storage.delete_session(sid)
@@ -3427,8 +3784,142 @@ def split_session(session_id: str):
                     vp.unlink()
             except Exception:
                 pass
+        try:
+            media_edit.clear_split_backup(group_id)
+        except Exception:
+            pass
         log.error("media", f"split failed for {session_id[:8]}: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sessions/<session_id>/split-info", methods=["GET"])
+def split_info(session_id: str):
+    """Report whether a split-rollback is available for this session.
+
+    Returns the group id, the list of current sibling parts (so the UI can
+    render the "delete these parts?" checklist), and the backup metadata
+    (original title + timestamp) so the confirm dialog can show a meaningful
+    summary. Returns ``has_backup: false`` if this session isn't part of a
+    split group or the backup on disk has been deleted.
+    """
+    group_id = storage.get_session_split_group_id(session_id)
+    if not group_id or not media_edit.has_split_backup(group_id):
+        return jsonify({"has_backup": False})
+    snapshot = media_edit.load_split_snapshot(group_id) or {}
+    snap_session = snapshot.get("session") or {}
+    return jsonify({
+        "has_backup": True,
+        "group_id": group_id,
+        "original": {
+            "title":      snap_session.get("title"),
+            "started_at": snap_session.get("started_at"),
+            "ended_at":   snap_session.get("ended_at"),
+        },
+        "members": storage.list_split_group_members(group_id),
+    })
+
+
+@app.route("/api/sessions/<session_id>/restore-split", methods=["POST"])
+def restore_split(session_id: str):
+    """Recreate the pre-split original session from its backup.
+
+    Body: ``{"delete_session_ids": ["..."]}`` — part sessions to delete in the
+    same transaction (typically all siblings). Any sibling not in this list
+    stays alive as a standalone session (its ``split_group_id`` is cleared so
+    the restore button disappears for it).
+
+    Safety rails:
+      - Every id in ``delete_session_ids`` MUST belong to the same split
+        group as ``session_id``. We never delete arbitrary sessions.
+      - Returns 409 if the backup has gone missing between the info fetch
+        and the restore click.
+      - Returns the new restored session id so the client can navigate to it.
+    """
+    with _state_lock:
+        if _state["is_recording"]:
+            active = _state["session_id"]
+            group_id = storage.get_session_split_group_id(session_id)
+            if active and group_id == storage.get_session_split_group_id(active):
+                return jsonify({"error": "Cannot restore while a related session is recording"}), 400
+
+    group_id = storage.get_session_split_group_id(session_id)
+    if not group_id:
+        return jsonify({"error": "This session is not part of a split group"}), 404
+    if not media_edit.has_split_backup(group_id):
+        return jsonify({"error": "Split backup is missing (already restored or manually deleted)"}), 409
+
+    snapshot = media_edit.load_split_snapshot(group_id)
+    if not snapshot:
+        return jsonify({"error": "Split backup manifest could not be read"}), 500
+    snap_session = snapshot.get("session") or {}
+
+    # Validate the user-chosen delete list: every id must be in this split
+    # group. Defensive — the UI already enforces it, but this is the API.
+    members = storage.list_split_group_members(group_id)
+    member_ids = {m["id"] for m in members}
+    data = request.get_json(silent=True) or {}
+    raw_delete = [str(x) for x in (data.get("delete_session_ids") or []) if x]
+    delete_ids = [i for i in raw_delete if i in member_ids]
+    invalid = [i for i in raw_delete if i not in member_ids]
+    if invalid:
+        return jsonify({"error": f"Session(s) not in this split group: {invalid}"}), 400
+
+    keep_ids = [m["id"] for m in members if m["id"] not in delete_ids]
+
+    # Create the restored session row. We use a FRESH uuid (the original id
+    # is gone; reusing it is fraught because anything that referenced it by
+    # path - screenshots, attachments - was cleaned by delete_session).
+    restored_id = storage.create_session(
+        title=snap_session.get("title") or "Restored Meeting",
+        started_at=snap_session.get("started_at"),
+        ended_at=snap_session.get("ended_at"),
+    )
+    try:
+        # Populate DB state from the snapshot. restore_session_snapshot does
+        # the full rehydration (segments, speakers, chat, summary, FTS).
+        storage.restore_session_snapshot(restored_id, snap_session)
+        # Folder assignment — restore to the original folder if any.
+        orig_folder = snap_session.get("folder_id")
+        if orig_folder:
+            try:
+                storage.set_session_folder(restored_id, orig_folder)
+            except Exception:
+                pass  # folder may have been deleted since split; non-fatal
+        # Copy WAV/MP4 from the backup dir into the live media paths.
+        media_edit.restore_split_media(group_id, restored_id)
+        # Preserve the video offset if one was stored for the original.
+        try:
+            settings.put(f"video_offset_{restored_id}", float(snapshot.get("video_offset") or 0.0))
+        except Exception:
+            pass
+        # Delete the user-selected parts (and their media) in one pass.
+        for sid in delete_ids:
+            try:
+                storage.delete_session(sid)
+            except Exception as e:
+                log.error("split-restore", f"failed to delete part {sid[:8]}: {e}")
+        # Detach any surviving parts from the group — they become standalone.
+        if keep_ids:
+            storage.clear_split_group_for_sessions(keep_ids)
+        # Finally drop the backup (restore is one-shot).
+        media_edit.clear_split_backup(group_id)
+    except Exception as e:
+        # Best-effort cleanup of the partially-restored session. The backup
+        # is preserved so the user can try again.
+        try:
+            storage.delete_session(restored_id)
+        except Exception:
+            pass
+        log.error("split-restore", f"restore failed for group {group_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    _push("session_title", {"session_id": restored_id, "title": snap_session.get("title") or ""})
+    return jsonify({
+        "ok": True,
+        "restored_session_id": restored_id,
+        "deleted_part_ids": delete_ids,
+        "kept_part_ids": keep_ids,
+    })
 
 
 def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
@@ -3633,7 +4124,9 @@ def patch_session(session_id: str):
     title = (data.get("title") or "").strip()
     if not title:
         return jsonify({"error": "title is required"}), 400
-    storage.update_session_title(session_id, title)
+    # Any user-initiated PATCH locks the title so post-recording auto-gen
+    # (and any future auto-title pass) won't clobber it.
+    storage.update_session_title(session_id, title, user_set=True)
     return jsonify({"ok": True})
 
 
@@ -3692,39 +4185,52 @@ def reorder():
 
 @app.route("/api/sessions/bulk", methods=["POST"])
 def bulk_sessions():
-    """Bulk operations: delete, retitle, or move sessions to a folder."""
+    """Bulk operations: delete, retitle, or move sessions to a folder.
+
+    For ``action="retitle"`` the body may carry either ``session_ids`` (list)
+    or ``folder_id`` (string — server resolves all nested sessions). Retitle
+    work is fanned out across a small thread pool so a folder of N meetings
+    finishes in roughly the time of a single LLM call rather than N×.
+    """
     data = request.get_json(silent=True) or {}
     action      = (data.get("action") or "").strip()
     session_ids = [str(s) for s in (data.get("session_ids") or []) if s]
+    folder_id   = data.get("folder_id")
+
+    # Resolve folder_id → session_ids server-side so the client can't fall out
+    # of sync with the actual folder membership.
+    if action == "retitle" and folder_id and not session_ids:
+        try:
+            session_ids = storage.list_session_ids_in_folder(str(folder_id), recursive=True)
+        except Exception as e:
+            return jsonify({"error": f"folder lookup failed: {e}"}), 500
+
     if not session_ids:
-        return jsonify({"error": "session_ids required"}), 400
+        return jsonify({"error": "session_ids or folder_id required"}), 400
 
     if action == "delete":
+        # Track split groups we touched so we can garbage-collect orphaned
+        # split backups if we deleted the last surviving member.
+        touched_groups = set()
         for sid in session_ids:
+            gid = storage.get_session_split_group_id(sid)
+            if gid:
+                touched_groups.add(gid)
             storage.delete_session(sid)
             # Clear active session state if it was one of the deleted sessions
             with _state_lock:
                 if _state["session_id"] == sid and not _state["is_recording"]:
                     _state["session_id"] = None
+        for gid in touched_groups:
+            try:
+                if not storage.list_split_group_members(gid):
+                    media_edit.clear_split_backup(gid)
+            except Exception:
+                pass
         return jsonify({"ok": True, "deleted": len(session_ids)})
 
     elif action == "retitle":
-        results = []
-        for sid in session_ids:
-            sess = storage.get_session(sid)
-            if not sess:
-                continue
-            labels  = sess.get("speaker_labels") or {}
-            segs    = sess.get("segments") or []
-            if not segs:
-                continue
-            transcript = _build_transcript(segs, labels)
-            title = ai.generate_title(transcript or " ".join(s["text"] for s in segs))
-            if title:
-                storage.update_session_title(sid, title)
-                _push("session_title", {"session_id": sid, "title": title})
-                results.append({"session_id": sid, "title": title})
-        return jsonify({"ok": True, "updated": results})
+        return _bulk_retitle(session_ids)
 
     elif action == "move":
         folder_id = data.get("folder_id")  # None = uncategorize
@@ -3733,6 +4239,67 @@ def bulk_sessions():
 
     else:
         return jsonify({"error": f"Unknown action: {action!r}"}), 400
+
+
+def _retitle_one(sid: str) -> dict | None:
+    """Generate a fresh AI title for a single session and persist it.
+
+    Designed to be called from a worker thread: each call gets its own SQLite
+    connection (via the thread-local ``_conn`` context in storage), assembles
+    the title-generation context independently, then commits the new title and
+    fans out an SSE event so the sidebar refreshes live.
+    """
+    try:
+        sess = storage.get_session(sid)
+        if not sess:
+            return None
+        labels = sess.get("speaker_labels") or {}
+        segs   = sess.get("segments") or []
+        if not segs:
+            return None
+        transcript = _build_transcript(segs, labels)
+        ctx = storage.get_title_generation_context(sid)
+        title = ai.generate_title(
+            transcript or " ".join(s["text"] for s in segs),
+            context=ctx,
+        )
+        if not title:
+            return None
+        # Bulk retitle is an explicit user action → AI title replaces any
+        # prior user-set lock (they're asking for a fresh AI pass).
+        storage.update_session_title(sid, title, user_set=False)
+        _push("session_title", {"session_id": sid, "title": title})
+        return {"session_id": sid, "title": title}
+    except Exception as e:
+        log.error("retitle", f"failed for {sid[:8]}: {e}")
+        return None
+
+
+def _bulk_retitle(session_ids: list[str]):
+    """Parallel-fan-out retitle for a list of sessions, returning JSON results.
+
+    Workers fetch their own DB snapshots before the LLM call, so all workers
+    see the same pre-batch state for the title-generation context (no
+    cascading drift mid-batch). SSE events fire as each worker completes, so
+    the sidebar updates titles incrementally even though the HTTP response
+    waits for the full batch to finish.
+    """
+    if not session_ids:
+        return jsonify({"ok": True, "updated": []})
+    # Notify the client that work has started so it can show progress
+    _push("retitle_start", {"count": len(session_ids), "session_ids": session_ids})
+    results: list[dict] = []
+    futures = [_retitle_executor.submit(_retitle_one, sid) for sid in session_ids]
+    for fut in futures:
+        try:
+            r = fut.result(timeout=120)
+        except Exception as e:
+            log.error("retitle", f"worker failed: {e}")
+            r = None
+        if r:
+            results.append(r)
+    _push("retitle_done", {"requested": len(session_ids), "updated": len(results)})
+    return jsonify({"ok": True, "updated": results, "requested": len(session_ids)})
 
 
 # ── Import / Export ────────────────────────────────────────────────────────────

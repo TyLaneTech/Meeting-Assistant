@@ -7,10 +7,39 @@
   <link rel="icon" id="favicon" href="/static/images/logo.png" type="image/png">
   <link rel="stylesheet" href="/static/fontAwesome/css/all.min.css">
   <link rel="stylesheet" href="/static/style.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <link rel="stylesheet" id="hljs-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/morphdom@2/dist/morphdom-umd.min.js"></script>
+  <script>
+    // Apply saved theme synchronously (pre-paint) to avoid flash-of-wrong-theme.
+    (function () {
+      try {
+        var c = JSON.parse(localStorage.getItem('ma-layout') || '{}');
+        var mode = c.theme_mode || 'system';
+        var accent = c.theme_accent || 'blue';
+        var effective = mode;
+        if (mode === 'system') {
+          effective = (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+        }
+        document.documentElement.dataset.themeMode = effective;
+        if (accent && accent !== 'blue') document.documentElement.dataset.accent = accent;
+        // Swap hljs stylesheet for light mode
+        if (effective === 'light') {
+          var link = document.getElementById('hljs-theme');
+          if (link) link.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
+        }
+        // Apply cached custom palette inline (per-mode) so custom themes don't flash
+        if (accent === 'custom') {
+          var palette = c['theme_custom_' + effective];
+          if (palette && typeof palette === 'object') {
+            var root = document.documentElement;
+            for (var k in palette) { if (palette.hasOwnProperty(k)) root.style.setProperty(k, palette[k]); }
+          }
+        }
+      } catch (_) {}
+    })();
+  </script>
 </head>
 <body>
 
@@ -369,8 +398,22 @@
             </div>-->
         </div>
 
-        <div id="video-viewer" class="video-viewer hidden">
-          <video id="playback-video" class="playback-video" muted playsinline></video>
+        <div id="video-viewer" class="video-viewer hidden" data-video-mode="compact">
+          <div class="video-viewport" id="video-viewport">
+            <video id="playback-video" class="playback-video" muted playsinline></video>
+            <div class="video-zoom-hint hidden" id="video-zoom-hint">100%</div>
+            <div class="video-toolbar" id="video-toolbar">
+              <button class="video-tool-btn" id="video-btn-zoom-reset"
+                      onclick="resetVideoZoom()" title="Reset zoom (double-click)"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+              <span class="video-tool-sep"></span>
+              <button class="video-tool-btn active" id="video-btn-compact"
+                      onclick="setVideoMode('compact')" title="Compact"><i class="fa-solid fa-window-minimize"></i></button>
+              <button class="video-tool-btn" id="video-btn-fill"
+                      onclick="setVideoMode('fill')" title="Fill panel"><i class="fa-solid fa-up-right-and-down-left-from-center"></i></button>
+              <button class="video-tool-btn" id="video-btn-fullscreen"
+                      onclick="setVideoMode('fullscreen')" title="Fullscreen"><i class="fa-solid fa-expand"></i></button>
+            </div>
+          </div>
         </div>
         <div id="screen-preview" class="screen-preview hidden">
           <div class="screen-preview-header">
@@ -495,6 +538,9 @@
             <span class="col-subtitle" id="chat-model-label"></span>
           </div>
           <div class="col-actions">
+            <button class="icon-btn chat-prompt-btn" id="chat-prompt-btn"
+                    title="Session system prompt"
+                    onclick="openChatPromptDialog()"><i class="fa-solid fa-sliders"></i></button>
             <button class="icon-btn" title="Clear chat" onclick="clearChat()"><i class="fa-duotone fa-eraser"></i></button>
           </div>
         </div>
@@ -727,9 +773,13 @@
             <div class="settings-row">
               <div class="settings-row-info">
                 <div class="settings-row-label">Model</div>
-                <div class="settings-row-desc">Which model to use for this provider</div>
+                <div class="settings-row-desc">Latest versions are auto-detected from each provider</div>
               </div>
-              <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
+              <div class="ai-model-row">
+                <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
+                <button class="icon-btn ai-model-refresh" id="ai-model-refresh-btn"
+                        onclick="refreshAiModels()" title="Check for newly released models"><i class="fa-solid fa-rotate"></i></button>
+              </div>
             </div>
           </div>
           <div class="settings-group" id="key-anthropic-field">
@@ -775,6 +825,26 @@
             </div>
           </div>
           <button class="btn-save-keys" onclick="saveApiKeys()">Save Keys</button>
+
+          <div class="settings-group-title">Chat System Prompt</div>
+          <div class="settings-group">
+            <div class="settings-key-row">
+              <div class="settings-key-header">
+                <span class="settings-row-label">Default Prompt</span>
+                <span class="settings-opt">global</span>
+                <button class="settings-key-link" onclick="resetGlobalChatPrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to built-in</button>
+              </div>
+              <textarea id="global-chat-prompt" class="chat-prompt-textarea"
+                        rows="10" spellcheck="false"
+                        placeholder="Leave empty to use the built-in assistant prompt."
+                        oninput="_globalChatPromptChanged(this.value)"></textarea>
+              <div class="chat-prompt-meta">
+                <span class="chat-prompt-status" id="global-chat-prompt-status">Using built-in default</span>
+                <button class="chat-prompt-ghost" onclick="loadBuiltinIntoGlobal()">Load built-in…</button>
+              </div>
+              <div class="settings-row-desc">Applied to every session unless overridden in the chat panel's <i class="fa-solid fa-sliders"></i> menu. The meeting transcript and context are always appended automatically.</div>
+            </div>
+          </div>
         </div>
 
         <!-- Transcription -->
@@ -950,6 +1020,77 @@
 
         <!-- System -->
         <div class="settings-panel" id="section-system">
+          <div class="settings-group-title">App Theme</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Appearance</div>
+                <div class="settings-row-desc">Match the system theme, or force light/dark</div>
+              </div>
+              <div class="theme-mode-seg" role="radiogroup" aria-label="Appearance mode">
+                <button class="theme-mode-btn" data-mode="system" onclick="setThemeMode('system')" title="Match system"><i class="fa-solid fa-desktop"></i>System</button>
+                <button class="theme-mode-btn" data-mode="light" onclick="setThemeMode('light')" title="Light mode"><i class="fa-solid fa-sun"></i>Light</button>
+                <button class="theme-mode-btn" data-mode="dark" onclick="setThemeMode('dark')" title="Dark mode"><i class="fa-solid fa-moon"></i>Dark</button>
+              </div>
+            </div>
+            <div class="settings-row theme-accent-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Accent Color</div>
+                <div class="settings-row-desc">Applied to buttons, links, selections, and highlights</div>
+              </div>
+              <div class="theme-accent-grid" id="theme-accent-grid">
+                <button class="theme-accent-btn" data-accent="blue" onclick="setThemeAccent('blue')" style="--swatch:#58a6ff;--swatch-a:#58a6ff;--swatch-b:#1f6feb;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Blue</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="ocean" onclick="setThemeAccent('ocean')" style="--swatch:#39c5cf;--swatch-a:#39c5cf;--swatch-b:#1b8f97;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Ocean</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="forest" onclick="setThemeAccent('forest')" style="--swatch:#3fb950;--swatch-a:#3fb950;--swatch-b:#238636;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Forest</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="sunset" onclick="setThemeAccent('sunset')" style="--swatch:#ff9f4e;--swatch-a:#ff9f4e;--swatch-b:#c56a18;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Sunset</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="rose" onclick="setThemeAccent('rose')" style="--swatch:#f778ba;--swatch-a:#f778ba;--swatch-b:#bf4b8a;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Rose</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="violet" onclick="setThemeAccent('violet')" style="--swatch:#bc8cff;--swatch-a:#bc8cff;--swatch-b:#8957e5;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Violet</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="amber" onclick="setThemeAccent('amber')" style="--swatch:#e3b341;--swatch-a:#e3b341;--swatch-b:#bb8009;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Amber</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="crimson" onclick="setThemeAccent('crimson')" style="--swatch:#ff7b72;--swatch-a:#ff7b72;--swatch-b:#c53d34;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Crimson</span>
+                </button>
+                <button class="theme-accent-btn" data-accent="mono" onclick="setThemeAccent('mono')" style="--swatch:#8b949e;--swatch-a:#e6edf3;--swatch-b:#484f58;">
+                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Mono</span>
+                </button>
+                <button class="theme-accent-btn theme-accent-custom" data-accent="custom" onclick="setThemeAccent('custom')">
+                  <span class="theme-accent-swatch theme-accent-swatch-rainbow"></span><span class="theme-accent-name">Custom</span>
+                </button>
+              </div>
+
+              <!-- Custom picker panel (revealed when Custom is active) -->
+              <div class="theme-custom-panel hidden" id="theme-custom-panel">
+                <div class="theme-custom-row">
+                  <label class="theme-custom-label">Accent color</label>
+                  <div class="theme-custom-color-row">
+                    <input type="color" class="theme-custom-color" id="theme-custom-accent-picker" value="#58a6ff" oninput="updateCustomAccent(this.value)">
+                    <input type="text" class="theme-custom-hex" id="theme-custom-accent-hex" value="#58a6ff" maxlength="7" oninput="updateCustomAccentFromHex(this.value)" spellcheck="false">
+                    <button class="theme-custom-reset" onclick="resetCustomTheme()" title="Reset to defaults"><i class="fa-solid fa-rotate-left"></i></button>
+                  </div>
+                </div>
+                <div class="theme-custom-row">
+                  <label class="theme-custom-label">Surface tint <span class="theme-custom-val" id="theme-custom-strength-val">30%</span></label>
+                  <input type="range" class="theme-custom-slider" id="theme-custom-strength" min="0" max="100" step="5" value="30" oninput="updateCustomStrength(this.value)">
+                </div>
+                <div class="theme-custom-hint">Derived automatically: darker accent for hovers, accent tint on backgrounds, matching borders.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-group-title">Hardware &amp; Startup</div>
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">
@@ -969,6 +1110,7 @@
               </label>
             </div>
           </div>
+          <div class="settings-group-title">Updates</div>
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">
@@ -1039,6 +1181,42 @@
 </div>
 
 <!-- ── Export modal ────────────────────────────────────────────────────── -->
+<!-- ── Chat system prompt dialog (per-session override) ─────────────────── -->
+<div class="overlay hidden" id="chat-prompt-overlay" onclick="if(event.target===this)closeChatPromptDialog()">
+  <div class="dialog chat-prompt-dialog">
+    <div class="chat-prompt-dialog-header">
+      <div class="chat-prompt-dialog-left">
+        <div class="chat-prompt-dialog-icon"><i class="fa-solid fa-sliders"></i></div>
+        <div>
+          <div class="chat-prompt-dialog-title">Session System Prompt</div>
+          <div class="chat-prompt-dialog-subtitle" id="chat-prompt-dialog-subtitle">Overrides the global default for this session</div>
+        </div>
+      </div>
+      <button class="icon-btn" onclick="closeChatPromptDialog()"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="chat-prompt-dialog-body">
+      <div class="chat-prompt-source-bar" id="chat-prompt-source-bar">
+        <span class="chat-prompt-source-label">Currently using:</span>
+        <span class="chat-prompt-source-chip" id="chat-prompt-source-chip">Built-in default</span>
+      </div>
+      <textarea id="session-chat-prompt" class="chat-prompt-textarea chat-prompt-textarea-lg"
+                rows="16" spellcheck="false"
+                placeholder="Leave empty to fall back to the global / built-in default"></textarea>
+      <div class="chat-prompt-presets">
+        <button class="chat-prompt-ghost" onclick="loadBuiltinIntoSession()" title="Replace textarea with the built-in default"><i class="fa-regular fa-file-lines"></i> Load built-in</button>
+        <button class="chat-prompt-ghost" id="chat-prompt-load-global-btn" onclick="loadGlobalIntoSession()" title="Replace textarea with the current global default"><i class="fa-solid fa-globe"></i> Load global</button>
+      </div>
+    </div>
+    <div class="chat-prompt-dialog-actions">
+      <button class="chat-prompt-secondary" onclick="clearSessionChatPrompt()" title="Remove the override; use global/built-in">Clear override</button>
+      <div class="chat-prompt-dialog-actions-right">
+        <button class="chat-prompt-secondary" onclick="closeChatPromptDialog()">Cancel</button>
+        <button class="chat-prompt-primary" onclick="saveSessionChatPrompt()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="overlay hidden" id="export-overlay" onclick="if(event.target===this)closeExportModal()">
   <div class="dialog export-dialog">
     <div class="export-header">

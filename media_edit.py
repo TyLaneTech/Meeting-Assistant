@@ -243,6 +243,114 @@ def clear_trim_backup(session_id: str) -> None:
         shutil.rmtree(target)
 
 
+# ── Split rollback ────────────────────────────────────────────────────────────
+# Keyed by a split-group UUID (not a session id) because the source session is
+# deleted immediately after the split completes. The group id is written into
+# every resulting part's ``sessions.split_group_id`` column so any part can
+# look up the backup later.
+
+def split_backup_dir(group_id: str) -> Path:
+    return BACKUP_DIR / f"split-{group_id}"
+
+
+def split_snapshot_path(group_id: str) -> Path:
+    return split_backup_dir(group_id) / "pre-split.json"
+
+
+def split_audio_backup_path(group_id: str) -> Path:
+    return split_backup_dir(group_id) / "audio-original.wav"
+
+
+def split_video_backup_path(group_id: str) -> Path:
+    return split_backup_dir(group_id) / "video-original.mp4"
+
+
+def has_split_backup(group_id: str | None) -> bool:
+    return bool(group_id) and split_snapshot_path(group_id).exists()
+
+
+def create_split_backup(
+    group_id: str,
+    source_session_id: str,
+    source_session: dict,
+    video_offset: float,
+    part_session_ids: list[str],
+) -> None:
+    """Snapshot a session and its media immediately before a split deletes it.
+
+    Writes:
+      - ``pre-split.json``       : full session payload (title, timestamps,
+                                   segments, chat, speakers, summary, folder
+                                   membership, etc.)
+      - ``audio-original.wav``   : copy of the pre-split WAV
+      - ``video-original.mp4``   : copy of the pre-split MP4 (if any)
+
+    All three writes are fatal on failure — the caller must not proceed with
+    the destructive ``delete_session`` if this raises.
+    """
+    target = split_backup_dir(group_id)
+    target.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "source_session_id": source_session_id,
+        "group_id": group_id,
+        "part_session_ids": list(part_session_ids or []),
+        "video_offset": float(video_offset or 0.0),
+        "session": {
+            "title":            source_session.get("title", ""),
+            "started_at":       source_session.get("started_at"),
+            "ended_at":         source_session.get("ended_at"),
+            "summary":          source_session.get("summary", ""),
+            "folder_id":        source_session.get("folder_id"),
+            "chat_messages":    source_session.get("chat_messages", []),
+            "segments":         source_session.get("segments", []),
+            "speaker_profiles": source_session.get("speaker_profiles", []),
+        },
+    }
+    # Atomic-ish: write snapshot to a temp file and rename into place so we
+    # never leave a half-written JSON behind if the process crashes mid-write.
+    tmp = split_snapshot_path(group_id).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(split_snapshot_path(group_id))
+
+    src_audio = wav_path(source_session_id)
+    if src_audio.exists():
+        shutil.copy2(src_audio, split_audio_backup_path(group_id))
+    src_video = video_path(source_session_id)
+    if src_video.exists():
+        shutil.copy2(src_video, split_video_backup_path(group_id))
+
+
+def load_split_snapshot(group_id: str) -> dict | None:
+    path = split_snapshot_path(group_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def restore_split_media(group_id: str, target_session_id: str) -> None:
+    """Copy the backed-up WAV/MP4 into ``target_session_id``'s live media paths."""
+    src_audio = split_audio_backup_path(group_id)
+    if src_audio.exists():
+        dst = wav_path(target_session_id)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_audio, dst)
+    src_video = split_video_backup_path(group_id)
+    if src_video.exists():
+        dst = video_path(target_session_id)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_video, dst)
+
+
+def clear_split_backup(group_id: str) -> None:
+    target = split_backup_dir(group_id)
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+
+
 def trim_wav_file(src: Path, dst: Path, start_sec: float, end_sec: float) -> float:
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
