@@ -228,6 +228,16 @@ def _create_start_menu_shortcut():
         except Exception:
             pass
 
+    # Re-save the shortcut if the icon file is newer than the .lnk, so icon
+    # updates to logo.ico actually propagate (Windows keys its icon cache off
+    # the .lnk's mtime).
+    if already_correct and icon_path.exists():
+        try:
+            if icon_path.stat().st_mtime > lnk_path.stat().st_mtime:
+                already_correct = False
+        except Exception:
+            pass
+
     if already_correct:
         return
 
