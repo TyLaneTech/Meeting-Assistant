@@ -302,7 +302,7 @@ class SpeakerFingerprintDB:
                     (row["name"], row["color"], keep_id),
                 )
         self.recompute_centroid(keep_id)
-        log.info("fingerprint", f"Merged {merge_id[:8]} → {keep_id[:8]}")
+        log.info("fingerprint", f"Merged {merge_id[:8]} -> {keep_id[:8]}")
         return {"name": row["name"], "color": row["color"]} if row else {}
 
     def list_global_speakers(self) -> list[dict]:
@@ -729,7 +729,7 @@ class SpeakerFingerprintDB:
         after = before - len(all_remove) if all_remove else before
         self.recompute_centroid(global_id)
         log.info("fingerprint",
-                 f"Optimized {global_id[:8]}: {before}→{after} "
+                 f"Optimized {global_id[:8]}: {before}->{after} "
                  f"(outliers={len(outlier_ids)}, dupes={len(dedup_ids)})")
         return {"before": before, "after": after,
                 "outliers_removed": len(outlier_ids),

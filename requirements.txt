@@ -14,13 +14,13 @@ nvidia-cublas-cu12
 nvidia-cudnn-cu12
 
 # ── Speaker diarization ───────────────────────────────────────────────────────
-# diart depends on torch/torchaudio/pyannote. A plain `pip install diart` pulls
-# in CPU-only torch from PyPI. For GPU diarization, launch.bat installs the
-# CUDA-enabled torch variant first (via the PyTorch index URL) so this resolves
-# to the already-installed GPU build instead.
+# Streaming diarization uses pyannote segmentation + embedding models directly
+# (no diart). For GPU diarization, launch.bat installs the CUDA-enabled torch
+# variant first (via the PyTorch index URL) so this resolves to the
+# already-installed GPU build instead.
 torch>=2.0.0
 torchaudio>=2.0.0
-diart
+pyannote.audio>=3.1.0,<4.0.0
 # Pin speechbrain to avoid LazyModule crashes in >=1.1 that break
 # inspect.stack() during pyannote/pytorch_lightning model loading.
 speechbrain==1.0.3

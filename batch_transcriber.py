@@ -5,6 +5,10 @@ Uses batched Whisper inference (transformers.pipeline) and full-file pyannote
 SpeakerDiarization for higher accuracy than the real-time streaming path.
 This module is completely independent of transcriber.py / diarizer.py.
 
+Currently uses pyannote/speaker-diarization-3.1 on pyannote.audio 3.x.
+When pyannote 4.x is adopted, upgrade to speaker-diarization-community-1
+for 10-17% DER improvement via VBx clustering (see pyannote 4.0 release notes).
+
 Usage:
     bt = BatchTranscriber(on_text_callback=..., fingerprint_callback=..., hf_token=...)
     bt.process_wav_file("path/to/file.wav", params)

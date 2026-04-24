@@ -70,12 +70,13 @@ def detect_device() -> tuple[str, str, str]:
 
 # All available whisper presets: (label, device, compute_type, model_size, requires_cuda)
 WHISPER_PRESETS = [
-    {"id": "cuda-large-v3",  "label": "GPU - large-v3 (float16)",  "device": "cuda", "compute_type": "float16", "model_size": "large-v3",  "requires_cuda": True},
-    {"id": "cuda-medium",    "label": "GPU - medium (float16)",    "device": "cuda", "compute_type": "float16", "model_size": "medium",    "requires_cuda": True},
-    {"id": "cuda-small",     "label": "GPU - small (float16)",     "device": "cuda", "compute_type": "float16", "model_size": "small",     "requires_cuda": True},
-    {"id": "cpu-medium",     "label": "CPU - medium (int8)",       "device": "cpu",  "compute_type": "int8",    "model_size": "medium",    "requires_cuda": False},
-    {"id": "cpu-small",      "label": "CPU - small (int8)",        "device": "cpu",  "compute_type": "int8",    "model_size": "small",     "requires_cuda": False},
-    {"id": "cpu-tiny",       "label": "CPU - tiny (int8)",         "device": "cpu",  "compute_type": "int8",    "model_size": "tiny",      "requires_cuda": False},
+    {"id": "cuda-large-v3",  "label": "GPU - large-v3 (float16)",       "device": "cuda", "compute_type": "float16", "model_size": "large-v3",       "requires_cuda": True},
+    {"id": "cuda-turbo",     "label": "GPU - large-v3-turbo (float16)", "device": "cuda", "compute_type": "float16", "model_size": "large-v3-turbo", "requires_cuda": True},
+    {"id": "cuda-medium",    "label": "GPU - medium (float16)",         "device": "cuda", "compute_type": "float16", "model_size": "medium",         "requires_cuda": True},
+    {"id": "cuda-small",     "label": "GPU - small (float16)",          "device": "cuda", "compute_type": "float16", "model_size": "small",          "requires_cuda": True},
+    {"id": "cpu-medium",     "label": "CPU - medium (int8)",            "device": "cpu",  "compute_type": "int8",    "model_size": "medium",         "requires_cuda": False},
+    {"id": "cpu-small",      "label": "CPU - small (int8)",             "device": "cpu",  "compute_type": "int8",    "model_size": "small",          "requires_cuda": False},
+    {"id": "cpu-tiny",       "label": "CPU - tiny (int8)",              "device": "cpu",  "compute_type": "int8",    "model_size": "tiny",           "requires_cuda": False},
 ]
 
 DIARIZER_OPTIONS = [
@@ -109,7 +110,9 @@ def get_default_model_config() -> tuple[str, str, str]:
     return _DEFAULT_DEVICE, _DEFAULT_COMPUTE_TYPE, _DEFAULT_MODEL_SIZE
 
 # Minimum samples to pass to Whisper - very short clips produce garbage output.
-_MIN_WHISPER_SAMPLES = 3_200   # 0.2 s at 16 kHz
+# Raised from 0.2s to 0.5s: diarized segments shorter than this yield
+# unreliable speaker embeddings and single-word Whisper hallucinations.
+_MIN_WHISPER_SAMPLES = 8_000   # 0.5 s at 16 kHz
 
 # Short-fragment threshold: Whisper adds a trailing period to tiny audio clips
 # (e.g. a single word from diarization).  Outputs with this few words or fewer
@@ -276,6 +279,9 @@ class Transcriber:
         self.diarization_enabled = True  # Can be toggled via the UI
         self.fingerprint_callback: Callable | None = None
         # (speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None
+        self.on_diarizer_error: Callable[[str], None] | None = None
+        # Called when the diarizer fails so the UI can surface the error.
+        self._diarizer_error_fired = False  # only fire once per session
 
         # Tunable parameters - loaded from saved settings, reset-able to defaults
         from default_audio_params import get_all_defaults
@@ -372,9 +378,9 @@ class Transcriber:
         self.load_model()
 
     def load_diarizer(self, hf_token: str, device: str | None = None) -> None:
-        """Load diart diarization pipeline. Blocking - run in a thread."""
-        from diarizer import DiartDiarizer
-        self.diarizer = DiartDiarizer(hf_token, device=device)
+        """Load streaming diarization pipeline. Blocking - run in a thread."""
+        from diarizer import StreamingDiarizer
+        self.diarizer = StreamingDiarizer(hf_token, device=device)
 
     def reload_diarizer(self, hf_token: str, device: str) -> None:
         """Reload the diarizer on a different device. Blocking."""
@@ -391,6 +397,7 @@ class Transcriber:
         self.sample_rate = sample_rate
         self.channels = channels
         self._context = ""
+        self._diarizer_error_fired = False
         if self.diarizer is not None:
             self.diarizer.reset(next_label=next_speaker_label)
         self.is_running = True
@@ -505,6 +512,15 @@ class Transcriber:
                 log.error("diarizer", "Error in process() - falling back to plain Whisper:")
                 traceback.print_exc()
                 segments = []
+                if not self._diarizer_error_fired and self.on_diarizer_error:
+                    self._diarizer_error_fired = True
+                    try:
+                        self.on_diarizer_error(
+                            "Speaker diarization failed — transcript will "
+                            "continue without speaker labels."
+                        )
+                    except Exception:
+                        pass
 
             if segments:
                 # Timestamps from diart are relative to the start of `audio`.

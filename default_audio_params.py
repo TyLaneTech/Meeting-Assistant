@@ -241,7 +241,7 @@ DIARIZATION_DEFAULTS = {
         "type": "number",
     },
     "rho_update": {
-        "value": 0.422,
+        "value": 0.25,
         "label": "Centroid Update Rate",
         "description": "Speaker embedding adaptation speed.",
         "tooltip": (
@@ -261,7 +261,7 @@ DIARIZATION_DEFAULTS = {
         "type": "number",
     },
     "delta_new": {
-        "value": 0.5,
+        "value": 0.8,
         "label": "New Speaker Threshold",
         "description": "Distance required to create a new speaker.",
         "tooltip": (
@@ -281,7 +281,7 @@ DIARIZATION_DEFAULTS = {
         "type": "number",
     },
     "merge_gap_seconds": {
-        "value": 0.1,
+        "value": 0.15,
         "label": "Merge Gap",
         "unit": "s",
         "description": "Max gap before same-speaker segments merge.",
@@ -700,7 +700,7 @@ REANALYSIS_DEFAULTS = {
         "type": "int",
     },
     "reanalysis_merge_gap": {
-        "value": 0.5,
+        "value": 0.8,
         "label": "Merge Gap",
         "unit": "s",
         "description": "Merge same-speaker segments closer than this.",
@@ -732,7 +732,7 @@ REANALYSIS_DEFAULTS = {
         "inverts_siblings": True,
     },
     "reanalysis_clustering_threshold": {
-        "value": 0.45,
+        "value": 0.70,
         "label": "Clustering Threshold",
         "description": "Speaker clustering sensitivity.",
         "tooltip": (
@@ -749,7 +749,7 @@ REANALYSIS_DEFAULTS = {
         "type": "number",
     },
     "reanalysis_min_duration_off": {
-        "value": 0.0,
+        "value": 0.3,
         "label": "Min Silence Duration",
         "unit": "s",
         "description": "Minimum silence before a speaker turn can end.",
@@ -780,50 +780,50 @@ def get_reanalysis_defaults() -> dict:
 DIARIZATION_PRESETS = {
     "responsive": {
         "label": "Responsive",
-        "description": "Fast speaker detection - may over-segment in noisy environments",
+        "description": "Faster speaker detection - may create extra speakers in noisy audio",
         "values": {
             "step_seconds": 0.15,
             "duration_seconds": 4.0,
-            "tau_active": 0.4,
-            "rho_update": 0.5,
-            "delta_new": 0.4,
-            "merge_gap_seconds": 0.05,
+            "tau_active": 0.45,
+            "rho_update": 0.35,
+            "delta_new": 0.60,
+            "merge_gap_seconds": 0.10,
         },
     },
     "balanced": {
         "label": "Balanced (Default)",
-        "description": "Good speaker tracking for typical meetings - recommended",
+        "description": "Optimized for typical 2-6 person meetings - recommended",
         "values": {
             "step_seconds": 0.25,
             "duration_seconds": 5.0,
             "tau_active": 0.5,
-            "rho_update": 0.422,
-            "delta_new": 0.5,
-            "merge_gap_seconds": 0.1,
+            "rho_update": 0.25,
+            "delta_new": 0.80,
+            "merge_gap_seconds": 0.15,
         },
     },
     "conservative": {
         "label": "Conservative",
-        "description": "Fewer false speaker changes - better for small groups",
+        "description": "Fewer speakers - prefer merging over splitting",
         "values": {
-            "step_seconds": 0.35,
+            "step_seconds": 0.30,
             "duration_seconds": 5.0,
-            "tau_active": 0.6,
-            "rho_update": 0.35,
-            "delta_new": 0.7,
-            "merge_gap_seconds": 0.2,
+            "tau_active": 0.55,
+            "rho_update": 0.20,
+            "delta_new": 0.90,
+            "merge_gap_seconds": 0.25,
         },
     },
     "large_meeting": {
         "label": "Large Meeting",
-        "description": "Tuned for 5+ speakers - sensitive detection, stable centroids",
+        "description": "Tuned for 5+ speakers - more sensitive to new voices",
         "values": {
-            "step_seconds": 0.2,
+            "step_seconds": 0.20,
             "duration_seconds": 5.0,
             "tau_active": 0.45,
-            "rho_update": 0.3,
-            "delta_new": 0.35,
-            "merge_gap_seconds": 0.15,
+            "rho_update": 0.30,
+            "delta_new": 0.65,
+            "merge_gap_seconds": 0.12,
         },
     },
     "custom": {

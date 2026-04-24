@@ -11149,6 +11149,8 @@ async function openSettings() {
     _toolOverrides.summary_model = aiCfg.summary_model || null;
     _toolOverrides.chat_provider = aiCfg.chat_provider || null;
     _toolOverrides.chat_model = aiCfg.chat_model || null;
+    _toolOverrides.global_chat_provider = aiCfg.global_chat_provider || null;
+    _toolOverrides.global_chat_model = aiCfg.global_chat_model || null;
 
     const anthSet = !!(status.keys?.ANTHROPIC_API_KEY?.is_set);
     const oaiSet = !!(status.keys?.OPENAI_API_KEY?.is_set);
@@ -11312,22 +11314,14 @@ async function refreshAiModels() {
 let _toolOverrides = {
   summary_provider: null, summary_model: null,
   chat_provider: null, chat_model: null,
+  global_chat_provider: null, global_chat_model: null,
 };
 let _bothKeysSet = false;
 
 function _effectiveProvider(tool) {
-  // Inline pickers (Summary / Session-Chat / Global-Chat) all track the single
-  // global model — any per-tool override set via Settings still applies to the
-  // backend resolver, but the inline labels reflect the global choice.
-  if (tool === 'summary' || tool === 'chat' || tool === 'global_chat') {
-    return _currentAiProvider;
-  }
   return _toolOverrides[tool + '_provider'] || _currentAiProvider;
 }
 function _effectiveModel(tool) {
-  if (tool === 'summary' || tool === 'chat' || tool === 'global_chat') {
-    return _currentAiModel;
-  }
   const p = _effectiveProvider(tool);
   const m = _toolOverrides[tool + '_model'];
   if (m) {
@@ -11353,6 +11347,8 @@ async function setToolProvider(tool, provider) {
     _toolOverrides.summary_model = data.summary_model;
     _toolOverrides.chat_provider = data.chat_provider;
     _toolOverrides.chat_model = data.chat_model;
+    _toolOverrides.global_chat_provider = data.global_chat_provider;
+    _toolOverrides.global_chat_model = data.global_chat_model;
     _applyToolOverrides();
     _updateSessionModelLabels();
   } catch (_) {}
@@ -11369,6 +11365,8 @@ async function setToolModel(tool, model) {
     _toolOverrides.summary_model = data.summary_model;
     _toolOverrides.chat_provider = data.chat_provider;
     _toolOverrides.chat_model = data.chat_model;
+    _toolOverrides.global_chat_provider = data.global_chat_provider;
+    _toolOverrides.global_chat_model = data.global_chat_model;
     _applyToolOverrides();
     _updateSessionModelLabels();
   } catch (_) {}
@@ -11558,24 +11556,19 @@ function _buildModelPickerPanel(tool) {
 
 async function _selectModelFromPicker(tool, provider, model) {
   try {
-    // Inline pickers on Summary / Session-Chat / Global-Chat all drive the
-    // single global provider/model, so selection persists across pages and
-    // interfaces. Per-tool overrides are cleared server-side.
+    // Each inline picker sets its own per-tool override so Summary,
+    // Session Chat, and Global Chat can each use a different model.
     const data = await fetch('/api/ai_settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider, model }),
+      body: JSON.stringify({ tool, provider, model }),
     }).then(r => r.json());
-    _currentAiProvider = data.provider;
-    _currentAiModel = data.model;
-    _toolOverrides.summary_provider = null;
-    _toolOverrides.summary_model = null;
-    _toolOverrides.chat_provider = null;
-    _toolOverrides.chat_model = null;
-    if (typeof _applyAiConfig === 'function'
-        && document.getElementById('provider-btn-anthropic')) {
-      _applyAiConfig(data.provider, data.model, currentAiModels);
-    }
+    _toolOverrides.summary_provider = data.summary_provider;
+    _toolOverrides.summary_model = data.summary_model;
+    _toolOverrides.chat_provider = data.chat_provider;
+    _toolOverrides.chat_model = data.chat_model;
+    _toolOverrides.global_chat_provider = data.global_chat_provider;
+    _toolOverrides.global_chat_model = data.global_chat_model;
     if (typeof _applyToolOverrides === 'function') _applyToolOverrides();
     _updateSessionModelLabels();
   } catch (_) {}
@@ -12906,6 +12899,8 @@ fetch('/api/ai_settings')
     _toolOverrides.summary_model = aiCfg.summary_model || null;
     _toolOverrides.chat_provider = aiCfg.chat_provider || null;
     _toolOverrides.chat_model = aiCfg.chat_model || null;
+    _toolOverrides.global_chat_provider = aiCfg.global_chat_provider || null;
+    _toolOverrides.global_chat_model = aiCfg.global_chat_model || null;
     _updateSessionModelLabels();
   })
   .catch(() => {});

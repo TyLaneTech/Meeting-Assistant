@@ -94,6 +94,14 @@ _transcriber = Transcriber(
     lambda text, source, st=0.0, et=0.0: _on_segment(text, source, st, et),
 )
 
+
+def _on_diarizer_error(message: str) -> None:
+    """Log diarizer failures visibly in the console."""
+    log.warn("diarizer", message)
+
+
+_transcriber.on_diarizer_error = _on_diarizer_error
+
 # Apply saved model preferences
 _saved_whisper_preset = _saved_prefs.get("whisper_preset", "")
 _transcriber.diarization_enabled = _saved_prefs.get("diarization_enabled", True)
@@ -1495,6 +1503,20 @@ def start_recording():
 
             video_dir = Path(__file__).parent / "data" / "video"
             video_path = str(video_dir / f"{session_id}.mp4")
+
+            # When resuming, preserve the previous video as a numbered
+            # part file so it isn't overwritten by the new recording.
+            if resume_session_id:
+                existing_video = Path(video_path)
+                if existing_video.exists():
+                    # Find the next available part number
+                    part_num = 0
+                    while (video_dir / f"{session_id}_part{part_num}.mp4").exists():
+                        part_num += 1
+                    part_path = video_dir / f"{session_id}_part{part_num}.mp4"
+                    existing_video.rename(part_path)
+                    log.info("screen", f"Preserved previous video as {part_path.name}")
+
             _screen_recorder.start(
                 output_path=video_path,
                 display_index=display_idx,
@@ -1516,6 +1538,86 @@ def start_recording():
         "screen_recording": screen_recording_active,
     })
     return jsonify({"session_id": session_id, "screen_recording": screen_recording_active})
+
+
+def _concat_video_parts(session_id: str) -> None:
+    """Concatenate video part files from pause/resume cycles into one MP4.
+
+    Part files are named {session_id}_part0.mp4, _part1.mp4, etc. and are
+    created when recording is resumed (the previous video is renamed to
+    preserve it).  After recording stops, this function merges all parts
+    plus the final recording into a single {session_id}.mp4 and cleans up.
+    """
+    video_dir = Path(__file__).parent / "data" / "video"
+    final_path = video_dir / f"{session_id}.mp4"
+
+    # Collect part files in order
+    parts: list[Path] = []
+    i = 0
+    while True:
+        p = video_dir / f"{session_id}_part{i}.mp4"
+        if p.exists():
+            parts.append(p)
+            i += 1
+        else:
+            break
+
+    if not parts:
+        return  # no resume happened, nothing to concat
+
+    # The final recording (most recent) is the current {session_id}.mp4
+    if final_path.exists():
+        parts.append(final_path)
+
+    if len(parts) < 2:
+        return  # only one file total, rename back if needed
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        log.warn("screen", "Cannot concat video parts: ffmpeg not found")
+        return
+
+    log.info("screen", f"Concatenating {len(parts)} video parts for {session_id}...")
+
+    # Build ffmpeg concat demuxer file list
+    concat_list = video_dir / f"{session_id}_concat.txt"
+    try:
+        with open(concat_list, "w") as f:
+            for p in parts:
+                # ffmpeg concat demuxer needs forward slashes and escaped quotes
+                safe = str(p.resolve()).replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{safe}'\n")
+
+        merged_path = video_dir / f"{session_id}_merged.mp4"
+        import subprocess
+        result = subprocess.run(
+            [ffmpeg, "-y", "-f", "concat", "-safe", "0",
+             "-i", str(concat_list),
+             "-c", "copy", "-movflags", "+faststart",
+             str(merged_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        if result.returncode == 0 and merged_path.exists():
+            # Replace final with merged
+            if final_path.exists():
+                final_path.unlink()
+            merged_path.rename(final_path)
+            # Clean up part files
+            for p in parts:
+                if p.exists() and p != final_path:
+                    p.unlink()
+            # Video now starts at audio time 0 (full session coverage)
+            settings.put(f"video_offset_{session_id}", 0.0)
+            log.info("screen", f"Video concat complete: {len(parts)} parts merged")
+        else:
+            log.warn("screen", f"Video concat failed (rc={result.returncode}): "
+                     f"{result.stderr[:200] if result.stderr else 'no stderr'}")
+    except Exception as e:
+        log.warn("screen", f"Video concat error: {e}")
+    finally:
+        if concat_list.exists():
+            concat_list.unlink(missing_ok=True)
 
 
 @app.route("/api/recording/stop", methods=["POST"])
@@ -1544,6 +1646,9 @@ def stop_recording():
             # Stop screen recording if active
             if _screen_recorder.is_recording:
                 _screen_recorder.stop()
+            # Concatenate video parts from pause/resume cycles
+            if sid:
+                _concat_video_parts(sid)
             if sid:
                 storage.end_session(sid)
                 seg_count = len(_state.get("segments", []))
@@ -2144,6 +2249,8 @@ def get_ai_settings():
         "summary_model": settings.get("summary_model"),
         "chat_provider": settings.get("chat_provider"),
         "chat_model": settings.get("chat_model"),
+        "global_chat_provider": settings.get("global_chat_provider"),
+        "global_chat_model": settings.get("global_chat_model"),
     })
 
 
@@ -2157,7 +2264,7 @@ def set_ai_settings():
     data = request.get_json(silent=True) or {}
     tool = data.get("tool")
 
-    if tool in ("summary", "chat"):
+    if tool in ("summary", "chat", "global_chat"):
         tp = data.get("provider")
         tm = data.get("model")
         updates = {}
@@ -2174,6 +2281,8 @@ def set_ai_settings():
             "summary_model": settings.get("summary_model"),
             "chat_provider": settings.get("chat_provider"),
             "chat_model": settings.get("chat_model"),
+            "global_chat_provider": settings.get("global_chat_provider"),
+            "global_chat_model": settings.get("global_chat_model"),
             "provider": ai.provider,
             "model": ai.model,
         })
@@ -2190,11 +2299,11 @@ def set_ai_settings():
     if target_model != ai.model:
         updates["ai_model"] = target_model
 
-    # Clear per-tool overrides so Summary / Session-Chat / Global-Chat pickers
-    # all act as a single global choice — a later global pick should beat any
-    # stale per-tool override saved in earlier versions.
+    # Clear per-tool overrides when a global model is explicitly set from
+    # the Settings page — the global pick should beat any stale override.
     for k in ("summary_provider", "summary_model",
-             "chat_provider", "chat_model"):
+             "chat_provider", "chat_model",
+             "global_chat_provider", "global_chat_model"):
         if settings.get(k) is not None:
             updates[k] = None
 
@@ -3317,7 +3426,7 @@ def global_chat():
 
             _push("global_chat_done", {"request_id": request_id})
 
-        cp, cm = _resolve_tool_ai("chat")
+        cp, cm = _resolve_tool_ai("global_chat")
         ai.ask_global(
             chat_history, on_token, on_done,
             cancel=cancel_event,
@@ -3982,12 +4091,18 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
             saved = settings.load().get("reanalysis_params", {})
             params = {**get_reanalysis_defaults(), **saved}
 
-            # If "Use Live Diarization Settings" is on, copy live thresholds
+            # If "Use Live Diarization Settings" is on, derive batch
+            # clustering threshold from the live delta_new value.
+            # delta_new is a cosine-distance threshold (0-2) for the
+            # streaming pipeline's online clustering.  The batch pipeline
+            # uses agglomerative clustering with a different scale.
+            # Map roughly: clustering_threshold ~ delta_new * 0.75,
+            # clamped to [0.35, 0.75] to avoid extreme under/over-merge.
             if params.get("reanalysis_use_live_diarization"):
                 live_saved = settings.load().get("audio_params", {})
                 live = {**get_all_defaults(), **live_saved}
-                # Map live diarization params to batch equivalents
-                params["reanalysis_clustering_threshold"] = live.get("delta_new", 0.5)
+                raw = live.get("delta_new", 0.5) * 0.75
+                params["reanalysis_clustering_threshold"] = max(0.35, min(0.75, raw))
 
             batch = BatchTranscriber(
                 on_text_callback=_on_segment,
