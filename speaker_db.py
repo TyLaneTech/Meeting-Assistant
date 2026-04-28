@@ -539,12 +539,18 @@ class SpeakerFingerprintDB:
         embedding: np.ndarray,
         exclude_global_ids: set | None = None,
         top_k: int = 3,
+        min_similarity: float | None = None,
     ) -> list[dict]:
         """
         Compare embedding against all global profile centroids.
-        Returns list of matches >= SUGGEST_THRESHOLD, sorted by similarity desc.
-        Each entry: {global_id, name, color, similarity, auto_apply}.
+        Returns top_k matches sorted by similarity desc.
+
+        ``min_similarity`` defaults to SUGGEST_THRESHOLD; callers wanting a
+        diagnostic view of *all* nearest profiles (including ones that
+        wouldn't trigger a suggestion) can pass ``0.0``. The ``auto_apply``
+        flag still reflects AUTO_APPLY_THRESHOLD regardless.
         """
+        threshold = _SUGGEST_THRESHOLD if min_similarity is None else min_similarity
         if not self._ready:
             return []
 
@@ -564,7 +570,7 @@ class SpeakerFingerprintDB:
             centroid = _blob_to_emb(r["centroid"])
             # Cosine similarity = dot product for L2-normalized vectors
             sim = float(np.dot(embedding, centroid))
-            if sim >= _SUGGEST_THRESHOLD:
+            if sim >= threshold:
                 results.append({
                     "global_id":   r["id"],
                     "name":        r["name"],

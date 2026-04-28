@@ -4123,6 +4123,17 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
 }
 .btn-settings-action:hover { background: var(--surface3); border-color: var(--accent); }
 .btn-settings-action:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-settings-action.btn-settings-secondary { color: var(--fg-muted); font-weight: 500; }
+
+.settings-row-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+.settings-row-mono {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+  font-size: 11px;
+  color: var(--fg-muted);
+  word-break: break-all;
+  margin-top: 4px;
+  opacity: 0.85;
+}
 
 .toggle-switch { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; }
 .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
@@ -7696,7 +7707,6 @@ button#viz-autodetect-btn:hover {
     flex-direction: column;
     gap: 4px;
     margin-bottom: 18px;
-    max-height: 200px;
     overflow-y: auto;
 }
 

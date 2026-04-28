@@ -8232,6 +8232,8 @@ function destroyVideo() {
   _videoAvailable = false;
   _videoVisible = false;
   _videoOffset = 0;
+  _videoSeekPending = false;
+  _cancelVideoSeek();
   // Exit fullscreen if we were in it
   if (_videoMode === 'fullscreen') setVideoMode('compact');
   resetVideoZoom();
@@ -8252,7 +8254,10 @@ function toggleVideoViewer() {
   if (_videoVisible) {
     // Sync video to current audio position
     _syncVideoToAudio();
-    if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
+    // 'seeked' listener resumes if _syncVideoToAudio kicked off a seek
+    if (!_playbackAudio.paused && !_videoSeekPending) {
+      _playbackVideo.play().catch(() => {});
+    }
   } else {
     _playbackVideo.pause();
     // If we were in fullscreen, leave that mode too
@@ -8280,7 +8285,10 @@ function setVideoMode(mode) {
       document.getElementById('playback-video-toggle')?.classList.add('active');
       savePref('video_viewer_open', true);
       _syncVideoToAudio();
-      if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
+      // 'seeked' listener will resume if a seek is in flight
+      if (!_playbackAudio.paused && !_videoSeekPending) {
+        _playbackVideo.play().catch(() => {});
+      }
     } else {
       return;
     }
@@ -8457,31 +8465,53 @@ function _audioToVideoTime(audioTime) {
 // Video seek - cancels any in-flight seek before issuing a new one
 let _videoScrubbing = false;    // true while the user is dragging the seek bar
 let _videoSeekDebounce = 0;     // timeout id for debounced seek during scrub
+let _videoSeekPending = false;  // true between currentTime= and 'seeked' event
 
 function _cancelVideoSeek() {
   clearTimeout(_videoSeekDebounce);
   _videoSeekDebounce = 0;
-  // Abort any in-flight seek by forcing the video to stop loading the old frame
-  if (_playbackVideo.seeking) {
-    // Re-assign the same src won't help, but we can let the next
-    // currentTime assignment naturally cancel the pending seek.
-  }
+  // The next currentTime assignment naturally supersedes any in-flight seek
+  // — we don't need to do anything explicit here.
 }
 
 function _seekVideoImmediate(targetTime) {
   _cancelVideoSeek();
+  // Skip no-op seeks: if we set currentTime to its current value, the
+  // browser doesn't fire 'seeked', and our pending flag would stick.
+  if (Math.abs(_playbackVideo.currentTime - targetTime) < 0.01) return;
+  _videoSeekPending = true;
   _playbackVideo.currentTime = targetTime;
 }
 
 function _seekVideoDebounced(targetTime, delayMs) {
   _cancelVideoSeek();
   _videoSeekDebounce = setTimeout(() => {
+    if (Math.abs(_playbackVideo.currentTime - targetTime) < 0.01) return;
+    _videoSeekPending = true;
     _playbackVideo.currentTime = targetTime;
   }, delayMs);
 }
 
+// Single persistent 'seeked' listener — clears the pending flag and resumes
+// playback after the decoder has actually landed on the new frame. This is
+// the fix for the preview-freeze: calling .play() immediately after setting
+// currentTime can land Chrome on a non-keyframe and freeze the rendered
+// image even though currentTime reports the new value.
+_playbackVideo.addEventListener('seeked', () => {
+  _videoSeekPending = false;
+  if (_videoScrubbing) return;  // scrub logic manages play state itself
+  if (!_videoAvailable || !_videoVisible) return;
+  if (!_playbackAudio.paused && _playbackVideo.paused) {
+    _playbackVideo.play().catch(() => {});
+  }
+});
+
 function _syncVideoToAudio() {
   if (!_videoAvailable || !_videoVisible) return;
+  // Don't fight an in-flight seek — issuing a new currentTime mid-seek can
+  // chain decode requests faster than Chrome can deliver frames, freezing
+  // the preview on a stale frame.
+  if (_videoSeekPending) return;
   const expected = _audioToVideoTime(_playbackAudio.currentTime);
   const drift = Math.abs(_playbackVideo.currentTime - expected);
   if (drift > 0.3) {
@@ -8539,7 +8569,9 @@ togglePlayback = function() {
     _playbackVideo.pause();
   } else {
     _syncVideoToAudio();
-    _playbackVideo.play().catch(() => {});
+    // The 'seeked' listener resumes play if _syncVideoToAudio kicked off
+    // a seek; only start now if nothing is pending.
+    if (!_videoSeekPending) _playbackVideo.play().catch(() => {});
   }
 };
 
@@ -8561,11 +8593,12 @@ const _origSeekToTime = seekToTime;
 seekToTime = function(t) {
   _origSeekToTime(t);
   if (_videoAvailable) {
-    _cancelVideoSeek();
     _seekVideoImmediate(_audioToVideoTime(t));
-    if (_videoVisible && !_playbackVideo.paused !== !_playbackAudio.paused) {
-      if (!_playbackAudio.paused) _playbackVideo.play().catch(() => {});
-      else _playbackVideo.pause();
+    // Play resumption is handled by the persistent 'seeked' listener so the
+    // video isn't told to play() while still seeking — that race is what
+    // freezes the preview on a stale frame after segment clicks.
+    if (_videoVisible && _playbackAudio.paused && !_playbackVideo.paused) {
+      _playbackVideo.pause();
     }
   }
 };
@@ -8580,8 +8613,11 @@ setPlaybackSpeed = function(val) {
 _playbackAudio.addEventListener('timeupdate', () => {
   if (_videoAvailable && _videoVisible && !_playbackAudio.paused && !_videoScrubbing) {
     _syncVideoToAudio();
-    // Keep play state in sync (filter skipping can pause/seek audio)
-    if (_playbackVideo.paused) _playbackVideo.play().catch(() => {});
+    // Keep play state in sync (filter skipping can pause/seek audio).
+    // Skip while a seek is in flight — the 'seeked' listener will resume.
+    if (!_videoSeekPending && _playbackVideo.paused) {
+      _playbackVideo.play().catch(() => {});
+    }
   }
 });
 
@@ -8597,10 +8633,12 @@ _playbackAudio.addEventListener('pause', () => {
 
 // When audio plays, play video
 _playbackAudio.addEventListener('play', () => {
-  if (_videoAvailable && _videoVisible) {
-    _syncVideoToAudio();
-    _playbackVideo.play().catch(() => {});
-  }
+  if (!_videoAvailable || !_videoVisible) return;
+  _syncVideoToAudio();
+  // If a seek is in flight, leave the play() call to the 'seeked' listener
+  // — calling .play() during a pending seek can lock the decoder onto a
+  // non-keyframe and freeze the preview.
+  if (!_videoSeekPending) _playbackVideo.play().catch(() => {});
 });
 
 /* ── Live screen preview ─────────────────────────────────────────────────── */
@@ -11180,6 +11218,7 @@ async function openSettings() {
   loadDiarizationPresets();
   loadScreenPresets();
   loadScreenDisplays();
+  loadDataFolder();
 }
 
 function _renderQuietReminderSettings() {
@@ -11817,6 +11856,93 @@ async function setStartupLaunch(enabled) {
   }
 }
 
+// ── Data folder ──────────────────────────────────────────────────────────
+
+async function loadDataFolder() {
+  const pathEl = document.getElementById('data-folder-current');
+  const resetBtn = document.getElementById('data-folder-reset-btn');
+  if (!pathEl) return;
+  try {
+    const info = await fetch('/api/data_folder').then(r => r.json());
+    pathEl.textContent = info.current;
+    pathEl.title = info.overridden
+      ? `Overridden — default is ${info.default}`
+      : 'Default location';
+    if (resetBtn) resetBtn.style.display = info.overridden ? '' : 'none';
+  } catch (_) {
+    pathEl.textContent = '(error reading data folder)';
+  }
+}
+
+async function pickDataFolder() {
+  const btn = document.getElementById('data-folder-pick-btn');
+  if (!btn || btn.disabled) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Opening picker…';
+  try {
+    const cur = document.getElementById('data-folder-current')?.textContent || '';
+    const res = await fetch('/api/data_folder/pick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initial: cur }),
+    }).then(r => r.json());
+    if (!res.selected) {
+      // user cancelled
+      return;
+    }
+    const ok = window.confirm(
+      `Move data folder to:\n\n${res.selected}\n\n` +
+      `This will copy every recording, database, and setting to the new ` +
+      `location and switch over. The original folder is kept as a backup ` +
+      `until you delete it manually.\n\n` +
+      `The app will need a restart afterwards. Continue?`
+    );
+    if (!ok) return;
+    btn.textContent = 'Migrating…';
+    const out = await fetch('/api/data_folder/migrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ destination: res.selected }),
+    }).then(r => r.json());
+    if (out.error) {
+      window.alert(`Migration failed:\n\n${out.error}`);
+      return;
+    }
+    const mb = (out.bytes_copied / 1024 / 1024).toFixed(1);
+    window.alert(
+      `Data folder migrated.\n\n` +
+      `${out.files_copied} files + ${out.dbs_copied} databases (${mb} MB)\n\n` +
+      `Please close and reopen the app for the change to take full effect. ` +
+      `The original folder is preserved at:\n${out.src}`
+    );
+    loadDataFolder();
+  } catch (e) {
+    window.alert(`Error: ${e.message || e}`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+async function resetDataFolder() {
+  const ok = window.confirm(
+    `Revert to the default data folder?\n\n` +
+    `This only changes which folder the app reads from on next startup — ` +
+    `it does NOT move files. If you want your current data at the default ` +
+    `location, copy it there manually first.\n\n` +
+    `The app will need a restart afterwards. Continue?`
+  );
+  if (!ok) return;
+  try {
+    await fetch('/api/data_folder/reset', { method: 'POST' }).then(r => r.json());
+    window.alert('Reverted to default data folder. Please close and reopen the app.');
+    loadDataFolder();
+  } catch (e) {
+    window.alert(`Error: ${e.message || e}`);
+  }
+}
+
 function closeSettingsOnOverlay(e) {
   if (e.target === e.currentTarget) closeSettings();
 }
@@ -12118,8 +12244,10 @@ async function _apSave(key, value) {
       }
       // Keep sidebar screen toggle in sync with settings panel
       if (key === 'screen_record_enabled') _syncScreenToggle();
-      // Switch preset to "Custom" when a parameter is manually changed
-      _switchToCustomPreset(key);
+      // Backend auto-flips the section's preset to "custom" when a
+      // preset-controlled key is edited. Sync the dropdowns from the
+      // server response so the UI matches the persisted state.
+      _syncPresetDropdownsFromResponse(res);
     }
   } catch (_) {}
 }
@@ -12149,6 +12277,29 @@ async function resetReanalysisParams() {
       _apRenderSection('ap-reanalysis-params', _raCache.reanalysis, _raCache.current);
     }
   } catch (_) {}
+}
+
+function _syncPresetDropdownsFromResponse(res) {
+  // Sync the section preset dropdowns from /api/audio_params PUT response,
+  // which echoes back the post-flip preset names. The server auto-flips the
+  // relevant section to "custom" whenever a preset-controlled key is edited.
+  const map = [
+    ['transcription_preset', 'transcription-preset-sel', 'transcription-preset-desc'],
+    ['diarization_preset',   'diarization-preset-sel',   'diarization-preset-desc'],
+    ['screen_preset',        'screen-preset-sel',        'screen-preset-desc'],
+  ];
+  for (const [field, selId, descId] of map) {
+    const newVal = res[field];
+    if (!newVal) continue;
+    const sel = document.getElementById(selId);
+    if (sel && sel.value !== newVal) {
+      sel.value = newVal;
+      const desc = document.getElementById(descId);
+      if (desc && newVal === 'custom') {
+        desc.textContent = 'Manually configure all parameters';
+      }
+    }
+  }
 }
 
 function _switchToCustomPreset(key) {

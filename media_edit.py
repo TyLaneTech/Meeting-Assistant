@@ -9,26 +9,39 @@ from pathlib import Path
 
 import numpy as np
 
+import paths
 
-ROOT = Path(__file__).parent
-DATA_DIR = ROOT / "data"
-AUDIO_DIR = DATA_DIR / "audio"
-VIDEO_DIR = DATA_DIR / "video"
-PROFILE_DIR = DATA_DIR / "audio_profiles"
-BACKUP_DIR = DATA_DIR / "backups"
-TMP_DIR = DATA_DIR / "tmp"
+
+def __getattr__(name):
+    """Expose data directories as live properties so callers always see
+    the current data folder, even after a runtime migration."""
+    if name == "DATA_DIR":
+        return paths.data_dir()
+    if name == "AUDIO_DIR":
+        return paths.audio_dir()
+    if name == "VIDEO_DIR":
+        return paths.video_dir()
+    if name == "PROFILE_DIR":
+        return paths.profile_dir()
+    if name == "BACKUP_DIR":
+        return paths.backup_dir()
+    if name == "TMP_DIR":
+        return paths.tmp_dir()
+    if name == "ROOT":
+        return Path(__file__).parent
+    raise AttributeError(name)
 
 
 def wav_path(session_id: str) -> Path:
-    return AUDIO_DIR / f"{session_id}.wav"
+    return paths.audio_dir() / f"{session_id}.wav"
 
 
 def video_path(session_id: str) -> Path:
-    return VIDEO_DIR / f"{session_id}.mp4"
+    return paths.video_dir() / f"{session_id}.mp4"
 
 
 def backup_dir(session_id: str) -> Path:
-    return BACKUP_DIR / session_id
+    return paths.backup_dir() / session_id
 
 
 def session_snapshot_path(session_id: str) -> Path:
@@ -77,7 +90,7 @@ def build_audio_profile(
         raise FileNotFoundError("Audio not found")
     bins = max(50, min(int(bins or 1200), 5000))
     stat = path.stat()
-    cache = PROFILE_DIR / f"{session_id}.{int(stat.st_mtime)}.{stat.st_size}.{bins}.json"
+    cache = paths.profile_dir() / f"{session_id}.{int(stat.st_mtime)}.{stat.st_size}.{bins}.json"
     if cache.exists():
         try:
             return json.loads(cache.read_text(encoding="utf-8"))
@@ -127,7 +140,7 @@ def build_audio_profile(
         "segments": profile_segments,
         "quiet_spans": quiet_spans,
     }
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    paths.profile_dir().mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(result), encoding="utf-8")
     return result
 
@@ -250,7 +263,7 @@ def clear_trim_backup(session_id: str) -> None:
 # look up the backup later.
 
 def split_backup_dir(group_id: str) -> Path:
-    return BACKUP_DIR / f"split-{group_id}"
+    return paths.backup_dir() / f"split-{group_id}"
 
 
 def split_snapshot_path(group_id: str) -> Path:
@@ -352,7 +365,7 @@ def clear_split_backup(group_id: str) -> None:
 
 
 def trim_wav_file(src: Path, dst: Path, start_sec: float, end_sec: float) -> float:
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    paths.tmp_dir().mkdir(parents=True, exist_ok=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(src), "rb") as wf:
         params = wf.getparams()

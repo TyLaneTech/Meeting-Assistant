@@ -283,12 +283,12 @@ class Transcriber:
         # Called when the diarizer fails so the UI can surface the error.
         self._diarizer_error_fired = False  # only fire once per session
 
-        # Tunable parameters - loaded from saved settings, reset-able to defaults
-        from default_audio_params import get_all_defaults
-        import settings as _settings
-        defaults = get_all_defaults()
-        saved = _settings.load().get("audio_params", {})
-        p = {**defaults, **saved}
+        # Tunable parameters — resolved against the active transcription preset.
+        # When the user is on a non-custom preset, preset values win over any
+        # stale per-key entries in audio_params, so updates to the preset
+        # definitions in default_audio_params.py auto-propagate.
+        from default_audio_params import resolve_audio_params
+        p = resolve_audio_params()
         self.silence_threshold   = float(p["silence_threshold"])
         self.silence_duration    = float(p["silence_duration"])
         self.min_buffer_seconds  = float(p["min_buffer_seconds"])

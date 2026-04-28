@@ -804,6 +804,23 @@
               </label>
             </div>
           </div>
+          <div class="settings-group-title">Storage</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Data Folder</div>
+                <div class="settings-row-desc">
+                  Where recordings, databases, and settings are stored.
+                  Point this at OneDrive/Dropbox/etc. to sync data across machines.
+                </div>
+                <div class="settings-row-desc settings-row-mono" id="data-folder-current">…</div>
+              </div>
+              <div class="settings-row-actions">
+                <button class="btn-settings-action" id="data-folder-pick-btn" onclick="pickDataFolder()">Choose…</button>
+                <button class="btn-settings-action btn-settings-secondary" id="data-folder-reset-btn" onclick="resetDataFolder()" style="display:none">Reset to default</button>
+              </div>
+            </div>
+          </div>
           <div class="settings-group-title">Updates</div>
           <div class="settings-group">
             <div class="settings-row">

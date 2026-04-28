@@ -4,15 +4,23 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "data" / "meetings.db"
+import paths
+
+
+def __getattr__(name):
+    """Expose ``DB_PATH`` as a live property so callers always see the
+    current data folder, even after a runtime migration."""
+    if name == "DB_PATH":
+        return paths.db_path()
+    raise AttributeError(name)
 
 
 @contextmanager
 def _conn():
-    DB_PATH.parent.mkdir(exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    db = paths.db_path()
+    db.parent.mkdir(exist_ok=True)
+    conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 3000")
     try:
@@ -801,13 +809,13 @@ def delete_session(session_id: str) -> None:
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     # Clean up WAV file if it exists
-    wav_path = DB_PATH.parent / "audio" / f"{session_id}.wav"
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
     if wav_path.exists():
         try:
             wav_path.unlink()
         except OSError:
             pass
-    video_path = DB_PATH.parent / "video" / f"{session_id}.mp4"
+    video_path = paths.video_dir() / f"{session_id}.mp4"
     if video_path.exists():
         try:
             video_path.unlink()
@@ -816,7 +824,7 @@ def delete_session(session_id: str) -> None:
 
 
 def list_sessions() -> list[dict]:
-    audio_dir = DB_PATH.parent / "audio"
+    audio_dir = paths.audio_dir()
     with _conn() as conn:
         rows = conn.execute(
             "SELECT s.id, s.title, s.started_at, s.ended_at,"
@@ -940,7 +948,7 @@ def delete_folder(folder_id: str, delete_contents: bool = False) -> list[str]:
             conn.execute("DELETE FROM folders WHERE id=?", (folder_id,))
 
     # Clean up WAV files outside the transaction
-    audio_dir = DB_PATH.parent / "audio"
+    audio_dir = paths.audio_dir()
     for sid in deleted_session_ids:
         wav_path = audio_dir / f"{sid}.wav"
         if wav_path.exists():

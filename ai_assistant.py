@@ -888,6 +888,47 @@ class AIAssistant:
             out.append({"role": m["role"], "content": parts or content})
         return out
 
+    @staticmethod
+    def _to_responses_input(messages: list[dict]) -> list[dict]:
+        """Convert internal message list to OpenAI Responses API input items."""
+        out: list[dict] = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            text_type = "input_text" if role == "user" else "output_text"
+            if isinstance(content, str):
+                out.append({"role": role, "content": [{"type": text_type, "text": content}]})
+                continue
+            parts: list[dict] = []
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "text":
+                    parts.append({"type": text_type, "text": block["text"]})
+                elif btype == "image":
+                    src = block.get("source", {})
+                    mime = src.get("media_type", "image/png")
+                    b64 = src.get("data", "")
+                    parts.append({"type": "input_image", "image_url": f"data:{mime};base64,{b64}"})
+            out.append({"role": role, "content": parts})
+        return out
+
+    @staticmethod
+    def _convert_tools_for_responses(tools: list[dict]) -> list[dict]:
+        """Flatten chat.completions function tool shape to Responses API shape."""
+        out: list[dict] = []
+        for t in tools:
+            if t.get("type") == "function" and "function" in t:
+                fn = t["function"]
+                out.append({
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                })
+            else:
+                out.append(t)
+        return out
+
     def _stream_openai(self, system: str, messages: list[dict], on_token: Callback,
                         cancel: "threading.Event | None" = None,
                         client=None, model: str | None = None) -> None:
@@ -1228,7 +1269,7 @@ class AIAssistant:
 
     def _execute_tool_openai(
         self,
-        tc_id: str,
+        call_id: str,
         tc_name: str,
         tc_args_raw: str,
         msgs: list[dict],
@@ -1236,7 +1277,7 @@ class AIAssistant:
         tool_executor: "ToolExecutor | None",
         on_tool_event: ToolEventCallback | None,
     ) -> None:
-        """Execute a single OpenAI tool call, appending results to msgs."""
+        """Execute a single OpenAI tool call, appending Responses API items to msgs."""
         try:
             parsed_args = json.loads(tc_args_raw)
         except Exception:
@@ -1250,7 +1291,11 @@ class AIAssistant:
             try:
                 content, is_error, summary, extra = tool_executor(tc_name, parsed_args)
                 result_text = content if isinstance(content, str) else json.dumps(content)
-                msgs.append({"role": "tool", "tool_call_id": tc_id, "content": result_text})
+                msgs.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": result_text,
+                })
                 if on_tool_event:
                     payload = {"name": tc_name, "success": not is_error, "summary": summary}
                     if extra:
@@ -1274,10 +1319,16 @@ class AIAssistant:
                 if url:
                     text_msg += f" Embed in your response with: ![Screenshot at {ts:.1f}s]({url})"
                 msgs.append({
-                    "role": "tool", "tool_call_id": tc_id,
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": text_msg,
+                })
+                # function_call_output.output is text-only; provide the image as a
+                # follow-up user input so vision models can ground their answer.
+                msgs.append({
+                    "role": "user",
                     "content": [
-                        {"type": "text", "text": text_msg},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
                     ],
                 })
                 if on_tool_event:
@@ -1287,8 +1338,9 @@ class AIAssistant:
                     })
             else:
                 msgs.append({
-                    "role": "tool", "tool_call_id": tc_id,
-                    "content": "Could not extract frame - the timestamp may be out of range or no video is available.",
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "Could not extract frame - the timestamp may be out of range or no video is available.",
                 })
                 if on_tool_event:
                     on_tool_event("tool_result", {
@@ -1297,7 +1349,11 @@ class AIAssistant:
             return
 
         # Unknown tool
-        msgs.append({"role": "tool", "tool_call_id": tc_id, "content": f"Unknown tool: {tc_name}"})
+        msgs.append({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": f"Unknown tool: {tc_name}",
+        })
         if on_tool_event:
             on_tool_event("tool_result", {
                 "name": tc_name, "success": False, "summary": f"Unknown tool: {tc_name}",
@@ -1316,91 +1372,80 @@ class AIAssistant:
         client=None,
         model: str | None = None,
     ) -> None:
-        import openai
-
         c = client or self.client
         m = model or self.model
-        converted = self._to_openai_messages(messages)
-        msgs = [{"role": "system", "content": system}] + converted
+        o_tools = self._convert_tools_for_responses(tools or [_SCREENSHOT_FUNC_OAI])
         max_rounds = 50
-        o_tools = tools or [_SCREENSHOT_FUNC_OAI]
 
+        next_input = self._to_responses_input(messages)
+        previous_response_id: str | None = None
         had_text = False
+
         for _ in range(max_rounds):
             if cancel and cancel.is_set():
                 return
 
-            stream = c.chat.completions.create(
-                model=m,
-                messages=msgs,
-                tools=o_tools,
-                stream=True,
-            )
+            kwargs = {
+                "model": m,
+                "instructions": system,
+                "input": next_input,
+                "tools": o_tools,
+            }
+            if previous_response_id:
+                kwargs["previous_response_id"] = previous_response_id
 
-            full_content = ""
+            function_calls: list[dict] = []
+            web_search_seen = False
             round_had_text = False
-            tool_calls_acc: dict[int, dict] = {}
-            finish_reason = None
-            _oai_annotations: list = []
-            for chunk in stream:
-                if cancel and cancel.is_set():
-                    break
-                choice = chunk.choices[0]
-                finish_reason = choice.finish_reason or finish_reason
-                delta = choice.delta
-                if delta.content:
-                    if not round_had_text and had_text:
-                        on_token("\n\n---\n\n")
-                        full_content += "\n\n---\n\n"
-                    round_had_text = True
-                    full_content += delta.content
-                    on_token(delta.content)
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        entry = tool_calls_acc.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
-                        if tc.id:
-                            entry["id"] = tc.id
-                        if tc.function.name:
-                            entry["name"] += tc.function.name
-                        if tc.function.arguments:
-                            entry["arguments"] += tc.function.arguments
-                # Track URL citation annotations (native web search)
-                for ann in getattr(delta, "annotations", None) or []:
-                    _oai_annotations.append(ann)
+            cancelled = False
+
+            with c.responses.stream(**kwargs) as stream:
+                for event in stream:
+                    if cancel and cancel.is_set():
+                        cancelled = True
+                        stream.close()
+                        break
+                    etype = getattr(event, "type", "")
+                    if etype == "response.output_text.delta":
+                        delta = getattr(event, "delta", "") or ""
+                        if delta:
+                            if not round_had_text and had_text:
+                                on_token("\n\n---\n\n")
+                            round_had_text = True
+                            on_token(delta)
+                    elif etype == "response.output_item.done":
+                        item = getattr(event, "item", None)
+                        itype = getattr(item, "type", "") if item is not None else ""
+                        if itype == "function_call":
+                            function_calls.append({
+                                "call_id": getattr(item, "call_id", "") or "",
+                                "name": getattr(item, "name", "") or "",
+                                "arguments": getattr(item, "arguments", "") or "",
+                            })
+                        elif itype == "web_search_call" and not web_search_seen and on_tool_event:
+                            web_search_seen = True
+                            on_tool_event("tool_call", {"name": "web_search", "input": {}})
+                            on_tool_event("tool_result", {
+                                "name": "web_search",
+                                "success": True,
+                                "summary": "Web search performed",
+                            })
+
+                if cancelled:
+                    return
+                final = stream.get_final_response()
+                previous_response_id = getattr(final, "id", None) or previous_response_id
 
             if round_had_text:
                 had_text = True
 
-            # Emit tool events for native web search if annotations detected
-            if on_tool_event and _oai_annotations:
-                url_cites = [
-                    a for a in _oai_annotations
-                    if getattr(a, "type", "") == "url_citation"
-                ]
-                if url_cites:
-                    on_tool_event("tool_call", {
-                        "name": "web_search",
-                        "input": {},
-                    })
-                    on_tool_event("tool_result", {
-                        "name": "web_search",
-                        "success": True,
-                        "summary": f"Found {len(url_cites)} source{'s' if len(url_cites) != 1 else ''}",
-                    })
-
-            if not tool_calls_acc or finish_reason != "tool_calls":
+            if not function_calls:
                 return
 
-            tc_list = [
-                {"id": v["id"], "type": "function",
-                 "function": {"name": v["name"], "arguments": v["arguments"]}}
-                for v in tool_calls_acc.values()
-            ]
-            msgs.append({"role": "assistant", "content": full_content or None, "tool_calls": tc_list})
-
-            for v in tool_calls_acc.values():
+            next_input = []
+            for call in function_calls:
                 self._execute_tool_openai(
-                    v["id"], v["name"], v["arguments"], msgs,
+                    call["call_id"], call["name"], call["arguments"], next_input,
                     frame_extractor, tool_executor, on_tool_event,
                 )
 

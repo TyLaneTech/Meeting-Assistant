@@ -3,6 +3,7 @@
 /__pycache__
 AGENT.md
 data/
+.data_location
 *.db
 *.wav
 .env

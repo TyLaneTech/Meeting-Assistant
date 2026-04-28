@@ -1,7 +1,7 @@
 """
 Meeting Assistant - Flask web server.
 Run: python app.py
-Opens http://127.0.0.1:5000 automatically.
+Opens http://localhost:6969 automatically.
 """
 import faulthandler
 faulthandler.enable()  # dump traceback on native crashes (SIGSEGV, etc.)
@@ -39,6 +39,7 @@ import log
 import config
 import media_edit
 import notifications
+import paths
 import settings
 import storage
 from ai_assistant import AIAssistant
@@ -154,7 +155,7 @@ _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
 # concurrency >> CPU count is fine; capped at 4 to avoid hammering the LLM API.
 _retitle_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retitle")
 _tray = None  # MeetingTray instance (set in main(), None if no tray)
-_server_url = f"http://127.0.0.1:{int(os.getenv('PORT', 6969))}"
+_server_url = f"http://localhost:{int(os.getenv('PORT', 6969))}"
 _quiet_audio_rms_threshold = float(settings.get("quiet_prompt_audio_rms_threshold", 0.006))
 _startup_init_lock = threading.Lock()
 _startup_init_started = False
@@ -994,18 +995,45 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
     def _extract_and_match() -> None:
         emb = fingerprint_db.extract_embedding(seg_audio)
         if emb is None:
+            log.info("fingerprint", f"{speaker_key}: embedding extraction failed")
             return
+
+        # Profiles already linked to OTHER speaker_keys in this session — never
+        # candidates regardless of whether speaker_key is linked or not.
+        session_links = fingerprint_db.get_session_links(sid)
+        other_links = {gid for k, gid in session_links.items()
+                       if k != speaker_key and gid}
+
         if existing_link:
             fingerprint_db.add_embedding(existing_link, sid, speaker_key, emb, duration)
             return
-        excluded = dismissals.get(speaker_key, set())
-        # Also exclude global profiles already linked to OTHER speakers in this session
-        # to prevent "Rogan sounds like Dave Smith" when Dave is already identified
-        session_links = fingerprint_db.get_session_links(sid)
-        for k, gid in session_links.items():
-            if k != speaker_key and gid:
-                excluded.add(gid)
-        matches = fingerprint_db.find_matches(emb, exclude_global_ids=excluded)
+
+        excluded = dismissals.get(speaker_key, set()) | other_links
+
+        # Diagnostic: pull top candidates regardless of threshold so we can see
+        # *why* a speaker isn't getting matched (closest profile sim too low,
+        # library empty, all candidates excluded, etc.).
+        all_candidates = fingerprint_db.find_matches(
+            emb, exclude_global_ids=excluded, min_similarity=0.0,
+        )
+        if all_candidates:
+            top_summary = ", ".join(
+                f"{c['name']} sim={c['similarity']:.2f}"
+                for c in all_candidates[:3]
+            )
+            log.info(
+                "fingerprint",
+                f"{speaker_key} closest: {top_summary} "
+                f"(suggest>={fingerprint_db.SUGGEST_THRESHOLD:.2f}, "
+                f"auto>={fingerprint_db.AUTO_APPLY_THRESHOLD:.2f})",
+            )
+        else:
+            reason = "library empty" if not fingerprint_db.ready else "all candidates excluded/dismissed"
+            log.info("fingerprint", f"{speaker_key}: no candidates ({reason})")
+
+        # Actionable matches: those crossing the suggest threshold.
+        matches = [c for c in all_candidates
+                   if c["similarity"] >= fingerprint_db.SUGGEST_THRESHOLD]
         if not matches:
             return
         top = matches[0]
@@ -1229,8 +1257,8 @@ def get_session(session_id: str):
     data = storage.get_session(session_id)
     if not data:
         return jsonify({"error": "Not found"}), 404
-    wav_path = Path(__file__).parent / "data" / "audio" / f"{session_id}.wav"
-    video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
+    video_path = paths.video_dir() / f"{session_id}.mp4"
     data["has_audio"] = wav_path.exists()
     data["has_video"] = video_path.exists()
     data["video_offset"] = float(settings.get(f"video_offset_{session_id}", 0))
@@ -1280,8 +1308,8 @@ def start_audio_test():
     capture = AudioCapture(test_queue)
 
     # Apply audio processing settings so the test reflects real behavior
-    from default_audio_params import get_all_defaults
-    _params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
+    from default_audio_params import resolve_audio_params
+    _params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
     capture.agc_mic_enabled = bool(int(_params.get("agc_mic_enabled", 0)))
@@ -1427,8 +1455,8 @@ def start_recording():
     capture = AudioCapture(_audio_queue)
 
     # Apply echo cancellation setting to the new capture instance
-    from default_audio_params import get_all_defaults
-    _ec_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
+    from default_audio_params import resolve_audio_params
+    _ec_params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
     capture.agc_mic_enabled = bool(int(_ec_params.get("agc_mic_enabled", 0)))
@@ -1437,7 +1465,7 @@ def start_recording():
     capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
 
     # Set up WAV recording - append to existing file on resume
-    wav_dir = Path(__file__).parent / "data" / "audio"
+    wav_dir = paths.audio_dir()
     wav_path = str(wav_dir / f"{session_id}.wav")
     capture.start_wav(wav_path, append=bool(resume_session_id))
     try:
@@ -1489,7 +1517,7 @@ def start_recording():
 
     # ── Screen recording (optional) ────────────────────────────────────────
     screen_recording_active = False
-    all_params = {**get_all_defaults(), **settings.load().get("audio_params", {})}
+    all_params = resolve_audio_params()
     if int(all_params.get("screen_record_enabled", 0)) and find_ffmpeg():
         try:
             display_idx = int(settings.get("screen_display", 0))
@@ -1501,7 +1529,7 @@ def start_recording():
             scale_w = int(all_params.get("screen_scale_width", 0))
             scale = f"{scale_w}:-2" if scale_w > 0 else ""
 
-            video_dir = Path(__file__).parent / "data" / "video"
+            video_dir = paths.video_dir()
             video_path = str(video_dir / f"{session_id}.mp4")
 
             # When resuming, preserve the previous video as a numbered
@@ -1548,7 +1576,7 @@ def _concat_video_parts(session_id: str) -> None:
     preserve it).  After recording stops, this function merges all parts
     plus the final recording into a single {session_id}.mp4 and cleans up.
     """
-    video_dir = Path(__file__).parent / "data" / "video"
+    video_dir = paths.video_dir()
     final_path = video_dir / f"{session_id}.mp4"
 
     # Collect part files in order
@@ -2332,19 +2360,102 @@ def set_preferences():
     return jsonify(updated)
 
 
+# ── Data folder relocation ───────────────────────────────────────────────────
+
+@app.route("/api/data_folder", methods=["GET"])
+def get_data_folder():
+    """Return the active data folder path and whether it's user-overridden."""
+    return jsonify({
+        "current": str(paths.data_dir()),
+        "default": str(paths.default_dir()),
+        "overridden": paths.is_overridden(),
+    })
+
+
+@app.route("/api/data_folder/pick", methods=["POST"])
+def pick_data_folder():
+    """Show a native folder picker and return the selected path.
+
+    Does not migrate — caller must POST to /api/data_folder/migrate to commit.
+    """
+    data = request.get_json(silent=True) or {}
+    initial = data.get("initial") or str(paths.data_dir())
+    selected = paths.pick_folder(initial_dir=initial)
+    return jsonify({"selected": selected})
+
+
+@app.route("/api/data_folder/migrate", methods=["POST"])
+def migrate_data_folder():
+    """Copy the current data folder to a new location and switch over.
+
+    Refuses if a recording is in progress (would risk losing in-flight WAV
+    writes) or if any reanalysis / batch jobs are running. After a successful
+    migration, the response includes ``restart_required: True`` — the caller
+    should prompt the user to restart so module-level caches re-read.
+    """
+    data = request.get_json(silent=True) or {}
+    dst = (data.get("destination") or "").strip()
+    if not dst:
+        return jsonify({"error": "destination required"}), 400
+
+    # Refuse mid-recording — moving WAVs/DBs while writers are open would
+    # corrupt them. Caller can stop recording and try again.
+    with _state_lock:
+        if _state.get("is_recording"):
+            return jsonify({
+                "error": "A recording is in progress. Stop recording first.",
+            }), 409
+        if _state.get("reanalyzing"):
+            return jsonify({
+                "error": "A reanalysis is in progress. Wait for it to finish.",
+            }), 409
+
+    try:
+        result = paths.migrate(dst=Path(dst))
+    except paths.MigrationError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        log.error("data_folder", f"Unexpected migration error: {e}")
+        return jsonify({"error": f"Unexpected error: {e}"}), 500
+
+    log.info(
+        "data_folder",
+        f"Migrated data folder → {result['dst']} "
+        f"({result['files_copied']} files, {result['dbs_copied']} DBs, "
+        f"{result['bytes_copied'] / 1024 / 1024:.1f} MB)",
+    )
+    return jsonify({
+        "ok": True,
+        "restart_required": True,
+        **result,
+    })
+
+
+@app.route("/api/data_folder/reset", methods=["POST"])
+def reset_data_folder():
+    """Forget the user override and revert to the default location.
+
+    Does NOT move data — caller is responsible for migrating the contents
+    back to the default folder first if they want it there.
+    """
+    paths.reset_to_default()
+    return jsonify({
+        "ok": True,
+        "current": str(paths.data_dir()),
+        "restart_required": True,
+    })
+
+
 @app.route("/api/audio_params", methods=["GET"])
 def get_audio_params():
     """Return current audio parameter values, defaults, and metadata."""
     from default_audio_params import (
         TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
         AUTO_GAIN_DEFAULTS, ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
-        get_all_defaults,
+        resolve_audio_params,
     )
-    saved = settings.load().get("audio_params", {})
-    defaults = get_all_defaults()
-    current = {**defaults, **saved}
     return jsonify({
-        "current": current,
+        "current": resolve_audio_params(settings.load()),
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
         "auto_gain": AUTO_GAIN_DEFAULTS,
@@ -2355,25 +2466,69 @@ def get_audio_params():
 
 @app.route("/api/audio_params", methods=["PUT"])
 def set_audio_params():
-    """Update one or more audio parameters."""
-    from default_audio_params import get_all_defaults
+    """Update one or more audio parameters.
+
+    If any key being set is controlled by a non-custom preset, that
+    section's preset is auto-flipped to ``"custom"`` and the *currently
+    effective* values for the rest of the section are snapshotted into
+    audio_params first, so untouched params keep their preset values
+    while the user's edit lands on top.
+    """
+    from default_audio_params import (
+        get_all_defaults, resolve_audio_params, preset_keys,
+        _screen_preset_overrides,
+    )
     data = request.get_json(silent=True) or {}
     all_settings = settings.load()
     params = all_settings.get("audio_params", {})
     defaults = get_all_defaults()
-    for key, val in data.items():
-        if key in defaults:
-            params[key] = val
+
+    edited_keys = {k for k in data if k in defaults}
+    screen_keys = set(_screen_preset_overrides(SCREEN_DEFAULT_PRESET).keys())
+
+    # Determine which section presets need to flip to custom.
+    flips: list[tuple[str, set]] = []
+    t_preset = all_settings.get("transcription_preset", TRANSCRIPTION_DEFAULT_PRESET)
+    if t_preset != "custom" and edited_keys & preset_keys(TRANSCRIPTION_PRESETS):
+        flips.append(("transcription_preset", preset_keys(TRANSCRIPTION_PRESETS)))
+    d_preset = all_settings.get("diarization_preset", DIARIZATION_DEFAULT_PRESET)
+    if d_preset != "custom" and edited_keys & preset_keys(DIARIZATION_PRESETS):
+        flips.append(("diarization_preset", preset_keys(DIARIZATION_PRESETS)))
+    s_preset = all_settings.get("screen_preset", SCREEN_DEFAULT_PRESET)
+    if s_preset != "custom" and edited_keys & screen_keys:
+        flips.append(("screen_preset", screen_keys))
+
+    # Snapshot effective values into audio_params for the sections we're
+    # flipping, BEFORE applying the user's edit, so untouched keys retain
+    # their preset values.
+    if flips:
+        effective = resolve_audio_params(all_settings)
+        for preset_setting_key, section_keys in flips:
+            for k in section_keys:
+                if k in effective:
+                    params[k] = effective[k]
+            settings.put(preset_setting_key, "custom")
+
+    # Apply the user's edits last — they always win over the snapshot.
+    for key in edited_keys:
+        params[key] = data[key]
     settings.put("audio_params", params)
-    # Apply to running transcriber/diarizer
-    _apply_audio_params({**defaults, **params})
-    return jsonify({"ok": True, "audio_params": {**defaults, **params}})
+
+    current = resolve_audio_params()
+    _apply_audio_params(current)
+    return jsonify({
+        "ok": True,
+        "audio_params": current,
+        "transcription_preset": settings.get("transcription_preset", TRANSCRIPTION_DEFAULT_PRESET),
+        "diarization_preset": settings.get("diarization_preset", DIARIZATION_DEFAULT_PRESET),
+        "screen_preset": settings.get("screen_preset", SCREEN_DEFAULT_PRESET),
+    })
 
 
 @app.route("/api/audio_params/reset", methods=["POST"])
 def reset_audio_param():
     """Reset one or all audio parameters to defaults."""
-    from default_audio_params import get_all_defaults, get_default
+    from default_audio_params import resolve_audio_params
     data = request.get_json(silent=True) or {}
     key = data.get("key")
     all_settings = settings.load()
@@ -2383,8 +2538,7 @@ def reset_audio_param():
     else:
         params = {}
     settings.put("audio_params", params)
-    defaults = get_all_defaults()
-    current = {**defaults, **params}
+    current = resolve_audio_params()
     _apply_audio_params(current)
     return jsonify({"ok": True, "audio_params": current})
 
@@ -2392,7 +2546,7 @@ def reset_audio_param():
 @app.route("/api/audio_params/reset_section", methods=["POST"])
 def reset_audio_section():
     """Reset all parameters in a specific section to defaults."""
-    from default_audio_params import get_all_defaults
+    from default_audio_params import resolve_audio_params
     section_map = {
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
@@ -2421,8 +2575,7 @@ def reset_audio_section():
         pkey, pval = preset_defaults[section]
         settings.put(pkey, pval)
 
-    defaults = get_all_defaults()
-    current = {**defaults, **params}
+    current = resolve_audio_params()
     _apply_audio_params(current)
     return jsonify({"ok": True, "audio_params": current})
 
@@ -2487,22 +2640,31 @@ def get_transcription_presets():
 
 @app.route("/api/transcription/presets", methods=["PUT"])
 def set_transcription_preset():
-    """Apply a transcription preset."""
-    from default_audio_params import get_all_defaults
+    """Switch the active transcription preset.
+
+    Non-custom presets are stored by *name only* — effective values come
+    from the preset definitions at read time, so source-code updates to
+    the preset propagate automatically. When switching to ``"custom"`` we
+    snapshot the currently effective values for the transcription keys
+    into audio_params so the user can edit from where they were.
+    """
+    from default_audio_params import resolve_audio_params, preset_keys
     data = request.get_json(silent=True) or {}
     preset_id = data.get("preset", TRANSCRIPTION_DEFAULT_PRESET)
-    if preset_id not in TRANSCRIPTION_PRESETS or preset_id == "custom":
-        settings.put("transcription_preset", preset_id)
-        return jsonify({"ok": True, "preset": preset_id})
+    if preset_id not in TRANSCRIPTION_PRESETS:
+        return jsonify({"error": "invalid preset"}), 400
 
-    param_updates = TRANSCRIPTION_PRESETS[preset_id]["values"]
-    all_settings = settings.load()
-    params = all_settings.get("audio_params", {})
-    params.update(param_updates)
-    settings.put("audio_params", params)
+    if preset_id == "custom":
+        all_settings = settings.load()
+        effective = resolve_audio_params(all_settings)
+        params = all_settings.get("audio_params", {})
+        for k in preset_keys(TRANSCRIPTION_PRESETS):
+            if k in effective:
+                params[k] = effective[k]
+        settings.put("audio_params", params)
+
     settings.put("transcription_preset", preset_id)
-
-    current = {**get_all_defaults(), **params}
+    current = resolve_audio_params()
     _apply_audio_params(current)
     return jsonify({"ok": True, "preset": preset_id, "audio_params": current})
 
@@ -2519,22 +2681,25 @@ def get_diarization_presets():
 
 @app.route("/api/diarization/presets", methods=["PUT"])
 def set_diarization_preset():
-    """Apply a diarization preset."""
-    from default_audio_params import get_all_defaults
+    """Switch the active diarization preset. See ``set_transcription_preset``
+    for the non-custom-by-name / snapshot-on-custom semantics."""
+    from default_audio_params import resolve_audio_params, preset_keys
     data = request.get_json(silent=True) or {}
     preset_id = data.get("preset", DIARIZATION_DEFAULT_PRESET)
-    if preset_id not in DIARIZATION_PRESETS or preset_id == "custom":
-        settings.put("diarization_preset", preset_id)
-        return jsonify({"ok": True, "preset": preset_id})
+    if preset_id not in DIARIZATION_PRESETS:
+        return jsonify({"error": "invalid preset"}), 400
 
-    param_updates = DIARIZATION_PRESETS[preset_id]["values"]
-    all_settings = settings.load()
-    params = all_settings.get("audio_params", {})
-    params.update(param_updates)
-    settings.put("audio_params", params)
+    if preset_id == "custom":
+        all_settings = settings.load()
+        effective = resolve_audio_params(all_settings)
+        params = all_settings.get("audio_params", {})
+        for k in preset_keys(DIARIZATION_PRESETS):
+            if k in effective:
+                params[k] = effective[k]
+        settings.put("audio_params", params)
+
     settings.put("diarization_preset", preset_id)
-
-    current = {**get_all_defaults(), **params}
+    current = resolve_audio_params()
     _apply_audio_params(current)
     return jsonify({"ok": True, "preset": preset_id, "audio_params": current})
 
@@ -2614,32 +2779,26 @@ def get_screen_presets():
 
 @app.route("/api/screen/presets", methods=["PUT"])
 def set_screen_preset():
-    """Apply a screen recording preset (updates individual params)."""
+    """Switch the active screen recording preset. See
+    ``set_transcription_preset`` for the non-custom-by-name /
+    snapshot-on-custom semantics."""
+    from default_audio_params import resolve_audio_params, _screen_preset_overrides
     data = request.get_json(silent=True) or {}
     preset_id = data.get("preset", SCREEN_DEFAULT_PRESET)
-    if preset_id not in SCREEN_PRESETS or preset_id == "custom":
-        settings.put("screen_preset", preset_id)
-        return jsonify({"ok": True, "preset": preset_id})
+    if preset_id not in SCREEN_PRESETS:
+        return jsonify({"error": "invalid preset"}), 400
 
-    p = SCREEN_PRESETS[preset_id]
-    h264_idx = H264_PRESETS.index(p["preset"]) if p["preset"] in H264_PRESETS else 2
-    scale_w = int(p["scale"].split(":")[0]) if p["scale"] else 0
+    if preset_id == "custom":
+        all_settings = settings.load()
+        effective = resolve_audio_params(all_settings)
+        params = all_settings.get("audio_params", {})
+        for k in _screen_preset_overrides(SCREEN_DEFAULT_PRESET).keys():
+            if k in effective:
+                params[k] = effective[k]
+        settings.put("audio_params", params)
 
-    param_updates = {
-        "screen_framerate": p["framerate"],
-        "screen_crf": p["crf"],
-        "screen_h264_preset": h264_idx,
-        "screen_scale_width": scale_w,
-    }
-
-    all_settings = settings.load()
-    params = all_settings.get("audio_params", {})
-    params.update(param_updates)
-    settings.put("audio_params", params)
     settings.put("screen_preset", preset_id)
-
-    from default_audio_params import get_all_defaults
-    current = {**get_all_defaults(), **params}
+    current = resolve_audio_params()
     return jsonify({"ok": True, "preset": preset_id, "audio_params": current})
 
 
@@ -2677,7 +2836,7 @@ def get_session_screenshot(session_id, filename):
 @app.route("/api/sessions/<session_id>/video", methods=["GET"])
 def get_session_video(session_id):
     """Serve the recorded video file for a session."""
-    video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+    video_path = paths.video_dir() / f"{session_id}.mp4"
     if not video_path.exists():
         return jsonify({"error": "No video recording for this session"}), 404
     return send_file(str(video_path), mimetype="video/mp4")
@@ -2690,7 +2849,7 @@ def get_session_frame(session_id):
     Query params:
         t: timestamp in seconds (float)
     """
-    video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+    video_path = paths.video_dir() / f"{session_id}.mp4"
     if not video_path.exists():
         return jsonify({"error": "No video recording for this session"}), 404
     t = request.args.get("t", 0, type=float)
@@ -2838,10 +2997,10 @@ def set_diarizer_model():
     return jsonify({"ok": True})
 
 
-_ATTACH_DIR = Path(__file__).parent / "data" / "attachments"
+_ATTACH_DIR = paths.attachments_dir()
 _ATTACH_DIR.mkdir(parents=True, exist_ok=True)
 
-_SCREENSHOT_DIR = Path(__file__).parent / "data" / "screenshots"
+_SCREENSHOT_DIR = paths.screenshots_dir()
 _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -3053,7 +3212,7 @@ def chat():
         # Returns (jpeg_bytes, url) so ai_assistant can show the image to the
         # model AND give it a markdown-embeddable URL for inline screenshots.
         fe = None
-        video_path = Path(__file__).parent / "data" / "video" / f"{session_id}.mp4"
+        video_path = paths.video_dir() / f"{session_id}.mp4"
         live_path = _screen_recorder.live_video_path
 
         display_idx = int(settings.get("screen_display", 0))
@@ -3491,7 +3650,7 @@ def update_segment_label(seg_id: int):
             seg = storage.get_segment(seg_id)
             if not seg:
                 return
-            wav_path = Path(__file__).parent / "data" / "audio" / f"{seg['session_id']}.wav"
+            wav_path = paths.audio_dir() / f"{seg['session_id']}.wav"
             if not wav_path.exists():
                 return
             if seg["end_time"] - seg["start_time"] < fingerprint_db.MIN_DURATION_SEC:
@@ -3669,7 +3828,7 @@ def update_speaker_label(session_id: str):
                             log.info("fingerprint", f"Added embedding from accumulator for {label!r}")
                             continue
                     # Fallback: extract from WAV file (past session or accumulator empty)
-                    wav_path = Path(__file__).parent / "data" / "audio" / f"{sid}.wav"
+                    wav_path = paths.audio_dir() / f"{sid}.wav"
                     if wav_path.exists():
                         segments = storage.get_segments_by_speaker(sid, k)
                         added = 0
@@ -3700,7 +3859,7 @@ def update_speaker_label(session_id: str):
 @app.route("/api/sessions/<session_id>/audio")
 def session_audio(session_id: str):
     """Serve the recorded WAV file for browser playback."""
-    wav_path = Path(__file__).parent / "data" / "audio" / f"{session_id}.wav"
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
     if not wav_path.exists():
         return jsonify({"error": "No audio recording for this session"}), 404
     return send_file(str(wav_path), mimetype="audio/wav", conditional=True)
@@ -4087,7 +4246,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
         # otherwise fall back to the real-time pipeline.
         try:
             from batch_transcriber import BatchTranscriber
-            from default_audio_params import get_reanalysis_defaults, get_all_defaults
+            from default_audio_params import get_reanalysis_defaults, resolve_audio_params
             saved = settings.load().get("reanalysis_params", {})
             params = {**get_reanalysis_defaults(), **saved}
 
@@ -4099,8 +4258,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
             # Map roughly: clustering_threshold ~ delta_new * 0.75,
             # clamped to [0.35, 0.75] to avoid extreme under/over-merge.
             if params.get("reanalysis_use_live_diarization"):
-                live_saved = settings.load().get("audio_params", {})
-                live = {**get_all_defaults(), **live_saved}
+                live = resolve_audio_params()
                 raw = live.get("delta_new", 0.5) * 0.75
                 params["reanalysis_clustering_threshold"] = max(0.35, min(0.75, raw))
 
@@ -4133,7 +4291,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
 @app.route("/api/sessions/<session_id>/reanalyze", methods=["POST"])
 def reanalyze_session(session_id: str):
     """Re-transcribe + re-summarize a session from its saved WAV file."""
-    wav_path = Path(__file__).parent / "data" / "audio" / f"{session_id}.wav"
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
     if not wav_path.exists():
         return jsonify({"error": "No audio recording for this session"}), 404
 
@@ -4190,7 +4348,7 @@ def upload_session():
 
     # Create session
     session_id = storage.create_session()
-    audio_dir = Path(__file__).parent / "data" / "audio"
+    audio_dir = paths.audio_dir()
     audio_dir.mkdir(parents=True, exist_ok=True)
     wav_path = audio_dir / f"{session_id}.wav"
 
@@ -4459,7 +4617,7 @@ def export_session(session_id: str):
         zf.writestr("manifest.json", json.dumps(pkg, separators=(",", ":"), default=str))
 
         # Include media files if requested
-        data_dir = Path(__file__).parent / "data"
+        data_dir = paths.data_dir()
 
         include_audio = include is None or "audio" in (include or set())
         include_video = include is None or "video" in (include or set())
@@ -4610,7 +4768,7 @@ def import_session():
             new_session_id = storage.import_session_data(pkg)
 
             # Extract media files
-            data_dir = Path(__file__).parent / "data"
+            data_dir = paths.data_dir()
 
             # Audio: support Opus (current), FLAC (legacy v1), and raw WAV
             _audio_src = next(
@@ -4920,7 +5078,7 @@ def _train_from_bulk_link(global_id: str, affected: list[dict], profile_name: st
     """Background: extract voice embeddings from WAV files for newly linked labels.
     Skips sessions that already have embeddings for this profile+speaker_key,
     and only uses segments with healthy duration (≥ MIN_DURATION_SEC)."""
-    audio_dir = Path(__file__).parent / "data" / "audio"
+    audio_dir = paths.audio_dir()
     added_total = 0
     for label in affected:
         sid, key = label["session_id"], label["speaker_key"]
@@ -5110,7 +5268,7 @@ def fp_confirm():
             _fp_executor.submit(_add_emb)
         else:
             # Fallback: extract from WAV file
-            wav_path = Path(__file__).parent / "data" / "audio" / f"{session_id}.wav"
+            wav_path = paths.audio_dir() / f"{session_id}.wav"
             if wav_path.exists():
                 def _add_wav_embs():
                     segments = storage.get_segments_by_speaker(session_id, speaker_key)
@@ -5493,7 +5651,9 @@ def main() -> None:
     kill_stale_ffmpeg()
 
     port = int(os.getenv("PORT", 6969))
-    url = f"http://127.0.0.1:{port}"
+    # Bind to 127.0.0.1 (loopback only — never expose externally), but advertise
+    # the URL as ``localhost`` so the browser/tray see a friendly hostname.
+    url = f"http://localhost:{port}"
     _server_url = url
 
     if not _handshake_existing_instance(url):

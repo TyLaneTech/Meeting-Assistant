@@ -29,13 +29,11 @@ from pathlib import Path
 
 import numpy as np
 
-DATA_DIR = Path(__file__).parent / "data"
-DB_PATH = DATA_DIR / "meetings.db"
-SETTINGS_PATH = DATA_DIR / "settings.json"
+import paths
 
 
 def _conn():
-    c = sqlite3.connect(str(DB_PATH))
+    c = sqlite3.connect(str(paths.db_path()))
     c.row_factory = sqlite3.Row
     return c
 
@@ -118,14 +116,18 @@ def recommend_streaming_params(analysis: dict) -> dict:
     over_pct = analysis.get("over_seg_pct", 0)
     excess = analysis.get("mean_excess_ratio", 1.0)
 
+    # NOTE: delta_new is cosine *distance*; the match threshold is 1 - delta_new.
+    # Keep delta_new <= ~0.65 — pushing higher drops the match threshold below
+    # typical inter-speaker similarity (~0.2-0.4) and collapses distinct voices
+    # into a single speaker.
     if over_pct >= 50:
-        # Severe over-segmentation — aggressive correction
-        delta_new = 0.80
+        # Severe over-segmentation — aggressive correction (still bounded)
+        delta_new = 0.65
         rho_update = 0.25
         merge_gap = 0.15
     elif over_pct >= 25:
         # Moderate over-segmentation
-        delta_new = 0.70
+        delta_new = 0.60
         rho_update = 0.30
         merge_gap = 0.12
     else:
@@ -172,8 +174,9 @@ def recommend_reanalysis_params(analysis: dict) -> dict:
 
 def apply_recommendations(streaming: dict, reanalysis: dict) -> None:
     """Write recommended parameters to settings.json."""
-    if SETTINGS_PATH.exists():
-        with open(SETTINGS_PATH) as f:
+    settings_file = paths.settings_path()
+    if settings_file.exists():
+        with open(settings_file) as f:
             settings = json.load(f)
     else:
         settings = {}
@@ -184,7 +187,7 @@ def apply_recommendations(streaming: dict, reanalysis: dict) -> None:
     for k, v in reanalysis.items():
         ap[k] = v
 
-    with open(SETTINGS_PATH, "w") as f:
+    with open(settings_file, "w") as f:
         json.dump(settings, f, indent=2)
 
 
@@ -203,7 +206,7 @@ def run_sweep(session_id: str, hf_token: str, device: str = "cpu") -> list[dict]
     actual_speakers = row["actual"] if row else 0
 
     # Check WAV exists
-    wav_path = DATA_DIR / "audio" / f"{session_id}.wav"
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
     if not wav_path.exists():
         print(f"  WAV not found: {wav_path}")
         conn.close()

@@ -232,8 +232,7 @@ DIARIZATION_DEFAULTS = {
             "<b>Lower values</b> are more sensitive \u2014 picks up quiet speech "
             "and distant speakers, but may also pick up background noise.<br>"
             "<b>Higher values</b> require stronger voice activity, reducing "
-            "false positives but potentially missing soft-spoken participants.<br><br>"
-            "<em>Requires session restart to take effect.</em>"
+            "false positives but potentially missing soft-spoken participants."
         ),
         "min": 0.1,
         "max": 0.9,
@@ -252,8 +251,7 @@ DIARIZATION_DEFAULTS = {
             "(useful for varying mic distance or tone), but may cause speaker "
             "identities to drift and merge.<br>"
             "<b>Lower values</b> keep centroids stable, which is better for "
-            "long recordings with consistent audio quality.<br><br>"
-            "<em>Requires session restart to take effect.</em>"
+            "long recordings with consistent audio quality."
         ),
         "min": 0.1,
         "max": 1.0,
@@ -261,7 +259,7 @@ DIARIZATION_DEFAULTS = {
         "type": "number",
     },
     "delta_new": {
-        "value": 0.8,
+        "value": 0.65,
         "label": "New Speaker Threshold",
         "description": "Distance required to create a new speaker.",
         "tooltip": (
@@ -272,8 +270,7 @@ DIARIZATION_DEFAULTS = {
             "meetings with many participants who sound similar.<br>"
             "<b>Higher values</b> are more conservative, merging similar voices "
             "into existing speakers \u2014 better when there are fewer participants "
-            "to avoid over-segmentation.<br><br>"
-            "<em>Requires session restart to take effect.</em>"
+            "to avoid over-segmentation."
         ),
         "min": 0.1,
         "max": 2.0,
@@ -786,7 +783,7 @@ DIARIZATION_PRESETS = {
             "duration_seconds": 4.0,
             "tau_active": 0.45,
             "rho_update": 0.35,
-            "delta_new": 0.60,
+            "delta_new": 0.55,
             "merge_gap_seconds": 0.10,
         },
     },
@@ -798,7 +795,7 @@ DIARIZATION_PRESETS = {
             "duration_seconds": 5.0,
             "tau_active": 0.5,
             "rho_update": 0.25,
-            "delta_new": 0.80,
+            "delta_new": 0.65,
             "merge_gap_seconds": 0.15,
         },
     },
@@ -810,7 +807,7 @@ DIARIZATION_PRESETS = {
             "duration_seconds": 5.0,
             "tau_active": 0.55,
             "rho_update": 0.20,
-            "delta_new": 0.90,
+            "delta_new": 0.75,
             "merge_gap_seconds": 0.25,
         },
     },
@@ -822,7 +819,7 @@ DIARIZATION_PRESETS = {
             "duration_seconds": 5.0,
             "tau_active": 0.45,
             "rho_update": 0.30,
-            "delta_new": 0.65,
+            "delta_new": 0.55,
             "merge_gap_seconds": 0.12,
         },
     },
@@ -857,3 +854,74 @@ def get_default(key: str):
         if key in d:
             return d[key]["value"]
     return None
+
+
+def preset_keys(presets: dict) -> set[str]:
+    """Union of parameter keys controlled by any variant in a preset dict."""
+    keys: set[str] = set()
+    for p in presets.values():
+        keys.update((p.get("values") or {}).keys())
+    return keys
+
+
+def _screen_preset_overrides(preset_name: str) -> dict:
+    """Translate a screen_recorder preset name into audio_params keys.
+
+    Screen presets live in screen_recorder.py with a different shape
+    (framerate/crf/preset/scale) than audio_params (screen_framerate/etc).
+    Lazy-imported to avoid a circular dep at module load.
+    """
+    if not preset_name or preset_name == "custom":
+        return {}
+    try:
+        from screen_recorder import PRESETS as _SCREEN_PRESETS, H264_PRESETS as _H264
+    except Exception:
+        return {}
+    if preset_name not in _SCREEN_PRESETS:
+        return {}
+    p = _SCREEN_PRESETS[preset_name]
+    h264_idx = _H264.index(p["preset"]) if p.get("preset") in _H264 else 2
+    scale = p.get("scale") or ""
+    scale_w = int(scale.split(":")[0]) if scale else 0
+    return {
+        "screen_framerate": p["framerate"],
+        "screen_crf": p["crf"],
+        "screen_h264_preset": h264_idx,
+        "screen_scale_width": scale_w,
+    }
+
+
+def resolve_audio_params(settings_dict: dict | None = None) -> dict:
+    """Compute the effective audio_params for the current presets.
+
+    Resolution order per parameter:
+      1. Default value from this file.
+      2. Saved per-key value in ``audio_params``.
+      3. Active preset value, if the active preset for the section is a
+         known non-custom preset.
+
+    Effect: when a non-custom preset is selected, that preset's values are
+    *the* source of truth — updates to the preset definitions in this file
+    propagate to all users on that preset on next read, without any
+    migration. Per-key overrides only take effect when the section is set
+    to ``"custom"``.
+    """
+    if settings_dict is None:
+        import settings as _settings
+        settings_dict = _settings.load()
+
+    out = get_all_defaults()
+    saved = settings_dict.get("audio_params", {}) or {}
+    out.update(saved)
+
+    t_preset = settings_dict.get("transcription_preset", TRANSCRIPTION_DEFAULT_PRESET)
+    if t_preset in TRANSCRIPTION_PRESETS and t_preset != "custom":
+        out.update(TRANSCRIPTION_PRESETS[t_preset].get("values") or {})
+
+    d_preset = settings_dict.get("diarization_preset", DIARIZATION_DEFAULT_PRESET)
+    if d_preset in DIARIZATION_PRESETS and d_preset != "custom":
+        out.update(DIARIZATION_PRESETS[d_preset].get("values") or {})
+
+    out.update(_screen_preset_overrides(settings_dict.get("screen_preset")))
+
+    return out

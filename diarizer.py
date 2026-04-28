@@ -263,7 +263,11 @@ class StreamingDiarizer:
     """
 
     SAMPLE_RATE = 16_000
-    _MIN_EMBEDDING_SAMPLES = 8_000   # 0.5 s — minimum for a reliable embedding
+    _MIN_EMBEDDING_SAMPLES = 8_000    # 0.5 s — minimum to attempt any match
+    _MIN_CREATE_SAMPLES    = 16_000   # 1.0 s — minimum to spawn a new speaker
+    # Splitting these matters: short clips give noisy embeddings, fine for
+    # confirming an existing speaker (max(centroid, anchor) absorbs the
+    # noise) but liable to spawn ghost speakers if treated as authoritative.
 
     def __init__(self, hf_token: str, device: str | None = None) -> None:
         if device is None:
@@ -315,13 +319,13 @@ class StreamingDiarizer:
                 f"Check your HuggingFace token and network: {e}"
             ) from e
 
-        # ── Load saved audio params ─────────────────────────────────────────
-        from default_audio_params import DIARIZATION_DEFAULTS
-        import settings as _settings
-        saved = _settings.load().get("audio_params", {})
-        p = {}
-        for key, spec in DIARIZATION_DEFAULTS.items():
-            p[key] = saved.get(key, spec["value"])
+        # ── Load effective audio params ─────────────────────────────────────
+        # resolve_audio_params() honours the active diarization preset, so
+        # changes to the preset definitions in default_audio_params.py are
+        # picked up automatically — users on a non-custom preset don't need
+        # to re-select it after an update.
+        from default_audio_params import resolve_audio_params
+        p = resolve_audio_params()
 
         self._step_seconds     = float(p["step_seconds"])
         self._duration_seconds = float(p["duration_seconds"])
@@ -364,8 +368,12 @@ class StreamingDiarizer:
         self._buf_start_sec = 0.0
         self._total_fed_sec = 0.0
 
-        # Online clustering: global speaker label → L2-normalised centroid
-        self._centroids: dict[str, np.ndarray] = {}
+        # Online clustering: global speaker label → {"centroid", "anchor"}.
+        # Both are L2-normalised. The centroid drifts slowly with each match;
+        # the anchor is the first embedding seen for the speaker and never
+        # changes — matching uses max(sim_to_centroid, sim_to_anchor) so a
+        # drifting centroid can't cause self-reinforcing misclassification.
+        self._centroids: dict[str, dict[str, np.ndarray]] = {}
         self._next_label = 1
 
         log.info("diarizer", f"Streaming diarizer ready on {self._dev}.")
@@ -443,22 +451,28 @@ class StreamingDiarizer:
     def apply_params(self, params: dict) -> None:
         """Update runtime-tunable diarization parameters.
 
-        step_seconds, duration_seconds, tau_active, rho_update, and delta_new
-        are baked in at init time — changing them requires a diarizer reload.
-        merge_gap is applied immediately.
+        step_seconds and duration_seconds are baked into the segmentation
+        windowing at init time — changing them requires a diarizer reload.
+        Everything else (merge_gap, tau_active, rho_update, delta_new) is
+        consulted on every call and can be tuned mid-session without a
+        restart.
         """
-        self._merge_gap = float(params.get("merge_gap_seconds", self._merge_gap))
+        self._merge_gap   = float(params.get("merge_gap_seconds", self._merge_gap))
+        self._tau_active  = float(params.get("tau_active",        self._tau_active))
+        self._rho_update  = float(params.get("rho_update",        self._rho_update))
+        self._delta_new   = float(params.get("delta_new",         self._delta_new))
 
     def merge_speakers(self, keep_label: str, merge_label: str) -> None:
-        """Merge one speaker's centroid into another."""
-        if merge_label in self._centroids:
-            if keep_label in self._centroids:
-                self._centroids[keep_label] = _normalize(
-                    self._centroids[keep_label] + self._centroids[merge_label]
-                )
-            else:
-                self._centroids[keep_label] = self._centroids[merge_label]
-            del self._centroids[merge_label]
+        """Merge one speaker's centroid into another. Anchor of `keep` is preserved."""
+        if merge_label not in self._centroids:
+            return
+        if keep_label in self._centroids:
+            keep = self._centroids[keep_label]
+            merge = self._centroids[merge_label]
+            keep["centroid"] = _normalize(keep["centroid"] + merge["centroid"])
+        else:
+            self._centroids[keep_label] = self._centroids[merge_label]
+        del self._centroids[merge_label]
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -528,12 +542,18 @@ class StreamingDiarizer:
             if len(combined) < self._MIN_EMBEDDING_SAMPLES:
                 continue
 
-            # Extract embedding and match to global speaker
+            # Extract embedding and match to global speaker.
+            # ``can_create`` gates new-speaker spawning on a longer minimum
+            # clip — short embeddings can still match existing speakers but
+            # never create new ones (avoids spawning ghosts from noisy frags).
             embedding = self._extract_embedding(combined)
             if embedding is None:
                 continue
+            can_create = len(combined) >= self._MIN_CREATE_SAMPLES
 
-            global_label = self._match_or_create(embedding)
+            global_label = self._match_or_create(embedding, can_create=can_create)
+            if global_label is None:
+                continue  # short clip with no match found — drop the segment
 
             # Emit only segments that overlap with the latest step window
             # and with the newly received audio
@@ -568,40 +588,63 @@ class StreamingDiarizer:
             log.error("diarizer", f"Embedding extraction failed: {exc}")
             return None
 
-    def _match_or_create(self, embedding: np.ndarray) -> str:
-        """Match embedding to an existing centroid or create a new speaker.
+    def _match_or_create(
+        self, embedding: np.ndarray, can_create: bool = True,
+    ) -> str | None:
+        """Match an embedding to an existing speaker or create a new one.
 
-        Uses cosine distance with delta_new as the threshold:
-        - distance = 1 − cosine_sim
-        - new speaker if distance > delta_new  (i.e. sim < 1 − delta_new)
+        Each speaker keeps both a drifting `centroid` (running average) and an
+        immutable `anchor` (the first embedding observed for that speaker).
+        Matching uses ``max(sim_to_centroid, sim_to_anchor)`` so a centroid
+        that has drifted toward another voice can't cause permanent
+        misclassification — the anchor still gives the original distance.
+
+        - New speaker if best similarity < ``1 - delta_new``.
+        - Otherwise label as the best match. The centroid is only updated
+          when the match is *confidently* above threshold (hysteresis margin),
+          so borderline matches don't poison the centroid.
+        - When ``can_create`` is False, a low-confidence embedding will not
+          spawn a new speaker; if it doesn't match anything well we return
+          None so the caller can drop the segment instead of creating a ghost.
         """
         if not self._centroids:
-            label = f"Speaker {self._next_label}"
-            self._next_label += 1
-            self._centroids[label] = embedding.copy()
-            return label
+            return self._create_new(embedding) if can_create else None
 
         best_sim = -1.0
         best_label = ""
-        for label, centroid in self._centroids.items():
-            sim = float(np.dot(embedding, centroid))
+        for label, info in self._centroids.items():
+            sim = max(
+                float(np.dot(embedding, info["centroid"])),
+                float(np.dot(embedding, info["anchor"])),
+            )
             if sim > best_sim:
                 best_sim = sim
                 best_label = label
 
         similarity_threshold = 1.0 - self._delta_new
         if best_sim < similarity_threshold:
-            label = f"Speaker {self._next_label}"
-            self._next_label += 1
-            self._centroids[label] = embedding.copy()
-            return label
+            return self._create_new(embedding) if can_create else None
 
-        # Update centroid incrementally
-        old = self._centroids[best_label]
-        self._centroids[best_label] = _normalize(
-            old * (1.0 - self._rho_update) + embedding * self._rho_update
-        )
+        # Hysteresis: only update the centroid when the match is clearly above
+        # threshold (margin = 0.10 on cosine sim). This prevents drift from
+        # ambiguous matches gradually merging two voices into one centroid.
+        update_threshold = similarity_threshold + 0.10
+        if best_sim >= update_threshold:
+            info = self._centroids[best_label]
+            info["centroid"] = _normalize(
+                info["centroid"] * (1.0 - self._rho_update)
+                + embedding * self._rho_update
+            )
         return best_label
+
+    def _create_new(self, embedding: np.ndarray) -> str:
+        label = f"Speaker {self._next_label}"
+        self._next_label += 1
+        self._centroids[label] = {
+            "centroid": embedding.copy(),
+            "anchor": embedding.copy(),
+        }
+        return label
 
 
 # Backward-compat alias — transcriber.py historically imported DiartDiarizer

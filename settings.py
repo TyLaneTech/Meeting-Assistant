@@ -1,17 +1,23 @@
 """Simple JSON file-based settings store for Meeting Assistant.
 
 Stores user preferences (device selections, model choices, UI state, etc.)
-in a human-readable JSON file under data/settings.json.
+in a human-readable JSON file under the active data folder, resolved by
+``paths.settings_path()``.
 
 Thread-safe: all reads/writes are protected by a module-level lock.
-This module has NO imports from other project files to avoid circular deps.
 """
 import json
 import threading
-from pathlib import Path
 
-_SETTINGS_PATH = Path(__file__).parent / "data" / "settings.json"
+import paths
+
 _lock = threading.Lock()
+
+
+def _path():
+    """Return the current settings.json path. Resolved on every call so
+    a runtime data-folder migration takes effect immediately."""
+    return paths.settings_path()
 
 # Default values for all known settings.  Any key not present in the
 # saved file will be filled in from here on load.
@@ -60,16 +66,17 @@ DEFAULTS: dict = {
 
 
 def _ensure_dir() -> None:
-    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _path().parent.mkdir(parents=True, exist_ok=True)
 
 
 def load() -> dict:
     """Load settings from disk, merged with defaults for any missing keys."""
     with _lock:
         settings = dict(DEFAULTS)
-        if _SETTINGS_PATH.exists():
+        p = _path()
+        if p.exists():
             try:
-                with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                with open(p, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
                     settings.update(saved)
@@ -82,7 +89,7 @@ def save(settings: dict) -> None:
     """Write the full settings dict to disk."""
     with _lock:
         _ensure_dir()
-        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(_path(), "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
 
 
@@ -96,9 +103,10 @@ def put(key: str, value) -> None:
     """Update a single setting and persist."""
     with _lock:
         settings = dict(DEFAULTS)
-        if _SETTINGS_PATH.exists():
+        p = _path()
+        if p.exists():
             try:
-                with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                with open(p, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
                     settings.update(saved)
@@ -106,7 +114,7 @@ def put(key: str, value) -> None:
                 pass
         settings[key] = value
         _ensure_dir()
-        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
 
 
@@ -114,9 +122,10 @@ def update(updates: dict) -> dict:
     """Merge multiple key-value pairs into settings and persist. Returns full settings."""
     with _lock:
         settings = dict(DEFAULTS)
-        if _SETTINGS_PATH.exists():
+        p = _path()
+        if p.exists():
             try:
-                with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                with open(p, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 if isinstance(saved, dict):
                     settings.update(saved)
@@ -124,6 +133,6 @@ def update(updates: dict) -> dict:
                 pass
         settings.update(updates)
         _ensure_dir()
-        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
         return dict(settings)
