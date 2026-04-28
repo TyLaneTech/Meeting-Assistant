@@ -1,6 +1,21 @@
 /* ── marked.js setup ─────────────────────────────────────────────────────── */
 marked.use({ breaks: true, gfm: true });
 
+// Open every rendered markdown link in a new tab. Skip links that already
+// declare a `target` *or* have an `onclick` handler — the latter is how the
+// timestamp pills are wired (`href="#" onclick="seekPlayback(…)"`), and
+// adding target="_blank" to them would open a blank tab on middle-click.
+marked.use({
+  hooks: {
+    postprocess(html) {
+      return html.replace(
+        /<a (?![^>]*\b(?:target|onclick)=)([^>]*?)>/g,
+        '<a target="_blank" rel="noopener noreferrer" $1>',
+      );
+    },
+  },
+});
+
 function renderMd(text) {
   return marked.parse(text || '');
 }
@@ -1045,6 +1060,11 @@ async function refreshSidebar() {
   _sidebarAllSessions = sessions;
   _sidebarFolders = folders;
   _renderSidebar();
+  // Bootstrap race: if a session was opened via URL before this fetch
+  // completed, expand its ancestors now that we know the folder tree.
+  if (typeof state !== 'undefined' && state.sessionId) {
+    _revealSessionInSidebar(state.sessionId);
+  }
 }
 
 /* ── Sidebar search ───────────────────────────────────────────────────────── */
@@ -1549,6 +1569,55 @@ function _renderSidebar() {
   list.innerHTML = '';
   list.appendChild(fragment);
   _updateBulkBar();
+  _updateActiveFolderHighlights();
+}
+
+// Returns the set of folder IDs in the active session's ancestor chain
+// (immediate folder + every parent up to root). Empty set when no session
+// is active or the active session isn't filed in any folder.
+function _getActiveSessionAncestorFolderIds() {
+  const out = new Set();
+  const sid = (typeof state !== 'undefined') ? state.sessionId : null;
+  if (!sid) return out;
+  const sess = _sidebarAllSessions.find(s => s.id === sid);
+  if (!sess || !sess.folder_id) return out;
+  const folderById = new Map(_sidebarFolders.map(f => [f.id, f]));
+  let cursor = folderById.get(sess.folder_id);
+  const seen = new Set();
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    out.add(cursor.id);
+    cursor = cursor.parent_id ? folderById.get(cursor.parent_id) : null;
+  }
+  return out;
+}
+
+// The immediate (leaf) folder containing the active session, or null.
+function _getActiveSessionImmediateFolderId() {
+  const sid = (typeof state !== 'undefined') ? state.sessionId : null;
+  if (!sid) return null;
+  const sess = _sidebarAllSessions.find(s => s.id === sid);
+  return (sess && sess.folder_id) || null;
+}
+
+// Toggle two classes on every .sidebar-folder element:
+//   - `folder-active`          : the immediate folder of the active session
+//   - `folder-active-ancestor` : every folder that transitively contains it
+//                                (immediate folder + every parent)
+// Use `.folder-active` for a leaf-only highlight, `.folder-active-ancestor`
+// for a breadcrumb/trail effect. Caveat: descendant selectors like
+// `.folder-active-ancestor .folder-header` will also match nested
+// sibling folders' headers (e.g. a sibling subfolder under the same
+// parent). Use `>` child combinator (`.folder-active-ancestor > .folder-header`)
+// or target `.folder-active` directly.
+function _updateActiveFolderHighlights() {
+  const ancestors = _getActiveSessionAncestorFolderIds();
+  const immediate = _getActiveSessionImmediateFolderId();
+  document.querySelectorAll('.sidebar-folder').forEach(el => {
+    const id = el.dataset.folderId;
+    el.classList.toggle('folder-active-ancestor', !!id && ancestors.has(id));
+    el.classList.toggle('folder-active', !!id && id === immediate);
+  });
 }
 
 function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds) {
@@ -1559,7 +1628,7 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     const collapsed = _sidebarCollapsed.has(folder.id);
 
     const folderEl = document.createElement('div');
-    folderEl.className = 'sidebar-folder';
+    folderEl.className = `sidebar-folder ${collapsed ? 'collapsed' : 'expanded'}`;
     folderEl.dataset.folderId = folder.id;
 
 
@@ -1682,6 +1751,12 @@ function _makeSessionEl(s) {
       _toggleSidebarSelect(s.id);
       return;
     }
+    // Snap the active class onto this row immediately so the click feels
+    // responsive — loadSession is async (fetch + render), and waiting for
+    // it to finish before flipping the highlight makes the click feel
+    // dead. The next sidebar render reapplies it idempotently.
+    document.querySelectorAll('.session-item.active').forEach(n => n.classList.remove('active'));
+    el.classList.add('active');
     loadSession(s.id);
   });
 
@@ -1974,6 +2049,29 @@ function _toggleFolder(folderId) {
   else _sidebarCollapsed.add(folderId);
   try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
   _renderSidebar();
+}
+
+// Expand every ancestor folder of the given session so the active session
+// is visible in the sidebar. Persists the new collapsed-set to localStorage
+// and re-renders. No-op if the session isn't in any folder.
+function _revealSessionInSidebar(sessionId) {
+  if (!sessionId) return;
+  const sess = _sidebarAllSessions.find(s => s.id === sessionId);
+  if (!sess || !sess.folder_id) return;
+  const folderById = new Map(_sidebarFolders.map(f => [f.id, f]));
+  let changed = false;
+  let cursor = folderById.get(sess.folder_id);
+  // Walk up the parent chain; guard against cycles with a seen-set.
+  const seen = new Set();
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    if (_sidebarCollapsed.delete(cursor.id)) changed = true;
+    cursor = cursor.parent_id ? folderById.get(cursor.parent_id) : null;
+  }
+  if (changed) {
+    try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+    _renderSidebar();
+  }
 }
 
 async function createFolder() {
@@ -2362,13 +2460,25 @@ function formatSessionMeta(s) {
     : start.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: start.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
   const timePart = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   const time = `${datePart}, ${timePart}`;
-  if (!s.ended_at) return `${time} <span class="session-meta-sep">|</span> In progress`;
+  // Only call a session "In progress" when it actually is the active
+  // recording. Stale ended_at=NULL rows from app crashes / aborted splits
+  // would otherwise mislead the sidebar — fall through and compute the
+  // duration from last_segment_time instead.
+  const isActiveRecording = state.sessionId === s.id && state.isRecording;
+  if (!s.ended_at && isActiveRecording) {
+    return `${time} <span class="session-meta-sep">|</span> In progress`;
+  }
   // Use actual transcript duration (last segment end_time) when available,
   // falling back to wall-clock duration between start/end timestamps.
   let secs = s.last_segment_time;
   if (secs == null || secs <= 0) {
-    const end = new Date(s.ended_at + 'Z');
-    secs = (end - start) / 1000;
+    if (s.ended_at) {
+      const end = new Date(s.ended_at + 'Z');
+      secs = (end - start) / 1000;
+    } else {
+      // No ended_at and no segments — show just the date/time.
+      return time;
+    }
   }
   return `${time} <span class="session-meta-sep">|</span> ${fmtDuration(secs)}`;
 }
@@ -2432,6 +2542,7 @@ function newSession() {
   state.sessionId    = null;
   state.isViewingPast = false;
   clearAll();
+  _updateActiveFolderHighlights();
   history.pushState({}, '', '/session');
   _applyPromptText('');
   updateRecordBtn();
@@ -9943,6 +10054,11 @@ async function loadSession(sessionId) {
   updateRecordBtn();
   _loadPaneVisible(sessionId);
   refreshSessionChatPromptBadge();
+  _revealSessionInSidebar(sessionId);
+  // _revealSessionInSidebar only re-renders if it actually expanded
+  // anything; refresh the highlight unconditionally so the new active
+  // session's folders get the class even when nothing was collapsed.
+  _updateActiveFolderHighlights();
 
   if (data.speaker_profiles?.length) {
     data.speaker_profiles.forEach(profile => applySpeakerProfileUpdate(profile));
@@ -13138,6 +13254,7 @@ if (!_isHomePage) {
       state.isViewingPast = false;
       clearAll();
       updateRecordBtn();
+      _updateActiveFolderHighlights();
     }
   });
 

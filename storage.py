@@ -467,6 +467,53 @@ def resume_session(session_id: str) -> None:
         )
 
 
+def heal_stale_in_progress(active_session_id: str | None = None) -> int:
+    """Set ended_at on any session that's marked in-progress but isn't the
+    currently-recording one.
+
+    Stale ``ended_at IS NULL`` rows happen when the app is killed mid-record,
+    when a crashed split leaves a partial source row behind, or when other
+    edge cases skip the normal stop-recording path. We compute a sensible
+    ended_at from the last transcript segment's end_time (preferred) or fall
+    back to ``started_at`` (zero-duration). Returns the number of rows fixed.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT s.id, s.started_at,"
+            "       (SELECT MAX(end_time) FROM transcript_segments"
+            "        WHERE session_id = s.id) AS last_seg"
+            " FROM sessions s"
+            " WHERE s.ended_at IS NULL"
+        ).fetchall()
+        fixed = 0
+        for r in rows:
+            sid = r["id"]
+            if active_session_id and sid == active_session_id:
+                continue  # actually recording — leave it alone
+            started = r["started_at"]
+            last_seg = r["last_seg"]
+            new_end = None
+            if started:
+                try:
+                    base = datetime.fromisoformat(started)
+                    if last_seg and last_seg > 0:
+                        new_end = (base + timedelta(seconds=float(last_seg))).isoformat()
+                    else:
+                        # No segments — call it a zero-duration record so it
+                        # at least stops showing "In progress".
+                        new_end = base.isoformat()
+                except Exception:
+                    new_end = _now()
+            else:
+                new_end = _now()
+            conn.execute(
+                "UPDATE sessions SET ended_at = ? WHERE id = ?",
+                (new_end, sid),
+            )
+            fixed += 1
+    return fixed
+
+
 def update_session_title(session_id: str, title: str, *, user_set: bool = False) -> None:
     """Update a session's title.
 
@@ -684,32 +731,41 @@ def create_split_session(
     title: str | None = None,
     *,
     split_group_id: str | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
 ) -> str:
     """Create a new session containing clamped transcript/speaker data from a range.
 
-    The new session's ``started_at`` / ``ended_at`` are derived from the
-    source's ``started_at`` plus the offsets, so each split part keeps its
-    correct position on the original timeline (instead of being stamped with
-    "now"). The new session is also marked complete (``ended_at`` populated)
-    so the sidebar shows a duration rather than "In progress".
+    Caller may pass explicit ``started_at`` / ``ended_at`` (preferred — lets
+    ``split_session`` compute a single base time and stamp every part
+    consistently). If omitted, derive them from the source's ``started_at``
+    plus ``start_sec`` / ``end_sec``. Falls back to ``_now()`` only as a
+    last resort, with a warning.
     """
     source = get_session(source_session_id)
     if not source:
         raise ValueError("Source session not found")
 
-    # Derive timestamps from the source so split parts sit at the correct
-    # absolute time on the user's history. Falls back to "now" if the source
-    # somehow lacks a started_at (shouldn't happen, but be defensive).
-    new_started_at = None
-    new_ended_at = None
-    src_started = source.get("started_at")
-    if src_started:
-        try:
-            base = datetime.fromisoformat(src_started)
-            new_started_at = (base + timedelta(seconds=start_sec)).isoformat()
-            new_ended_at   = (base + timedelta(seconds=end_sec)).isoformat()
-        except Exception:
-            pass
+    new_started_at = started_at
+    new_ended_at = ended_at
+    if new_started_at is None or new_ended_at is None:
+        src_started = source.get("started_at")
+        if src_started:
+            try:
+                base = datetime.fromisoformat(src_started)
+                if new_started_at is None:
+                    new_started_at = (base + timedelta(seconds=start_sec)).isoformat()
+                if new_ended_at is None:
+                    new_ended_at = (base + timedelta(seconds=end_sec)).isoformat()
+            except Exception as e:
+                import log as _log
+                _log.warn(
+                    "storage",
+                    f"create_split_session: could not parse source started_at "
+                    f"{src_started!r} for {source_session_id[:8]}: {e}; "
+                    f"part will use _now() and end up at the wrong time on "
+                    f"the timeline.",
+                )
 
     sid = create_session(
         title or f"{source['title']} (split)",

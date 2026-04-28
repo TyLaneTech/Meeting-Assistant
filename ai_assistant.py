@@ -6,6 +6,7 @@ Provider and model are runtime-configurable via reload_client().
 import base64
 import json
 import re
+import traceback
 from typing import Callable
 
 import log
@@ -189,6 +190,52 @@ _GLOBAL_TOOLS = [
                 },
             },
             "required": ["speaker_name"],
+        },
+    },
+    {
+        "name": "list_recent_meetings",
+        "description": (
+            "List meetings from a time range, sorted by date (newest first). "
+            "Use this to BROWSE the meeting library by date — e.g. 'meetings "
+            "from last week', 'today's meetings', 'meetings between Apr 1 "
+            "and Apr 14'. This is the right tool when the user wants an "
+            "overview rather than a keyword search. Returns titles, IDs, "
+            "dates, durations, speakers, folders, and truncated summaries. "
+            "Follow up with `get_session_detail` to load the full transcript "
+            "of any specific meeting from the list."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "within_days": {
+                    "type": "integer",
+                    "description": (
+                        "Limit to meetings from the last N days. Use this "
+                        "for relative ranges (e.g. 7 for last week). Omit "
+                        "or set to 0 to use start_date/end_date instead."
+                    ),
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD) for the earliest meeting to "
+                        "include. Optional — combine with end_date for an "
+                        "explicit range."
+                    ),
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD) for the latest meeting to "
+                        "include. Defaults to now if omitted."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of meetings to return (default 30, max 200).",
+                    "default": 30,
+                },
+            },
         },
     },
 ]
@@ -585,26 +632,35 @@ class AIAssistant:
         "## How to respond\n"
         "- Use your tools to find relevant information before answering - "
         "do not guess or make up content\n"
-        "- Always cite which session(s) your information comes from by "
-        "**meeting title** (e.g. \"In *Sprint Planning (Apr 7)*...\")\n"
+        "- **Cite every session you reference as a markdown link** so the user "
+        "can open it in one click. Format: `[Meeting Title](/session?id=<session_id>)`. "
+        "The `session_id` is included in every tool result. Example: \"In "
+        "[Sprint Planning (Apr 7)](/session?id=abc-123-def), the team decided…\"\n"
         "- Reference speakers by name and note their involvement across sessions\n"
         "- Do NOT include [M:SS] timestamps - this is a cross-session view, "
         "not a single-recording player\n"
         "- If the user asks about something you can't find, say so clearly\n"
         "- Answer directly and concisely using markdown formatting\n"
-        "- When multiple sessions are relevant, synthesize information across them\n"
+        "- When multiple sessions are relevant, synthesize information across them "
+        "and link to each one inline\n"
         "- For questions about who said what, be precise about speaker attribution "
-        "and which meeting it was in\n"
+        "and link to the meeting it was in\n"
         "- Always respond in English regardless of any foreign words or phrases "
         "in the transcripts\n\n"
         "## Tool usage strategy\n"
-        "- Start with `search_transcripts` for specific keywords or phrases\n"
+        "- Use `list_recent_meetings` when the user asks for a date-bounded "
+        "browse (e.g. 'last week', 'today', 'this month', explicit dates) — "
+        "this returns a chronological overview without needing keywords\n"
+        "- Use `search_transcripts` for specific keywords or phrases\n"
         "- Use `semantic_search` for conceptual/thematic queries\n"
-        "- Use `get_session_detail` to load full context from a particular meeting\n"
+        "- Use `get_session_detail` to load full transcript + summary from "
+        "a particular meeting (use after listing/searching to dig deeper)\n"
         "- Use `list_speakers` to see all known participants across all meetings\n"
         "- Use `get_speaker_history` to find all meetings a specific person "
         "appeared in, with their activity level in each\n"
-        "- You may call tools multiple times to gather enough context\n\n"
+        "- You may call tools multiple times to gather enough context. "
+        "Combine tools freely — e.g. list recent meetings, then load "
+        "details for the ones that look relevant.\n\n"
         "## Context in results\n"
         "- Search results include session summaries (truncated) so you can often "
         "answer without loading the full transcript\n"
@@ -1280,7 +1336,8 @@ class AIAssistant:
         """Execute a single OpenAI tool call, appending Responses API items to msgs."""
         try:
             parsed_args = json.loads(tc_args_raw)
-        except Exception:
+        except Exception as parse_err:
+            log.warn("ai", f"OpenAI tool {tc_name!r} bad JSON args: {parse_err} -- raw={tc_args_raw!r}")
             parsed_args = {}
 
         if on_tool_event:
@@ -1302,8 +1359,22 @@ class AIAssistant:
                         payload.update(extra)
                     on_tool_event("tool_result", payload)
                 return
-            except Exception:
-                pass  # fall through
+            except Exception as exec_err:
+                # Don't silently swallow — surface the error to both the
+                # model (so it can correct course) and the server log.
+                log.error("ai", f"OpenAI tool {tc_name!r} executor raised: {exec_err}")
+                traceback.print_exc()
+                err_text = f"Tool {tc_name!r} failed: {exec_err}"
+                msgs.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": err_text,
+                })
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "name": tc_name, "success": False, "summary": err_text,
+                    })
+                return
 
         # Built-in: get_screenshot
         if tc_name == "get_screenshot" and frame_extractor:
@@ -1380,8 +1451,10 @@ class AIAssistant:
         next_input = self._to_responses_input(messages)
         previous_response_id: str | None = None
         had_text = False
+        tool_names = sorted({t.get("name") or t.get("type") for t in o_tools if t})
+        log.info("ai", f"OpenAI tool loop on model={m!r}, tools={tool_names}")
 
-        for _ in range(max_rounds):
+        for round_idx in range(max_rounds):
             if cancel and cancel.is_set():
                 return
 
@@ -1399,7 +1472,18 @@ class AIAssistant:
             round_had_text = False
             cancelled = False
 
-            with c.responses.stream(**kwargs) as stream:
+            try:
+                stream_ctx = c.responses.stream(**kwargs)
+            except Exception as e:
+                log.error("ai", f"OpenAI responses.stream rejected request on model {m!r}: {e}")
+                on_token(
+                    f"\n\n*OpenAI rejected the request: {e}. The model "
+                    f"({m}) may not support tool use via the Responses API. "
+                    f"Try a different model in Settings.*"
+                )
+                return
+
+            with stream_ctx as stream:
                 for event in stream:
                     if cancel and cancel.is_set():
                         cancelled = True
@@ -1430,6 +1514,9 @@ class AIAssistant:
                                 "success": True,
                                 "summary": "Web search performed",
                             })
+                    elif etype == "response.error" or etype == "error":
+                        err = getattr(event, "error", None) or getattr(event, "message", None)
+                        log.error("ai", f"OpenAI Responses stream error event: {err}")
 
                 if cancelled:
                     return
@@ -1439,7 +1526,23 @@ class AIAssistant:
             if round_had_text:
                 had_text = True
 
+            log.info(
+                "ai",
+                f"OpenAI round {round_idx}: {len(function_calls)} function call(s), "
+                f"text={'yes' if round_had_text else 'no'}",
+            )
+
             if not function_calls:
+                # Diagnostic: model gave a final answer without using tools at
+                # all. If the user expected tool use this is the smoking gun.
+                if round_idx == 0 and tool_executor and tool_names:
+                    log.warn(
+                        "ai",
+                        f"OpenAI model {m!r} produced a response without "
+                        f"calling any of the provided tools: {tool_names}. "
+                        f"If tool use was expected, verify the model "
+                        f"supports the Responses API + function calling.",
+                    )
                 return
 
             next_input = []

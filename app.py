@@ -65,6 +65,12 @@ from transcriber import (
 
 config.ensure_env()
 storage.init_db()
+# Heal sessions left "in progress" by a previous crash, killed split, etc.
+# No active recording can exist this early in startup, so we don't need to
+# pass an active_session_id.
+_healed = storage.heal_stale_in_progress()
+if _healed:
+    log.info("storage", f"Healed {_healed} stale 'in progress' session(s) on startup.")
 
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0   # disable static file caching
@@ -3457,6 +3463,91 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         text = json.dumps(enriched, indent=2)
         return text, False, f"Found {len(enriched)} speakers", None
 
+    if name == "list_recent_meetings":
+        from datetime import datetime, timedelta, timezone
+        within_days = tool_input.get("within_days") or 0
+        start_date = (tool_input.get("start_date") or "").strip()
+        end_date = (tool_input.get("end_date") or "").strip()
+        limit = max(1, min(200, int(tool_input.get("limit") or 30)))
+
+        def _parse_iso(s: str):
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        start_dt = _parse_iso(start_date) if start_date else None
+        end_dt = _parse_iso(end_date) if end_date else None
+        if end_dt:
+            # Inclusive end-of-day if a bare date was given
+            if "T" not in end_date and " " not in end_date:
+                end_dt = end_dt + timedelta(days=1) - timedelta(seconds=1)
+        cutoff = None
+        if within_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(within_days))
+
+        sessions = storage.list_sessions()  # already sorted started_at DESC
+
+        def in_range(s):
+            sa = s.get("started_at")
+            if not sa:
+                return False
+            ts = _parse_iso(sa)
+            if ts is None:
+                return False
+            # Make naive timestamps timezone-aware for comparison
+            if ts.tzinfo is None and (cutoff or start_dt or end_dt):
+                ts = ts.replace(tzinfo=timezone.utc)
+            if cutoff and ts < cutoff:
+                return False
+            if start_dt:
+                sd = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=timezone.utc)
+                if ts < sd:
+                    return False
+            if end_dt:
+                ed = end_dt if end_dt.tzinfo else end_dt.replace(tzinfo=timezone.utc)
+                if ts > ed:
+                    return False
+            return True
+
+        if cutoff or start_dt or end_dt:
+            sessions = [s for s in sessions if in_range(s)]
+        sessions = sessions[:limit]
+
+        folders = {f["id"]: f["name"] for f in storage.list_folders()}
+        enriched = []
+        for s in sessions:
+            sess = storage.get_session(s["id"])
+            entry = {
+                "session_id": s["id"],
+                "title": s.get("title") or "Untitled",
+                "started_at": s.get("started_at"),
+                "ended_at": s.get("ended_at"),
+                "speakers": [sp["name"] for sp in (s.get("speakers") or []) if sp.get("name")],
+            }
+            if sess:
+                fid = sess.get("folder_id")
+                entry["folder"] = folders.get(fid) if fid else None
+                summary = sess.get("summary", "") or ""
+                if summary:
+                    entry["summary"] = summary[:300] + ("…" if len(summary) > 300 else "")
+                entry["segment_count"] = len(sess.get("segments") or [])
+            enriched.append(entry)
+
+        if within_days > 0:
+            range_desc = f"last {within_days} day{'s' if within_days != 1 else ''}"
+        elif start_date and end_date:
+            range_desc = f"{start_date} to {end_date}"
+        elif start_date:
+            range_desc = f"since {start_date}"
+        elif end_date:
+            range_desc = f"until {end_date}"
+        else:
+            range_desc = "all time"
+
+        text = json.dumps(enriched, indent=2)
+        return text, False, f"Listed {len(enriched)} meetings ({range_desc})", None
+
     if name == "get_speaker_history":
         speaker_name = tool_input.get("speaker_name", "").strip()
         if not speaker_name:
@@ -3989,6 +4080,31 @@ def split_session(session_id: str):
     # about-to-be-deleted source session id.
     group_id = str(uuid.uuid4())
     should_delete_original = data.get("delete_original", True)
+
+    # Resolve a single base time for the whole split. Every part's
+    # started_at/ended_at is derived from this base + its (start_sec, end_sec)
+    # so part N+1 always lands exactly when part N ended. Computing it once
+    # at the call site (rather than inside create_split_session for each
+    # part) makes the cumulative-offset behavior explicit and prevents any
+    # silent _now() fallback from making all parts cluster at "right now".
+    from datetime import datetime as _dt, timedelta as _td
+    src_started = source.get("started_at")
+    base_dt: _dt | None = None
+    if src_started:
+        try:
+            base_dt = _dt.fromisoformat(src_started)
+        except Exception as e:
+            log.warn("media", f"split: source {session_id[:8]} started_at "
+                              f"{src_started!r} could not be parsed: {e}")
+    if base_dt is None:
+        # Fallback: anchor at now() but rewind by total source duration so the
+        # last part lands roughly at "now" — better than every part stacking
+        # at the same instant.
+        total_dur = max((float(r.get("end", 0)) for r in ranges), default=0.0)
+        base_dt = _dt.utcnow() - _td(seconds=total_dur)
+        log.warn("media", f"split: source {session_id[:8]} has no parseable "
+                          f"started_at; anchoring base at now() - {total_dur:.1f}s.")
+
     try:
         for idx, r in enumerate(ranges, start=1):
             start_sec = float(r.get("start", 0))
@@ -4005,6 +4121,11 @@ def split_session(session_id: str):
                 title = src_title
             else:
                 title = f"{src_title} Part {idx}"
+            # Compute this part's absolute timeline position from the shared
+            # base. Subsequent parts naturally pick up where the previous
+            # left off because their start_sec is the previous end_sec.
+            part_started_at = (base_dt + _td(seconds=start_sec)).isoformat()
+            part_ended_at = (base_dt + _td(seconds=end_sec)).isoformat()
             # Only tag parts with the split group id if the original will be
             # deleted (i.e. a real, undoable split). If the caller chooses to
             # keep the original, the "parts" are more like clips — no rollback
@@ -4012,6 +4133,8 @@ def split_session(session_id: str):
             new_sid = storage.create_split_session(
                 session_id, start_sec, end_sec, title=title,
                 split_group_id=group_id if should_delete_original else None,
+                started_at=part_started_at,
+                ended_at=part_ended_at,
             )
             created.append(new_sid)
             media_edit.trim_wav_file(source_audio, media_edit.wav_path(new_sid), start_sec, end_sec)
