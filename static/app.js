@@ -8497,14 +8497,17 @@ function _seekVideoDebounced(targetTime, delayMs) {
 // the fix for the preview-freeze: calling .play() immediately after setting
 // currentTime can land Chrome on a non-keyframe and freeze the rendered
 // image even though currentTime reports the new value.
-_playbackVideo.addEventListener('seeked', () => {
-  _videoSeekPending = false;
-  if (_videoScrubbing) return;  // scrub logic manages play state itself
-  if (!_videoAvailable || !_videoVisible) return;
-  if (!_playbackAudio.paused && _playbackVideo.paused) {
-    _playbackVideo.play().catch(() => {});
-  }
-});
+// Home page has no playback-video element, so guard the listener attach.
+if (_playbackVideo) {
+  _playbackVideo.addEventListener('seeked', () => {
+    _videoSeekPending = false;
+    if (_videoScrubbing) return;  // scrub logic manages play state itself
+    if (!_videoAvailable || !_videoVisible) return;
+    if (!_playbackAudio.paused && _playbackVideo.paused) {
+      _playbackVideo.play().catch(() => {});
+    }
+  });
+}
 
 function _syncVideoToAudio() {
   if (!_videoAvailable || !_videoVisible) return;
