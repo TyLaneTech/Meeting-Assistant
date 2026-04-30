@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-import log
+from core import log as log
 
 _SUGGEST_THRESHOLD    = 0.70   # cosine sim → push fingerprint_match SSE
 _AUTO_APPLY_THRESHOLD = 0.82   # cosine sim → apply silently

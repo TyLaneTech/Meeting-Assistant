@@ -22,10 +22,10 @@ from typing import Callable
 import numpy as np
 from scipy import signal as scipy_signal
 
-import log
+from core import log as log
 
 # ── Hallucination detection (shared with transcriber.py) ─────────────────────
-from transcriber import (
+from ml.transcriber import (
     _HALLUCINATION_THRESHOLD,
     _repetition_ratio,
     _clean_ellipses,
@@ -84,14 +84,25 @@ class BatchTranscriber:
         import torch
 
         # ── Resolve device ────────────────────────────────────────────────────
+        from core.compute_device import best_torch_device
         device_pref = params.get("reanalysis_device", "auto")
         if device_pref == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = best_torch_device()
         else:
             device = device_pref
+        # Validate user-requested accelerator is actually available; fall back.
+        best = best_torch_device()
         if device == "cuda" and not torch.cuda.is_available():
-            log.warn("batch", "CUDA requested but not available - falling back to CPU")
-            device = "cpu"
+            log.warn("batch", "CUDA requested but not available - falling back to "
+                     f"{best}")
+            device = best
+        elif device == "mps" and not (
+            getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()
+        ):
+            log.warn("batch", "MPS requested but not available - falling back to "
+                     f"{best}")
+            device = best
         torch_device = torch.device(device)
 
         log.info("batch", f"Device: {device}")
@@ -153,7 +164,7 @@ class BatchTranscriber:
 
         log.info("batch", "Loading diarization pipeline...")
         try:
-            from network import _load_hf_pipeline
+            from core.network import _load_hf_pipeline
             pipeline = _load_hf_pipeline(
                 "pyannote/speaker-diarization-3.1", self.hf_token,
             )
@@ -239,8 +250,8 @@ class BatchTranscriber:
         # Release diarization pipeline to free VRAM before transcription
         del pipeline
         del waveform
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        from core.compute_device import empty_cache as _empty_cache
+        _empty_cache(torch_device.type)
 
         # Re-enable TF32 - pyannote disables it for reproducibility but
         # it significantly speeds up Whisper inference on RTX GPUs.
@@ -282,10 +293,18 @@ class BatchTranscriber:
         model_name = params.get("reanalysis_whisper_model", "openai/whisper-large-v3")
         batch_size = params.get("reanalysis_batch_size", 16)
 
-        attn_impl = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+        # flash-attn-2 only ships CUDA kernels; on MPS or CPU pipeline auto-falls
+        # back to scaled_dot_product_attention (sdpa).
+        attn_impl = "flash_attention_2" if (device == "cuda" and is_flash_attn_2_available()) else "sdpa"
         log.info("batch", f"Loading Whisper model: {model_name} (attn: {attn_impl})")
 
-        torch_dtype = torch.float16 if device == "cuda" else torch.float32
+        # MPS supports fp16; CUDA prefers fp16; CPU sticks with fp32.
+        if device == "cuda":
+            torch_dtype = torch.float16
+        elif device == "mps":
+            torch_dtype = torch.float16
+        else:
+            torch_dtype = torch.float32
         whisper_pipe = hf_pipeline(
             "automatic-speech-recognition",
             model=model_name,
@@ -373,8 +392,8 @@ class BatchTranscriber:
 
         # Release Whisper model
         del whisper_pipe
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        from core.compute_device import empty_cache as _empty_cache
+        _empty_cache(device)
 
         log.info("batch", f"Transcription complete: {processed} segments processed")
 

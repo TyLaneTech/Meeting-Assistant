@@ -9,7 +9,7 @@ Thread-safe: all reads/writes are protected by a module-level lock.
 import json
 import threading
 
-import paths
+from core import paths as paths
 
 _lock = threading.Lock()
 
@@ -62,7 +62,36 @@ DEFAULTS: dict = {
     "quiet_prompt_audio_rms_threshold": 0.006,
     "quiet_prompt_require_no_transcript": True,
     "quiet_prompt_cooldown_sec": 120,
+
+    # Per-session video offsets (start time in screen recording aligned with
+    # transcript t=0). Keyed by session_id. Replaces the legacy
+    # `video_offset_<session_id>` flat-key scheme — `_migrate_video_offsets()`
+    # auto-migrates older settings files at load time.
+    "video_offsets": {},
 }
+
+
+# ── Migrations ──────────────────────────────────────────────────────────────
+
+def _migrate_video_offsets(settings: dict) -> bool:
+    """Fold legacy ``video_offset_<session_id>`` keys into ``video_offsets``.
+
+    Mutates ``settings`` in place. Returns True if anything changed (caller
+    can use this to decide whether to persist).
+    """
+    offsets = settings.get("video_offsets")
+    if not isinstance(offsets, dict):
+        offsets = {}
+        settings["video_offsets"] = offsets
+    changed = False
+    legacy_keys = [k for k in settings if k.startswith("video_offset_")]
+    for k in legacy_keys:
+        sid = k[len("video_offset_"):]
+        if sid and sid not in offsets:
+            offsets[sid] = settings[k]
+        del settings[k]
+        changed = True
+    return changed
 
 
 def _ensure_dir() -> None:
@@ -82,6 +111,7 @@ def load() -> dict:
                     settings.update(saved)
             except (json.JSONDecodeError, OSError):
                 pass  # corrupted file - fall back to defaults
+        _migrate_video_offsets(settings)
         return settings
 
 
@@ -112,6 +142,7 @@ def put(key: str, value) -> None:
                     settings.update(saved)
             except (json.JSONDecodeError, OSError):
                 pass
+        _migrate_video_offsets(settings)
         settings[key] = value
         _ensure_dir()
         with open(p, "w", encoding="utf-8") as f:
@@ -131,7 +162,48 @@ def update(updates: dict) -> dict:
                     settings.update(saved)
             except (json.JSONDecodeError, OSError):
                 pass
+        _migrate_video_offsets(settings)
         settings.update(updates)
+        _ensure_dir()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+
+
+# ── Per-session video offset helpers ────────────────────────────────────────
+
+def get_video_offset(session_id: str, default: float = 0.0) -> float:
+    """Return the persisted video offset for ``session_id`` (seconds)."""
+    settings = load()
+    offsets = settings.get("video_offsets") or {}
+    raw = offsets.get(session_id, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def put_video_offset(session_id: str, value: float | None) -> None:
+    """Persist a session's video offset. Pass ``None`` to delete the entry."""
+    with _lock:
+        settings = dict(DEFAULTS)
+        p = _path()
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                if isinstance(saved, dict):
+                    settings.update(saved)
+            except (json.JSONDecodeError, OSError):
+                pass
+        _migrate_video_offsets(settings)
+        offsets = settings.setdefault("video_offsets", {})
+        if not isinstance(offsets, dict):
+            offsets = {}
+            settings["video_offsets"] = offsets
+        if value is None:
+            offsets.pop(session_id, None)
+        else:
+            offsets[session_id] = float(value)
         _ensure_dir()
         with open(p, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)

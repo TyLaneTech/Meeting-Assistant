@@ -34,29 +34,29 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 import numpy as np
 
-import log
+from core import log as log
 
-import config
-import media_edit
-import notifications
-import paths
-import settings
-import storage
-from ai_assistant import AIAssistant
-from audio_capture import (
+from core import config as config
+from capture_video import media_edit as media_edit
+from ui_desktop import notifications as notifications
+from core import paths as paths
+from core import settings as settings
+from core import storage as storage
+from ai.assistant import AIAssistant
+from capture_audio import (
     AudioCapture, enumerate_audio_devices, enumerate_dshow_audio_devices,
     auto_detect_devices,
 )
-from default_audio_params import (
+from capture_audio.params import (
     TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, AUTO_GAIN_DEFAULTS,
     SCREEN_RECORDING_DEFAULTS,
     TRANSCRIPTION_PRESETS, TRANSCRIPTION_DEFAULT_PRESET,
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
-from screen_recorder import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, kill_stale_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
-from speaker_db import SpeakerFingerprintDB
-import text_embeddings
-from transcriber import (
+from capture_video import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, kill_stale_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
+from ml.speaker_db import SpeakerFingerprintDB
+from ml import text_embeddings as text_embeddings
+from ml.transcriber import (
     DIARIZER_OPTIONS,
     WHISPER_PRESETS,
     Transcriber,
@@ -72,7 +72,7 @@ _healed = storage.heal_stale_in_progress()
 if _healed:
     log.info("storage", f"Healed {_healed} stale 'in progress' session(s) on startup.")
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="ui_web/templates", static_folder="ui_web/static")
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0   # disable static file caching
 app.config["TEMPLATES_AUTO_RELOAD"]     = True  # re-read templates on every request
 
@@ -759,7 +759,12 @@ def _load_diarizer() -> None:
         return
     try:
         saved_device = settings.get("diarizer_device", "")
-        if saved_device and (saved_device != "cuda" or get_cuda_available()):
+        # Validate the saved choice against what the current machine actually
+        # supports — accelerator strings ("cuda", "mps") only honored if probe
+        # succeeds, falling back to auto-detection otherwise.
+        from core.compute_device import best_torch_device
+        _accel_ok = best_torch_device() in ("cuda", "mps")
+        if saved_device and (saved_device == "cpu" or _accel_ok):
             log.info("settings", f"Restored diarizer device: {saved_device}")
             _transcriber.load_diarizer(hf_token, device=saved_device)
         else:
@@ -1267,7 +1272,7 @@ def get_session(session_id: str):
     video_path = paths.video_dir() / f"{session_id}.mp4"
     data["has_audio"] = wav_path.exists()
     data["has_video"] = video_path.exists()
-    data["video_offset"] = float(settings.get(f"video_offset_{session_id}", 0))
+    data["video_offset"] = settings.get_video_offset(session_id)
     data["has_trim_backup"] = media_edit.has_trim_backup(session_id)
     # Split rollback: true when this session is part of a split group whose
     # pre-split backup is still on disk. The editor uses this to surface an
@@ -1314,7 +1319,7 @@ def start_audio_test():
     capture = AudioCapture(test_queue)
 
     # Apply audio processing settings so the test reflects real behavior
-    from default_audio_params import resolve_audio_params
+    from capture_audio.params import resolve_audio_params
     _params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
@@ -1461,7 +1466,7 @@ def start_recording():
     capture = AudioCapture(_audio_queue)
 
     # Apply echo cancellation setting to the new capture instance
-    from default_audio_params import resolve_audio_params
+    from capture_audio.params import resolve_audio_params
     _ec_params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
@@ -1519,7 +1524,7 @@ def start_recording():
     video_offset = 0.0
     if resume_session_id and capture.wav_writer:
         video_offset = capture.wav_writer.elapsed_seconds
-    settings.put(f"video_offset_{session_id}", video_offset)
+    settings.put_video_offset(session_id, video_offset)
 
     # ── Screen recording (optional) ────────────────────────────────────────
     screen_recording_active = False
@@ -1642,7 +1647,7 @@ def _concat_video_parts(session_id: str) -> None:
                 if p.exists() and p != final_path:
                     p.unlink()
             # Video now starts at audio time 0 (full session coverage)
-            settings.put(f"video_offset_{session_id}", 0.0)
+            settings.put_video_offset(session_id, 0.0)
             log.info("screen", f"Video concat complete: {len(parts)} parts merged")
         else:
             log.warn("screen", f"Video concat failed (rc={result.returncode}): "
@@ -1851,7 +1856,7 @@ def set_startup():
     if enable:
         root = Path(__file__).parent
         bat  = root / "launch.bat"
-        icon = root / "static" / "images" / "logo.ico"
+        icon = root / "ui_web" / "static" / "images" / "logo.ico"
         ps = (
             f"$ws = New-Object -ComObject WScript.Shell; "
             f"$s = $ws.CreateShortcut('{lnk}'); "
@@ -2455,7 +2460,7 @@ def reset_data_folder():
 @app.route("/api/audio_params", methods=["GET"])
 def get_audio_params():
     """Return current audio parameter values, defaults, and metadata."""
-    from default_audio_params import (
+    from capture_audio.params import (
         TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS,
         AUTO_GAIN_DEFAULTS, ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
         resolve_audio_params,
@@ -2480,7 +2485,7 @@ def set_audio_params():
     audio_params first, so untouched params keep their preset values
     while the user's edit lands on top.
     """
-    from default_audio_params import (
+    from capture_audio.params import (
         get_all_defaults, resolve_audio_params, preset_keys,
         _screen_preset_overrides,
     )
@@ -2534,7 +2539,7 @@ def set_audio_params():
 @app.route("/api/audio_params/reset", methods=["POST"])
 def reset_audio_param():
     """Reset one or all audio parameters to defaults."""
-    from default_audio_params import resolve_audio_params
+    from capture_audio.params import resolve_audio_params
     data = request.get_json(silent=True) or {}
     key = data.get("key")
     all_settings = settings.load()
@@ -2552,7 +2557,7 @@ def reset_audio_param():
 @app.route("/api/audio_params/reset_section", methods=["POST"])
 def reset_audio_section():
     """Reset all parameters in a specific section to defaults."""
-    from default_audio_params import resolve_audio_params
+    from capture_audio.params import resolve_audio_params
     section_map = {
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
@@ -2591,7 +2596,7 @@ def reset_audio_section():
 @app.route("/api/reanalysis_params", methods=["GET"])
 def get_reanalysis_params():
     """Return current reanalysis parameter values, defaults, and metadata."""
-    from default_audio_params import REANALYSIS_DEFAULTS, get_reanalysis_defaults
+    from capture_audio.params import REANALYSIS_DEFAULTS, get_reanalysis_defaults
     saved = settings.load().get("reanalysis_params", {})
     defaults = get_reanalysis_defaults()
     current = {**defaults, **saved}
@@ -2604,7 +2609,7 @@ def get_reanalysis_params():
 @app.route("/api/reanalysis_params", methods=["PUT"])
 def set_reanalysis_params():
     """Update one or more reanalysis parameters."""
-    from default_audio_params import get_reanalysis_defaults
+    from capture_audio.params import get_reanalysis_defaults
     data = request.get_json(silent=True) or {}
     all_settings = settings.load()
     params = all_settings.get("reanalysis_params", {})
@@ -2619,7 +2624,7 @@ def set_reanalysis_params():
 @app.route("/api/reanalysis_params/reset", methods=["POST"])
 def reset_reanalysis_param():
     """Reset one or all reanalysis parameters to defaults."""
-    from default_audio_params import get_reanalysis_defaults
+    from capture_audio.params import get_reanalysis_defaults
     data = request.get_json(silent=True) or {}
     key = data.get("key")
     all_settings = settings.load()
@@ -2654,7 +2659,7 @@ def set_transcription_preset():
     snapshot the currently effective values for the transcription keys
     into audio_params so the user can edit from where they were.
     """
-    from default_audio_params import resolve_audio_params, preset_keys
+    from capture_audio.params import resolve_audio_params, preset_keys
     data = request.get_json(silent=True) or {}
     preset_id = data.get("preset", TRANSCRIPTION_DEFAULT_PRESET)
     if preset_id not in TRANSCRIPTION_PRESETS:
@@ -2689,7 +2694,7 @@ def get_diarization_presets():
 def set_diarization_preset():
     """Switch the active diarization preset. See ``set_transcription_preset``
     for the non-custom-by-name / snapshot-on-custom semantics."""
-    from default_audio_params import resolve_audio_params, preset_keys
+    from capture_audio.params import resolve_audio_params, preset_keys
     data = request.get_json(silent=True) or {}
     preset_id = data.get("preset", DIARIZATION_DEFAULT_PRESET)
     if preset_id not in DIARIZATION_PRESETS:
@@ -2788,7 +2793,7 @@ def set_screen_preset():
     """Switch the active screen recording preset. See
     ``set_transcription_preset`` for the non-custom-by-name /
     snapshot-on-custom semantics."""
-    from default_audio_params import resolve_audio_params, _screen_preset_overrides
+    from capture_audio.params import resolve_audio_params, _screen_preset_overrides
     data = request.get_json(silent=True) or {}
     preset_id = data.get("preset", SCREEN_DEFAULT_PRESET)
     if preset_id not in SCREEN_PRESETS:
@@ -2875,10 +2880,11 @@ def get_models():
         diarizer_ready = _state["diarizer_ready"]
 
     # If the diarizer hasn't loaded yet but an HF key exists, infer the
-    # device from CUDA availability so the dropdown shows the right value
-    # instead of "Disabled".
+    # device from accelerator availability so the dropdown shows the right
+    # value instead of "Disabled".
     if diarizer_device is None and has_hf_key:
-        diarizer_device = "cuda" if cuda_available else "cpu"
+        from core.compute_device import best_torch_device
+        diarizer_device = best_torch_device()
 
     return jsonify({
         "cuda_available": cuda_available,
@@ -4007,13 +4013,13 @@ def trim_session(session_id: str):
 
     try:
         ffmpeg_bin = find_ffmpeg()
-        video_offset = float(settings.get(f"video_offset_{session_id}", 0))
+        video_offset = settings.get_video_offset(session_id)
         media_edit.backup_session_snapshot(session_id, sess, video_offset)
         if media_edit.video_path(session_id).exists() and not ffmpeg_bin:
             return jsonify({"error": "FFmpeg is required to trim a session with screen recording video"}), 500
         new_offset = media_edit.trim_video(session_id, start_sec, end_sec, video_offset, ffmpeg_bin)
         media_edit.trim_wav(session_id, start_sec, end_sec)
-        settings.put(f"video_offset_{session_id}", new_offset)
+        settings.put_video_offset(session_id, new_offset)
         kept = storage.trim_session_segments(session_id, start_sec, end_sec)
         threading.Thread(target=update_session_embedding, args=(session_id,), daemon=True).start()
         return jsonify({
@@ -4043,7 +4049,7 @@ def restore_session(session_id: str):
     try:
         media_edit.restore_original_media(session_id)
         storage.restore_session_snapshot(session_id, snapshot.get("session") or {})
-        settings.put(f"video_offset_{session_id}", float(snapshot.get("video_offset") or 0.0))
+        settings.put_video_offset(session_id, float(snapshot.get("video_offset") or 0.0))
         media_edit.clear_trim_backup(session_id)
         threading.Thread(target=update_session_embedding, args=(session_id,), daemon=True).start()
         return jsonify({"ok": True, "session_id": session_id})
@@ -4067,7 +4073,7 @@ def split_session(session_id: str):
 
     source_audio = media_edit.wav_path(session_id)
     source_video = media_edit.video_path(session_id)
-    source_video_offset = float(settings.get(f"video_offset_{session_id}", 0))
+    source_video_offset = settings.get_video_offset(session_id)
     ffmpeg_bin = find_ffmpeg()
     if source_video.exists() and not ffmpeg_bin:
         return jsonify({"error": "FFmpeg is required to split a session with screen recording video"}), 500
@@ -4147,7 +4153,7 @@ def split_session(session_id: str):
                     source_video_offset,
                     ffmpeg_bin,
                 )
-                settings.put(f"video_offset_{new_sid}", new_offset)
+                settings.put_video_offset(new_sid, new_offset)
             else:
                 new_offset = 0.0
             threading.Thread(target=update_session_embedding, args=(new_sid,), daemon=True).start()
@@ -4298,7 +4304,7 @@ def restore_split(session_id: str):
         media_edit.restore_split_media(group_id, restored_id)
         # Preserve the video offset if one was stored for the original.
         try:
-            settings.put(f"video_offset_{restored_id}", float(snapshot.get("video_offset") or 0.0))
+            settings.put_video_offset(restored_id, float(snapshot.get("video_offset") or 0.0))
         except Exception:
             pass
         # Delete the user-selected parts (and their media) in one pass.
@@ -4368,8 +4374,8 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
         # Run batch pipeline (transformers + pyannote) if available,
         # otherwise fall back to the real-time pipeline.
         try:
-            from batch_transcriber import BatchTranscriber
-            from default_audio_params import get_reanalysis_defaults, resolve_audio_params
+            from ml.batch_transcriber import BatchTranscriber
+            from capture_audio.params import get_reanalysis_defaults, resolve_audio_params
             saved = settings.load().get("reanalysis_params", {})
             params = {**get_reanalysis_defaults(), **saved}
 
@@ -4426,7 +4432,7 @@ def reanalyze_session(session_id: str):
         # Batch reanalysis loads its own models; only require model_ready
         # if the batch pipeline is unavailable (fallback to real-time).
         try:
-            from batch_transcriber import BatchTranscriber  # noqa: F401
+            from ml.batch_transcriber import BatchTranscriber  # noqa: F401
             _batch_available = True
         except ImportError:
             _batch_available = False
@@ -5617,7 +5623,7 @@ _UPDATE_REMOTES = [
 
 def _git_fetch(root: Path) -> tuple[bool, str, str]:
     """Try fetching from each remote in _UPDATE_REMOTES; return (ok, remote_used, error)."""
-    from network import warp_reconnect
+    from core.network import warp_reconnect
     warp_reconnect()
     last_err = ""
     for remote in _UPDATE_REMOTES:
@@ -5798,7 +5804,7 @@ def main() -> None:
     # Try to start system tray immediately so it becomes available during the
     # same startup window as the webserver, rather than after the bind wait.
     try:
-        from tray import TRAY_AVAILABLE, MeetingTray
+        from ui_desktop.tray import TRAY_AVAILABLE, MeetingTray
         if not TRAY_AVAILABLE:
             raise ImportError("pystray or Pillow not installed")
 

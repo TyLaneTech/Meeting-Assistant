@@ -35,7 +35,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-import log
+from core import log as log
 import numpy as np
 from scipy import signal as scipy_signal
 
@@ -60,7 +60,13 @@ def detect_cuda_available() -> bool:
 
 
 def detect_device() -> tuple[str, str, str]:
-    """Returns (device, compute_type, model_size). Prefers CUDA if available."""
+    """Returns (device, compute_type, model_size). Best for current platform."""
+    if sys.platform == "darwin":
+        # Apple Silicon: mlx-whisper drives Metal directly. Compute-type is
+        # an mlx-whisper concept (fp16) and the device string is purely
+        # informational since mlx selects Metal automatically.
+        log.info("whisper", "Using mlx-whisper on Metal - large-v3.")
+        return "mlx", "fp16", "large-v3"
     if detect_cuda_available():
         log.info("whisper", "CUDA OK - using large-v3 (float16).")
         return "cuda", "float16", "large-v3"
@@ -68,20 +74,47 @@ def detect_device() -> tuple[str, str, str]:
     return "cpu", "int8", "small"
 
 
-# All available whisper presets: (label, device, compute_type, model_size, requires_cuda)
-WHISPER_PRESETS = [
-    {"id": "cuda-large-v3",  "label": "GPU - large-v3 (float16)",       "device": "cuda", "compute_type": "float16", "model_size": "large-v3",       "requires_cuda": True},
-    {"id": "cuda-turbo",     "label": "GPU - large-v3-turbo (float16)", "device": "cuda", "compute_type": "float16", "model_size": "large-v3-turbo", "requires_cuda": True},
-    {"id": "cuda-medium",    "label": "GPU - medium (float16)",         "device": "cuda", "compute_type": "float16", "model_size": "medium",         "requires_cuda": True},
-    {"id": "cuda-small",     "label": "GPU - small (float16)",          "device": "cuda", "compute_type": "float16", "model_size": "small",          "requires_cuda": True},
-    {"id": "cpu-medium",     "label": "CPU - medium (int8)",            "device": "cpu",  "compute_type": "int8",    "model_size": "medium",         "requires_cuda": False},
-    {"id": "cpu-small",      "label": "CPU - small (int8)",             "device": "cpu",  "compute_type": "int8",    "model_size": "small",          "requires_cuda": False},
-    {"id": "cpu-tiny",       "label": "CPU - tiny (int8)",              "device": "cpu",  "compute_type": "int8",    "model_size": "tiny",           "requires_cuda": False},
+# Whisper presets shown in the settings UI dropdown. The "requires_gpu" key
+# replaces the old "requires_cuda" so the UI gates correctly on Mac too —
+# but we keep "requires_cuda" as an alias for backward compat with app.py.
+def _preset(*, id: str, label: str, device: str, compute_type: str,
+            model_size: str, requires_gpu: bool, platforms: tuple[str, ...]) -> dict:
+    return {
+        "id": id, "label": label, "device": device,
+        "compute_type": compute_type, "model_size": model_size,
+        "requires_cuda": requires_gpu and "cuda" in (device,),  # legacy alias
+        "requires_gpu": requires_gpu,
+        "platforms": platforms,
+    }
+
+
+# All presets across platforms; app.py filters by sys.platform via the
+# `platforms` tuple so each OS only sees relevant choices.
+_ALL_WHISPER_PRESETS = [
+    # Windows / Linux — faster-whisper / CTranslate2
+    _preset(id="cuda-large-v3", label="GPU - large-v3 (float16)",       device="cuda", compute_type="float16", model_size="large-v3",       requires_gpu=True,  platforms=("win32", "linux")),
+    _preset(id="cuda-turbo",    label="GPU - large-v3-turbo (float16)", device="cuda", compute_type="float16", model_size="large-v3-turbo", requires_gpu=True,  platforms=("win32", "linux")),
+    _preset(id="cuda-medium",   label="GPU - medium (float16)",         device="cuda", compute_type="float16", model_size="medium",         requires_gpu=True,  platforms=("win32", "linux")),
+    _preset(id="cuda-small",    label="GPU - small (float16)",          device="cuda", compute_type="float16", model_size="small",          requires_gpu=True,  platforms=("win32", "linux")),
+    _preset(id="cpu-medium",    label="CPU - medium (int8)",            device="cpu",  compute_type="int8",    model_size="medium",         requires_gpu=False, platforms=("win32", "linux")),
+    _preset(id="cpu-small",     label="CPU - small (int8)",             device="cpu",  compute_type="int8",    model_size="small",          requires_gpu=False, platforms=("win32", "linux")),
+    _preset(id="cpu-tiny",      label="CPU - tiny (int8)",              device="cpu",  compute_type="int8",    model_size="tiny",           requires_gpu=False, platforms=("win32", "linux")),
+    # macOS — mlx-whisper / Metal
+    _preset(id="mlx-large-v3",       label="Metal - large-v3 (fp16)",       device="mlx", compute_type="fp16", model_size="large-v3",       requires_gpu=False, platforms=("darwin",)),
+    _preset(id="mlx-large-v3-turbo", label="Metal - large-v3-turbo (fp16)", device="mlx", compute_type="fp16", model_size="large-v3-turbo", requires_gpu=False, platforms=("darwin",)),
+    _preset(id="mlx-medium",         label="Metal - medium (fp16)",         device="mlx", compute_type="fp16", model_size="medium",         requires_gpu=False, platforms=("darwin",)),
+    _preset(id="mlx-small",          label="Metal - small (fp16)",          device="mlx", compute_type="fp16", model_size="small",          requires_gpu=False, platforms=("darwin",)),
+    _preset(id="mlx-tiny",           label="Metal - tiny (fp16)",           device="mlx", compute_type="fp16", model_size="tiny",           requires_gpu=False, platforms=("darwin",)),
 ]
 
+WHISPER_PRESETS = [p for p in _ALL_WHISPER_PRESETS if sys.platform in p["platforms"]]
+
+# Diarizer device options. IDs ("cuda" / "cpu") are kept for backward
+# compatibility with saved user settings. On macOS the diarizer translates
+# "cuda" → "mps" automatically (see diarizer.py).
 DIARIZER_OPTIONS = [
-    {"id": "cuda", "label": "GPU", "requires_cuda": True},
-    {"id": "cpu",  "label": "CPU", "requires_cuda": False},
+    {"id": "cuda", "label": "GPU", "requires_cuda": False, "requires_gpu": True},
+    {"id": "cpu",  "label": "CPU", "requires_cuda": False, "requires_gpu": False},
 ]
 
 _RUNTIME_LOCK = threading.Lock()
@@ -287,7 +320,7 @@ class Transcriber:
         # When the user is on a non-custom preset, preset values win over any
         # stale per-key entries in audio_params, so updates to the preset
         # definitions in default_audio_params.py auto-propagate.
-        from default_audio_params import resolve_audio_params
+        from capture_audio.params import resolve_audio_params
         p = resolve_audio_params()
         self.silence_threshold   = float(p["silence_threshold"])
         self.silence_duration    = float(p["silence_duration"])
@@ -318,31 +351,30 @@ class Transcriber:
         return getattr(self.diarizer, "_device_name", None)
 
     def load_model(self) -> None:
-        """Download (first run) and load Whisper. Blocking - run in a thread."""
+        """Download (first run) and load Whisper. Blocking - run in a thread.
+
+        Engine selection is automatic per platform: faster-whisper on
+        Windows/Linux, mlx-whisper on macOS. See transcriber_engine.py.
+        """
         if self._auto_model_config:
             self.device, self.compute_type, self.model_size = get_default_model_config()
         log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
-        from faster_whisper import WhisperModel
+        from ml.transcriber_engine import make_engine
         try:
-            self.model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type=self.compute_type,
-            )
+            self.model = make_engine(self.model_size, self.device, self.compute_type)
         except Exception as e:
             if not self._clear_bad_model_cache(str(e)):
                 raise
             log.info("whisper", "Retrying after cache clear…")
-            self.model = WhisperModel(
-                self.model_size,
-                device=self.device,
-                compute_type=self.compute_type,
-            )
-        # Warm up CUDA kernels - first inference is significantly slower
-        # due to kernel compilation and memory allocation.
+            self.model = make_engine(self.model_size, self.device, self.compute_type)
+        # Warm up the model - first inference is significantly slower due to
+        # kernel compilation, weight loading, and memory allocation. The kwargs
+        # set used here matches the steady-state call site below so all hot
+        # codepaths get JIT'd / cached on this dummy run.
         try:
             _warmup = np.zeros(self.TARGET_RATE, dtype=np.float32)
-            list(self.model.transcribe(_warmup, beam_size=1)[0])
+            _segs, _info = self.model.transcribe(_warmup, language="en")
+            list(_segs)
         except Exception:
             pass
         log.info("whisper", "Model ready.")
@@ -350,8 +382,13 @@ class Transcriber:
     def _clear_bad_model_cache(self, error_msg: str) -> bool:
         """Delete a corrupted HuggingFace model cache and return True if cleared."""
         import shutil
-        from faster_whisper.utils import _MODELS
-        repo_id = _MODELS.get(self.model_size, self.model_size)
+        if sys.platform == "darwin":
+            # mlx-whisper pulls from MLX-quantized repos under mlx-community/.
+            from ml.transcriber_engine import _MLX_MODEL_REPOS
+            repo_id = _MLX_MODEL_REPOS.get(self.model_size, self.model_size)
+        else:
+            from faster_whisper.utils import _MODELS  # type: ignore[import-not-found]
+            repo_id = _MODELS.get(self.model_size, self.model_size)
         # HF hub cache stores models under models--<org>--<name>
         cache_dir_name = "models--" + repo_id.replace("/", "--")
         hf_cache = os.path.join(
@@ -379,7 +416,7 @@ class Transcriber:
 
     def load_diarizer(self, hf_token: str, device: str | None = None) -> None:
         """Load streaming diarization pipeline. Blocking - run in a thread."""
-        from diarizer import StreamingDiarizer
+        from ml.diarizer import StreamingDiarizer
         self.diarizer = StreamingDiarizer(hf_token, device=device)
 
     def reload_diarizer(self, hf_token: str, device: str) -> None:
@@ -651,12 +688,18 @@ class Transcriber:
             traceback.print_exc()
 
     def _switch_to_cpu(self) -> None:
-        """Reload the Whisper model in CPU/int8 mode after a CUDA failure."""
+        """Reload the Whisper model in CPU/int8 mode after a CUDA failure.
+
+        Only relevant on Windows/Linux — on macOS the engine is mlx-whisper
+        which doesn't fail with cublas/cuda errors. We keep the method
+        available for callers that don't check platform.
+        """
+        from ml.transcriber_engine import make_engine
         self.device = "cpu"
         self.compute_type = "int8"
         self.model_size = "small"
         log.warn("whisper", "Reloading as 'small' on CPU (int8)…")
-        self.model = WhisperModel("small", device="cpu", compute_type="int8")
+        self.model = make_engine("small", "cpu", "int8")
         log.info("whisper", "CPU fallback ready.")
 
     def _loop(self) -> None:

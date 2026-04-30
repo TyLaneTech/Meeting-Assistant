@@ -5,7 +5,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
-import paths
+from core import paths as paths
 
 
 def __getattr__(name):
@@ -758,7 +758,7 @@ def create_split_session(
                 if new_ended_at is None:
                     new_ended_at = (base + timedelta(seconds=end_sec)).isoformat()
             except Exception as e:
-                import log as _log
+                from core import log as _log
                 _log.warn(
                     "storage",
                     f"create_split_session: could not parse source started_at "

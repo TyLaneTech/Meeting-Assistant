@@ -314,7 +314,7 @@ def run_streaming_diarizer(
     params: dict | None = None,
 ) -> list[tuple[str, float, float]]:
     """Run the streaming diarizer on audio and return hypothesis segments."""
-    from diarizer import StreamingDiarizer
+    from ml.diarizer import StreamingDiarizer
 
     diarizer = StreamingDiarizer(hf_token, device=device)
     if params:
@@ -351,7 +351,7 @@ def run_batch_diarizer(
     def on_text(text, speaker, start, end):
         segments.append((speaker, start, end))
 
-    from batch_transcriber import BatchTranscriber
+    from ml.batch_transcriber import BatchTranscriber
     bt = BatchTranscriber(on_text_callback=on_text, hf_token=hf_token)
 
     p = params or {}
@@ -387,7 +387,7 @@ def parameter_sweep(
         print(f"  [{i}/{total}] tau={tau}, delta={delta}, rho={rho} ... ", end="", flush=True)
 
         # Patch settings for this run
-        import settings
+        from core import settings as settings
         saved = settings.load()
         saved.setdefault("audio_params", {})
         saved["audio_params"]["tau_active"] = tau
@@ -444,7 +444,7 @@ def main():
     load_dotenv()
     hf_token = os.getenv("HUGGING_FACE_KEY", "")
     if not hf_token:
-        from config import hf_token as _cfg_token
+        from core.config import hf_token as _cfg_token
         hf_token = _cfg_token()
 
     if args.wav and args.rttm:

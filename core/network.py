@@ -13,7 +13,7 @@ Strategy:
 import shutil
 import subprocess
 
-import log
+from core import log as log
 
 _warp_cli: str | None = None  # cached path
 

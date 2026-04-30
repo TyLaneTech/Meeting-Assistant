@@ -9,7 +9,7 @@ import re
 import traceback
 from typing import Callable
 
-import log
+from core import log as log
 
 Callback = Callable[[str], None]
 ToolEventCallback = Callable[[str, dict], None]  # (event_type, payload) → None
@@ -877,7 +877,7 @@ class AIAssistant:
     ) -> None:
         """Stream tokens from the active provider."""
         try:
-            from network import warp_disconnect
+            from core.network import warp_disconnect
             warp_disconnect()
             client, prov, mdl = self._resolve(provider, model)
             if client is None:
@@ -1015,7 +1015,7 @@ class AIAssistant:
     def _complete(self, system: str, prompt: str, max_tokens: int = 1024,
                    provider: str | None = None, model: str | None = None) -> str:
         """Non-streaming single completion from the active provider."""
-        from network import warp_disconnect
+        from core.network import warp_disconnect
         warp_disconnect()
         client, prov, mdl = self._resolve(provider, model)
         if client is None:
@@ -1049,7 +1049,7 @@ class AIAssistant:
         OpenAI: uses json_object response format + prompt instructions.
         Returns {} on empty or unparseable responses.
         """
-        from network import warp_disconnect
+        from core.network import warp_disconnect
         warp_disconnect()
         client, prov, mdl = self._resolve(provider, model)
         if client is None:
@@ -1109,7 +1109,7 @@ class AIAssistant:
         or generic ``tool_executor`` + tool lists for arbitrary tool handling.
         """
         try:
-            from network import warp_disconnect
+            from core.network import warp_disconnect
             warp_disconnect()
             client, prov, mdl = self._resolve(provider, model)
             if client is None:

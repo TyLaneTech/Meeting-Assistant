@@ -2938,7 +2938,6 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     state.isTesting = !!d.testing;
     updateTestBtn();
-    syncBrowserMic();
     // Zero out levels when test ends (and we're not recording)
     if (!d.testing && !state.isRecording) {
       vizLbTarget  = 0;
@@ -3290,7 +3289,6 @@ function updateRecordBtn() {
   if (scrToggle) scrToggle.disabled = state.isRecording;
   _syncRecordBtnDisabled();
   updateTestBtn();
-  syncBrowserMic();
   _syncUploadBtn();
 }
 
@@ -7218,6 +7216,14 @@ function _skipFilteredAudio(t) {
     if (r.start > t) {
       _lastSkipTime = r.start;
       _playbackAudio.currentTime = r.start;
+      // Drive the video seek directly here rather than waiting for the
+      // drift-detection path in _syncVideoToAudio to notice. With the filter
+      // active the audio can jump faster than Chrome finishes a video seek,
+      // which left _videoSeekPending stuck and produced a "video loops a
+      // short snippet" symptom while audio kept skipping forward.
+      if (_videoAvailable && _videoVisible) {
+        _seekVideoImmediate(_audioToVideoTime(r.start));
+      }
       return;
     }
   }
@@ -10522,62 +10528,6 @@ function flashStatus(msg) {
   setTimeout(() => { el.textContent = prev; }, 1800);
 }
 
-/* ── Browser mic capture ─────────────────────────────────────────────────── */
-let _bmStream    = null;   // MediaStream
-let _bmCtx       = null;   // AudioContext
-let _bmProcessor = null;   // ScriptProcessorNode
-
-async function startBrowserMic() {
-  if (_bmStream) return;   // already running
-  try {
-    _bmStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    // Request 48 kHz to match the server-side assumption in inject_mic_data
-    _bmCtx = new AudioContext({ sampleRate: 48000 });
-    const source = _bmCtx.createMediaStreamSource(_bmStream);
-    // 4096-sample buffer ≈ 85 ms at 48 kHz - fine for transcription latency
-    _bmProcessor = _bmCtx.createScriptProcessor(4096, 1, 1);
-    _bmProcessor.onaudioprocess = e => {
-      if (!state.isRecording && !state.isTesting) return;
-      const f32 = e.inputBuffer.getChannelData(0);   // mono Float32
-      // Convert to Int16
-      const i16 = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++) {
-        const s = Math.max(-1, Math.min(1, f32[i]));
-        i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-      }
-      // Fire-and-forget - don't await; high-frequency short requests
-      fetch('/api/audio/mic-chunk', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body:    i16.buffer,
-      }).catch(() => {});
-    };
-    source.connect(_bmProcessor);
-    _bmProcessor.connect(_bmCtx.destination);
-    console.log('[mic] Browser mic started @', _bmCtx.sampleRate, 'Hz');
-  } catch (err) {
-    console.error('[mic] getUserMedia failed:', err);
-    alert('Could not access browser microphone:\n' + err.message);
-    _bmStream = null;
-  }
-}
-
-function stopBrowserMic() {
-  if (_bmProcessor) { _bmProcessor.disconnect(); _bmProcessor = null; }
-  if (_bmCtx)       { _bmCtx.close();            _bmCtx       = null; }
-  if (_bmStream)    { _bmStream.getTracks().forEach(t => t.stop()); _bmStream = null; }
-}
-
-// Ensure browser mic is released when the page is closed or refreshed
-window.addEventListener('beforeunload', () => stopBrowserMic());
-
-function syncBrowserMic() {
-  const micVal   = document.getElementById('viz-mic-sel')?.value;
-  const needsMic = (state.isRecording || state.isTesting) && micVal === '-2';
-  if (needsMic && !_bmStream)  startBrowserMic();
-  if (!needsMic && _bmStream)  stopBrowserMic();
-}
-
 /* ── Audio device selection ──────────────────────────────────────────────── */
 async function loadAudioDevices() {
   const lbSel  = document.getElementById('viz-loopback-sel');
@@ -10685,10 +10635,6 @@ function saveDeviceSelection() {
   const micSel = document.getElementById('viz-mic-sel');
   if (lbSel)  savePref('loopback_device', lbSel.value);
   if (micSel) savePref('mic_device',      micSel.value);
-  // Release or acquire the browser getUserMedia stream immediately when the
-  // mic selector changes - otherwise a stale getUserMedia lock on the physical
-  // mic device causes WASAPI shared-mode contention and garbled audio.
-  syncBrowserMic();
 }
 
 async function toggleAudioTest() {
@@ -10700,7 +10646,6 @@ async function toggleAudioTest() {
     // don't wait for SSE event which may be delayed or lost.
     state.isTesting = false;
     updateTestBtn();
-    stopBrowserMic();
   } else {
     const lbVal  = document.getElementById('viz-loopback-sel')?.value;
     const micVal = document.getElementById('viz-mic-sel')?.value;

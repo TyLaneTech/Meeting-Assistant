@@ -203,7 +203,7 @@ def _create_start_menu_shortcut():
 
     root       = Path(__file__).parent
     bat_path   = root / "launch.bat"
-    icon_path  = root / "static" / "images" / "logo.ico"
+    icon_path  = root / "ui_web" / "static" / "images" / "logo.ico"
     start_menu = (
         Path(os.environ.get("APPDATA", ""))
         / "Microsoft" / "Windows" / "Start Menu" / "Programs"
@@ -268,12 +268,137 @@ def _create_start_menu_shortcut():
         _warn("Could not update Start Menu shortcut (non-fatal)")
 
 
+# ── Storage layout migration ──────────────────────────────────────────────────
+
+def _migrate_legacy_layout():
+    """One-shot migration to the storage/ folder layout.
+
+    Moves legacy project-root directories into ``storage/``:
+      <project>/tools/   → <project>/storage/tools/
+      <project>/models/  → <project>/storage/models/
+      <project>/data/    → <project>/storage/data/   (only if at default location)
+
+    The data folder is only migrated when it's still at the original default
+    location — i.e. either ``.data_location`` is absent, or it points to
+    ``<project>/data``. If the user has relocated their data via the System
+    settings (pointer points elsewhere), we leave both the data folder and
+    the pointer alone.
+
+    After moving the default-located data folder, the pointer file is
+    removed so ``core.paths.data_dir()`` resolves to the new default
+    (``storage/data/``) without an explicit pointer.
+
+    Idempotent — safe to call on every launch. Silent when there's nothing
+    to do.
+    """
+    project_root = Path(__file__).parent
+    storage_dir = project_root / "storage"
+    pointer_file = project_root / ".data_location"
+
+    moved: list[str] = []
+
+    # tools/ and models/ are unconditional — always inside the project root.
+    for name in ("tools", "models"):
+        src = project_root / name
+        dst = storage_dir / name
+        if src.is_dir() and not dst.exists():
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                moved.append(f"{name}/ -> storage/{name}/")
+            except OSError as exc:
+                _warn(f"Could not migrate {name}/ to storage/: {exc}")
+
+    # data/ requires the pointer check.
+    src_data = project_root / "data"
+    dst_data = storage_dir / "data"
+    if src_data.is_dir() and not dst_data.exists():
+        # Mirror core.paths._read_pointer: empty / non-absolute / unreadable
+        # pointer files are treated as "no pointer" — i.e. data is at the
+        # default location and should be migrated. This keeps migration in
+        # lockstep with how paths.py itself resolves the data dir.
+        pointer_target: Path | None = None
+        if pointer_file.exists():
+            try:
+                text = pointer_file.read_text(encoding="utf-8").strip()
+                if text:
+                    p = Path(text)
+                    if p.is_absolute():
+                        pointer_target = p
+            except (OSError, UnicodeDecodeError, ValueError):
+                # Unreadable / corrupt pointer file — treat as "no pointer".
+                # Mirrors paths._read_pointer's defensive posture.
+                pointer_target = None
+
+        try:
+            is_default_location = (
+                pointer_target is None
+                or pointer_target.resolve() == src_data.resolve()
+            )
+        except OSError:
+            # If the pointer can't be resolved (broken path on a missing
+            # volume, etc.), assume the user has data elsewhere and play
+            # it safe — leave both data/ and the pointer alone.
+            is_default_location = False
+
+        if is_default_location:
+            try:
+                dst_data.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src_data), str(dst_data))
+                moved.append("data/ -> storage/data/")
+            except OSError as exc:
+                _warn(f"Could not migrate data/ to storage/data/: {exc}")
+            else:
+                # Migration succeeded: the new default IS storage/data/, so
+                # the pointer becomes redundant. Best-effort cleanup — failing
+                # to delete the pointer (e.g. it's a corrupt directory) does
+                # NOT undo the successful data move and shouldn't surface as
+                # a migration error to the user.
+                try:
+                    pointer_file.unlink()
+                except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+                    pass
+
+    if moved:
+        _section("STORAGE LAYOUT")
+        for line in moved:
+            _ok(f"Migrated  {GRY}{line}{R}")
+
+
 # ── GPU detection ─────────────────────────────────────────────────────────────
 
 TORCH_INDEX = "https://download.pytorch.org/whl/"
 
 def _detect_gpu():
-    """Return (wheel_tag, gpu_name, cuda_ver_str) or ('cpu', '', '')."""
+    """Return (wheel_tag, gpu_name, cuda_ver_str) or ('cpu', '', '').
+
+    On macOS the result is ('mps', <chip>, '') if Apple Silicon Metal is
+    available, else ('cpu', '', ''). The 'mps' tag is purely informational —
+    we don't pin a torch wheel on Mac because the default arm64 wheel is
+    Metal-enabled out of the box.
+    """
+    if sys.platform == "darwin":
+        # Cheap check: arm64 Apple Silicon. We don't probe torch here because
+        # this runs before the venv has torch installed.
+        try:
+            arch = subprocess.run(
+                ["uname", "-m"], capture_output=True, text=True
+            ).stdout.strip()
+            if arch == "arm64":
+                # Try to read the chip name from sysctl. Falls back to a
+                # generic label if the sysctl key isn't present.
+                try:
+                    chip = subprocess.run(
+                        ["sysctl", "-n", "machdep.cpu.brand_string"],
+                        capture_output=True, text=True,
+                    ).stdout.strip() or "Apple Silicon"
+                except Exception:
+                    chip = "Apple Silicon"
+                return "mps", chip, ""
+        except Exception:
+            pass
+        return "cpu", "", ""
+
     try:
         r = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
         if r.returncode != 0:
@@ -345,7 +470,7 @@ def _is_model_cached(hf_model_id: str) -> bool:
     """
     target = "models--" + hf_model_id.replace("/", "--")
     roots = [
-        Path(__file__).parent / "models",   # project-local HF_HOME
+        Path(__file__).parent / "storage" / "models",   # project-local HF_HOME
         Path.home() / ".cache",             # covers huggingface/, torch/, etc.
     ]
     for root in roots:
@@ -378,9 +503,15 @@ def _find_model_dir(base: Path, target: str, max_depth: int) -> bool:
     return False
 
 
-# Map task IDs → HuggingFace model IDs for cache checking
+# Map task IDs → HuggingFace model IDs for cache checking.
+# On macOS the streaming Whisper engine is mlx-whisper (faster-whisper has no
+# Metal backend), so we predownload the MLX-quantized large-v3 repo instead.
 _MODEL_IDS = {
-    "faster-whisper":        "Systran/faster-whisper-large-v3",
+    "faster-whisper":        (
+        "mlx-community/whisper-large-v3-mlx"
+        if sys.platform == "darwin"
+        else "Systran/faster-whisper-large-v3"
+    ),
     "pyannote-segmentation": "pyannote/segmentation-3.0",
     "pyannote-embedding":    "pyannote/wespeaker-voxceleb-resnet34-LM",
     "pyannote-pipeline":     "pyannote/speaker-diarization-3.1",
@@ -401,28 +532,33 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 warnings.filterwarnings("ignore")
 
 # Load config which sets HF_TOKEN from .env or bundled token
-import config
+from core import config as config
 hf_token = os.environ.get("HF_TOKEN", "")
 
 task = sys.argv[1]
 
 if task == "faster-whisper":
-    from faster_whisper import WhisperModel
-    WhisperModel("large-v3", device="cpu", compute_type="int8")
+    if sys.platform == "darwin":
+        # mlx-whisper pulls from MLX-quantized repos under mlx-community/.
+        from huggingface_hub import snapshot_download
+        snapshot_download("mlx-community/whisper-large-v3-mlx")
+    else:
+        from faster_whisper import WhisperModel
+        WhisperModel("large-v3", device="cpu", compute_type="int8")
 
 elif task == "pyannote-segmentation":
     # Import diarizer to get all the torchaudio/speechbrain shims
-    import diarizer  # noqa: F401
+    from ml import diarizer as diarizer  # noqa: F401
     from diart.models import SegmentationModel
     SegmentationModel.from_pretrained("pyannote/segmentation-3.0", use_hf_token=hf_token)
 
 elif task == "pyannote-embedding":
-    import diarizer  # noqa: F401
+    from ml import diarizer as diarizer  # noqa: F401
     from pyannote.audio import Model
     Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", use_auth_token=hf_token)
 
 elif task == "pyannote-pipeline":
-    import diarizer  # noqa: F401
+    from ml import diarizer as diarizer  # noqa: F401
     from pyannote.audio import Pipeline
     Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
 
@@ -504,6 +640,11 @@ def main():
     os.chdir(Path(__file__).parent)
     _ensure_venv()   # re-execs into .venv if not already running inside it
 
+    # Migrate legacy <project>/{tools,models,data}/ into storage/ on update.
+    # Runs before any module imports that resolve those paths (HF_HOME,
+    # ffmpeg lookup, settings/paths bootstrap).
+    _migrate_legacy_layout()
+
     # Ensure uv can find the active venv
     os.environ["VIRTUAL_ENV"] = str(VENV_DIR)
 
@@ -538,7 +679,9 @@ def main():
     # GPU
     whl, gpu_name, cuda_ver = _detect_gpu()
     if whl == "cpu":
-        print(f"{GRY}  [--] No NVIDIA GPU detected -- CPU mode{R}")
+        print(f"{GRY}  [--] No accelerator detected -- CPU mode{R}")
+    elif whl == "mps":
+        print(f"{GRN}  [OK] {gpu_name}  {GRY}|  Metal (MPS){R}")
     else:
         print(f"{GRN}  [OK] {gpu_name}  {GRY}|  CUDA {cuda_ver}{R}")
 
@@ -554,13 +697,23 @@ def main():
 
     # Cloudflare WARP's TLS inspection breaks pip/uv (untrusted CA).
     # Disconnect before package installs, reconnect after (git/HF need it).
-    from network import warp_disconnect, warp_reconnect
+    from core.network import warp_disconnect, warp_reconnect
     warp_disconnect()
 
     # PyTorch - only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
 
-    if whl == "cpu":
+    if sys.platform == "darwin":
+        # macOS: the default PyPI arm64 torch wheel ships Metal/MPS support.
+        # No special index URL, no reinstall dance.
+        if installed_build:
+            _ok(f"PyTorch  {GRY}[arm64 | Metal/MPS]{R}")
+        else:
+            _info(f"PyTorch [arm64]  {GRY}(downloading...){R}")
+            if not _uv_streaming("torch", "torchaudio"):
+                _fatal("PyTorch install failed -- check your connection and retry")
+            _ok(f"PyTorch  {GRY}[arm64 | Metal/MPS]{R}")
+    elif whl == "cpu":
         if installed_build == "cpu":
             _ok(f"PyTorch  {GRY}[CPU]{R}")
         else:
@@ -594,10 +747,11 @@ def main():
 
     # All other deps
     _info("Dependencies...")
-    if not _uv_streaming("-r", "requirements.txt"):
+    req_file = "requirements-macos.txt" if sys.platform == "darwin" else "requirements.txt"
+    if not _uv_streaming("-r", req_file):
         _warn("Some packages failed -- retrying with full output...")
         print()
-        if not _uv("-r", "requirements.txt", show_output=True):
+        if not _uv("-r", req_file, show_output=True):
             _fatal("Dependency install failed -- see errors above")
     _ok("All packages ready")
 
@@ -614,7 +768,7 @@ def main():
     # ── FFmpeg ────────────────────────────────────────────────────────────────
     _section("FFMPEG")
 
-    from screen_recorder import find_ffmpeg, download_ffmpeg, _LOCAL_FFMPEG
+    from capture_video import find_ffmpeg, download_ffmpeg, _LOCAL_FFMPEG
 
     ffmpeg_path = find_ffmpeg()
     if ffmpeg_path:
@@ -636,6 +790,23 @@ def main():
         except Exception as e:
             _warn(f"Could not download ffmpeg: {e}")
             _warn("Screen recording will be unavailable. Install ffmpeg manually to enable it.")
+
+    # ── macOS audio bootstrap (BlackHole + aggregate device) ──────────────
+    if sys.platform == "darwin":
+        _section("macOS AUDIO")
+        from capture_audio.mac_bootstrap import bootstrap_first_launch
+        try:
+            mac_status = bootstrap_first_launch()
+            if mac_status["installed"]:
+                _ok(f"BlackHole 2ch installed")
+            else:
+                _warn("BlackHole 2ch not installed automatically")
+            if mac_status["aggregate_ready"]:
+                _ok(f"Aggregate output device ready")
+            for msg in mac_status.get("messages", []):
+                _warn(msg)
+        except Exception as e:
+            _warn(f"macOS audio bootstrap failed: {e}")
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print()

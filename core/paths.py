@@ -20,9 +20,9 @@ import sqlite3
 import threading
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).parent
+_PROJECT_ROOT = Path(__file__).parent.parent
 _POINTER_FILE = _PROJECT_ROOT / ".data_location"
-_DEFAULT_DATA_DIR = _PROJECT_ROOT / "data"
+_DEFAULT_DATA_DIR = _PROJECT_ROOT / "storage" / "data"
 
 _lock = threading.Lock()
 _cached: Path | None = None

@@ -39,16 +39,18 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 
 | Requirement | Details |
 |---|---|
-| **Operating System** | Windows 10 or 11 (WASAPI loopback capture is Windows-only) |
+| **Operating System** | Windows 10/11 (WASAPI loopback) **or** macOS 12+ on Apple Silicon (BlackHole loopback) |
 | **Python** | 3.10 or higher - [python.org/downloads](https://www.python.org/downloads/) (check "Add to PATH") |
 | **AI API Key** | [Anthropic](https://console.anthropic.com/settings/keys) or [OpenAI](https://platform.openai.com/api-keys) - for summaries and chat |
 | **HuggingFace Token** | *(Optional)* - enables speaker diarization ([get one here](https://huggingface.co/settings/tokens)) |
-| **NVIDIA GPU** | *(Optional)* - CUDA acceleration for transcription and diarization; falls back to CPU |
+| **GPU acceleration** | *(Optional)* - NVIDIA GPU with CUDA on Windows, or Apple Silicon Metal on macOS. Falls back to CPU otherwise. |
+| **macOS audio loopback** | [BlackHole 2ch](https://existential.audio/blackhole/) - auto-installed via Homebrew on first launch |
 
 ---
 
 ## Quick Start
 
+**Windows:**
 ```
 1. Install Python 3.10+ (add to PATH)
 2. Double-click launch.bat
@@ -56,7 +58,17 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 4. Hit Record
 ```
 
-`launch.bat` handles everything on first run - virtual environment creation, GPU detection, PyTorch installation, pip dependencies, model downloads, and browser launch. Subsequent starts are fast.
+**macOS (Apple Silicon):**
+```
+1. Install Homebrew if you don't have it: https://brew.sh
+2. brew install ffmpeg blackhole-2ch    # may prompt for sudo on the BlackHole pkg step
+3. sudo killall coreaudiod              # register the BlackHole driver without rebooting
+4. ./launch.command                     # or: python launch.py
+5. Enter your API key in Settings
+6. Hit Record
+```
+
+The launcher handles everything on first run — virtual environment creation, accelerator detection (CUDA on Windows, Metal/MPS on macOS), PyTorch + Whisper backend installation (`faster-whisper` on Windows/Linux, `mlx-whisper` on macOS), model downloads, BlackHole aggregate device setup (macOS), and browser launch. Subsequent starts are fast.
 
 ### Updating
 
@@ -109,25 +121,36 @@ Audio Input (WASAPI)
 
 ### Audio Capture
 
-- **Library:** `pyaudiowpatch` - PyAudio fork with Windows WASAPI loopback support
-- **Loopback:** Captures system audio output (what you hear)
-- **Microphone:** WASAPI input device or browser `getUserMedia` injection
-- **Source-gated mixing:** Prevents echo duplication by analyzing RMS levels - when one source dominates, the other is suppressed
-- **Sample rate:** Device native (typically 48 kHz), resampled to 16 kHz for Whisper via `scipy.signal.resample_poly`
-- **Recording format:** WAV, 16-bit signed integer, mono
+- **Windows backend:** `pyaudiowpatch` (PyAudio fork) for native WASAPI loopback. System audio is captured directly without any virtual driver.
+- **macOS backend:** `sounddevice` + `BlackHole 2ch` virtual audio device. The launcher creates a multi-output aggregate device that fans system audio to both your speakers (so you still hear it) and BlackHole's input (which we capture). System default output is auto-switched to the aggregate during recording and restored on stop.
+- **Microphone:** WASAPI input device on Windows, AVFoundation on macOS, or browser `getUserMedia` injection.
+- **Source-gated mixing:** Prevents echo duplication by analyzing RMS levels — when one source dominates, the other is suppressed.
+- **Sample rate:** Device native (typically 48 kHz), resampled to 16 kHz for Whisper via `scipy.signal.resample_poly`.
+- **Recording format:** WAV, 16-bit signed integer, mono.
 
-### Transcription (faster-whisper)
+### Transcription
 
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper) provides CTranslate2-optimized Whisper inference with significantly lower memory usage and faster processing than the original OpenAI implementation.
+The Whisper engine is selected per platform — `ml/transcriber_engine.py` is the factory.
 
-| Preset | Model | Compute | Quantization | Quality |
-|---|---|---|---|---|
-| GPU - Large | `large-v3` | CUDA | float16 | Highest accuracy |
-| GPU - Medium | `medium` | CUDA | float16 | Good balance |
-| GPU - Small | `small` | CUDA | float16 | Fast, decent |
-| CPU - Medium | `medium` | CPU | int8 | Moderate speed |
-| CPU - Small | `small` | CPU | int8 | Fastest on CPU |
-| CPU - Tiny | `tiny` | CPU | int8 | Fastest, lower accuracy |
+| Platform | Engine | Backend |
+|---|---|---|
+| Windows / Linux + NVIDIA GPU | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2) | CUDA float16 |
+| macOS Apple Silicon | [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) | Metal fp16 |
+| Any | faster-whisper | CPU int8 |
+
+The model picker only shows presets the current OS can actually run (via the `platforms` tuple on each preset row).
+
+| Preset | Model | Compute | Available on |
+|---|---|---|---|
+| GPU - Large | `large-v3` | CUDA float16 | Windows / Linux |
+| GPU - Medium | `medium` | CUDA float16 | Windows / Linux |
+| GPU - Small | `small` | CUDA float16 | Windows / Linux |
+| Metal - Large | `mlx-community/whisper-large-v3-mlx` | Metal fp16 | macOS |
+| Metal - Medium | `mlx-community/whisper-medium-mlx` | Metal fp16 | macOS |
+| Metal - Small | `mlx-community/whisper-small-mlx` | Metal fp16 | macOS |
+| CPU - Medium | `medium` | CPU int8 | All |
+| CPU - Small | `small` | CPU int8 | All |
+| CPU - Tiny | `tiny` | CPU int8 | All |
 
 **Optimizations:**
 - **Rolling context:** 800 characters of prior text passed as `initial_prompt` to maintain coherence across chunks
@@ -391,35 +414,81 @@ Set `PORT=7000` (or any available port) in your `.env` file.
 
 ## Project Structure
 
+Code is organized into seven packages by responsibility. Alphabetical order follows the grouping (`capture_audio` and `capture_video` sit together; `ui_desktop` and `ui_web` sit together).
+
 ```
 Meeting Assistant/
-├── launch.bat             ← Entry point - double-click to run
+├── launch.bat             ← Windows entry point (double-click to run)
+├── launch.command         ← macOS entry point
 ├── launch.py              ← Setup automation (venv, GPU, deps, launch)
 ├── app.py                 ← Flask server, SSE streaming, session state, API routes
-├── transcriber.py         ← faster-whisper integration, chunking, hallucination detection
-├── diarizer.py            ← diart/pyannote streaming speaker diarization
-├── speaker_db.py          ← Voice library: embeddings, centroids, cross-session matching
-├── ai_assistant.py        ← Summary generation and chat via Anthropic/OpenAI
-├── capture.py             ← WASAPI loopback + microphone audio capture
-├── wav_writer.py          ← WAV recording with sample-accurate timestamps
-├── storage.py             ← SQLite persistence layer
-├── settings.py            ← Settings read/write (settings.json)
-├── config.py              ← App-wide constants and API key management
-├── tray.py                ← System tray icon, menu, and status indicators
-├── log.py                 ← Structured logging utilities
-├── requirements.txt       ← Python dependencies
+├── requirements.txt       ← Windows/Linux Python dependencies
+├── requirements-macos.txt ← macOS dependencies (mlx-whisper, pyobjc, arm64 torch)
 ├── .env                   ← API keys and configuration (gitignored)
-├── data/                  ← Runtime data (gitignored, created automatically)
-│   ├── meetings.db
-│   ├── settings.json
-│   └── audio/
-├── templates/
-│   └── index.html         ← Single-page application template
-└── static/
-    ├── app.js             ← Frontend application logic
-    ├── style.css           ← UI styling
-    └── images/            ← Logo and tray icon assets
+│
+├── ai/                    ← LLM assistant
+│   └── assistant.py        — Summary generation and chat via Anthropic/OpenAI
+│
+├── capture_audio/         ← Audio input pipeline
+│   ├── __init__.py         — Platform dispatcher (selects backend at import)
+│   ├── windows.py          — WASAPI loopback + mic capture (DSP, mixer, AGC)
+│   ├── mac.py              — BlackHole loopback + AVFoundation mic capture
+│   ├── mac_bootstrap.py    — BlackHole install + aggregate device routing
+│   ├── wav_writer.py       — WAV recording with sample-accurate timestamps
+│   ├── params.py           — Default audio parameters and presets
+│   └── audio/              — Bundled MP3s used by input-device auto-detection
+│       ├── test_sample.mp3
+│       └── complete.mp3
+│
+├── capture_video/         ← Screen recording + media editing
+│   ├── __init__.py         — Platform dispatcher + cross-platform presets
+│   ├── windows.py          — gdigrab + DPI-aware EnumDisplayMonitors
+│   ├── mac.py              — AVFoundation screen capture
+│   ├── ffmpeg_util.py      — find_ffmpeg / download_ffmpeg / kill_stale_ffmpeg
+│   └── media_edit.py       — Trim, split, concatenate audio/video files
+│
+├── core/                  ← Foundational utilities (no domain knowledge)
+│   ├── log.py              — Structured logging
+│   ├── config.py           — .env management, API key status, first-run detection
+│   ├── paths.py            — Data directory resolution (configurable via .data_location)
+│   ├── settings.py         — JSON user preferences
+│   ├── network.py          — HuggingFace token + pipeline download helpers
+│   ├── compute_device.py   — CUDA/MPS/CPU probe (single source of truth)
+│   └── storage.py          — SQLite CRUD (sessions, segments, summaries, chat)
+│
+├── ml/                    ← Transcription, diarization, speakers
+│   ├── transcriber.py            — Streaming Whisper, pause-based flush logic
+│   ├── transcriber_engine.py     — faster-whisper / mlx-whisper backend wrapper
+│   ├── batch_transcriber.py      — Reanalysis pipeline (full-file pyannote + Whisper)
+│   ├── diarizer.py               — pyannote streaming speaker diarization
+│   ├── speaker_db.py             — Voice library: embeddings, cross-session matching
+│   ├── text_embeddings.py        — Text embedding helpers for chat memory
+│   ├── eval_diarization.py       — Diarization evaluation script
+│   └── optimize_diarization.py   — Hyperparameter tuning script
+│
+├── ui_desktop/            ← Desktop OS integration
+│   ├── tray.py             — System tray icon (pystray + Pillow)
+│   └── notifications.py    — Toast/banner notifications (winotify / osascript)
+│
+├── ui_web/                ← Flask web UI assets
+│   ├── templates/
+│   │   ├── index.html       — Session SPA shell
+│   │   └── home.html        — Home page
+│   └── static/
+│       ├── app.js           — Frontend application logic
+│       ├── home.js          — Home page logic
+│       ├── style.css        — Dark-theme CSS
+│       └── images/          — Logo and tray icon assets
+│
+└── storage/               ← Runtime data + bundled binaries (gitignored, auto-created)
+    ├── data/                — SQLite DB, settings.json, recorded audio/video,
+    │                          attachments, screenshots, voice profiles
+    │                          (location overridable via .data_location pointer)
+    ├── models/              — HuggingFace model cache
+    └── tools/               — ffmpeg(.exe), auto-downloaded if not on PATH
 ```
+
+**Platform dispatch:** `capture_audio` and `capture_video` are packages whose `__init__.py` re-exports the active platform backend (`windows.py` on win32, `mac.py` on darwin). All callers do `from capture_audio import AudioCapture` and remain platform-agnostic.
 
 ---
 

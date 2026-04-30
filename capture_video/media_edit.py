@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-import paths
+from core import paths as paths
 
 
 def __getattr__(name):

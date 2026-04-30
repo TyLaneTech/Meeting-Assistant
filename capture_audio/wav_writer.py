@@ -7,7 +7,7 @@ from math import gcd
 import numpy as np
 from scipy.signal import resample_poly
 
-import log
+from core import log as log
 
 
 class WavWriter:

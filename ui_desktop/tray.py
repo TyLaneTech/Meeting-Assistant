@@ -1,12 +1,14 @@
 """System tray icon for Meeting Assistant.
 
-Provides a Windows notification-area icon with a dynamic context menu
-for status, recording controls, key management, and quit.
+Cross-platform: Windows notification area, macOS menu bar, Linux system tray.
+Backend (pystray) is platform-agnostic; we adapt the icon styling per OS so
+it reads correctly against macOS's dark/light menu bar.
 
 Requires: pystray, Pillow.  If not installed the app runs without a tray.
 """
 from __future__ import annotations
 
+import sys
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -20,10 +22,19 @@ try:
 except ImportError:
     TRAY_AVAILABLE = False
 
-import config
+from core import config as config
+
+# macOS menu-bar icons should be rendered as "template images" — black
+# silhouettes with alpha — so AppKit can invert them automatically for
+# dark menu bars. We achieve this two ways:
+#   1. Provide a monochrome (black) variant of each state icon.
+#   2. After pystray creates the NSStatusItem, mark the NSImage as a
+#      template image via setTemplate_(True). Wrapped in try/except so
+#      it degrades cleanly if pystray's internals shift.
+_IS_MACOS = sys.platform == "darwin"
 
 # ── Icon loading ───────────────────────────────────────────────────────────────
-_IMAGES_DIR = Path(__file__).parent / "static" / "images"
+_IMAGES_DIR = Path(__file__).parent.parent / "ui_web" / "static" / "images"
 _TRAY_SIZE  = 64
 _icons: dict[str, "Image.Image"] = {}   # populated lazily by _ensure_icons()
 
@@ -35,6 +46,19 @@ def _tint(img: "Image.Image", color: tuple[int, int, int]) -> "Image.Image":
     colored = ImageOps.colorize(gray, black=(0, 0, 0), white=color).convert("RGBA")
     colored.putalpha(alpha)
     return colored
+
+
+def _to_template(img: "Image.Image") -> "Image.Image":
+    """Convert an icon to a black silhouette suitable for a macOS template image.
+
+    Preserves alpha but flattens all RGB to black. AppKit then renders it
+    correctly on both dark and light menu bars when setTemplate_(True) is
+    set on the NSImage.
+    """
+    alpha = img.split()[3]
+    black = Image.new("RGBA", img.size, (0, 0, 0, 255))
+    black.putalpha(alpha)
+    return black
 
 
 def _ensure_icons() -> None:
@@ -52,10 +76,21 @@ def _ensure_icons() -> None:
         idle      = _load("logo.png")
         recording = _load("logo_recording.png")
 
-        _icons["ready"]     = idle
-        _icons["recording"] = recording
-        _icons["loading"]   = _tint(idle, (110, 118, 129))   # gray
-        _icons["setup"]     = _tint(idle, (210, 153, 34))    # amber
+        if _IS_MACOS:
+            # Menu bar template images: monochrome silhouette, no fill colour.
+            # AppKit inverts them automatically for dark menu bars when the
+            # underlying NSImage is marked template (handled in run()).
+            idle_template      = _to_template(idle)
+            recording_template = _to_template(recording)
+            _icons["ready"]     = idle_template
+            _icons["recording"] = recording_template
+            _icons["loading"]   = idle_template
+            _icons["setup"]     = idle_template
+        else:
+            _icons["ready"]     = idle
+            _icons["recording"] = recording
+            _icons["loading"]   = _tint(idle, (110, 118, 129))   # gray
+            _icons["setup"]     = _tint(idle, (210, 153, 34))    # amber
     except Exception as e:
         print(f"[tray] Could not load PNG icons, falling back to drawn icons: {e}")
 
@@ -126,6 +161,10 @@ class MeetingTray:
             self._icon.icon = self._pick_icon()
             self._icon.title = self._pick_tooltip()
             self._icon.update_menu()
+            # Re-apply template-image flag — pystray rebuilds the NSImage
+            # whenever .icon is reassigned, so the flag is lost on each refresh.
+            if _IS_MACOS:
+                self._mark_template_image(self._icon)
         except Exception:
             pass
 
@@ -142,6 +181,24 @@ class MeetingTray:
     def _on_setup(self, icon: "pystray.Icon") -> None:
         """Called once after the icon enters its event loop."""
         icon.visible = True
+        if _IS_MACOS:
+            self._mark_template_image(icon)
+
+    @staticmethod
+    def _mark_template_image(icon: "pystray.Icon") -> None:
+        """Mark the menu-bar NSImage as a template so AppKit inverts it
+        automatically for dark menu bars. pystray exposes the underlying
+        NSStatusItem via internal attrs; we walk it defensively."""
+        try:
+            status_item = getattr(icon, "_status_item", None) or getattr(icon, "_status_bar_item", None)
+            if status_item is None:
+                return
+            ns_button = status_item.button() if callable(getattr(status_item, "button", None)) else None
+            ns_image = ns_button.image() if ns_button is not None else None
+            if ns_image is not None and hasattr(ns_image, "setTemplate_"):
+                ns_image.setTemplate_(True)
+        except Exception:
+            pass  # styling polish only — not worth crashing the tray over
 
     def _get_tray_state(self) -> str:
         """Return the current tray state key."""

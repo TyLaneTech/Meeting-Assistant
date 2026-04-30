@@ -874,7 +874,7 @@ def _screen_preset_overrides(preset_name: str) -> dict:
     if not preset_name or preset_name == "custom":
         return {}
     try:
-        from screen_recorder import PRESETS as _SCREEN_PRESETS, H264_PRESETS as _H264
+        from capture_video import PRESETS as _SCREEN_PRESETS, H264_PRESETS as _H264
     except Exception:
         return {}
     if preset_name not in _SCREEN_PRESETS:
@@ -907,7 +907,7 @@ def resolve_audio_params(settings_dict: dict | None = None) -> dict:
     to ``"custom"``.
     """
     if settings_dict is None:
-        import settings as _settings
+        from core import settings as _settings
         settings_dict = _settings.load()
 
     out = get_all_defaults()

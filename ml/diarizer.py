@@ -17,7 +17,7 @@ import time
 import traceback
 import warnings
 
-import log
+from core import log as log
 import numpy as np
 import torch
 import torchaudio
@@ -270,8 +270,15 @@ class StreamingDiarizer:
     # noise) but liable to spawn ghost speakers if treated as authoritative.
 
     def __init__(self, hf_token: str, device: str | None = None) -> None:
+        from core.compute_device import best_torch_device
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = best_torch_device()
+        elif device == "cuda" and not torch.cuda.is_available():
+            # User has "cuda" saved but this machine has no CUDA — auto-route
+            # to whatever accelerator is actually available (MPS on Mac, else CPU).
+            # This keeps backward-compat with settings.json values from another
+            # machine while letting the right hardware be used.
+            device = best_torch_device()
         self._device_name = device
         self._dev = torch.device(device)
         log.info("diarizer", f"Loading streaming diarizer on {self._dev}…")
@@ -324,7 +331,7 @@ class StreamingDiarizer:
         # changes to the preset definitions in default_audio_params.py are
         # picked up automatically — users on a non-custom preset don't need
         # to re-select it after an update.
-        from default_audio_params import resolve_audio_params
+        from capture_audio.params import resolve_audio_params
         p = resolve_audio_params()
 
         self._step_seconds     = float(p["step_seconds"])

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv, set_key
 
-ENV_PATH = Path(__file__).parent / ".env"
+ENV_PATH = Path(__file__).parent.parent / ".env"
 
 # Pre-load .env early so HuggingFace environment flags are applied before any
 # model imports happen (app.py imports transcriber before calling ensure_env()).
@@ -34,7 +34,7 @@ if not os.getenv("HF_TOKEN", "").strip():
 
 # Pin HuggingFace cache to a project-local directory so pre-downloaded models
 # are always found at runtime, regardless of the user's global HF_HOME.
-_MODEL_CACHE = str(Path(__file__).parent / "models")
+_MODEL_CACHE = str(Path(__file__).parent.parent / "storage" / "models")
 os.environ.setdefault("HF_HOME", _MODEL_CACHE)
 
 # Corporate Cloudflare WARP injects a self-signed CA for TLS inspection,

@@ -2,7 +2,17 @@
 /.claude
 /__pycache__
 AGENT.md
-data/
+**/storage/
+
+# Legacy locations from before the storage/ consolidation. These are NORMALLY
+# auto-migrated into storage/ on first launch (see launch._migrate_legacy_layout).
+# Listed here as a safety net so a partial / skipped migration doesn't leak
+# private user data into git diffs. Trailing slash + leading slash anchors to
+# project root only — does not shadow `core/storage.py` etc.
+/data/
+/tools/
+/models/
+/audio/
 .data_location
 *.db
 *.wav
@@ -10,7 +20,5 @@ data/
 __pycache__/
 *.pyc
 .venv/
-tools/
-models/
 .model_download.py
 **/update_plans/

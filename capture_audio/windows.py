@@ -16,8 +16,8 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy.signal import resample_poly
 
-import log
-from wav_writer import WavWriter
+from core import log as log
+from capture_audio.wav_writer import WavWriter
 
 # FFT window size for the spectrum visualizer.  2048 samples ≈ 43 ms at 48 kHz,
 # giving ~23 Hz frequency resolution.  The deque keeps the most recent window
@@ -263,7 +263,7 @@ class AudioCapture:
         if mic_index == -3:
             # FFmpeg subprocess mic via DirectShow - completely independent of
             # Python/WASAPI audio stack for maximum reliability.
-            from screen_recorder import find_ffmpeg
+            from capture_video import find_ffmpeg
             ffmpeg_path = find_ffmpeg()
             if not ffmpeg_path:
                 log.warn("audio", "ffmpeg not found - cannot use FFmpeg mic capture")
@@ -868,7 +868,7 @@ def auto_detect_devices() -> dict:
             log.warn("auto-detect", f"  Failed loopback '{lb['name']}': {e}")
 
     # ── Spawn ffmpeg for each dshow mic ──────────────────────────────────
-    from screen_recorder import find_ffmpeg
+    from capture_video import find_ffmpeg
     ffmpeg_path = find_ffmpeg()
     mic_procs: list[tuple[dict, subprocess.Popen, list]] = []  # (info, proc, data_chunks)
     if ffmpeg_path:
@@ -1066,7 +1066,7 @@ def enumerate_dshow_audio_devices() -> list[dict]:
     expects in ``-i audio=<name>``.  Returns an empty list if ffmpeg is
     unavailable or the query fails.
     """
-    from screen_recorder import find_ffmpeg
+    from capture_video import find_ffmpeg
     ffmpeg_path = find_ffmpeg()
     if not ffmpeg_path:
         return []

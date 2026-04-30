@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-import paths
+from core import paths as paths
 
 
 def _conn():
@@ -228,7 +228,7 @@ def run_sweep(session_id: str, hf_token: str, device: str = "cpu") -> list[dict]
         print(f"  threshold={ct:.2f} ... ", end="", flush=True)
         try:
             import torch
-            from batch_transcriber import BatchTranscriber
+            from ml.batch_transcriber import BatchTranscriber
 
             segments = []
             def on_text(text, speaker, start, end):
@@ -323,7 +323,7 @@ def main():
     elif args.cmd == "sweep":
         from dotenv import load_dotenv
         load_dotenv()
-        import config
+        from core import config as config
         hf_token = os.getenv("HUGGING_FACE_KEY", "")
 
         if args.session:
