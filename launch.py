@@ -193,9 +193,12 @@ _SHORTCUT_NAME = "Meeting Assistant.lnk"
 
 def _create_start_menu_shortcut():
     """
-    Ensures a Start Menu shortcut exists and points to the current launch.bat.
-    Reads the existing shortcut's Arguments via PowerShell before writing so it
-    only touches the filesystem when the shortcut is missing or stale.
+    Ensures a Start Menu shortcut exists and points to the current launch.bat
+    with the right working directory and icon. Reads the existing shortcut's
+    properties via PowerShell and only re-saves when something is missing or
+    stale, so we don't churn the .lnk on every launch. Self-heals shortcuts
+    that were created before files moved (e.g. logo.ico relocating into
+    ui_web/static/images/ during the package reorganization).
     No-ops silently on non-Windows.
     """
     if sys.platform != "win32":
@@ -213,18 +216,51 @@ def _create_start_menu_shortcut():
     if not bat_path.exists():
         return
 
+    def _norm(p: str) -> str:
+        try:
+            return str(Path(p)).lower()
+        except Exception:
+            return (p or "").lower()
+
     # ── Check whether the existing shortcut already points here ──────────────
     already_correct = False
     if lnk_path.exists():
         try:
+            # Read all four fields we care about. Sentinel between fields keeps
+            # us safe even if one of them is empty.
+            ps_read = (
+                "$ws = New-Object -ComObject WScript.Shell; "
+                f"$s  = $ws.CreateShortcut('{lnk_path}'); "
+                "Write-Output $s.TargetPath; Write-Output '---'; "
+                "Write-Output $s.Arguments; Write-Output '---'; "
+                "Write-Output $s.WorkingDirectory; Write-Output '---'; "
+                "Write-Output $s.IconLocation"
+            )
             check = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 f"$ws = New-Object -ComObject WScript.Shell; "
-                 f"$s = $ws.CreateShortcut('{lnk_path}'); $s.Arguments"],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_read],
                 capture_output=True, text=True,
             )
-            if check.returncode == 0 and str(bat_path) in check.stdout:
-                already_correct = True
+            if check.returncode == 0:
+                parts = [p.strip() for p in check.stdout.split("---")]
+                if len(parts) >= 4:
+                    cur_target, cur_args, cur_wd, cur_icon = parts[:4]
+                    cur_icon_file = cur_icon.split(",", 1)[0].strip() if cur_icon else ""
+                    target_ok = "cmd.exe" in cur_target.lower()
+                    args_ok   = str(bat_path) in cur_args
+                    wd_ok     = _norm(cur_wd) == _norm(str(root))
+                    if icon_path.exists():
+                        # Icon must point at the right path AND that path must
+                        # still resolve — catches the case where the icon was
+                        # moved out from under a previously-valid shortcut.
+                        icon_ok = (
+                            _norm(cur_icon_file) == _norm(str(icon_path))
+                            and Path(cur_icon_file).exists()
+                        )
+                    else:
+                        # No icon to install — leave whatever is there alone.
+                        icon_ok = True
+                    if target_ok and args_ok and wd_ok and icon_ok:
+                        already_correct = True
         except Exception:
             pass
 
