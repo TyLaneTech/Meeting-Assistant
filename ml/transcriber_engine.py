@@ -62,7 +62,16 @@ class FasterWhisperEngine(_EngineBase):
         # Pass straight through — faster-whisper's signature is the canonical
         # one we standardize on, so no kwarg translation needed here.
         segments, info = self._inner.transcribe(audio, **kwargs)
-        return segments, (info._asdict() if hasattr(info, "_asdict") else dict(info or {}))
+        if hasattr(info, "_asdict"):
+            info_dict = info._asdict()
+        elif hasattr(info, "__dict__"):
+            info_dict = dict(info.__dict__)
+        else:
+            try:
+                info_dict = dict(info or {})
+            except TypeError:
+                info_dict = {}
+        return segments, info_dict
 
     def reload(self, device: str, compute_type: str, model_size: str) -> None:
         self.model_size = model_size

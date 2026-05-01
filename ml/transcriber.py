@@ -681,11 +681,27 @@ class Transcriber:
                 self._run_whisper(audio, label, use_vad,
                                  start_time=start_time, end_time=end_time)
             else:
-                log.error("transcriber", f"Error in Whisper ({label}):")
-                traceback.print_exc()
-        except Exception:
-            log.error("transcriber", f"Error in Whisper ({label}):")
-            traceback.print_exc()
+                self._log_whisper_error(label, audio, use_vad, e)
+        except Exception as e:
+            self._log_whisper_error(label, audio, use_vad, e)
+
+    def _log_whisper_error(
+        self,
+        label: str,
+        audio: np.ndarray,
+        use_vad: bool,
+        exc: BaseException,
+    ) -> None:
+        duration = len(audio) / 16000.0
+        log.error(
+            "transcriber",
+            f"Whisper failed [{label}] ({duration:.2f}s, vad={use_vad}, "
+            f"device={self.device}/{self.compute_type}): "
+            f"{type(exc).__name__}: {exc}",
+        )
+        tb = traceback.format_exc().rstrip()
+        for line in tb.splitlines():
+            log.error("transcriber", f"  {line}")
 
     def _switch_to_cpu(self) -> None:
         """Reload the Whisper model in CPU/int8 mode after a CUDA failure.
