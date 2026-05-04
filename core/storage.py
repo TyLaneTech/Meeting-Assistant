@@ -112,6 +112,8 @@ def init_db() -> None:
             "ALTER TABLE chat_messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
             # Per-session chat system prompt override (NULL = use global/default)
             "ALTER TABLE sessions ADD COLUMN chat_system_prompt TEXT DEFAULT NULL",
+            # Per-session summary system prompt override (NULL = use global/default)
+            "ALTER TABLE sessions ADD COLUMN summary_system_prompt TEXT DEFAULT NULL",
             # Title lock: 1 = user manually set the title, auto-gen must skip this row
             "ALTER TABLE sessions ADD COLUMN title_user_set INTEGER NOT NULL DEFAULT 0",
             # Split rollback: sessions created from the same split share a group id
@@ -659,6 +661,25 @@ def set_session_chat_prompt(session_id: str, prompt: str | None) -> None:
         )
 
 
+def get_session_summary_prompt(session_id: str) -> str | None:
+    """Return the per-session summary system prompt override, or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT summary_system_prompt FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return row["summary_system_prompt"] if row else None
+
+
+def set_session_summary_prompt(session_id: str, prompt: str | None) -> None:
+    """Store a per-session summary system prompt override. Pass None to clear."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET summary_system_prompt = ? WHERE id = ?",
+            (prompt, session_id),
+        )
+
+
 def update_session_times(session_id: str, started_at: str | None = None, ended_at: str | None = None) -> None:
     """Update session timestamps.  Pass None to leave a value unchanged."""
     sets = []
@@ -1062,13 +1083,14 @@ def bulk_reorder(folders: list[dict] | None = None,
 
 
 def reset_session_transcript(session_id: str) -> None:
-    """Delete all transcript, summary, chat, and speaker data for a session.
-    The sessions row (title, timestamps) is preserved.
+    """Delete transcript and speaker data for a session.
+
+    The sessions row (title, timestamps), chat history, and last-known
+    summary are preserved so reanalysis doesn't wipe user-visible data
+    that the new transcript will replace anyway.
     """
     with _conn() as conn:
         conn.execute("DELETE FROM transcript_segments WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
 
 

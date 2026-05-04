@@ -45,162 +45,7 @@
 
 <div class="app-layout">
 
-  <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
-  <aside class="sidebar" id="sidebar">
-    <div class="sidebar-header">
-      <div class="sidebar-header-pinned">
-        <button class="icon-btn new-session-btn" onclick="newSession()" title="New session"><i class="fa-solid fa-plus"></i></button>
-        <button class="icon-btn sidebar-toggle-btn" id="sidebar-close-btn" onclick="toggleSidebar()" title="Collapse sidebar"><i class="fa-solid fa-bars"></i></button>
-      </div>
-      <div class="sidebar-header-row">
-        <span class="sidebar-title">Sessions</span>
-        <div class="sidebar-header-tools">
-          <button class="icon-btn folder-btn" onclick="createFolder()" title="New folder"><i class="fa-solid fa-folder-plus"></i></button>
-          <button class="icon-btn fingerprint-btn" onclick="openFingerprintPanel()" title="Voice Library"><i class="fa-solid fa-waveform-lines"></i></button>
-          <button class="icon-btn multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions"><i class="fa-solid fa-list-check"></i></button>
-        </div>
-      </div>
-    </div>
-    <div class="sidebar-bulk-bar hidden" id="sidebar-bulk-bar">
-      <span class="sidebar-bulk-count" id="sidebar-bulk-count">0 selected</span>
-      <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI"><i class="fa-solid fa-arrows-rotate"></i> Titles</button>
-      <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()"><i class="fa-solid fa-trash"></i> Delete</button>
-      <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()"><i class="fa-solid fa-xmark"></i></button>
-    </div>
-    <div class="sidebar-search" id="sidebar-search">
-      <div class="sidebar-search-wrap">
-        <i class="fa-solid fa-magnifying-glass sidebar-search-icon"></i>
-        <input type="text" id="sidebar-search-input" placeholder="Search sessions…"
-               oninput="_onSidebarSearch(this.value)" autocomplete="off" spellcheck="false">
-        <button class="sidebar-search-clear hidden" id="sidebar-search-clear"
-                onclick="_clearSidebarSearch()"><i class="fa-solid fa-xmark"></i></button>
-        <span class="sidebar-search-ai" id="sidebar-search-ai" title="Search matches by title, transcript content, and AI-powered semantic meaning when available"><i class="fa-solid fa-brain"></i></span>
-      </div>
-    </div>
-    <div class="sidebar-body" id="session-list">
-      <p class="sidebar-empty">No past sessions yet.</p>
-    </div>
-    <div class="sidebar-pane" id="model-config">
-      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('models')">
-        <div class="nav-menu-left">
-            <i class="fa-solid fa-microchip sidebar-pane-icon"></i>
-            <span class="sidebar-pane-label">Models</span>
-        </div>
-        <span class="sidebar-pane-arrow" id="pane-arrow-models">
-        <i class="fa-solid fa-chevron-right"></i></span>
-      </button>
-      <div class="sidebar-pane-body hidden" id="pane-body-models">
-        <div class="model-config-row">
-          <label class="model-config-lbl">Whisper</label>
-          <select id="whisper-preset-sel" class="model-config-sel" onchange="changeWhisperPreset(this.value)">
-          </select>
-        </div>
-        <div class="model-config-row">
-          <label class="model-config-lbl">Diarizer</label>
-          <select id="diarizer-device-sel" class="model-config-sel" onchange="changeDiarizerDevice(this.value)">
-          </select>
-        </div>
-        <div class="model-config-row hidden" id="diarization-enabled-row">
-          <label class="model-config-lbl">Speaker ID</label>
-          <button class="icon-btn active" id="diarization-toggle-btn"
-                  onclick="toggleDiarizationEnabled()" title="Enable/disable speaker diarization">On</button>
-        </div>
-      </div>
-    </div>
-    <div class="sidebar-pane" id="audio-viz-pane">
-      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('audio')">
-          <div class="nav-menu-left">
-            <i class="fa-solid fa-sliders sidebar-pane-icon"></i><span class="sidebar-pane-label">Input Devices</span>
-          </div>
-          <span class="sidebar-pane-arrow" id="pane-arrow-audio">
-          <i class="fa-solid fa-chevron-down"></i></span>
-      </button>
-      <div class="sidebar-pane-body" id="pane-body-audio">
-      <!-- Desktop device + gain -->
-      <div class="viz-device-row">
-        <label class="viz-device-lbl viz-lbl-desktop">Desktop</label>
-        <select id="viz-loopback-sel" class="viz-select" onchange="saveDeviceSelection()">
-          <option value="">- loading -</option>
-        </select>
-        <button class="icon-btn viz-refresh-btn" onclick="loadAudioDevices()" title="Refresh device list"><i class="fa-solid fa-rotate-right"></i></button>
-      </div>
-      <div class="viz-gain-row">
-        <div class="gain-group-left">
-            <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
-            <span id="viz-lb-gain-val" class="viz-gain-val viz-lbl-desktop">1.0×</span>
-        </div>
-        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('lb', this.value)">
-      </div>
-
-      <!-- Waveform canvas + level meter -->
-      <div class="viz-canvas-row">
-        <canvas id="viz-canvas"></canvas>
-        <div class="viz-level-meter" id="viz-level-meter">
-          <div class="viz-meter-track">
-            <div class="viz-meter-fill viz-meter-lb" id="viz-meter-lb"></div>
-          </div>
-          <div class="viz-meter-track">
-            <div class="viz-meter-fill viz-meter-mic" id="viz-meter-mic"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Mic gain + device -->
-      <div class="viz-gain-row">
-        <div class="gain-group-left">
-            <label class="viz-gain-lbl viz-lbl-mic">Gain</label>
-            <span id="viz-mic-gain-val" class="viz-gain-val viz-lbl-mic">1.0×</span>
-        </div>
-            <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('mic', this.value)">
-      </div>
-      <div class="viz-device-row">
-        <label class="viz-device-lbl viz-lbl-mic">Mic</label>
-        <select id="viz-mic-sel" class="viz-select" onchange="saveDeviceSelection()">
-          <option value="-2">Browser Mic (this tab)</option>
-          <option value="-1">None</option>
-        </select>
-      </div>
-
-      <div class="viz-btn-row">
-        <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
-          <i class="fa-solid fa-play"></i> Test Audio
-        </button>
-        <button id="viz-autodetect-btn" class="btn viz-test-btn viz-autodetect-btn" onclick="autoDetectDevices()" title="Auto-detect best audio devices">
-          <i class="fa-duotone fa-wand-magic-sparkles"></i>
-        </button>
-      </div>
-      <div id="agc-debug" class="agc-debug" style="display:none">
-        <div class="agc-debug-title">AGC Debug</div>
-        <div class="agc-debug-grid">
-          <div class="agc-debug-col" id="agc-debug-lb"></div>
-          <div class="agc-debug-col" id="agc-debug-mic"></div>
-        </div>
-      </div>
-      </div><!-- /pane-body-audio -->
-    </div>
-    <div class="sidebar-pane" id="screen-capture-section">
-      <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('screen')">
-      <div class="nav-menu-left">
-        <i class="fa-solid fa-display sidebar-pane-icon"></i>
-        <span class="sidebar-pane-label">Screen Recording</span>
-      </div>
-        <span class="sidebar-pane-actions">
-          <label class="toggle-switch toggle-switch-sm" onclick="event.stopPropagation()">
-            <input type="checkbox" id="screen-record-toggle" onchange="toggleScreenRecordEnabled(this.checked)">
-            <span class="toggle-slider"></span>
-          </label>
-          <span class="sidebar-pane-arrow" id="pane-arrow-screen"><i class="fa-solid fa-chevron-right"></i></span>
-        </span>
-      </button>
-      <div class="sidebar-pane-body hidden" id="pane-body-screen">
-        <div class="screen-display-grid" id="screen-display-grid">
-          <!-- Populated by JS: clickable display thumbnails -->
-        </div>
-        <div class="screen-capture-status" id="screen-capture-status"></div>
-      </div>
-    </div>
-  </aside>
-  <div class="sidebar-resize-handle" id="sidebar-resize-handle"></div>
+  {% include "_sidebar.html" %}
 
   <!-- ── Main area ────────────────────────────────────────────────────── -->
   <div class="main-area">
@@ -499,13 +344,64 @@
           </div>
         </div>
         <div id="summary-prompt-area" class="summary-prompt-area hidden">
-          <textarea
-            id="summary-custom-prompt"
-            class="summary-prompt-input"
-            placeholder="Optional: describe the context to shape the summary - e.g. &quot;This is a podcast interview. Summarize the guest's key insights and talking points instead of action items.&quot;"
-            rows="3"
-            oninput="saveSummaryPrompt()"
-          ></textarea>
+          <div class="sp-tabs" role="tablist">
+            <button type="button" class="sp-tab active" data-sp-tab="instructions"
+                    onclick="_spSwitchTab('instructions')" role="tab" aria-selected="true">
+              <i class="fa-regular fa-pen-to-square"></i> Custom Instructions
+            </button>
+            <button type="button" class="sp-tab" data-sp-tab="system"
+                    onclick="_spSwitchTab('system')" role="tab" aria-selected="false">
+              <i class="fa-solid fa-sliders"></i> System Prompt
+            </button>
+          </div>
+
+          <!-- Custom Instructions tab -->
+          <div class="sp-pane" id="sp-pane-instructions" data-sp-pane="instructions">
+            <div class="sp-pane-header">
+              <span class="sp-pane-title">Custom Instructions for this session</span>
+              <span class="sp-pane-hint">Appended to the system prompt to shape the summary's focus, tone, or structure.</span>
+            </div>
+            <textarea
+              id="summary-custom-prompt"
+              class="summary-prompt-input"
+              placeholder="e.g. This is a podcast interview. Summarize the guest's key insights and talking points instead of action items."
+              rows="4"
+              oninput="saveSummaryPrompt()"
+            ></textarea>
+            <div class="sp-pane-footer">
+              <label class="sp-default-toggle" title="Save these instructions as the default for any new session you start">
+                <input type="checkbox" id="summary-instr-default-toggle" onchange="_onSummaryInstrDefaultToggle(this.checked)">
+                <span>Use as default for new sessions</span>
+              </label>
+              <span class="sp-pane-status" id="summary-instr-status"></span>
+            </div>
+          </div>
+
+          <!-- System Prompt tab -->
+          <div class="sp-pane hidden" id="sp-pane-system" data-sp-pane="system">
+            <div class="sp-pane-header">
+              <span class="sp-pane-title">Summary System Prompt for this session</span>
+              <span class="sp-pane-hint">Overrides the default rules the summarizer follows. Leave empty to use the default. Manage the default in <strong>Settings → System Prompts</strong>.</span>
+            </div>
+            <div class="sp-source-bar">
+              <span class="sp-source-label">Currently using:</span>
+              <span class="sp-source-chip" id="summary-prompt-source-chip">Default</span>
+            </div>
+            <textarea
+              id="summary-system-prompt"
+              class="summary-prompt-input summary-prompt-input-lg"
+              placeholder="Leave empty to fall back to the default."
+              rows="8"
+              spellcheck="false"
+            ></textarea>
+            <div class="sp-pane-footer sp-pane-footer-actions">
+              <div class="sp-pane-footer-left">
+                <button type="button" class="sp-ghost-btn" id="summary-prompt-load-default-btn" onclick="loadDefaultIntoSessionSummary()" title="Replace textarea with the current default"><i class="fa-regular fa-file-lines"></i> Load default</button>
+                <button type="button" class="sp-ghost-btn sp-ghost-danger" onclick="clearSessionSummaryPrompt()" title="Remove the override; use the default"><i class="fa-solid fa-eraser"></i> Clear override</button>
+              </div>
+              <button type="button" class="sp-primary-btn" onclick="saveSessionSummaryPrompt()">Save</button>
+            </div>
+          </div>
         </div>
         <div id="summary" class="col-body markdown-body">
           <p class="empty-hint">An auto-updating summary will appear here as the meeting progresses.</p>
@@ -711,438 +607,7 @@
   </div>
 </div>
 
-<!-- ── Settings modal ──────────────────────────────────────────────────── -->
-<div class="overlay hidden" id="settings-overlay" onclick="closeSettingsOnOverlay(event)">
-  <div class="dialog settings-dialog">
-    <div class="settings-header">
-      <span class="settings-title-text">Settings</span>
-      <button class="icon-btn" onclick="closeSettings()"><i class="fa-solid fa-xmark"></i></button>
-    </div>
-    <div class="settings-layout">
-
-      <!-- ── Sidebar nav ──────────────────────────────────────────── -->
-      <nav class="settings-nav">
-        <button class="settings-nav-item active" data-target="section-ai" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-robot"></i><span>AI Assistant</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-transcription" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-waveform-lines"></i><span>Transcription</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-diarization" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-users"></i><span>Diarization</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-reanalysis" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-arrows-rotate"></i><span>Reanalysis</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-agc" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-sliders"></i><span>Auto Gain</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-echo" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-tower-broadcast"></i><span>Echo Cancellation</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-screen" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-display"></i><span>Screen Recording</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-reminders" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-bell"></i><span>Reminders</span>
-        </button>
-        <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
-          <i class="fa-solid fa-microchip"></i><span>System</span>
-        </button>
-      </nav>
-
-      <!-- ── Content panels ──────────────────────────────────────── -->
-      <div class="settings-content">
-
-        <!-- AI Assistant -->
-        <div class="settings-panel active" id="section-ai">
-          <p class="settings-setup-hint" id="settings-setup-hint" style="display:none">
-            Enter your API keys to get started. HuggingFace is optional but enables speaker diarization.
-          </p>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Provider</div>
-                <div class="settings-row-desc">AI engine for summaries and chat</div>
-              </div>
-              <div class="provider-toggle" id="provider-toggle">
-                <button id="provider-btn-anthropic" onclick="setAiProvider('anthropic')">Anthropic</button>
-                <button id="provider-btn-openai"    onclick="setAiProvider('openai')">OpenAI</button>
-              </div>
-            </div>
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Model</div>
-                <div class="settings-row-desc">Latest versions are auto-detected from each provider</div>
-              </div>
-              <div class="ai-model-row">
-                <select id="ai-model-sel" onchange="setAiModel(this.value)"></select>
-                <button class="icon-btn ai-model-refresh" id="ai-model-refresh-btn"
-                        onclick="refreshAiModels()" title="Check for newly released models"><i class="fa-solid fa-rotate"></i></button>
-              </div>
-            </div>
-          </div>
-          <div class="settings-group" id="key-anthropic-field">
-            <div class="settings-key-row">
-              <div class="settings-key-header">
-                <span class="settings-row-label">Anthropic API Key</span>
-                <span class="settings-req" id="key-anthropic-req">required</span>
-                <a class="settings-key-link" href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Get a key →</a>
-              </div>
-              <div class="key-input-row">
-                <input type="password" id="key-anthropic" placeholder="sk-ant-..." autocomplete="off" />
-                <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-anthropic')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
-              </div>
-              <div class="key-status" id="key-anthropic-status"></div>
-            </div>
-          </div>
-          <div class="settings-group" id="key-openai-field">
-            <div class="settings-key-row">
-              <div class="settings-key-header">
-                <span class="settings-row-label">OpenAI API Key</span>
-                <span class="settings-req" id="key-openai-req">required</span>
-                <a class="settings-key-link" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Get a key →</a>
-              </div>
-              <div class="key-input-row">
-                <input type="password" id="key-openai" placeholder="sk-..." autocomplete="off" />
-                <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-openai')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
-              </div>
-              <div class="key-status" id="key-openai-status"></div>
-            </div>
-          </div>
-          <div class="settings-group">
-            <div class="settings-key-row">
-              <div class="settings-key-header">
-                <span class="settings-row-label">HuggingFace Token</span>
-                <span class="settings-opt" id="key-huggingface-req">optional</span>
-                <a class="settings-key-link" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Get a token →</a>
-              </div>
-              <div class="key-input-row">
-                <input type="password" id="key-huggingface" placeholder="hf_..." autocomplete="off" />
-                <button class="icon-btn key-vis-btn" onclick="toggleKeyVis('key-huggingface')" title="Show/hide"><i class="fa-solid fa-eye"></i></button>
-              </div>
-              <div class="key-status" id="key-huggingface-status"></div>
-            </div>
-          </div>
-          <button class="btn-save-keys" onclick="saveApiKeys()">Save Keys</button>
-
-          <div class="settings-group-title">Chat System Prompt</div>
-          <div class="settings-group">
-            <div class="settings-key-row">
-              <div class="settings-key-header">
-                <span class="settings-row-label">Default Prompt</span>
-                <span class="settings-opt">global</span>
-                <button class="settings-key-link" onclick="resetGlobalChatPrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to built-in</button>
-              </div>
-              <textarea id="global-chat-prompt" class="chat-prompt-textarea"
-                        rows="10" spellcheck="false"
-                        placeholder="Leave empty to use the built-in assistant prompt."
-                        oninput="_globalChatPromptChanged(this.value)"></textarea>
-              <div class="chat-prompt-meta">
-                <span class="chat-prompt-status" id="global-chat-prompt-status">Using built-in default</span>
-                <button class="chat-prompt-ghost" onclick="loadBuiltinIntoGlobal()">Load built-in…</button>
-              </div>
-              <div class="settings-row-desc">Applied to every session unless overridden in the chat panel's <i class="fa-solid fa-sliders"></i> menu. The meeting transcript and context are always appended automatically.</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Transcription -->
-        <div class="settings-panel" id="section-transcription">
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Preset</div>
-                <div class="settings-row-desc" id="transcription-preset-desc">Balanced preset for most meetings</div>
-              </div>
-              <select id="transcription-preset-sel" class="model-config-sel" onchange="setTranscriptionPreset(this.value)">
-              </select>
-            </div>
-          </div>
-          <div class="settings-group" id="ap-transcription-params">
-            <!-- Populated dynamically by JS -->
-          </div>
-          <div class="ap-reset-all-wrap">
-            <button class="ap-reset-all-btn" onclick="resetSection('transcription')">
-              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
-            </button>
-          </div>
-        </div>
-
-        <!-- Diarization -->
-        <div class="settings-panel" id="section-diarization">
-          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
-            Pipeline parameters marked with <i class="fa-solid fa-rotate-right" style="font-size:9px"></i> require a session restart to take effect.
-          </p>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Preset</div>
-                <div class="settings-row-desc" id="diarization-preset-desc">Balanced preset for typical meetings</div>
-              </div>
-              <select id="diarization-preset-sel" class="model-config-sel" onchange="setDiarizationPreset(this.value)">
-              </select>
-            </div>
-          </div>
-          <div class="settings-group" id="ap-diarization-params">
-            <!-- Populated dynamically by JS -->
-          </div>
-          <div class="ap-reset-all-wrap">
-            <button class="ap-reset-all-btn" onclick="resetSection('diarization')">
-              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
-            </button>
-          </div>
-        </div>
-
-        <!-- Reanalysis (Batch Pipeline) -->
-        <div class="settings-panel" id="section-reanalysis">
-          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
-            Batch processing settings for reanalysis. Uses HuggingFace transformers
-            + pyannote for higher accuracy than real-time processing. These settings
-            are independent of the live transcription and diarization settings.
-          </p>
-          <div class="settings-group" id="ap-reanalysis-params">
-            <!-- Populated dynamically by JS -->
-          </div>
-          <div class="ap-reset-all-wrap">
-            <button class="ap-reset-all-btn" onclick="resetReanalysisParams()">
-              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
-            </button>
-          </div>
-        </div>
-
-        <!-- Auto Gain -->
-        <div class="settings-panel" id="section-agc">
-          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
-            Gently boosts quiet audio sources to a consistent level. Useful when
-            meeting participants have mismatched volumes.
-          </p>
-          <div class="settings-group" id="ap-agc-params">
-            <!-- Populated dynamically by JS -->
-          </div>
-          <div class="ap-reset-all-wrap">
-            <button class="ap-reset-all-btn" onclick="resetSection('auto_gain')">
-              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
-            </button>
-          </div>
-        </div>
-
-        <!-- Echo Cancellation -->
-        <div class="settings-panel" id="section-echo">
-          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
-            Uses WebRTC AEC to remove speaker audio that bleeds into the microphone.
-            Leave disabled if you use headphones.
-          </p>
-          <div class="settings-group" id="ap-echo-params">
-            <!-- Populated dynamically by JS -->
-          </div>
-        </div>
-
-        <!-- Screen Recording -->
-        <div class="settings-panel" id="section-screen">
-          <p class="settings-row-desc" style="margin:0 0 10px;font-size:11px;color:var(--fg-muted)">
-            Records your screen as an MP4 video during meetings using FFmpeg.
-            Enable below and select a display in the sidebar.
-          </p>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">FFmpeg</div>
-                <div class="settings-row-desc">Required for screen recording</div>
-              </div>
-              <span class="settings-info-val" id="settings-ffmpeg-status">checking...</span>
-            </div>
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Preset</div>
-                <div class="settings-row-desc" id="screen-preset-desc">Performance profile for encoding</div>
-              </div>
-              <select id="screen-preset-sel" class="model-config-sel" onchange="setScreenPreset(this.value)">
-              </select>
-            </div>
-          </div>
-          <div class="settings-group" id="ap-screen-params">
-            <!-- Populated dynamically by JS (same system as audio params) -->
-          </div>
-          <div class="ap-reset-all-wrap">
-            <button class="ap-reset-all-btn" onclick="resetSection('screen_recording')">
-              <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
-            </button>
-          </div>
-        </div>
-
-        <!-- Recording Reminders -->
-        <div class="settings-panel" id="section-reminders">
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Quiet Recording Toast</div>
-                <div class="settings-row-desc">Windows notification when a recording goes quiet</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="quiet-prompt-enabled" onchange="saveQuietReminderSettings()">
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Quiet Threshold</div>
-                <div class="settings-row-desc">Seconds of no audio before showing the toast</div>
-              </div>
-              <input type="number" id="quiet-prompt-threshold" class="settings-number-input" min="5" max="600" step="5" onchange="saveQuietReminderSettings()">
-            </div>
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Audio Floor</div>
-                <div class="settings-row-desc">RMS level treated as activity</div>
-              </div>
-              <input type="number" id="quiet-prompt-rms" class="settings-number-input" min="0.001" max="0.2" step="0.001" onchange="saveQuietReminderSettings()">
-            </div>
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Require No Transcript</div>
-                <div class="settings-row-desc">Only notify when both audio and transcript are quiet</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="quiet-prompt-transcript" onchange="saveQuietReminderSettings()">
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Reminder Cooldown</div>
-                <div class="settings-row-desc">Minimum seconds between repeated quiet toasts</div>
-              </div>
-              <input type="number" id="quiet-prompt-cooldown" class="settings-number-input" min="0" max="1800" step="30" onchange="saveQuietReminderSettings()">
-            </div>
-          </div>
-        </div>
-
-        <!-- System -->
-        <div class="settings-panel" id="section-system">
-          <div class="settings-group-title">App Theme</div>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Appearance</div>
-                <div class="settings-row-desc">Match the system theme, or force light/dark</div>
-              </div>
-              <div class="theme-mode-seg" role="radiogroup" aria-label="Appearance mode">
-                <button class="theme-mode-btn" data-mode="system" onclick="setThemeMode('system')" title="Match system"><i class="fa-solid fa-desktop"></i>System</button>
-                <button class="theme-mode-btn" data-mode="light" onclick="setThemeMode('light')" title="Light mode"><i class="fa-solid fa-sun"></i>Light</button>
-                <button class="theme-mode-btn" data-mode="dark" onclick="setThemeMode('dark')" title="Dark mode"><i class="fa-solid fa-moon"></i>Dark</button>
-              </div>
-            </div>
-            <div class="settings-row theme-accent-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Accent Color</div>
-                <div class="settings-row-desc">Applied to buttons, links, selections, and highlights</div>
-              </div>
-              <div class="theme-accent-grid" id="theme-accent-grid">
-                <button class="theme-accent-btn" data-accent="blue" onclick="setThemeAccent('blue')" style="--swatch:#58a6ff;--swatch-a:#58a6ff;--swatch-b:#1f6feb;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Blue</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="ocean" onclick="setThemeAccent('ocean')" style="--swatch:#39c5cf;--swatch-a:#39c5cf;--swatch-b:#1b8f97;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Ocean</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="forest" onclick="setThemeAccent('forest')" style="--swatch:#3fb950;--swatch-a:#3fb950;--swatch-b:#238636;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Forest</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="sunset" onclick="setThemeAccent('sunset')" style="--swatch:#ff9f4e;--swatch-a:#ff9f4e;--swatch-b:#c56a18;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Sunset</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="rose" onclick="setThemeAccent('rose')" style="--swatch:#f778ba;--swatch-a:#f778ba;--swatch-b:#bf4b8a;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Rose</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="violet" onclick="setThemeAccent('violet')" style="--swatch:#bc8cff;--swatch-a:#bc8cff;--swatch-b:#8957e5;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Violet</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="amber" onclick="setThemeAccent('amber')" style="--swatch:#e3b341;--swatch-a:#e3b341;--swatch-b:#bb8009;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Amber</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="crimson" onclick="setThemeAccent('crimson')" style="--swatch:#ff7b72;--swatch-a:#ff7b72;--swatch-b:#c53d34;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Crimson</span>
-                </button>
-                <button class="theme-accent-btn" data-accent="mono" onclick="setThemeAccent('mono')" style="--swatch:#8b949e;--swatch-a:#e6edf3;--swatch-b:#484f58;">
-                  <span class="theme-accent-swatch"></span><span class="theme-accent-name">Mono</span>
-                </button>
-                <button class="theme-accent-btn theme-accent-custom" data-accent="custom" onclick="setThemeAccent('custom')">
-                  <span class="theme-accent-swatch theme-accent-swatch-rainbow"></span><span class="theme-accent-name">Custom</span>
-                </button>
-              </div>
-
-              <!-- Custom picker panel (revealed when Custom is active) -->
-              <div class="theme-custom-panel hidden" id="theme-custom-panel">
-                <div class="theme-custom-row">
-                  <label class="theme-custom-label">Accent color</label>
-                  <div class="theme-custom-color-row">
-                    <input type="color" class="theme-custom-color" id="theme-custom-accent-picker" value="#58a6ff" oninput="updateCustomAccent(this.value)">
-                    <input type="text" class="theme-custom-hex" id="theme-custom-accent-hex" value="#58a6ff" maxlength="7" oninput="updateCustomAccentFromHex(this.value)" spellcheck="false">
-                    <button class="theme-custom-reset" onclick="resetCustomTheme()" title="Reset to defaults"><i class="fa-solid fa-rotate-left"></i></button>
-                  </div>
-                </div>
-                <div class="theme-custom-row">
-                  <label class="theme-custom-label">Surface tint <span class="theme-custom-val" id="theme-custom-strength-val">30%</span></label>
-                  <input type="range" class="theme-custom-slider" id="theme-custom-strength" min="0" max="100" step="5" value="30" oninput="updateCustomStrength(this.value)">
-                </div>
-                <div class="theme-custom-hint">Derived automatically: darker accent for hovers, accent tint on backgrounds, matching borders.</div>
-              </div>
-            </div>
-          </div>
-
-          <div class="settings-group-title">Hardware &amp; Startup</div>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">GPU Acceleration</div>
-                <div class="settings-row-desc">CUDA available for transcription &amp; diarization</div>
-              </div>
-              <span class="settings-info-val" id="settings-cuda-status">checking...</span>
-            </div>
-            <div class="settings-row" id="startup-row" style="display:none">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Launch at Startup</div>
-                <div class="settings-row-desc">Open Meeting Assistant when you log in</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="startup-toggle" onchange="setStartupLaunch(this.checked)">
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          </div>
-          <div class="settings-group-title">Storage</div>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Data Folder</div>
-                <div class="settings-row-desc">
-                  Where recordings, databases, and settings are stored.
-                  Point this at OneDrive/Dropbox/etc. to sync data across machines.
-                </div>
-                <div class="settings-row-desc settings-row-mono" id="data-folder-current">…</div>
-              </div>
-              <div class="settings-row-actions">
-                <button class="btn-settings-action" id="data-folder-pick-btn" onclick="pickDataFolder()">Choose…</button>
-                <button class="btn-settings-action btn-settings-secondary" id="data-folder-reset-btn" onclick="resetDataFolder()" style="display:none">Reset to default</button>
-              </div>
-            </div>
-          </div>
-          <div class="settings-group-title">Updates</div>
-          <div class="settings-group">
-            <div class="settings-row">
-              <div class="settings-row-info">
-                <div class="settings-row-label">Updates</div>
-                <div class="settings-row-desc" id="settings-update-status"></div>
-              </div>
-              <button class="btn-settings-action" id="check-update-btn" onclick="checkForUpdates()">Check for Updates</button>
-            </div>
-          </div>
-        </div>
-
-      </div>
-    </div>
-  </div>
-</div>
+{% include "_settings.html" %}
 
 <div class="overlay hidden" id="session-editor-overlay">
   <div class="dialog session-editor-dialog">

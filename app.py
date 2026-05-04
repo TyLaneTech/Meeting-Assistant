@@ -656,8 +656,13 @@ def _run_summary(
                     _push("summary_done", {"session_id": session_id})
 
                 sp, sm = _resolve_tool_ai("summary")
+                # Resolve effective system prompt: session override > global > built-in
+                sess_sp = storage.get_session_summary_prompt(session_id)
+                global_sp = settings.get("summary_system_prompt") or None
+                effective_sp = sess_sp or global_sp
                 ai.summarize(transcript, on_token, on_done, custom_prompt=custom_prompt, meta=meta,
-                             provider=sp, model=sm)
+                             provider=sp, model=sm,
+                             system_prompt=effective_sp)
         finally:
             with _state_lock:
                 if _state["session_id"] == session_id:
@@ -675,6 +680,9 @@ def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None
         return
 
     with _state_lock:
+        # custom_prompt mirrors whichever session the user is viewing in the
+        # textarea — always honor it regardless of active recording session.
+        custom_prompt = _state["custom_prompt"]
         if _state["session_id"] == session_id:
             existing_summary = _state["summary"]
             if not existing_summary:
@@ -683,7 +691,6 @@ def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None
             labels = dict(_state["speaker_labels"])
             transcript = _build_transcript(segments, labels)
             seg_count = len(segments)
-            custom_prompt = _state["custom_prompt"]
             meta = _build_session_meta(
                 segments,
                 labels,
@@ -695,7 +702,6 @@ def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None
             existing_summary = ""
             transcript = ""
             seg_count = 0
-            custom_prompt = ""
             meta = None
 
     if not existing_summary:
@@ -716,6 +722,7 @@ def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None
             started_at=sess.get("started_at", ""),
             ended_at=sess.get("ended_at", ""),
             current_summary=existing_summary,
+            custom_prompt=custom_prompt,
         )
 
     threading.Thread(
@@ -1732,15 +1739,18 @@ def summarize():
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
 
-    # Get full transcript for this session
+    # Get full transcript for this session.
+    # custom_prompt is taken from _state regardless of whether this session
+    # is the active recording — the summary textarea always POSTs its value
+    # via /api/custom-prompt for whichever session the user is viewing.
     with _state_lock:
         active_sid = _state["session_id"]
+        custom_prompt = _state["custom_prompt"]
         if session_id == active_sid:
             segments = list(_state["segments"])
             labels = dict(_state["speaker_labels"])
             transcript = _build_transcript(segments, labels)
             seg_count = len(segments)
-            custom_prompt = _state["custom_prompt"]
             meta = _build_session_meta(
                 segments, labels,
                 is_live=_state["is_recording"],
@@ -1749,7 +1759,6 @@ def summarize():
         else:
             transcript = None
             seg_count = None
-            custom_prompt = ""
             meta = None
 
     if transcript is None:
@@ -1766,6 +1775,7 @@ def summarize():
             is_live=False,
             started_at=sess.get("started_at", ""),
             ended_at=sess.get("ended_at", ""),
+            custom_prompt=custom_prompt,
         )
 
     # Signal any running auto-summary to discard its result, then regenerate from scratch.
@@ -1923,6 +1933,7 @@ _OPENAI_EXCLUDE = (
     "realtime", "-audio-", "-transcribe", "-tts", "whisper", "dall-e",
     "embedding", "davinci", "babbage", "curie", "ada", "-search-",
     "instruct", "moderation", "-image-", "-preview-", "omni-moderation",
+    "-pro",  # Pro tiers (e.g. gpt-5-pro) — too pricey for this app's use cases
 )
 
 # Models cache (keyed by provider) — keeps the UI snappy and avoids hammering
@@ -3321,6 +3332,37 @@ def api_set_session_chat_prompt(sid):
     return jsonify({"ok": True, "session_prompt": prompt})
 
 
+# ── Summary system prompt (built-in default, global override, per-session)
+
+@app.route("/api/summary/default-prompt", methods=["GET"])
+def api_summary_default_prompt():
+    """Return the built-in default summary system prompt (read-only)."""
+    return jsonify({"prompt": AIAssistant._SYSTEM_SUMMARY})
+
+
+@app.route("/api/sessions/<sid>/summary-prompt", methods=["GET"])
+def api_get_session_summary_prompt(sid):
+    """Return all three prompt layers so the UI can show what's in effect."""
+    return jsonify({
+        "session_prompt": storage.get_session_summary_prompt(sid),
+        "global_prompt":  settings.get("summary_system_prompt") or "",
+        "default_prompt": AIAssistant._SYSTEM_SUMMARY,
+    })
+
+
+@app.route("/api/sessions/<sid>/summary-prompt", methods=["PUT"])
+def api_set_session_summary_prompt(sid):
+    """Store a per-session summary prompt override. Empty string or null clears."""
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt")
+    if isinstance(prompt, str) and prompt.strip() == "":
+        prompt = None
+    if prompt is not None and not isinstance(prompt, str):
+        return jsonify({"error": "prompt must be a string or null"}), 400
+    storage.set_session_summary_prompt(sid, prompt)
+    return jsonify({"ok": True, "session_prompt": prompt})
+
+
 # ── Global Chat ──────────────────────────────────────────────────────────────
 
 # Cancel events for global chat requests (separate from session chat)
@@ -4355,8 +4397,8 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
         with _state_lock:
             if _state["session_id"] == session_id:
                 _state["segments"] = []
-                _state["summary"] = ""
-                _state["chat_history"] = []
+                # Keep summary and chat_history intact across reanalysis;
+                # only the transcript is being recomputed.
                 _state["pending_segments"] = 0
                 _state["summarized_seg_count"] = 0
                 _state["speaker_labels"] = {}

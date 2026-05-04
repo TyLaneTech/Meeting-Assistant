@@ -502,15 +502,25 @@ class AIAssistant:
         meta: dict | None = None,
         provider: str | None = None,
         model: str | None = None,
+        system_prompt: str | None = None,
     ) -> None:
-        """Stream a structured meeting summary from a full transcript."""
+        """Stream a structured meeting summary from a full transcript.
+
+        ``system_prompt`` overrides the built-in ``_SYSTEM_SUMMARY`` when
+        provided and non-empty. ``custom_prompt`` is still appended on top
+        as additional user instructions.
+        """
         if not transcript.strip():
             on_token("*No transcript available yet - start recording first.*")
             if on_done:
                 on_done()
             return
 
-        system = self._SYSTEM_SUMMARY
+        system = (
+            system_prompt.strip()
+            if system_prompt and system_prompt.strip()
+            else self._SYSTEM_SUMMARY
+        )
         meta_block = _format_meta_block(meta)
         if meta_block:
             system += f"\n\n{meta_block}"
@@ -522,13 +532,30 @@ class AIAssistant:
             "and any instructions above - do not use a fixed structure.\n\n"
             f"Transcript:\n---\n{transcript}\n---"
         )
-        self._stream(
-            system,
-            [{"role": "user", "content": prompt}],
-            on_token,
-            on_done,
-            provider=provider, model=model,
-        )
+        # Summarization routes OpenAI through the Responses API; Anthropic
+        # keeps the existing messages.stream path via _stream().
+        try:
+            from core.network import warp_disconnect
+            warp_disconnect()
+            client, prov, mdl = self._resolve(provider, model)
+            if client is None:
+                on_token(
+                    f"\n\n*Error: No {prov.title()} API key configured. "
+                    f"Add it in Settings.*"
+                )
+                return
+            messages = [{"role": "user", "content": prompt}]
+            if prov == "openai":
+                self._stream_openai_responses(system, messages, on_token,
+                                              client=client, model=mdl)
+            else:
+                self._stream_anthropic(system, messages, on_token,
+                                       client=client, model=mdl)
+        except Exception as e:
+            on_token(f"\n\n*Error: {e}*")
+        finally:
+            if on_done:
+                on_done()
 
     def patch_summary(
         self,
@@ -582,6 +609,10 @@ class AIAssistant:
             "- Attribute decisions and points to speakers by name when identified\n"
             "- Always write in English regardless of any foreign words or phrases in the transcript"
         )
+        if custom_prompt.strip():
+            system_prompt += (
+                f"\n\nAdditional user instructions:\n{custom_prompt.strip()}"
+            )
         user_prompt = (
             f"Update the summary to reflect any significant new content in the transcript."
             f"{meta_note}{custom_note}{update_note}\n\n"
@@ -1012,6 +1043,60 @@ class AIAssistant:
         except openai.RateLimitError:
             on_token("\n\n*Error: OpenAI rate limit reached. Please wait and retry.*")
 
+    def _stream_openai_responses(
+        self,
+        system: str,
+        messages: list[dict],
+        on_token: Callback,
+        cancel: "threading.Event | None" = None,
+        client=None,
+        model: str | None = None,
+    ) -> None:
+        """Stream tokens from OpenAI's Responses API.
+
+        Used by ``summarize()`` for OpenAI models so summarization runs go
+        through ``/v1/responses`` instead of Chat Completions.
+        """
+        import openai
+        c = client or self.client
+        m = model or self.model
+        try:
+            stream_ctx = c.responses.stream(
+                model=m,
+                instructions=system,
+                input=self._to_responses_input(messages),
+            )
+        except openai.AuthenticationError:
+            on_token("\n\n*Error: Invalid OpenAI API key. Check Settings.*")
+            return
+        except openai.RateLimitError:
+            on_token("\n\n*Error: OpenAI rate limit reached. Please wait and retry.*")
+            return
+        except Exception as e:
+            log.error("ai", f"OpenAI responses.stream rejected request on model {m!r}: {e}")
+            on_token(
+                f"\n\n*OpenAI rejected the request: {e}. The model "
+                f"({m}) may not support the Responses API. "
+                f"Try a different model in Settings.*"
+            )
+            return
+
+        try:
+            with stream_ctx as stream:
+                for event in stream:
+                    if cancel and cancel.is_set():
+                        stream.close()
+                        break
+                    etype = getattr(event, "type", "")
+                    if etype == "response.output_text.delta":
+                        delta = getattr(event, "delta", "") or ""
+                        if delta:
+                            on_token(delta)
+        except openai.AuthenticationError:
+            on_token("\n\n*Error: Invalid OpenAI API key. Check Settings.*")
+        except openai.RateLimitError:
+            on_token("\n\n*Error: OpenAI rate limit reached. Please wait and retry.*")
+
     def _complete(self, system: str, prompt: str, max_tokens: int = 1024,
                    provider: str | None = None, model: str | None = None) -> str:
         """Non-streaming single completion from the active provider."""
@@ -1057,20 +1142,44 @@ class AIAssistant:
                 f"No {prov.title()} API key configured. Add it in Settings."
             )
         if prov == "openai":
-            schema_hint = (
-                ' Respond with valid JSON matching: '
-                '{"sections": [{"name": str, "action": "append"|"replace", "content": str}]}. '
-                'Use an empty sections array if no updates are needed.'
-            )
-            response = client.chat.completions.create(
+            # Responses API with a JSON-schema text format for the
+            # patch-summary contract. Mirrors _PATCH_TOOL.input_schema.
+            response = client.responses.create(
                 model=mdl,
-                messages=[
-                    {"role": "system", "content": system + schema_hint},
-                    {"role": "user", "content": prompt},
+                instructions=system,
+                input=[
+                    {"role": "user",
+                     "content": [{"type": "input_text", "text": prompt}]},
                 ],
-                response_format={"type": "json_object"},
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "summary_patch",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "sections": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "name":    {"type": "string"},
+                                            "action":  {"type": "string", "enum": ["append", "replace"]},
+                                            "content": {"type": "string"},
+                                        },
+                                        "required": ["name", "action", "content"],
+                                    },
+                                },
+                            },
+                            "required": ["sections"],
+                        },
+                    },
+                },
             )
-            text = response.choices[0].message.content.strip()
+            text = (response.output_text or "").strip()
             return json.loads(text) if text else {}
         else:
             response = client.messages.create(

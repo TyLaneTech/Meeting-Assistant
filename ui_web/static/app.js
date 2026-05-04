@@ -752,8 +752,11 @@ async function loadPreferences() {
     if (lc.theme_custom)  _prefs.theme_custom  = lc.theme_custom;
   }
   _syncThemeUI();
-  // Populate the global chat-system-prompt textarea (if on the session page)
+  // Populate the global chat/summary system-prompt textareas (if rendered)
   _syncGlobalChatPromptUI();
+  _syncGlobalSummaryPromptUI();
+  // Apply saved sidebar filter default (if any) on top of session list
+  try { _loadSidebarFilterDefault(); } catch (_) {}
   // Refresh session-override badge (no-op on home page)
   if (state.sessionId) refreshSessionChatPromptBadge();
 }
@@ -1052,6 +1055,42 @@ let _semanticSearchPending = false;       // true while a semantic request is in
 let _ftsSearchPending = false;            // true while FTS request is in flight
 let _pendingSearchHighlight = null;       // {segmentId, query} - scroll+highlight after session load
 
+// ── Sidebar filter state ──────────────────────────────────────────────────────
+const _SIDEBAR_FILTER_DEFAULTS = Object.freeze({
+  datePreset: 'any',          // any | today | yesterday | 7d | 30d | thisMonth | thisYear | custom
+  dateFrom: '',               // ISO yyyy-mm-dd (only with datePreset==='custom')
+  dateTo: '',
+  durationPreset: 'any',      // any | lt5 | 5to15 | 15to30 | 30to60 | gt60 | custom
+  durMin: '',                 // minutes
+  durMax: '',
+  folders: [],                // folder IDs; special tokens: '__uncat__'
+  speakers: [],               // speaker names (lowercase)
+  hasAudio: 'any',            // any | yes | no
+  hasTranscript: 'any',       // any | yes | no
+  status: 'any',              // any | done | inprog
+  splitGroup: 'any',          // any | yes | no
+  spkCountMin: '',
+  spkCountMax: '',
+  sortBy: 'date_desc',        // date_desc | date_asc | title_asc | title_desc | duration_desc | duration_asc | speakers_desc
+});
+
+let _sidebarFilter = { ..._SIDEBAR_FILTER_DEFAULTS };
+let _sidebarFilterDefault = { ..._SIDEBAR_FILTER_DEFAULTS };
+let _sidebarFilterPopoverOpen = false;
+
+// Collapse state for collapsible sections (variable-length lists). Persisted
+// to localStorage so refreshes preserve the user's preference. Default is
+// collapsed for every collapsible section on first run.
+const _SF_COLLAPSE_KEY = 'ma-sidebar-filter-open-sections';
+const _SF_COLLAPSIBLE = new Set(['folders', 'speakers']);
+let _sidebarFilterOpenSections = (() => {
+  try { return new Set(JSON.parse(localStorage.getItem(_SF_COLLAPSE_KEY) || '[]')); }
+  catch (_) { return new Set(); }
+})();
+
+// ResizeObserver that re-anchors the popover when the sidebar is resized
+let _sidebarFilterResizeObserver = null;
+
 async function refreshSidebar() {
   const [sessions, folders] = await Promise.all([
     fetch('/api/sessions').then(r => r.json()),
@@ -1183,6 +1222,608 @@ function _clearSidebarSearch() {
   const input = document.getElementById('sidebar-search-input');
   if (input) input.value = '';
   _onSidebarSearch('');
+}
+
+/* ── Sidebar filter ───────────────────────────────────────────────────────── */
+
+function _filterIsActive(f) {
+  const d = _SIDEBAR_FILTER_DEFAULTS;
+  for (const k of Object.keys(d)) {
+    const dv = d[k], v = f[k];
+    if (Array.isArray(dv)) { if ((v || []).length) return true; }
+    else if (v !== dv && v !== '' && v != null) return true;
+  }
+  return false;
+}
+
+function _activeFilterCount(f) {
+  let n = 0;
+  if (f.datePreset !== 'any') n++;
+  if (f.durationPreset !== 'any') n++;
+  if ((f.folders || []).length) n++;
+  if ((f.speakers || []).length) n++;
+  if (f.hasAudio !== 'any') n++;
+  if (f.hasTranscript !== 'any') n++;
+  if (f.status !== 'any') n++;
+  if (f.splitGroup !== 'any') n++;
+  if (f.spkCountMin !== '' || f.spkCountMax !== '') n++;
+  if (f.sortBy !== 'date_desc') n++;
+  return n;
+}
+
+function _filtersEqual(a, b) {
+  const keys = Object.keys(_SIDEBAR_FILTER_DEFAULTS);
+  for (const k of keys) {
+    const av = a[k], bv = b[k];
+    if (Array.isArray(av) || Array.isArray(bv)) {
+      const aa = av || [], bb = bv || [];
+      if (aa.length !== bb.length) return false;
+      const sa = [...aa].sort(), sb = [...bb].sort();
+      for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return false;
+    } else if ((av ?? '') !== (bv ?? '')) return false;
+  }
+  return true;
+}
+
+function _sessionDurationSec(s) {
+  if (s.last_segment_time != null && s.last_segment_time > 0) return s.last_segment_time;
+  if (s.ended_at) {
+    const start = new Date(s.started_at + 'Z');
+    const end   = new Date(s.ended_at + 'Z');
+    return Math.max(0, (end - start) / 1000);
+  }
+  return 0;
+}
+
+function _sessionDateMatchesPreset(s, f) {
+  if (f.datePreset === 'any') return true;
+  const start = new Date(s.started_at + 'Z');
+  const now = new Date();
+  if (f.datePreset === 'today') {
+    return start.toDateString() === now.toDateString();
+  }
+  if (f.datePreset === 'yesterday') {
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    return start.toDateString() === y.toDateString();
+  }
+  if (f.datePreset === '7d') {
+    const cutoff = new Date(now); cutoff.setDate(now.getDate() - 7);
+    return start >= cutoff;
+  }
+  if (f.datePreset === '30d') {
+    const cutoff = new Date(now); cutoff.setDate(now.getDate() - 30);
+    return start >= cutoff;
+  }
+  if (f.datePreset === 'thisMonth') {
+    return start.getFullYear() === now.getFullYear() && start.getMonth() === now.getMonth();
+  }
+  if (f.datePreset === 'thisYear') {
+    return start.getFullYear() === now.getFullYear();
+  }
+  if (f.datePreset === 'custom') {
+    if (f.dateFrom) {
+      const from = new Date(f.dateFrom + 'T00:00:00');
+      if (start < from) return false;
+    }
+    if (f.dateTo) {
+      const to = new Date(f.dateTo + 'T23:59:59');
+      if (start > to) return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+function _sessionDurationMatches(s, f) {
+  if (f.durationPreset === 'any') return true;
+  const min = _sessionDurationSec(s) / 60;
+  switch (f.durationPreset) {
+    case 'lt5':    return min < 5;
+    case '5to15':  return min >= 5 && min < 15;
+    case '15to30': return min >= 15 && min < 30;
+    case '30to60': return min >= 30 && min < 60;
+    case 'gt60':   return min >= 60;
+    case 'custom': {
+      const lo = f.durMin === '' ? -Infinity : parseFloat(f.durMin);
+      const hi = f.durMax === '' ? Infinity  : parseFloat(f.durMax);
+      return min >= lo && min <= hi;
+    }
+  }
+  return true;
+}
+
+function _sessionMatchesFilter(s, f, knownFolderIds) {
+  if (!_sessionDateMatchesPreset(s, f)) return false;
+  if (!_sessionDurationMatches(s, f)) return false;
+
+  if ((f.folders || []).length) {
+    const inUncat = f.folders.includes('__uncat__');
+    const isUncat = !s.folder_id || !knownFolderIds.has(s.folder_id);
+    const inSpec  = s.folder_id && f.folders.includes(s.folder_id);
+    if (!(inSpec || (inUncat && isUncat))) return false;
+  }
+
+  if ((f.speakers || []).length) {
+    const names = new Set((s.speakers || []).map(sp => (sp.name || '').toLowerCase()));
+    if (!f.speakers.some(n => names.has(n))) return false;
+  }
+
+  if (f.hasAudio === 'yes' && !s.has_audio) return false;
+  if (f.hasAudio === 'no'  &&  s.has_audio) return false;
+
+  const hasT = !!(s.last_segment_time && s.last_segment_time > 0);
+  if (f.hasTranscript === 'yes' && !hasT) return false;
+  if (f.hasTranscript === 'no'  &&  hasT) return false;
+
+  const isLive = s.id === state.sessionId && state.isRecording;
+  const isDone = !!s.ended_at && !isLive;
+  if (f.status === 'done'   && !isDone) return false;
+  if (f.status === 'inprog' && !isLive) return false;
+
+  if (f.splitGroup === 'yes' && !s.split_group_id) return false;
+  if (f.splitGroup === 'no'  &&  s.split_group_id) return false;
+
+  if (f.spkCountMin !== '' || f.spkCountMax !== '') {
+    const named = (s.speakers || []).filter(sp => sp.name && !/^Speaker \d+$/i.test(sp.name)).length;
+    if (f.spkCountMin !== '' && named < parseInt(f.spkCountMin, 10)) return false;
+    if (f.spkCountMax !== '' && named > parseInt(f.spkCountMax, 10)) return false;
+  }
+  return true;
+}
+
+function _applySidebarFilterToSessions(sessions) {
+  const f = _sidebarFilter;
+  const folderIds = new Set(_sidebarFolders.map(fl => fl.id));
+  let out = sessions;
+  if (_filterIsActive(f)) {
+    out = sessions.filter(s => _sessionMatchesFilter(s, f, folderIds));
+  }
+  // Sorting only applies a non-default order when explicitly chosen — the
+  // normal-mode renderer handles its own folder/date grouping when sortBy is
+  // 'date_desc', so we leave the array as-is in that case.
+  if (f.sortBy && f.sortBy !== 'date_desc') {
+    out = [...out];
+    const dur = s => _sessionDurationSec(s);
+    const spk = s => (s.speakers || []).filter(sp => sp.name && !/^Speaker \d+$/i.test(sp.name)).length;
+    const cmp = {
+      date_asc:      (a, b) => a.started_at.localeCompare(b.started_at),
+      title_asc:     (a, b) => (a.title || '').localeCompare(b.title || ''),
+      title_desc:    (a, b) => (b.title || '').localeCompare(a.title || ''),
+      duration_desc: (a, b) => dur(b) - dur(a),
+      duration_asc:  (a, b) => dur(a) - dur(b),
+      speakers_desc: (a, b) => spk(b) - spk(a),
+    }[f.sortBy];
+    if (cmp) out.sort(cmp);
+  }
+  return out;
+}
+
+function _updateSidebarFilterBtnState() {
+  const btn = document.getElementById('sidebar-filter-btn');
+  if (!btn) return;
+  btn.classList.toggle('active', _filterIsActive(_sidebarFilter));
+  const n = _activeFilterCount(_sidebarFilter);
+  btn.title = n ? `${n} filter${n === 1 ? '' : 's'} applied — click to edit` : 'Filter sessions';
+}
+
+function _toggleSidebarFilter(ev) {
+  if (ev) ev.stopPropagation();
+  if (_sidebarFilterPopoverOpen) { _closeSidebarFilter(); return; }
+  _openSidebarFilter();
+}
+
+function _openSidebarFilter() {
+  const pop = document.getElementById('sidebar-filter-popover');
+  const btn = document.getElementById('sidebar-filter-btn');
+  if (!pop || !btn) return;
+  _sidebarFilterPopoverOpen = true;
+  btn.classList.add('open');
+  _renderSidebarFilterPopover();
+  pop.classList.remove('hidden');
+  _positionSidebarFilterPopover();
+  // Track sidebar resize (drag handle, collapse/expand) so the popover follows.
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar && typeof ResizeObserver !== 'undefined') {
+    _sidebarFilterResizeObserver = new ResizeObserver(_positionSidebarFilterPopover);
+    _sidebarFilterResizeObserver.observe(sidebar);
+  }
+  // Defer listener attach so the click that opened us doesn't immediately close
+  setTimeout(() => {
+    document.addEventListener('mousedown', _onFilterDocClick, true);
+    document.addEventListener('keydown', _onFilterEsc, true);
+    window.addEventListener('resize', _positionSidebarFilterPopover);
+    window.addEventListener('scroll', _positionSidebarFilterPopover, true);
+  }, 0);
+}
+
+function _closeSidebarFilter() {
+  const pop = document.getElementById('sidebar-filter-popover');
+  const btn = document.getElementById('sidebar-filter-btn');
+  if (pop) pop.classList.add('hidden');
+  if (btn) btn.classList.remove('open');
+  _sidebarFilterPopoverOpen = false;
+  document.removeEventListener('mousedown', _onFilterDocClick, true);
+  document.removeEventListener('keydown', _onFilterEsc, true);
+  window.removeEventListener('resize', _positionSidebarFilterPopover);
+  window.removeEventListener('scroll', _positionSidebarFilterPopover, true);
+  if (_sidebarFilterResizeObserver) {
+    _sidebarFilterResizeObserver.disconnect();
+    _sidebarFilterResizeObserver = null;
+  }
+}
+
+function _onFilterDocClick(e) {
+  const pop = document.getElementById('sidebar-filter-popover');
+  const btn = document.getElementById('sidebar-filter-btn');
+  if (!pop || !btn) return;
+  if (pop.contains(e.target) || btn.contains(e.target)) return;
+  _closeSidebarFilter();
+}
+
+function _onFilterEsc(e) {
+  if (e.key === 'Escape') { e.stopPropagation(); _closeSidebarFilter(); }
+}
+
+function _positionSidebarFilterPopover() {
+  const pop = document.getElementById('sidebar-filter-popover');
+  const btn = document.getElementById('sidebar-filter-btn');
+  if (!pop || !btn || pop.classList.contains('hidden')) return;
+  const sidebar = document.getElementById('sidebar');
+  const margin = 8;
+  const gap = 8;
+  const popW = pop.offsetWidth || 340;
+  const popH = pop.offsetHeight || 480;
+
+  // Anchor to the right of the sidebar so the popover never overlaps the
+  // session list it's filtering. Falls back to the filter button rect when
+  // the sidebar is collapsed.
+  const sbRect = sidebar ? sidebar.getBoundingClientRect() : null;
+  const sbVisible = sbRect && sbRect.width > 4 && !sidebar.classList.contains('collapsed');
+  const anchorRight = sbVisible ? sbRect.right : btn.getBoundingClientRect().right;
+
+  let left = anchorRight + gap;
+  // If there's no horizontal room to the right (narrow viewport), flip to
+  // the left of the sidebar; if that doesn't fit either, clamp to viewport.
+  if (left + popW > window.innerWidth - margin) {
+    const flipped = (sbVisible ? sbRect.left : btn.getBoundingClientRect().left) - gap - popW;
+    if (flipped >= margin) left = flipped;
+    else left = Math.max(margin, window.innerWidth - popW - margin);
+  }
+
+  // Vertically align with the filter button's row, clamped to viewport.
+  const btnRect = btn.getBoundingClientRect();
+  let top = btnRect.top - 4;
+  if (top + popH > window.innerHeight - margin) top = Math.max(margin, window.innerHeight - popH - margin);
+  if (top < margin) top = margin;
+
+  pop.style.left = left + 'px';
+  pop.style.top  = top + 'px';
+}
+
+function _onFilterChange() {
+  _updateSidebarFilterBtnState();
+  _renderSidebarFilterPopover();    // refresh chip states + count
+  _renderSidebar();                 // re-render session list with new filter
+}
+
+function _resetSidebarFilter() {
+  _sidebarFilter = { ..._SIDEBAR_FILTER_DEFAULTS };
+  _onFilterChange();
+}
+
+function _setSidebarFilterAsDefault() {
+  _sidebarFilterDefault = { ..._sidebarFilter, folders: [...(_sidebarFilter.folders || [])], speakers: [...(_sidebarFilter.speakers || [])] };
+  // Persist via existing prefs API — `null` clears the default when no filters
+  // are active.
+  const payload = _filterIsActive(_sidebarFilterDefault) ? _sidebarFilterDefault : null;
+  savePref('sidebar_filter_default', payload);
+  // Visual confirmation in the footer
+  const note = document.getElementById('sf-default-saved');
+  if (note) {
+    note.classList.add('show');
+    clearTimeout(_setSidebarFilterAsDefault._t);
+    _setSidebarFilterAsDefault._t = setTimeout(() => note.classList.remove('show'), 1800);
+  }
+}
+
+function _loadSidebarFilterDefault() {
+  // Called once after preferences load. Apply saved default (if any) as the
+  // active filter, so the list opens pre-filtered the way the user wants.
+  const saved = _prefs && _prefs.sidebar_filter_default;
+  if (saved && typeof saved === 'object') {
+    _sidebarFilterDefault = { ..._SIDEBAR_FILTER_DEFAULTS, ...saved };
+    _sidebarFilter = { ..._sidebarFilterDefault,
+                       folders: [...(_sidebarFilterDefault.folders || [])],
+                       speakers: [...(_sidebarFilterDefault.speakers || [])] };
+  }
+  _updateSidebarFilterBtnState();
+}
+
+function _renderSidebarFilterPopover() {
+  const pop = document.getElementById('sidebar-filter-popover');
+  if (!pop) return;
+  const f = _sidebarFilter;
+  const n = _activeFilterCount(f);
+
+  // Collect distinct named speakers across all sessions
+  const speakerMap = new Map();   // lcname -> {name, color, count}
+  for (const s of _sidebarAllSessions) {
+    for (const sp of (s.speakers || [])) {
+      if (!sp.name || /^Speaker \d+$/i.test(sp.name)) continue;
+      const key = sp.name.toLowerCase();
+      const e = speakerMap.get(key) || { name: sp.name, color: sp.color, count: 0 };
+      e.count++;
+      if (sp.color && !e.color) e.color = sp.color;
+      speakerMap.set(key, e);
+    }
+  }
+  const speakerList = [...speakerMap.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+  const folders = (_sidebarFolders || []).slice().sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '')
+  );
+
+  const chip = (label, active, onClick, extra = '') =>
+    `<button type="button" class="sf-chip${active ? ' selected' : ''}" data-act="${onClick}" ${extra}>${label}</button>`;
+
+  const sectionActive = {
+    date:     f.datePreset !== 'any',
+    duration: f.durationPreset !== 'any',
+    folders:  (f.folders || []).length > 0,
+    speakers: (f.speakers || []).length > 0,
+    flags:    f.hasAudio !== 'any' || f.hasTranscript !== 'any' || f.status !== 'any' || f.splitGroup !== 'any',
+    spkCount: f.spkCountMin !== '' || f.spkCountMax !== '',
+    sort:     f.sortBy !== 'date_desc',
+  };
+  const sectClass = (k) => `sf-section${sectionActive[k] ? ' has-active' : ''}`;
+
+  const tri = (key, val, opts) => `<div class="sf-tri" data-tri="${key}">` +
+    opts.map(([v, label]) => `<button type="button" data-tri-val="${v}" class="${val === v ? 'active' : ''}">${label}</button>`).join('') + '</div>';
+
+  // Section header for collapsible sections — clicking the whole row toggles
+  // open/closed. Active filter dot is preserved.
+  const collapsibleHeader = (id, iconHtml, title, count) => {
+    const isOpen = _sidebarFilterOpenSections.has(id);
+    const badge = count > 0
+      ? `<span class="sf-section-count">${count}</span>`
+      : '';
+    return `<button type="button" class="sf-section-label sf-section-toggle" data-toggle-section="${id}">
+      ${iconHtml} ${title} ${badge} <span class="sf-active-dot"></span>
+      <span class="sf-section-chevron"><i class="fa-solid fa-chevron-${isOpen ? 'down' : 'right'}"></i></span>
+    </button>`;
+  };
+  const isOpen = id => _sidebarFilterOpenSections.has(id);
+
+  pop.innerHTML = `
+    <div class="sf-header">
+      <div class="sf-header-title">
+        <i class="fa-solid fa-filter"></i> Filter sessions
+        <span class="sf-header-count${n ? ' has-filters' : ''}">${n ? `${n} active` : 'none'}</span>
+      </div>
+      <button type="button" class="sf-close-btn" data-act="close" title="Close"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="sf-body">
+
+      <div class="${sectClass('sort')}" data-section="sort">
+        <div class="sf-section-label"><i class="fa-solid fa-arrow-down-wide-short"></i> Sort by <span class="sf-active-dot"></span></div>
+        <select class="sf-select" id="sf-sort">
+          <option value="date_desc"      ${f.sortBy === 'date_desc' ? 'selected' : ''}>Newest first (default)</option>
+          <option value="date_asc"       ${f.sortBy === 'date_asc' ? 'selected' : ''}>Oldest first</option>
+          <option value="title_asc"      ${f.sortBy === 'title_asc' ? 'selected' : ''}>Title A → Z</option>
+          <option value="title_desc"     ${f.sortBy === 'title_desc' ? 'selected' : ''}>Title Z → A</option>
+          <option value="duration_desc"  ${f.sortBy === 'duration_desc' ? 'selected' : ''}>Longest first</option>
+          <option value="duration_asc"   ${f.sortBy === 'duration_asc' ? 'selected' : ''}>Shortest first</option>
+          <option value="speakers_desc"  ${f.sortBy === 'speakers_desc' ? 'selected' : ''}>Most speakers first</option>
+        </select>
+      </div>
+
+      <div class="${sectClass('date')}" data-section="date">
+        <div class="sf-section-label"><i class="fa-regular fa-calendar"></i> Date <span class="sf-active-dot"></span></div>
+        <div class="sf-chip-row">
+          ${chip('Any',       f.datePreset === 'any',       'date:any')}
+          ${chip('Today',     f.datePreset === 'today',     'date:today')}
+          ${chip('Yesterday', f.datePreset === 'yesterday', 'date:yesterday')}
+          ${chip('Last 7d',   f.datePreset === '7d',        'date:7d')}
+          ${chip('Last 30d',  f.datePreset === '30d',       'date:30d')}
+          ${chip('This month',f.datePreset === 'thisMonth', 'date:thisMonth')}
+          ${chip('This year', f.datePreset === 'thisYear',  'date:thisYear')}
+          ${chip('Custom…',   f.datePreset === 'custom',    'date:custom')}
+        </div>
+        ${f.datePreset === 'custom' ? `
+        <div class="sf-range" style="margin-top:8px">
+          <div class="sf-range-inputs">
+            <input type="date" id="sf-date-from" value="${f.dateFrom || ''}" aria-label="From date">
+            <span class="sf-range-sep">→</span>
+            <input type="date" id="sf-date-to"   value="${f.dateTo   || ''}" aria-label="To date">
+          </div>
+        </div>` : ''}
+      </div>
+
+      <div class="${sectClass('duration')}" data-section="duration">
+        <div class="sf-section-label"><i class="fa-regular fa-clock"></i> Duration <span class="sf-active-dot"></span></div>
+        <div class="sf-chip-row">
+          ${chip('Any',         f.durationPreset === 'any',    'dur:any')}
+          ${chip('< 5 min',     f.durationPreset === 'lt5',    'dur:lt5')}
+          ${chip('5–15 min',    f.durationPreset === '5to15',  'dur:5to15')}
+          ${chip('15–30 min',   f.durationPreset === '15to30', 'dur:15to30')}
+          ${chip('30–60 min',   f.durationPreset === '30to60', 'dur:30to60')}
+          ${chip('> 60 min',    f.durationPreset === 'gt60',   'dur:gt60')}
+          ${chip('Custom…',     f.durationPreset === 'custom', 'dur:custom')}
+        </div>
+        ${f.durationPreset === 'custom' ? `
+        <div class="sf-range" style="margin-top:8px">
+          <div class="sf-range-inputs">
+            <input type="number" min="0" step="0.5" id="sf-dur-min" placeholder="min" value="${f.durMin}">
+            <span class="sf-range-sep">–</span>
+            <input type="number" min="0" step="0.5" id="sf-dur-max" placeholder="max" value="${f.durMax}">
+            <span class="sf-range-suffix">min</span>
+          </div>
+        </div>` : ''}
+      </div>
+
+      <div class="${sectClass('folders')}${isOpen('folders') ? ' open' : ''}" data-section="folders">
+        ${collapsibleHeader('folders',
+            '<i class="fa-regular fa-folder"></i>', 'Folder',
+            (f.folders || []).length)}
+        <div class="sf-section-body">
+          <div class="sf-chip-row">
+            ${chip('<i class="fa-solid fa-inbox"></i> Uncategorized',
+                   (f.folders || []).includes('__uncat__'),
+                   'folder:__uncat__')}
+            ${folders.length === 0 ? '<span class="sf-empty">No folders yet.</span>' :
+              folders.map(fl => chip(escapeHtml(fl.name || 'Untitled'),
+                                     (f.folders || []).includes(fl.id),
+                                     'folder:' + fl.id)).join('')}
+          </div>
+        </div>
+      </div>
+
+      <div class="${sectClass('speakers')}${isOpen('speakers') ? ' open' : ''}" data-section="speakers">
+        ${collapsibleHeader('speakers',
+            '<i class="fa-regular fa-user"></i>', 'Speakers',
+            (f.speakers || []).length)}
+        <div class="sf-section-body">
+          <div class="sf-chip-row">
+            ${speakerList.length === 0 ? '<span class="sf-empty">No named speakers yet.</span>' :
+              speakerList.slice(0, 80).map(sp => {
+                const sel = (f.speakers || []).includes(sp.name.toLowerCase());
+                const dot = sp.color
+                  ? `<span class="sf-chip-dot" style="background:${sp.color}"></span>`
+                  : '';
+                return `<button type="button" class="sf-chip${sel ? ' selected' : ''}" data-act="speaker:${escapeHtml(sp.name.toLowerCase())}">${dot}${escapeHtml(sp.name)}</button>`;
+              }).join('')}
+          </div>
+        </div>
+      </div>
+
+      <div class="${sectClass('flags')}" data-section="flags">
+        <div class="sf-section-label"><i class="fa-solid fa-toggle-on"></i> Has & Status <span class="sf-active-dot"></span></div>
+        <div class="sf-toggles-grid">
+          <div class="sf-toggle-row">
+            <span class="sf-toggle-label"><i class="fa-solid fa-volume-high"></i> Audio</span>
+            ${tri('hasAudio', f.hasAudio, [['any','Any'],['yes','Yes'],['no','No']])}
+          </div>
+          <div class="sf-toggle-row">
+            <span class="sf-toggle-label"><i class="fa-solid fa-align-left"></i> Transcript</span>
+            ${tri('hasTranscript', f.hasTranscript, [['any','Any'],['yes','Yes'],['no','No']])}
+          </div>
+          <div class="sf-toggle-row">
+            <span class="sf-toggle-label"><i class="fa-solid fa-circle-check"></i> Status</span>
+            ${tri('status', f.status, [['any','Any'],['done','Done'],['inprog','Live']])}
+          </div>
+          <div class="sf-toggle-row">
+            <span class="sf-toggle-label"><i class="fa-solid fa-code-branch"></i> Split</span>
+            ${tri('splitGroup', f.splitGroup, [['any','Any'],['yes','Yes'],['no','No']])}
+          </div>
+        </div>
+      </div>
+
+      <div class="${sectClass('spkCount')}" data-section="spkCount">
+        <div class="sf-section-label"><i class="fa-solid fa-people-group"></i> Speaker count <span class="sf-active-dot"></span></div>
+        <div class="sf-range">
+          <div class="sf-range-inputs">
+            <input type="number" min="0" step="1" id="sf-spk-min" placeholder="min" value="${f.spkCountMin}">
+            <span class="sf-range-sep">–</span>
+            <input type="number" min="0" step="1" id="sf-spk-max" placeholder="max" value="${f.spkCountMax}">
+            <span class="sf-range-suffix">named</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+    <div class="sf-footer">
+      <div class="sf-footer-left">
+        <button type="button" class="sf-btn subtle" data-act="reset" ${n ? '' : 'disabled'} title="Clear all active filters">
+          <i class="fa-solid fa-xmark"></i> Clear
+        </button>
+      </div>
+      <div class="sf-footer-right">
+        <span class="sf-default-saved" id="sf-default-saved"><i class="fa-solid fa-check"></i> Saved</span>
+        <button type="button" class="sf-btn" data-act="setDefault" title="Save current filter as default for future sessions">
+          <i class="fa-regular fa-bookmark"></i> Set as default
+        </button>
+        <button type="button" class="sf-btn primary" data-act="close" title="Done">Done</button>
+      </div>
+    </div>
+  `;
+
+  // ── Wire interactions ──
+  pop.querySelectorAll('[data-act]').forEach(el => {
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      const act = el.getAttribute('data-act');
+      _handleFilterAct(act);
+    });
+  });
+  pop.querySelectorAll('[data-toggle-section]').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const id = btn.getAttribute('data-toggle-section');
+      _toggleFilterSection(id);
+    });
+  });
+  pop.querySelectorAll('[data-tri]').forEach(group => {
+    const key = group.getAttribute('data-tri');
+    group.querySelectorAll('[data-tri-val]').forEach(b => {
+      b.addEventListener('click', e => {
+        e.stopPropagation();
+        _sidebarFilter[key] = b.getAttribute('data-tri-val');
+        _onFilterChange();
+      });
+    });
+  });
+  const dFrom = pop.querySelector('#sf-date-from');
+  const dTo   = pop.querySelector('#sf-date-to');
+  if (dFrom) dFrom.addEventListener('change', () => { _sidebarFilter.dateFrom = dFrom.value; _onFilterChange(); });
+  if (dTo)   dTo.addEventListener('change',   () => { _sidebarFilter.dateTo   = dTo.value;   _onFilterChange(); });
+  const dMin = pop.querySelector('#sf-dur-min');
+  const dMax = pop.querySelector('#sf-dur-max');
+  if (dMin) dMin.addEventListener('change', () => { _sidebarFilter.durMin = dMin.value; _onFilterChange(); });
+  if (dMax) dMax.addEventListener('change', () => { _sidebarFilter.durMax = dMax.value; _onFilterChange(); });
+  const sMin = pop.querySelector('#sf-spk-min');
+  const sMax = pop.querySelector('#sf-spk-max');
+  if (sMin) sMin.addEventListener('change', () => { _sidebarFilter.spkCountMin = sMin.value; _onFilterChange(); });
+  if (sMax) sMax.addEventListener('change', () => { _sidebarFilter.spkCountMax = sMax.value; _onFilterChange(); });
+  const sortSel = pop.querySelector('#sf-sort');
+  if (sortSel) sortSel.addEventListener('change', () => { _sidebarFilter.sortBy = sortSel.value; _onFilterChange(); });
+
+  _positionSidebarFilterPopover();
+}
+
+function _toggleFilterSection(id) {
+  if (!_SF_COLLAPSIBLE.has(id)) return;
+  if (_sidebarFilterOpenSections.has(id)) _sidebarFilterOpenSections.delete(id);
+  else                                    _sidebarFilterOpenSections.add(id);
+  try {
+    localStorage.setItem(_SF_COLLAPSE_KEY, JSON.stringify([..._sidebarFilterOpenSections]));
+  } catch (_) {}
+  _renderSidebarFilterPopover();
+}
+
+function _handleFilterAct(act) {
+  if (act === 'close')      { _closeSidebarFilter(); return; }
+  if (act === 'reset')      { _resetSidebarFilter(); return; }
+  if (act === 'setDefault') { _setSidebarFilterAsDefault(); return; }
+
+  const colon = act.indexOf(':');
+  const kind = colon < 0 ? act : act.slice(0, colon);
+  const val  = colon < 0 ? ''  : act.slice(colon + 1);
+  if (kind === 'date') {
+    _sidebarFilter.datePreset = val;
+    if (val !== 'custom') { _sidebarFilter.dateFrom = ''; _sidebarFilter.dateTo = ''; }
+  } else if (kind === 'dur') {
+    _sidebarFilter.durationPreset = val;
+    if (val !== 'custom') { _sidebarFilter.durMin = ''; _sidebarFilter.durMax = ''; }
+  } else if (kind === 'folder') {
+    const list = new Set(_sidebarFilter.folders || []);
+    list.has(val) ? list.delete(val) : list.add(val);
+    _sidebarFilter.folders = [...list];
+  } else if (kind === 'speaker') {
+    const list = new Set(_sidebarFilter.speakers || []);
+    list.has(val) ? list.delete(val) : list.add(val);
+    _sidebarFilter.speakers = [...list];
+  }
+  _onFilterChange();
 }
 
 function _checkSemanticSearchReady() {
@@ -1396,10 +2037,15 @@ function _attachFolderDragHandlers(headerEl, folderEl, folder) {
 // ── Render sidebar ────────────────────────────────────────────────────────────
 
 function _renderSidebar() {
-  const sessions = _sidebarAllSessions;
+  // Apply the active filter set first so every code path below operates on
+  // the filtered subset (search results, folder tree, ungrouped list).
+  const filterActive = _filterIsActive(_sidebarFilter);
+  const sessions = _applySidebarFilterToSessions(_sidebarAllSessions);
   const folders  = _sidebarFolders;
   const list     = document.getElementById('session-list');
-  const hasAny   = sessions.length > 0 || folders.length > 0;
+  const hasAny   = sessions.length > 0 || (folders.length > 0 && !filterActive);
+
+  _updateSidebarFilterBtnState();
 
   // ── Search mode: flat filtered list with snippets ──
   if (_sidebarSearchResults !== null) {
@@ -1425,9 +2071,11 @@ function _renderSidebar() {
     }
     const sessionMap = new Map(sessions.map(s => [s.id, s]));
     const fragment = document.createDocumentFragment();
+    let visibleResults = 0;
     for (const [sid, data] of _sidebarSearchResults) {
       const s = sessionMap.get(sid);
-      if (!s) continue;
+      if (!s) continue;   // filtered out by active filter, or not in list
+      visibleResults++;
       const el = _makeSessionEl(s);
       const info = el.querySelector('.session-info');
       if (info) {
@@ -1484,6 +2132,14 @@ function _renderSidebar() {
       }, true);  // capture phase - runs before the loadSession click
       fragment.appendChild(el);
     }
+    if (visibleResults === 0) {
+      list.innerHTML =
+        '<div class="search-empty-state">' +
+          '<div class="search-empty-icon"><i class="fa-solid fa-filter"></i></div>' +
+          '<p>No matches with the current filter</p>' +
+        '</div>';
+      return;
+    }
     list.appendChild(fragment);
     // Show refining indicator when semantic search is still running
     if (_semanticSearchPending && _sidebarSearchResults.size > 0) {
@@ -1497,8 +2153,52 @@ function _renderSidebar() {
 
   // ── Normal mode: folder hierarchy + date groups ──
   if (!hasAny) {
-    list.innerHTML = '<p class="sidebar-empty">No past sessions yet.</p>';
+    if (filterActive) {
+      list.innerHTML =
+        '<div class="search-empty-state">' +
+          '<div class="search-empty-icon"><i class="fa-solid fa-filter"></i></div>' +
+          '<p>No sessions match the current filter</p>' +
+          '<button type="button" class="sf-btn subtle" onclick="_resetSidebarFilter()" style="margin-top:6px"><i class="fa-solid fa-xmark"></i> Clear filters</button>' +
+        '</div>';
+    } else {
+      list.innerHTML = '<p class="sidebar-empty">No past sessions yet.</p>';
+    }
     _updateBulkBar();
+    return;
+  }
+
+  // ── Filter active: bypass folder hierarchy, show a flat sorted list ──
+  if (filterActive) {
+    const fragmentF = document.createDocumentFragment();
+    const ordered = (_sidebarFilter.sortBy && _sidebarFilter.sortBy !== 'date_desc')
+      ? sessions
+      : [...sessions].sort((a, b) => b.started_at.localeCompare(a.started_at));
+    // For the default "newest first" sort, group by date the same way the
+    // ungrouped pane does so the result still feels like the sidebar.
+    if (_sidebarFilter.sortBy === 'date_desc') {
+      const groups = groupByDate(ordered);
+      for (const [label, items] of groups) {
+        const groupEl = document.createElement('div');
+        groupEl.className = 'session-group';
+        groupEl.textContent = label;
+        fragmentF.appendChild(groupEl);
+        items.forEach(s => {
+          const el = _makeSessionEl(s);
+          _attachSessionDragHandlers(el, s);
+          fragmentF.appendChild(el);
+        });
+      }
+    } else {
+      ordered.forEach(s => {
+        const el = _makeSessionEl(s);
+        _attachSessionDragHandlers(el, s);
+        fragmentF.appendChild(el);
+      });
+    }
+    list.innerHTML = '';
+    list.appendChild(fragmentF);
+    _updateBulkBar();
+    _updateActiveFolderHighlights();
     return;
   }
 
@@ -2544,7 +3244,9 @@ function newSession() {
   clearAll();
   _updateActiveFolderHighlights();
   history.pushState({}, '', '/session');
-  _applyPromptText('');
+  // Re-seed the Custom Instructions / per-session system prompt the same way
+  // a fresh page load would (localStorage > default-instructions pref > "").
+  loadSummaryPrompt();
   updateRecordBtn();
   refreshSidebar();
   _syncUploadBtn();
@@ -2674,13 +3376,15 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id && d.session_id !== state.sessionId) return;
     if (d.seg_id) _lastLiveSegId = Math.max(_lastLiveSegId, d.seg_id);
-    if (!state.isViewingPast) appendTranscript(d.text, d.source || 'loopback', d.start_time, d.end_time, d.seg_id);
+    if (!state.isViewingPast || state.isReanalyzing) {
+      appendTranscript(d.text, d.source || 'loopback', d.start_time, d.end_time, d.seg_id);
+    }
   });
 
   src.addEventListener('transcript_update', e => {
     const d = JSON.parse(e.data);
     if (d.session_id && d.session_id !== state.sessionId) return;
-    if (!state.isViewingPast && d.seg_id) {
+    if ((!state.isViewingPast || state.isReanalyzing) && d.seg_id) {
       const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
       if (seg) {
         // Source changed (e.g. noise reclaimed as real speaker) - full re-render
@@ -3022,6 +3726,16 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     _clearSegmentRegistry();
+    // Drop stale speaker state - reanalysis re-derives speakers from scratch,
+    // and old pills/profiles would otherwise linger with count=0 until refresh.
+    _speakerLabels = {};
+    _speakerProfiles = {};
+    _selectedSpeakerKeys = [];
+    _speakerSelectionAnchor = null;
+    Object.keys(_speakerColors).forEach(k => delete _speakerColors[k]);
+    _speakerColorIdx = 0;
+    _manualNoiseKeys = new Set();
+    _tnRefreshSpeakerPills();
     // Clear notification queue on transcript reset (reanalysis)
     _fpNotifQueue = [];
     _fpToastActive = null;
@@ -3199,8 +3913,10 @@ function onStatus(d) {
       _updateBrandIcons(false);
       _updateScreenRecordingStatus(false);
       _stopScreenPreview();
-      // Transition to "viewing past" so Resume Session button appears
-      if (state.sessionId) state.isViewingPast = true;
+      // Transition to "viewing past" so Resume Session button appears.
+      // Don't flip during reanalysis - the transcript SSE listener uses
+      // isViewingPast to decide whether to live-append incoming segments.
+      if (state.sessionId && !state.isReanalyzing) state.isViewingPast = true;
       updateRecordBtn();
       refreshSidebar();
       // The WAV is finalized before this event fires, so playback is available
@@ -3729,9 +4445,18 @@ let _fpNotifQueue = [];          // persistent queue: [{session_id, speaker_key,
 let _fpToastActive = null;
 let _fpToastTimer  = null;
 
+// True if a suggestion is redundant - the speaker is already labeled with
+// the same name as the top match (e.g. "Jason Palmer → Jason Palmer").
+function _fpIsRedundantSuggestion(data) {
+  const top = data?.matches?.[0];
+  if (!top) return true;
+  const cur = (data.current_name || '').trim().toLowerCase();
+  if (!cur) return false;
+  return cur === (top.name || '').trim().toLowerCase();
+}
+
 function _fpEnqueueToast(data) {
-  const top = data.matches && data.matches[0];
-  if (top && data.current_name && top.name === data.current_name) return;
+  if (_fpIsRedundantSuggestion(data)) return;
   // Replace any existing entry for the same speaker_key
   _fpNotifQueue = _fpNotifQueue.filter(d => d.speaker_key !== data.speaker_key);
   _fpNotifQueue.push(data);
@@ -3767,7 +4492,21 @@ function _fpAutoCollapseIfEmpty() {
 }
 
 function _fpGetSuggestion(speakerKey) {
-  return _fpNotifQueue.find(d => d.speaker_key === speakerKey) || null;
+  const d = _fpNotifQueue.find(d => d.speaker_key === speakerKey) || null;
+  if (d && _fpIsRedundantSuggestion(d)) return null;
+  return d;
+}
+
+// Scroll the transcript to the first segment from the given speaker key.
+function _fpJumpToSpeaker(speakerKey) {
+  const target = _segmentRegistry.find(seg =>
+    seg.dataset.transcriptSource === speakerKey
+    || seg.dataset.originalSource === speakerKey
+  );
+  if (!target) return;
+  _doProgrammaticScroll(target, { block: 'center', behavior: 'smooth' });
+  target.classList.add('playing');
+  setTimeout(() => target.classList.remove('playing'), 1500);
 }
 
 // ── Bell badge ────────────────────────────────────────────────────────────
@@ -3775,7 +4514,7 @@ function _fpUpdateBell() {
   const btn = document.getElementById('fp-bell-btn');
   const badge = document.getElementById('fp-bell-badge');
   if (!btn || !badge) return;
-  const count = _fpNotifQueue.length;
+  const count = _fpNotifQueue.filter(d => !_fpIsRedundantSuggestion(d)).length;
   if (count > 0) {
     btn.classList.remove('hidden');
     btn.classList.add('has-notifications');
@@ -3856,10 +4595,17 @@ function _fpRenderNotifPanel() {
   for (const item of _fpNotifQueue) {
     const top = item.matches[0];
     if (!top) continue;
+    if (_fpIsRedundantSuggestion(item)) continue;
 
     const card = document.createElement('div');
     card.className = 'fp-notif-card';
     card.dataset.speakerKey = item.speaker_key;
+    card.title = 'Click to jump to first occurrence';
+    card.style.cursor = 'pointer';
+    card.addEventListener('click', e => {
+      if (e.target.closest('.fp-notif-actions')) return;
+      _fpJumpToSpeaker(item.speaker_key);
+    });
 
     const speaker = document.createElement('span');
     speaker.className = 'fp-notif-speaker';
@@ -3986,6 +4732,7 @@ async function _fpLoadSuggestions() {
     if (!res.suggestions?.length) return;
     if (res.session_id !== state.sessionId) return;
     for (const s of res.suggestions) {
+      if (_fpIsRedundantSuggestion(s)) continue;
       // Only add if not already in queue
       if (!_fpNotifQueue.some(q => q.speaker_key === s.speaker_key)) {
         _fpNotifQueue.push(s);
@@ -7027,12 +7774,38 @@ function toggleSummaryPrompt() {
   const hidden = area.classList.toggle('hidden');
   btn.classList.toggle('active', !hidden);
   localStorage.setItem('summary-prompt-open', hidden ? '' : '1');
-  if (!hidden) document.getElementById('summary-custom-prompt').focus();
+  if (!hidden) {
+    // Focus whichever pane is active
+    const activeTab = area.querySelector('.sp-tab.active')?.dataset.spTab || 'instructions';
+    const focusId = activeTab === 'system' ? 'summary-system-prompt' : 'summary-custom-prompt';
+    document.getElementById(focusId)?.focus();
+    // Refresh the system-prompt source chip when the panel opens
+    if (activeTab === 'system') _refreshSummarySystemPromptUI();
+  }
   _syncSummaryBottomRadius();
+}
+
+function _spSwitchTab(name) {
+  const area = document.getElementById('summary-prompt-area');
+  if (!area) return;
+  area.querySelectorAll('.sp-tab').forEach(t => {
+    const active = t.dataset.spTab === name;
+    t.classList.toggle('active', active);
+    t.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  area.querySelectorAll('.sp-pane').forEach(p => {
+    p.classList.toggle('hidden', p.dataset.spPane !== name);
+  });
+  if (name === 'system') _refreshSummarySystemPromptUI();
+  // Focus the visible textarea
+  const focusId = name === 'system' ? 'summary-system-prompt' : 'summary-custom-prompt';
+  document.getElementById(focusId)?.focus();
 }
 
 let _promptSaveTimer = null;
 function saveSummaryPrompt() {
+  // "Save" the custom instructions: persist locally + sync to active backend state.
+  // This is auto-saved per-session because instructions are session-scoped scratchpad.
   clearTimeout(_promptSaveTimer);
   _promptSaveTimer = setTimeout(async () => {
     const text = document.getElementById('summary-custom-prompt').value;
@@ -7043,12 +7816,50 @@ function saveSummaryPrompt() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ custom_prompt: text }),
     });
+    // Show transient saved indicator
+    const st = document.getElementById('summary-instr-status');
+    if (st) {
+      st.textContent = 'Saved';
+      st.classList.add('saved');
+      setTimeout(() => { st.textContent = ''; st.classList.remove('saved'); }, 1500);
+    }
+    // If "use as default" is checked, also persist global default
+    const tog = document.getElementById('summary-instr-default-toggle');
+    if (tog && tog.checked) {
+      _saveSummaryDefaultInstructions(text);
+    }
   }, 600);
+}
+
+function _onSummaryInstrDefaultToggle(checked) {
+  // When toggled ON: save the current text as the global default.
+  // When toggled OFF: clear the global default (but keep the session text).
+  const text = document.getElementById('summary-custom-prompt').value || '';
+  if (checked) {
+    _saveSummaryDefaultInstructions(text);
+  } else {
+    _saveSummaryDefaultInstructions('');
+  }
+}
+
+function _saveSummaryDefaultInstructions(text) {
+  savePref('summary_default_instructions', text);
+  const tog = document.getElementById('summary-instr-default-toggle');
+  if (tog) tog.checked = !!(text && text.length);
 }
 
 function _applyPromptText(text) {
   const ta = document.getElementById('summary-custom-prompt');
-  ta.value = text || '';
+  if (ta) ta.value = text || '';
+  // Reflect "default" toggle state from prefs
+  const tog = document.getElementById('summary-instr-default-toggle');
+  if (tog) {
+    const def = (_prefs.summary_default_instructions || '').trim();
+    // The toggle reads as ON when a non-empty default exists AND it matches what's
+    // currently in the textarea (so the user can see whether the textarea content
+    // *is* the default). It's still controllable manually via the checkbox.
+    tog.checked = !!def && def === (text || '').trim();
+  }
   const show = localStorage.getItem('summary-prompt-open') === '1';
   document.getElementById('summary-prompt-area').classList.toggle('hidden', !show);
   document.getElementById('summary-prompt-toggle').classList.toggle('active', show);
@@ -7058,21 +7869,33 @@ function _applyPromptText(text) {
 async function loadSummaryPrompt() {
   const key = 'summary-prompt:' + (state.sessionId || 'new');
   const stored = localStorage.getItem(key);
+  let initialText = '';
   if (stored !== null) {
-    _applyPromptText(stored);
-    // Sync to backend so active session picks it up
-    await fetch('/api/custom-prompt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ custom_prompt: stored }),
-    }).catch(() => {});
-    return;
+    initialText = stored;
+  } else {
+    // No per-session entry yet: seed from the user's "default instructions" pref
+    // (if set), otherwise from whatever the backend already has.
+    const def = (_prefs.summary_default_instructions || '');
+    if (def) {
+      initialText = def;
+      localStorage.setItem(key, def);
+    } else {
+      try {
+        const r = await fetch('/api/custom-prompt');
+        const data = await r.json();
+        initialText = data.custom_prompt || '';
+      } catch (_) {}
+    }
   }
-  try {
-    const r = await fetch('/api/custom-prompt');
-    const data = await r.json();
-    _applyPromptText(data.custom_prompt || '');
-  } catch (_) {}
+  _applyPromptText(initialText);
+  // Always sync to backend so active session picks it up
+  fetch('/api/custom-prompt', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ custom_prompt: initialText }),
+  }).catch(() => {});
+  // Also load the per-session summary system prompt state
+  loadSessionSummarySystemPrompt();
 }
 
 /* ── Playback ────────────────────────────────────────────────────────────── */
@@ -9553,10 +10376,11 @@ async function clearChat() {
   }).catch(() => {});
 }
 
-/* ── Chat system prompt (global default + per-session override) ───────────── */
+/* ── Chat & Summary system prompts (global defaults + per-session overrides) ─ */
 let _builtinChatPrompt = '';        // fetched once; used for "Load built-in"
-let _sessionChatPrompt = null;      // current session's override (null when none)
-let _globalChatPromptSaveTimer = 0;
+let _builtinSummaryPrompt = '';     // ditto
+let _sessionChatPrompt = null;      // current session's chat override (null = none)
+let _sessionSummaryPrompt = null;   // current session's summary override (null = none)
 
 async function _fetchBuiltinChatPrompt() {
   if (_builtinChatPrompt) return _builtinChatPrompt;
@@ -9567,43 +10391,203 @@ async function _fetchBuiltinChatPrompt() {
   return _builtinChatPrompt;
 }
 
-function _syncGlobalChatPromptUI() {
-  const ta  = document.getElementById('global-chat-prompt');
-  const st  = document.getElementById('global-chat-prompt-status');
+async function _fetchBuiltinSummaryPrompt() {
+  if (_builtinSummaryPrompt) return _builtinSummaryPrompt;
+  try {
+    const r = await fetch('/api/summary/default-prompt').then(r => r.json());
+    _builtinSummaryPrompt = r.prompt || '';
+  } catch { _builtinSummaryPrompt = ''; }
+  return _builtinSummaryPrompt;
+}
+
+// Pre-populate the System Prompts textareas: if the user has saved a custom
+// version, show it; otherwise show the built-in so the textarea is never blank.
+async function _syncGlobalChatPromptUI() {
+  const ta = document.getElementById('global-chat-prompt');
   if (!ta) return;
-  const val = (_prefs.chat_system_prompt || '').trim();
-  if (ta.value !== (_prefs.chat_system_prompt || '')) {
-    ta.value = _prefs.chat_system_prompt || '';
-  }
-  if (st) {
-    if (val) { st.textContent = 'Custom global prompt active'; st.classList.add('custom'); }
-    else     { st.textContent = 'Using built-in default';     st.classList.remove('custom'); }
+  const saved = _prefs.chat_system_prompt;
+  if (typeof saved === 'string' && saved.length) {
+    ta.value = saved;
+  } else {
+    ta.value = await _fetchBuiltinChatPrompt();
   }
 }
 
-function _globalChatPromptChanged(value) {
-  _prefs.chat_system_prompt = value;
-  clearTimeout(_globalChatPromptSaveTimer);
-  _globalChatPromptSaveTimer = setTimeout(() => {
-    savePref('chat_system_prompt', value);
+async function _syncGlobalSummaryPromptUI() {
+  const ta = document.getElementById('global-summary-prompt');
+  if (!ta) return;
+  const saved = _prefs.summary_system_prompt;
+  if (typeof saved === 'string' && saved.length) {
+    ta.value = saved;
+  } else {
+    ta.value = await _fetchBuiltinSummaryPrompt();
+  }
+}
+
+async function resetGlobalChatPrompt() {
+  const ta = document.getElementById('global-chat-prompt');
+  if (!ta) return;
+  ta.value = await _fetchBuiltinChatPrompt();
+  _markPromptsDirty();
+}
+
+async function resetGlobalSummaryPrompt() {
+  const ta = document.getElementById('global-summary-prompt');
+  if (!ta) return;
+  ta.value = await _fetchBuiltinSummaryPrompt();
+  _markPromptsDirty();
+}
+
+function _markPromptsDirty() {
+  const st = document.getElementById('prompts-save-status');
+  if (st) { st.textContent = 'Unsaved changes'; st.classList.add('dirty'); }
+}
+
+async function saveSystemPrompts() {
+  const chatTa    = document.getElementById('global-chat-prompt');
+  const summaryTa = document.getElementById('global-summary-prompt');
+  const chatRaw    = chatTa    ? chatTa.value    : '';
+  const summaryRaw = summaryTa ? summaryTa.value : '';
+
+  // If the textarea matches the built-in verbatim, persist an empty string
+  // so the backend keeps using the latest built-in (in case it ever changes).
+  const builtinChat    = await _fetchBuiltinChatPrompt();
+  const builtinSummary = await _fetchBuiltinSummaryPrompt();
+  const chatVal    = (chatRaw    === builtinChat)    ? '' : chatRaw;
+  const summaryVal = (summaryRaw === builtinSummary) ? '' : summaryRaw;
+
+  _prefs.chat_system_prompt    = chatVal;
+  _prefs.summary_system_prompt = summaryVal;
+
+  const btn = document.getElementById('prompts-save-btn');
+  const st  = document.getElementById('prompts-save-status');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    await fetch('/api/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_system_prompt:    chatVal,
+        summary_system_prompt: summaryVal,
+      }),
+    });
     _syncGlobalChatPromptUI();
-  }, 500);
+    _syncGlobalSummaryPromptUI();
+    if (st) { st.textContent = 'Saved'; st.classList.remove('dirty'); st.classList.add('saved'); }
+    setTimeout(() => { if (st) { st.textContent = ''; st.classList.remove('saved'); } }, 1800);
+  } catch (e) {
+    if (st) { st.textContent = 'Save failed'; st.classList.add('dirty'); }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+  }
 }
 
-function resetGlobalChatPrompt() {
-  const ta = document.getElementById('global-chat-prompt');
-  if (ta) ta.value = '';
-  _prefs.chat_system_prompt = '';
-  savePref('chat_system_prompt', '');
-  _syncGlobalChatPromptUI();
+// Wire dirty-tracking on the System Prompts tab textareas (auto-save was removed).
+document.addEventListener('DOMContentLoaded', () => {
+  ['global-chat-prompt', 'global-summary-prompt'].forEach(id => {
+    const ta = document.getElementById(id);
+    if (ta) ta.addEventListener('input', _markPromptsDirty);
+  });
+});
+
+/* ── Session-level summary system prompt (inline widget) ──────────────────── */
+
+async function loadSessionSummarySystemPrompt() {
+  if (!state.sessionId) {
+    _sessionSummaryPrompt = null;
+    const ta = document.getElementById('summary-system-prompt');
+    if (ta) ta.value = '';
+    _refreshSummarySystemPromptUI();
+    return;
+  }
+  try {
+    const r = await fetch(`/api/sessions/${state.sessionId}/summary-prompt`).then(r => r.json());
+    _sessionSummaryPrompt = r.session_prompt || null;
+    const ta = document.getElementById('summary-system-prompt');
+    if (ta) ta.value = _sessionSummaryPrompt || '';
+    // Cache the effective default text (custom default if set, else built-in)
+    // for the "Load default" button.
+    const loadBtn = document.getElementById('summary-prompt-load-default-btn');
+    if (loadBtn) {
+      const customDefault = (r.global_prompt || '').trim();
+      loadBtn._cachedDefault = customDefault || (r.default_prompt || '');
+    }
+    _refreshSummarySystemPromptUI();
+  } catch {
+    _sessionSummaryPrompt = null;
+    _refreshSummarySystemPromptUI();
+  }
 }
 
-async function loadBuiltinIntoGlobal() {
-  const text = await _fetchBuiltinChatPrompt();
-  const ta = document.getElementById('global-chat-prompt');
+function _refreshSummarySystemPromptUI() {
+  const chip = document.getElementById('summary-prompt-source-chip');
+  const toggleBtn = document.getElementById('summary-prompt-toggle');
+  // Highlight the gear icon when a per-session summary override is active
+  if (toggleBtn) {
+    toggleBtn.classList.toggle('has-override', !!_sessionSummaryPrompt);
+  }
+  if (!chip) return;
+  if (_sessionSummaryPrompt) {
+    chip.textContent = 'Session override';
+    chip.classList.add('custom');
+  } else {
+    chip.textContent = 'Default';
+    chip.classList.remove('custom');
+  }
+}
+
+async function loadDefaultIntoSessionSummary() {
+  const ta = document.getElementById('summary-system-prompt');
   if (!ta) return;
+  const btn = document.getElementById('summary-prompt-load-default-btn');
+  let text = (btn && btn._cachedDefault) || (_prefs.summary_system_prompt || '');
+  if (!text) text = await _fetchBuiltinSummaryPrompt();
   ta.value = text;
-  _globalChatPromptChanged(text);
+}
+
+async function saveSessionSummaryPrompt() {
+  if (!state.sessionId) return;
+  const ta = document.getElementById('summary-system-prompt');
+  const value = ta ? ta.value : '';
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/summary-prompt`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: value }),
+    });
+    _sessionSummaryPrompt = value.trim() ? value : null;
+    _refreshSummarySystemPromptUI();
+    // Brief confirmation flash on the chip
+    const chip = document.getElementById('summary-prompt-source-chip');
+    if (chip) {
+      const orig = chip.textContent;
+      chip.textContent = 'Saved';
+      chip.classList.add('saved-flash');
+      setTimeout(() => {
+        chip.classList.remove('saved-flash');
+        _refreshSummarySystemPromptUI();
+      }, 1200);
+    }
+  } catch (e) {
+    console.error('Failed to save session summary prompt', e);
+  }
+}
+
+async function clearSessionSummaryPrompt() {
+  if (!state.sessionId) return;
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/summary-prompt`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: null }),
+    });
+    _sessionSummaryPrompt = null;
+    const ta = document.getElementById('summary-system-prompt');
+    if (ta) ta.value = '';
+    _refreshSummarySystemPromptUI();
+  } catch (e) {
+    console.error('Failed to clear session summary prompt', e);
+  }
 }
 
 /* ── Session-level override: chat-header gear icon + dialog ──────────────── */
@@ -11333,11 +12317,6 @@ function _applyAiConfig(provider, model, modelsByProvider = AI_MODELS) {
   });
   sel.disabled = models.length === 0;
 
-  // Show only the active provider's key field
-  const anthField = document.getElementById('key-anthropic-field');
-  const oaiField  = document.getElementById('key-openai-field');
-  anthField.style.display = provider === 'anthropic' ? '' : 'none';
-  oaiField.style.display  = provider === 'openai'    ? '' : 'none';
 }
 
 async function setAiProvider(provider) {
