@@ -1707,7 +1707,11 @@ def stop_recording():
                     log.info("recording", f"Skipping auto-title for {sid}: user-set title is locked")
                 else:
                     ctx = storage.get_title_generation_context(sid)
-                    title = ai.generate_title(transcript_snapshot or plain_snapshot, context=ctx)
+                    title = ai.generate_title(
+                        transcript_snapshot or plain_snapshot,
+                        context=ctx,
+                        system_prompt=settings.get("title_system_prompt") or None,
+                    )
                     if title:
                         storage.update_session_title(sid, title, user_set=False)
                         _push("session_title", {"session_id": sid, "title": title})
@@ -3206,14 +3210,35 @@ def chat():
         def on_tool_event(event_type: str, payload: dict) -> None:
             if cancel_event.is_set():
                 return
-            # Collect tool call data for persistence (omit large image data)
+            # Collect tool call data for persistence (omit large image data).
+            # Match results to calls by id so parallel tool execution doesn't
+            # mis-pair them; fall back to the first unresolved entry if the
+            # backend somehow didn't supply an id.
             if event_type == "tool_call":
-                tool_calls_log.append({"name": payload["name"], "input": payload.get("input", {}), "result": None})
+                tool_calls_log.append({
+                    "id": payload.get("id"),
+                    "name": payload["name"],
+                    "input": payload.get("input", {}),
+                    "result": None,
+                })
             elif event_type == "tool_result" and tool_calls_log:
-                tool_calls_log[-1]["result"] = {
-                    "success": payload.get("success", False),
-                    "summary": payload.get("summary", ""),
-                }
+                target = None
+                pid = payload.get("id")
+                if pid is not None:
+                    for tc in tool_calls_log:
+                        if tc.get("id") == pid and tc["result"] is None:
+                            target = tc
+                            break
+                if target is None:
+                    for tc in tool_calls_log:
+                        if tc["result"] is None:
+                            target = tc
+                            break
+                if target is not None:
+                    target["result"] = {
+                        "success": payload.get("success", False),
+                        "summary": payload.get("summary", ""),
+                    }
             _push("chat_tool_event", {
                 "request_id": request_id,
                 "type": event_type,
@@ -3340,6 +3365,12 @@ def api_summary_default_prompt():
     return jsonify({"prompt": AIAssistant._SYSTEM_SUMMARY})
 
 
+@app.route("/api/title/default-prompt", methods=["GET"])
+def api_title_default_prompt():
+    """Return the built-in default session-title system prompt (read-only)."""
+    return jsonify({"prompt": AIAssistant._SYSTEM_TITLE})
+
+
 @app.route("/api/sessions/<sid>/summary-prompt", methods=["GET"])
 def api_get_session_summary_prompt(sid):
     """Return all three prompt layers so the UI can show what's in effect."""
@@ -3361,6 +3392,86 @@ def api_set_session_summary_prompt(sid):
         return jsonify({"error": "prompt must be a string or null"}), 400
     storage.set_session_summary_prompt(sid, prompt)
     return jsonify({"ok": True, "session_prompt": prompt})
+
+
+# ── Notes (rich-text Quill Delta + inline attachments) ──────────────────────
+
+_NOTES_DIR = paths.data_dir() / "notes"
+_NOTES_DIR.mkdir(parents=True, exist_ok=True)
+
+_NOTES_MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024  # 50 MB per attachment
+
+
+@app.route("/api/sessions/<sid>/notes", methods=["GET"])
+def api_get_session_notes(sid):
+    """Return the stored rich-text notes for a session, or an empty payload."""
+    payload = storage.get_session_notes(sid)
+    if not payload:
+        return jsonify({"delta": None, "updated_at": None})
+    return jsonify(payload)
+
+
+@app.route("/api/sessions/<sid>/notes", methods=["PUT"])
+def api_set_session_notes(sid):
+    """Persist a Quill Delta document for the session. Pass null to clear."""
+    data = request.get_json(silent=True, force=True) or {}
+    delta = data.get("delta")
+    if delta is not None and not isinstance(delta, (dict, list)):
+        return jsonify({"error": "delta must be an object, list, or null"}), 400
+    # Quill emits {"ops": [...]}; tolerate both shapes for forward compat.
+    if isinstance(delta, dict):
+        ops = delta.get("ops")
+        if ops is None or (isinstance(ops, list) and not ops):
+            delta = None
+    elif isinstance(delta, list) and not delta:
+        delta = None
+    storage.set_session_notes(sid, delta)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sessions/<sid>/notes/attachments", methods=["POST"])
+def api_upload_note_attachment(sid):
+    """Upload an inline image or attached file for the notes pane.
+
+    Returns a JSON payload with the URL for embedding into the Quill document
+    plus metadata (filename, mime, size) used to render the inline chip.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    data_bytes = f.read()
+    if len(data_bytes) > _NOTES_MAX_ATTACHMENT_SIZE:
+        return jsonify({"error": "File too large (max 50 MB)"}), 413
+
+    mime = (f.content_type or "application/octet-stream").lower()
+    fid = str(uuid.uuid4())
+    suffix = Path(f.filename).suffix.lower() or ""
+    stored_name = fid + suffix
+
+    session_dir = _NOTES_DIR / sid
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / stored_name).write_bytes(data_bytes)
+
+    return jsonify({
+        "id": fid,
+        "filename": f.filename,
+        "mime": mime,
+        "size": len(data_bytes),
+        "stored": stored_name,
+        "url": f"/api/sessions/{sid}/notes/attachments/{stored_name}",
+    })
+
+
+@app.route("/api/sessions/<sid>/notes/attachments/<stored>", methods=["GET"])
+def api_get_note_attachment(sid, stored):
+    """Serve a previously uploaded note attachment."""
+    path = _NOTES_DIR / sid / stored
+    if not path.exists() or ".." in stored or "/" in stored or "\\" in stored:
+        return jsonify({"error": "Not found"}), 404
+    return send_file(path)
 
 
 # ── Global Chat ──────────────────────────────────────────────────────────────
@@ -3689,13 +3800,34 @@ def global_chat():
         def on_tool_event(event_type: str, payload: dict) -> None:
             if cancel_event.is_set():
                 return
+            # Match results to calls by id so parallel tool execution doesn't
+            # mis-pair them; fall back to the first unresolved entry if the
+            # backend somehow didn't supply an id.
             if event_type == "tool_call":
-                tool_calls_log.append({"name": payload["name"], "input": payload.get("input", {}), "result": None})
+                tool_calls_log.append({
+                    "id": payload.get("id"),
+                    "name": payload["name"],
+                    "input": payload.get("input", {}),
+                    "result": None,
+                })
             elif event_type == "tool_result" and tool_calls_log:
-                tool_calls_log[-1]["result"] = {
-                    "success": payload.get("success", False),
-                    "summary": payload.get("summary", ""),
-                }
+                target = None
+                pid = payload.get("id")
+                if pid is not None:
+                    for tc in tool_calls_log:
+                        if tc.get("id") == pid and tc["result"] is None:
+                            target = tc
+                            break
+                if target is None:
+                    for tc in tool_calls_log:
+                        if tc["result"] is None:
+                            target = tc
+                            break
+                if target is not None:
+                    target["result"] = {
+                        "success": payload.get("success", False),
+                        "summary": payload.get("summary", ""),
+                    }
             _push("global_chat_tool_event", {
                 "request_id": request_id,
                 "type": event_type,
@@ -3712,7 +3844,10 @@ def global_chat():
             # Auto-title: if this is the first exchange and title is still default
             if conv and conv.get("title") in ("New Chat", None, ""):
                 try:
-                    title = ai.generate_title(question)
+                    title = ai.generate_title(
+                        question,
+                        system_prompt=settings.get("title_system_prompt") or None,
+                    )
                     if title:
                         storage.rename_global_conversation(conversation_id, title)
                         _push("global_chat_title", {
@@ -4724,6 +4859,7 @@ def _retitle_one(sid: str) -> dict | None:
         title = ai.generate_title(
             transcript or " ".join(s["text"] for s in segs),
             context=ctx,
+            system_prompt=settings.get("title_system_prompt") or None,
         )
         if not title:
             return None
@@ -4852,6 +4988,18 @@ def export_session(session_id: str):
                     stored = att.get("stored")
                     if stored and (attach_dir / stored).is_file():
                         zf.write(str(attach_dir / stored), f"attachments/{stored}")
+
+        # Include notes attachments (images + dropped files referenced in the
+        # rich-text Delta). Stored files are already in their final compressed
+        # form (PNG / PDF / etc.), so use ZIP_STORED to avoid re-compressing.
+        include_notes = include is None or "notes" in (include or set())
+        if include_notes:
+            notes_dir = data_dir / "notes" / session_id
+            if notes_dir.is_dir():
+                for f in notes_dir.iterdir():
+                    if f.is_file():
+                        zf.write(str(f), f"notes_attachments/{f.name}",
+                                 compress_type=zipfile.ZIP_STORED)
 
     buf.seek(0)
     title = (pkg.get("metadata", {}).get("title") or "meeting").strip()
@@ -5017,20 +5165,46 @@ def import_session():
                             import shutil
                             shutil.copyfileobj(src, dst)
 
-            # Rewrite screenshot URLs in chat messages and summary to point to new session ID
+            # Extract notes attachments — restore each file under the new
+            # session's notes dir so the in-Delta URLs (after the rewrite
+            # below) resolve.
+            notes_prefix = "notes_attachments/"
+            notes_files = [n for n in names if n.startswith(notes_prefix) and not n.endswith("/")]
+            if notes_files:
+                notes_out = data_dir / "notes" / new_session_id
+                notes_out.mkdir(parents=True, exist_ok=True)
+                for name in notes_files:
+                    fname = name[len(notes_prefix):]
+                    if fname and "/" not in fname:
+                        with zf.open(name) as src, open(str(notes_out / fname), "wb") as dst:
+                            import shutil
+                            shutil.copyfileobj(src, dst)
+
+            # Rewrite screenshot URLs in chat/summary AND notes-attachment
+            # URLs in the notes Delta to point to the new session ID.
             if old_session_id and old_session_id != new_session_id:
-                old_url_prefix = f"/api/sessions/{old_session_id}/screenshots/"
-                new_url_prefix = f"/api/sessions/{new_session_id}/screenshots/"
+                old_ss_prefix = f"/api/sessions/{old_session_id}/screenshots/"
+                new_ss_prefix = f"/api/sessions/{new_session_id}/screenshots/"
+                old_notes_prefix = f"/api/sessions/{old_session_id}/notes/attachments/"
+                new_notes_prefix = f"/api/sessions/{new_session_id}/notes/attachments/"
                 with storage._conn() as conn:
                     conn.execute(
                         "UPDATE chat_messages SET content = REPLACE(content, ?, ?) "
                         "WHERE session_id = ?",
-                        (old_url_prefix, new_url_prefix, new_session_id),
+                        (old_ss_prefix, new_ss_prefix, new_session_id),
                     )
                     conn.execute(
                         "UPDATE summaries SET content = REPLACE(content, ?, ?) "
                         "WHERE session_id = ?",
-                        (old_url_prefix, new_url_prefix, new_session_id),
+                        (old_ss_prefix, new_ss_prefix, new_session_id),
+                    )
+                    # Notes are stored as a JSON-serialized Quill Delta in
+                    # sessions.notes; embed URLs are plain strings inside
+                    # that JSON, so REPLACE at the column level is safe.
+                    conn.execute(
+                        "UPDATE sessions SET notes = REPLACE(notes, ?, ?) "
+                        "WHERE id = ? AND notes IS NOT NULL",
+                        (old_notes_prefix, new_notes_prefix, new_session_id),
                     )
 
             # Ingest speaker embeddings into the voice library if available
@@ -5653,6 +5827,180 @@ def restart():
 
     threading.Thread(target=_do_restart, daemon=True).start()
     return jsonify({"ok": True})
+
+
+# ── Changelog ────────────────────────────────────────────────────────────────
+
+_CHANGELOG_CACHE_NAME = "changelog.json"
+_CHANGELOG_MAX_COMMITS = 200
+
+
+def _changelog_category(subject: str) -> str:
+    """Crude categorization based on the first word of the commit subject.
+    Drives the icon + accent color in the UI; not user-editable.
+
+    Subject convention is past tense ("Added", "Fixed"). Imperative forms
+    ("Add", "Fix") are also accepted so commits from before that
+    convention landed still get their icons. Leading non-letter chars are
+    stripped defensively before matching."""
+    s = subject.strip().lower()
+    s = re.sub(r"^[^\w]+", "", s).lstrip()
+    # Fix
+    if s.startswith((
+        "fixed ", "fix ", "fix:", "bug ", "bug:",
+        "guarded ", "guard ", "hardened ", "harden ",
+    )) or s.startswith(("fix-", "self-heal")):
+        return "fix"
+    # Feature
+    if s.startswith((
+        "added ", "add ", "add:", "new ", "new:",
+        "created ", "create ", "built ", "build ",
+    )):
+        return "feature"
+    # Refactor
+    if s.startswith((
+        "refactored", "refactor",
+        "rewrote", "rewrite",
+        "restructured", "restructure",
+        "reorganized", "reorganize",
+        "consolidated", "consolidate",
+    )):
+        return "refactor"
+    # Improvement
+    if s.startswith((
+        "updated", "update",
+        "improved", "improve",
+        "enhanced", "enhance",
+        "polished", "polish",
+        "tightened", "tighten",
+        "tuned ", "tune ",
+        "reworked", "rework",
+        "replaced", "replace",
+        "switched", "switch",
+        "made ", "make ",
+    )):
+        return "improvement"
+    # Removal
+    if s.startswith((
+        "removed", "remove",
+        "dropped ", "drop ",
+        "killed ", "kill ",
+        "stripped ", "strip ",
+    )):
+        return "removal"
+    return "other"
+
+
+def _build_changelog(root: Path) -> dict:
+    """Run ``git log`` and parse it into a structured payload. Caller is
+    responsible for caching."""
+    from datetime import datetime as _dt
+    SEP = "\x1e"
+    FIELD_SEP = "\x1f"
+    fmt = FIELD_SEP.join(["%H", "%h", "%ad", "%s", "%b"]) + SEP
+    log = subprocess.run(
+        ["git", "log", f"--pretty=format:{fmt}",
+         "--date=short", "--no-merges", "-n", str(_CHANGELOG_MAX_COMMITS)],
+        cwd=str(root), capture_output=True, text=True, timeout=10,
+        encoding="utf-8",
+    )
+    if log.returncode != 0:
+        raise RuntimeError(log.stderr.strip() or "git log failed")
+
+    commits = []
+    # Drop trailers we don't want surfaced (Co-author signatures, generated-with
+    # footers). Defensive — these shouldn't normally land in commits per repo
+    # policy, but old commits may carry them.
+    skip_substrings = (
+        "co-authored-by:",
+        "co-author-by:",
+        "🤖 generated with",
+        "generated with [claude",
+    )
+    for raw in log.stdout.split(SEP):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split(FIELD_SEP)
+        if len(parts) < 5:
+            continue
+        h, sh, date, subject, body = parts[0], parts[1], parts[2], parts[3], parts[4]
+        body_lines = []
+        for line in body.splitlines():
+            if any(s in line.lower() for s in skip_substrings):
+                continue
+            body_lines.append(line)
+        body_clean = "\n".join(body_lines).strip()
+        commits.append({
+            "hash":     h,
+            "short":    sh,
+            "date":     date,
+            "subject":  subject.strip(),
+            "body":     body_clean,
+            "category": _changelog_category(subject),
+        })
+
+    head_hash = commits[0]["hash"] if commits else ""
+    return {
+        "head":         head_hash,
+        "generated_at": _dt.utcnow().isoformat(),
+        "count":        len(commits),
+        "commits":      commits,
+    }
+
+
+@app.route("/api/changelog")
+def api_changelog():
+    """Return a parsed, locally-cached changelog from git history.
+
+    The cache is keyed by HEAD; if HEAD hasn't moved since the last build,
+    git is not invoked and the cached payload is served. Pass ``?refresh=1``
+    to force a rebuild (used by the "Refresh" button on the Changelog tab).
+    """
+    root = Path(__file__).parent
+    cache_path = paths.data_dir() / _CHANGELOG_CACHE_NAME
+    refresh = bool(request.args.get("refresh"))
+
+    # Resolve current HEAD cheaply so we can short-circuit when cache is fresh.
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(root), capture_output=True, text=True, timeout=5,
+        )
+        if rev.returncode != 0:
+            return jsonify({"error": "Not a git repository"}), 500
+        head_hash = rev.stdout.strip()
+    except FileNotFoundError:
+        return jsonify({"error": "git not available on this machine"}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "git rev-parse timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if not refresh and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("head") == head_hash:
+                cached["fresh"] = False
+                return jsonify(cached)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    try:
+        payload = _build_changelog(root)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "git log timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as e:
+        log.warn("changelog", f"Failed to write cache: {e}")
+
+    payload["fresh"] = True
+    return jsonify(payload)
 
 
 # ── Update / self-update ──────────────────────────────────────────────────────

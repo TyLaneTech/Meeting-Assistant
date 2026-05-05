@@ -3820,6 +3820,623 @@ body.video-fullscreen .playback-bar {
 .settings-nav-item:hover { background: var(--surface2); color: var(--fg); }
 .settings-nav-item.active { background: var(--surface2); color: var(--accent); font-weight: 700; }
 
+/* Pin a nav item to the bottom of the nav column. The flex parent already
+ * stacks vertically, so margin-top:auto pushes this item all the way down
+ * regardless of how many sibling tabs are added above it. */
+ .settings-nav-item-pinned {
+     margin-top: auto;
+     /* border-top: 1px solid var(--border); */
+     padding-top: 12px;
+ }
+
+/* ── System Prompts collapsible sections ────────────────────────────────── */
+.prompt-section {
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--sub-panel-bg-trans);
+  overflow: hidden;
+}
+.prompt-section[open] {
+  background: var(--sub-panel-bg-trans);
+  border-color: color-mix(in srgb, var(--accent) 25%, var(--border));
+}
+.prompt-section-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+  transition: background .12s ease;
+}
+.prompt-section-summary::-webkit-details-marker { display: none; }
+.prompt-section-summary:hover { background: var(--surface2); }
+.prompt-section-chevron {
+  font-size: 10px;
+  color: var(--fg-muted);
+  transition: transform .15s ease;
+  width: 10px;
+  text-align: center;
+}
+.prompt-section[open] > .prompt-section-summary .prompt-section-chevron {
+  transform: rotate(90deg);
+  color: var(--accent);
+}
+.prompt-section-title { flex: 1; }
+.prompt-section-tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--fg-muted);
+}
+.prompt-section-tag.custom {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+.prompt-section .settings-group {
+  margin: 0 12px 12px 12px;
+  background: transparent;
+  border: none;
+}
+
+/* ── What's New popup ───────────────────────────────────────────────────── */
+.whats-new-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  opacity: 0;
+  transition: opacity .2s ease;
+  text-align: left;
+}
+.whats-new-overlay.visible { opacity: 1; }
+.whats-new-overlay.closing { opacity: 0; }
+
+.whats-new-dialog {
+  width: min(580px, 100%);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow:
+    0 30px 80px -16px rgba(0, 0, 0, 0.6),
+    0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+  overflow: hidden;
+  transform: translateY(10px) scale(0.97);
+  opacity: 0;
+  transition: transform .26s cubic-bezier(.2, .9, .3, 1), opacity .2s ease;
+}
+.whats-new-overlay.visible .whats-new-dialog {
+  transform: translateY(0) scale(1);
+  opacity: 1;
+}
+
+/* Hero gets a soft category-tinted wash — present but not loud, so the
+ * subject heading does the talking. */
+.whats-new-hero {
+  position: relative;
+  padding: 27px 30px 22px;
+  border-bottom: 1px solid var(--border-sub);
+  background:
+    radial-gradient(110% 90% at 0% 0%,
+      color-mix(in srgb, var(--accent) 11%, transparent) 0%,
+      transparent 60%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 5%, transparent),
+      transparent 80%);
+  text-align: left;
+}
+.whats-new-hero[data-cat="feature"] {
+  background:
+    radial-gradient(110% 90% at 0% 0%,
+      color-mix(in srgb, var(--green) 11%, transparent) 0%,
+      transparent 60%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--green) 5%, transparent),
+      transparent 80%);
+}
+.whats-new-hero[data-cat="fix"] {
+  background:
+    radial-gradient(110% 90% at 0% 0%,
+      color-mix(in srgb, var(--red) 11%, transparent) 0%,
+      transparent 60%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--red) 5%, transparent),
+      transparent 80%);
+}
+.whats-new-hero[data-cat="refactor"] {
+  background:
+    radial-gradient(110% 90% at 0% 0%,
+      color-mix(in srgb, var(--purple) 11%, transparent) 0%,
+      transparent 60%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--purple) 5%, transparent),
+      transparent 80%);
+}
+.whats-new-hero[data-cat="removal"] {
+  background:
+    radial-gradient(110% 90% at 0% 0%,
+      color-mix(in srgb, var(--yellow, #d29922) 11%, transparent) 0%,
+      transparent 60%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--yellow, #d29922) 5%, transparent),
+      transparent 80%);
+}
+
+.whats-new-x {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--bg) 50%, transparent);
+  color: var(--fg-muted);
+  font-size: 13px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .12s ease, color .12s ease;
+}
+.whats-new-x:hover { background: var(--surface2); color: var(--fg); }
+
+/* App brand mark instead of a generic category circle — keeps the popup
+ * grounded as "this is the Meeting Assistant talking", with the category
+ * still readable from the colored tag below the subject. */
+.whats-new-icon {
+  /* width: 52px; */
+  /* height: 52px; */
+  display: flex;
+  margin-inline: 0px 0px;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 17px;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.35));
+}
+.whats-new-icon img {
+    width: 52px;
+    height: 52px;
+}
+.whats-new-logo {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.whats-new-eyebrow {
+  font-size: 1.5em;
+  width: -webkit-fill-available;
+  font-weight: 700;
+  text-align: left;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  /* margin-bottom: 8px; */
+}
+.whats-new-subject {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--fg);
+  line-height: 1.25;
+  letter-spacing: -0.018em;
+  /* Slight text-shadow lifts the heading off the tinted hero background
+   * without competing with the soft gradient. */
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
+}
+.whats-new-meta {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+.whats-new-cat-tag {
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 700;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg-muted) 18%, transparent);
+  color: var(--fg-muted);
+}
+.whats-new-hero[data-cat="feature"] .whats-new-cat-tag {
+  background: color-mix(in srgb, var(--green) 22%, transparent); color: var(--green);
+}
+.whats-new-hero[data-cat="fix"] .whats-new-cat-tag {
+  background: color-mix(in srgb, var(--red) 22%, transparent); color: var(--red);
+}
+.whats-new-hero[data-cat="improvement"] .whats-new-cat-tag {
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent);
+}
+.whats-new-hero[data-cat="refactor"] .whats-new-cat-tag {
+  background: color-mix(in srgb, var(--purple) 22%, transparent); color: var(--purple);
+}
+.whats-new-hero[data-cat="removal"] .whats-new-cat-tag {
+  background: color-mix(in srgb, var(--yellow, #d29922) 22%, transparent);
+  color: var(--yellow, #d29922);
+}
+.whats-new-hash {
+  font-family: var(--font-mono);
+  letter-spacing: 0.4px;
+  color: var(--fg-subtle);
+}
+
+/* Body reuses the changelog renderer so every section heading + bullet
+ * matches the Changelog tab styling. Unlike that tab, the popup is meant
+ * to be fully readable — no max-height clamp, no fade-out gradient. */
+.whats-new-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 28px 22px;
+}
+.whats-new-body .changelog-entry-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg-muted);
+  max-height: none;
+  overflow: visible;
+}
+.whats-new-body .changelog-entry-body::after { display: none; }
+.whats-new-body .changelog-section { margin-top: 14px; }
+.whats-new-body .changelog-section:first-child { margin-top: 0; }
+.whats-new-body .changelog-section-heading {
+  font-size: 11.5px;
+  letter-spacing: 0.7px;
+}
+.whats-new-empty {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+.whats-new-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--border-sub);
+  background: var(--sub-panel-bg-trans);
+}
+.whats-new-secondary,
+.whats-new-primary {
+  border-radius: var(--radius-sm);
+  padding: 8px 16px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background .12s ease, color .12s ease, border-color .12s ease, filter .12s ease;
+}
+.whats-new-secondary {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+}
+.whats-new-secondary:hover {
+  background: var(--surface2);
+  color: var(--fg);
+  border-color: var(--fg-subtle);
+}
+.whats-new-primary {
+  background: var(--accent);
+  color: #fff;
+  border: 1px solid var(--accent);
+}
+.whats-new-primary:hover { filter: brightness(1.08); }
+.whats-new-primary:active { filter: brightness(0.95); }
+
+/* ── Changelog tab ──────────────────────────────────────────────────────── */
+.changelog-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 14px 16px 14px 18px;
+  background: var(--sub-panel-bg-trans);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+/* Accent gradient bar tying the header back to the changelog category palette. */
+.changelog-header::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: linear-gradient(180deg,
+    var(--accent),
+    color-mix(in srgb, var(--accent) 30%, transparent));
+}
+.changelog-header-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.changelog-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--fg);
+  letter-spacing: -0.005em;
+}
+.changelog-title-icon {
+  font-size: 13px;
+  color: var(--accent);
+}
+.changelog-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+/* Meta row with subtle bullet separators between parts and a mono hash chip. */
+.changelog-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+.changelog-meta > span:not(:last-child)::after {
+  /* content: '·'; */
+  margin-left: 8px;
+  color: var(--fg-subtle);
+  opacity: 0.6;
+}
+.changelog-meta-when { color: var(--fg-muted); }
+.changelog-meta-hash {
+  font-family: var(--font-mono);
+  letter-spacing: 0.4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg-subtle) 16%, transparent);
+  color: var(--fg-muted);
+}
+.changelog-meta-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.changelog-meta-status > i {
+  font-size: 5px;
+  line-height: 1;
+  color: var(--fg-subtle);
+}
+.changelog-meta-status.fresh > i { color: var(--green); }
+.changelog-meta-status.fresh { color: var(--green); }
+.changelog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 12px;
+}
+.changelog-empty,
+.changelog-error {
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  padding: 32px 12px;
+}
+.changelog-error { color: var(--red, #f05541); }
+
+/* Date heading: left-aligned with a hairline rule trailing off to the right
+ * so the eye can scan the timeline without center-aligned noise. */
+.changelog-day {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--fg);
+  text-align: left;
+}
+.changelog-day::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-sub);
+}
+.changelog-day:first-child { margin-top: 0; }
+
+.changelog-entry {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 14px;
+  padding: 14px 16px;
+  background: var(--sub-panel-bg-trans);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  /* Defensive — the surrounding settings panel inherits text-align: center
+   * from one of its ancestors; force left-aligned content here. */
+  text-align: left;
+  align-items: start;
+  transition: border-color .15s ease, background .15s ease;
+}
+.changelog-entry:hover {
+  border-color: color-mix(in srgb, var(--fg-subtle) 60%, var(--border));
+}
+.changelog-entry-icon {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--fg-muted) 16%, transparent);
+  color: var(--fg-muted);
+  font-size: 12px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.changelog-entry[data-cat="feature"] .changelog-entry-icon {
+  background: color-mix(in srgb, var(--green) 22%, transparent);
+  color: var(--green);
+}
+.changelog-entry[data-cat="fix"] .changelog-entry-icon {
+  background: color-mix(in srgb, var(--red) 22%, transparent);
+  color: var(--red);
+}
+.changelog-entry[data-cat="improvement"] .changelog-entry-icon {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+}
+.changelog-entry[data-cat="refactor"] .changelog-entry-icon {
+  background: color-mix(in srgb, var(--purple) 22%, transparent);
+  color: var(--purple);
+}
+.changelog-entry[data-cat="removal"] .changelog-entry-icon {
+  background: color-mix(in srgb, var(--yellow, #d29922) 22%, transparent);
+  color: var(--yellow, #d29922);
+}
+
+.changelog-entry-content {
+  min-width: 0;
+  text-align: left;
+}
+.changelog-entry-subject {
+  font-size: 13.5px;
+  color: var(--fg);
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
+  text-align: left;
+}
+.changelog-entry-body {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  line-height: 1.55;
+  text-align: left;
+  /* Collapsed by default — show ~5 lines worth, expanded removes the cap. */
+  max-height: 7.7em;
+  overflow: hidden;
+  position: relative;
+}
+.changelog-entry-body::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 26px;
+  pointer-events: none;
+  background: linear-gradient(transparent,
+    color-mix(in srgb, var(--bg) 75%, var(--sub-panel-bg-trans)));
+  opacity: 1;
+  transition: opacity .12s ease;
+}
+.changelog-entry.expanded .changelog-entry-body {
+  max-height: none;
+  overflow: visible;
+}
+.changelog-entry.expanded .changelog-entry-body::after { opacity: 0; }
+
+/* Sub-section: a heading line followed by its bullets. The accent-tinted
+ * left rule on the heading anchors it visually so the sub-section reads
+ * as its own group, distinct from any neighboring bullets. */
+.changelog-section {
+  margin-top: 12px;
+  text-align: left;
+}
+.changelog-section:first-child { margin-top: 0; }
+.changelog-section-heading {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--fg);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 2px 0 2px 9px;
+  margin-bottom: 4px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+}
+.changelog-para {
+  margin: 4px 0;
+  text-align: left;
+}
+.changelog-bullets {
+  margin: 2px 0 0 0;
+  padding: 0;
+  list-style: none;
+  text-align: left;
+}
+.changelog-bullets li {
+  position: relative;
+  padding-left: 16px;
+  margin: 2px 0;
+  text-align: left;
+}
+.changelog-bullets li::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 0.6em;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--fg-subtle) 80%, transparent);
+}
+
+.changelog-entry-toggle {
+  margin-top: 8px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.changelog-entry-toggle:hover { text-decoration: underline; }
+.changelog-entry-foot {
+  margin-top: 10px;
+  font-size: 10.5px;
+  color: var(--fg-subtle);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.4px;
+  text-align: left;
+}
+
 .settings-content {
   flex: 1;
   overflow-y: auto;
@@ -4252,8 +4869,8 @@ body.video-fullscreen .playback-bar {
 
 .settings-key-row { padding: 13px 16px; display: flex; flex-direction: column; gap: 8px; }
 .settings-key-header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.settings-key-link { font-size: 11px; color: var(--accent); text-decoration: none; margin-left: auto; }
-.settings-key-link:hover { text-decoration: underline; }
+.settings-key-link {font-size: 11px;color: var(--accent);text-decoration: none !important;cursor: pointer;margin-left: auto;border: none;background-color: var(--surface2);padding: 4px 6px;border-radius: 3px;}
+.settings-key-link:hover { text-decoration: underline; filter: brightness(1.2);}
 
 .settings-req { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--red); letter-spacing: 0.3px; }
 .settings-opt { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--fg-subtle); letter-spacing: 0.3px; }
@@ -6230,7 +6847,7 @@ button#analytics-btn.active {
     margin-right: -6px;
 }
 
-.col-summary .col-header, .col-chat .col-header {
+.col-summary .col-header, .col-chat .col-header, .col-notes .col-header {
     margin-right: -6px;
 }
 .col-chat .col-header {
@@ -8584,4 +9201,562 @@ button#upload-audio-btn {
 
 .expanded > .folder-header:hover {
     background: var(--surface3);
+}
+
+/* ── Notes pane ─────────────────────────────────────────────────────────── */
+.col-notes {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.col-notes .col-header { background: var(--surface); }
+
+.notes-badge {
+  background: var(--accent-dim);
+  color: var(--fg);
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+.notes-badge.saved {
+  background: var(--green, #00b464);
+  color: #0d1117;
+  animation: none;
+}
+
+/* ── Notes image resize handles ────────────────────────────────────────── */
+.notes-img-resize-overlay {
+  position: absolute;
+  pointer-events: none;
+  display: none;
+  z-index: 60;
+  border: 1.5px dashed var(--accent);
+  box-sizing: border-box;
+  border-radius: 2px;
+}
+.notes-img-resize-overlay.active { display: block; }
+
+.notes-img-handle {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  background: var(--accent);
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  pointer-events: auto;
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.notes-img-handle[data-corner="tl"] { top: -6px;    left: -6px;   cursor: nwse-resize; }
+.notes-img-handle[data-corner="tr"] { top: -6px;    right: -6px;  cursor: nesw-resize; }
+.notes-img-handle[data-corner="bl"] { bottom: -6px; left: -6px;   cursor: nesw-resize; }
+.notes-img-handle[data-corner="br"] { bottom: -6px; right: -6px;  cursor: nwse-resize; }
+
+.notes-img-size-label {
+  position: absolute;
+  bottom: -22px;
+  right: 0;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+body.notes-img-resizing .notes-img-size-label { opacity: 1; }
+body.notes-img-resizing { user-select: none; cursor: grabbing; }
+
+/* Pasted/uploaded images shouldn't overflow the editor width by default. */
+.col-notes .ql-editor img { max-width: 100%; height: auto; }
+
+/* ── Toolbar (Quill snow theme overrides) ───────────────────────────────── */
+.notes-toolbar-wrap {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  padding: 4px 8px;
+  /* Round bottom corners so the combined col-header + toolbar reads as one
+   * panel matching the other column headers (chat / summary). */
+  border-radius: 0 0 var(--radius) var(--radius);
+  margin-right: -6px;
+  /* Container query target — alignment options expand when there's room. */
+  container-type: inline-size;
+  container-name: notes-toolbar;
+}
+
+/* Expanded alignment buttons by default; collapse to a single picker when
+ * the toolbar can't fit them comfortably. Threshold tuned so the four
+ * align buttons (~120px) don't push the rightmost groups onto a wrap. */
+.notes-align-collapsed { display: none !important; }
+@container notes-toolbar (max-width: 520px) {
+  .notes-align-expanded  { display: none !important; }
+  .notes-align-collapsed { display: inline-flex !important; }
+}
+
+.notes-toolbar.ql-toolbar.ql-snow {
+  border: none;
+  padding: 4px 0;
+  background: transparent;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 4px;
+  font-family: inherit;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-formats {
+  margin-right: 4px;
+  padding: 1px 4px;
+  display: flex;
+  gap: 2px;
+  padding-block: 4px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface2) 75%, transparent);
+}
+.notes-toolbar.ql-toolbar.ql-snow button {
+  width: 26px;
+  height: 24px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: var(--fg-muted);
+  transition: background .12s, color .12s;
+}
+.notes-toolbar.ql-toolbar.ql-snow button:hover {
+  background: var(--surface3);
+  color: var(--fg);
+}
+.notes-toolbar.ql-toolbar.ql-snow button.ql-active,
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-label.ql-active,
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-item.ql-selected {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+/* Color / background pickers communicate "active" state via the colored
+ * underline already painted into their icon — no background tint needed. */
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-label.ql-active,
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-label.ql-active:hover {
+  background: transparent;
+  color: var(--fg-muted);
+}
+/* Force the "A" portion of the color/background icons to render as muted
+ * foreground so it never reads as "your text will be the accent color" —
+ * only the underline communicates the actual chosen color. The
+ * Quill-managed .ql-color-label keeps its inline style and shows the
+ * user's selected color regardless.
+ *
+ * Critical: only override stroke, never fill. The "A" body is a polyline
+ * whose triangular interior must stay unfilled (Quill snow's
+ * .ql-stroke { fill: none } is what produces the outline-only "A"). */
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-label .ql-stroke {
+  stroke: var(--fg-muted);
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-label .ql-fill {
+  fill: var(--fg-muted);
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-stroke,
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-label .ql-stroke { stroke: currentColor; }
+.notes-toolbar.ql-toolbar.ql-snow .ql-fill,
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-label .ql-fill { fill: currentColor; }
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker {
+  color: var(--fg-muted);
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-label {
+  border-radius: 4px;
+  /* Match Quill snow's defaults — the dropdown caret is absolutely positioned
+   * on the right and doesn't need flow padding. Over-padding here squeezes
+   * the inline icon SVG (color / background / align) to 0 width. */
+  padding: 1px 2px 1px 8px;
+}
+/* color/background/align pickers ship with a fixed 28px container in snow,
+ * which leaves no breathing room for the icon + caret. Widen them slightly. */
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker,
+.notes-toolbar.ql-toolbar.ql-snow .ql-icon-picker {
+  width: 30px;
+  border-radius: 4px;
+}
+/* Center the icon inside color / background / align labels. Quill snow
+ * absolutely-positions these SVGs against the right edge, which leaves
+ * them visually squeezed; flow them naturally and center via flex. */
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-label,
+.notes-toolbar.ql-toolbar.ql-snow .ql-icon-picker .ql-picker-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-label svg,
+.notes-toolbar.ql-toolbar.ql-snow .ql-icon-picker .ql-picker-label svg {
+  position: static;
+  margin: 0;
+  width: 18px;
+  height: 18px;
+  float: none;
+}
+/* Square dropdown items for the alignment (icon) picker so each option is
+ * a proper button and the icon sits centered. */
+.notes-toolbar.ql-toolbar.ql-snow .ql-icon-picker .ql-picker-options {
+  padding: 4px;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-icon-picker .ql-picker-item {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-icon-picker .ql-picker-item svg {
+  width: 16px;
+  height: 16px;
+}
+/* Drop the inner focus ring on every toolbar control. Buttons, picker
+ * labels, picker items, picker containers, and the toolbar root all get
+ * default browser outlines on click/focus — looks like a stuck selection
+ * halo. !important wins against Quill snow's own :focus rules. */
+.notes-toolbar.ql-toolbar.ql-snow,
+.notes-toolbar.ql-toolbar.ql-snow * {
+  outline: none !important;
+}
+.notes-toolbar.ql-toolbar.ql-snow :focus,
+.notes-toolbar.ql-toolbar.ql-snow :focus-visible,
+.notes-toolbar.ql-toolbar.ql-snow :focus-within {
+  outline: none !important;
+  box-shadow: none !important;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-label:hover { color: var(--fg); }
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-options {
+  background: var(--surface2);
+  border: none;
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px -8px rgba(0,0,0,0.45);
+  padding: 4px;
+  color: var(--fg);
+}
+/* Snow adds a 1px border to the label + popover when the picker is open.
+ * Override for both states so nothing draws a stray edge. */
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-label,
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker.ql-expanded .ql-picker-label,
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker.ql-expanded .ql-picker-options {
+  border: none !important;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-item {
+  border-radius: 3px;
+  padding: 2px 6px;
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-picker-item:hover {
+  background: var(--surface3);
+  color: var(--fg);
+}
+.notes-toolbar.ql-toolbar.ql-snow .ql-color-picker .ql-picker-options,
+.notes-toolbar.ql-toolbar.ql-snow .ql-background .ql-picker-options {
+  width: 168px;
+  padding: 6px;
+}
+
+/* Tooltip for inserting links */
+.col-notes .ql-tooltip.ql-snow {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  box-shadow: 0 8px 32px -8px rgba(0,0,0,0.55);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  z-index: 25;
+}
+.col-notes .ql-tooltip.ql-snow input[type="text"] {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 3px 7px;
+}
+.col-notes .ql-tooltip.ql-snow a.ql-action,
+.col-notes .ql-tooltip.ql-snow a.ql-remove {
+  color: var(--accent);
+}
+
+/* ── Editor body ────────────────────────────────────────────────────────── */
+.notes-body-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.notes-editor {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--bg);
+}
+.notes-editor.ql-container.ql-snow {
+  border: none;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--fg);
+}
+.notes-editor .ql-editor {
+  padding: 18px 22px 80px;
+  line-height: 1.65;
+  caret-color: var(--accent);
+  color: var(--fg);
+  min-height: 100%;
+}
+.notes-editor .ql-editor.ql-blank::before {
+  color: transparent;  /* we render our own empty hint */
+  content: '';
+}
+.notes-editor .ql-editor h1,
+.notes-editor .ql-editor h2,
+.notes-editor .ql-editor h3,
+.notes-editor .ql-editor h4 {
+  color: var(--fg);
+  margin: 0.6em 0 0.4em;
+  letter-spacing: -0.015em;
+  font-weight: 700;
+}
+.notes-editor .ql-editor h1 { font-size: 1.65em; }
+.notes-editor .ql-editor h2 { font-size: 1.35em; }
+.notes-editor .ql-editor h3 { font-size: 1.15em; }
+.notes-editor .ql-editor p { margin: 0 0 0.5em; }
+.notes-editor .ql-editor a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.notes-editor .ql-editor a:hover { text-decoration-color: var(--accent); }
+.notes-editor .ql-editor blockquote {
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  padding: 4px 12px;
+  margin: 8px 0;
+  color: var(--fg-muted);
+  border-radius: 0 4px 4px 0;
+}
+.notes-editor .ql-editor pre.ql-syntax,
+.notes-editor .ql-editor pre {
+  background: var(--surface4, var(--surface2));
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  overflow-x: auto;
+}
+.notes-editor .ql-editor code {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+.notes-editor .ql-editor ul[data-checked] { padding-left: 6px; }
+.notes-editor .ql-editor li[data-list="checked"] > .ql-ui::before,
+.notes-editor .ql-editor li[data-list="unchecked"] > .ql-ui::before {
+  color: var(--accent);
+}
+.notes-editor .ql-editor img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  margin: 4px 0;
+  cursor: zoom-in;
+  transition: filter .12s, box-shadow .12s, transform .12s;
+}
+.notes-editor .ql-editor img:hover {
+  filter: brightness(1.04);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.notes-editor .ql-editor img.ql-selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Custom scrollbar inside the editor */
+.notes-editor::-webkit-scrollbar { width: 10px; }
+.notes-editor::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 14%, transparent);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.notes-editor::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--fg) 28%, transparent);
+  background-clip: content-box;
+}
+
+/* ── Inline file attachment chips (rendered inside the editor) ──────────── */
+.notes-editor .ql-editor .note-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px 4px 8px;
+  margin: 2px 4px 2px 0;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font-size: 12.5px;
+  text-decoration: none;
+  vertical-align: baseline;
+  max-width: 100%;
+  user-select: none;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.notes-editor .ql-editor .note-file:hover {
+  background: var(--surface3);
+  border-color: var(--fg-subtle);
+}
+.notes-editor .ql-editor .note-file .nf-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+  color: var(--fg-muted);
+}
+.notes-editor .ql-editor .note-file .nf-name {
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.notes-editor .ql-editor .note-file .nf-meta {
+  color: var(--fg-subtle);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+/* File-type accent colors (icon + chip border tint) */
+.note-file[data-kind="pdf"]   .nf-icon { color: #f47067; }
+.note-file[data-kind="word"]  .nf-icon { color: #4a90e2; }
+.note-file[data-kind="excel"] .nf-icon { color: #00b464; }
+.note-file[data-kind="ppt"]   .nf-icon { color: #f0883e; }
+.note-file[data-kind="text"]  .nf-icon { color: var(--fg-muted); }
+.note-file[data-kind="code"]  .nf-icon { color: #d2a8ff; }
+.note-file[data-kind="archive"] .nf-icon { color: #e3b341; }
+.note-file[data-kind="audio"] .nf-icon { color: #2dd4bf; }
+.note-file[data-kind="video"] .nf-icon { color: #db61a2; }
+.note-file[data-kind="image"] .nf-icon { color: #79c0ff; }
+.note-file[data-kind="data"]  .nf-icon { color: #f6c177; }
+
+/* Uploading state shows a spinner badge over the icon circle */
+.note-file.uploading {
+  opacity: 0.78;
+  pointer-events: none;
+}
+.note-file.uploading .nf-icon::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  animation: noteSpin 0.85s linear infinite;
+}
+.note-file.uploading .nf-icon { position: relative; }
+.notes-editor .ql-editor .note-file .nf-meta { margin-left: 2px; }
+.note-file.upload-error {
+  border-color: var(--red, #f85149);
+  background: color-mix(in srgb, var(--red, #f85149) 8%, var(--surface2));
+}
+.note-file.upload-error .nf-icon { color: var(--red, #f85149); }
+
+@keyframes noteSpin { to { transform: rotate(360deg); } }
+
+/* ── Empty hint overlay ─────────────────────────────────────────────────── */
+.notes-empty-hint {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  z-index: 1;
+}
+.notes-empty-hint.visible { opacity: 1; }
+.notes-empty-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  padding: 32px;
+  max-width: 320px;
+}
+.notes-empty-icon {
+  font-size: 38px;
+  color: color-mix(in srgb, var(--accent) 60%, var(--fg-subtle));
+  margin-bottom: 6px;
+  filter: drop-shadow(0 4px 14px color-mix(in srgb, var(--accent) 30%, transparent));
+}
+.notes-empty-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 0;
+}
+.notes-empty-sub {
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  margin: 0;
+  line-height: 1.5;
+}
+
+/* ── Drag-and-drop overlay ──────────────────────────────────────────────── */
+.notes-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: var(--radius);
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.12s ease;
+}
+.notes-drop-overlay.active {opacity: 1;backdrop-filter: blur(6px);}
+
+.notes-drop-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  color: var(--fg-muted);
+}
+.notes-drop-icon { font-size: 24px; color: var(--accent); }
+.notes-drop-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  margin: 0;
+}
+
+/* ── Light theme tweaks ─────────────────────────────────────────────────── */
+:root[data-theme-mode="light"] .note-file {
+  background: var(--surface);
+}
+:root[data-theme-mode="light"] .notes-editor .ql-editor img {
+  border-color: var(--border);
+}
+
+/* ── Wider screens: slightly more breathing room inside the editor ──────── */
+@media (min-width: 1500px) {
+  .notes-editor .ql-editor { padding: 22px 28px 100px; }
+}
+
+span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
+    background-color: var(--surface3);
+    color: var(--fg);
 }

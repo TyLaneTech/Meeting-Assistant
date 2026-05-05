@@ -192,7 +192,7 @@ function _updateAssistantBody(msgWrap, text) {
   _addCodeCopyButtons(body);
 }
 
-function _renderToolWidget(msgWrap, toolCalls) {
+function _renderToolWidget(msgWrap, toolCalls, isFinal = false) {
   let widget = msgWrap.querySelector('.chat-tool-widget');
   if (!widget) {
     widget = document.createElement('div');
@@ -202,15 +202,32 @@ function _renderToolWidget(msgWrap, toolCalls) {
   }
   const count = toolCalls.length;
   const doneCount = toolCalls.filter(tc => tc.result).length;
-  const allDone = doneCount === count;
+  // isFinal=true is used by the hydration path (loading saved messages from
+  // the DB). The response has already completed, so any tool entry whose
+  // result wasn't persisted (older sessions saved before the parallel-tool
+  // pairing fix) must still render as "completed" \u2014 the spinner state would
+  // be permanently stuck otherwise.
+  const allDone = isFinal || doneCount === count;
   const isOpen = widget.classList.contains('open');
 
   let itemsHtml = '';
   for (const tc of toolCalls) {
-    const icon = !tc.result ? '\u23F3' : tc.result.success ? '\u2713' : '\u2717';
-    const iconCls = !tc.result ? 'pending' : tc.result.success ? 'success' : 'error';
+    const hasResult = !!tc.result;
+    let icon, iconCls, detail;
+    if (hasResult) {
+      icon = tc.result.success ? '\u2713' : '\u2717';
+      iconCls = tc.result.success ? 'success' : 'error';
+      detail = tc.result.summary;
+    } else if (isFinal) {
+      icon = '\u2713';
+      iconCls = 'success';
+      detail = '(no details saved)';
+    } else {
+      icon = '\u23F3';
+      iconCls = 'pending';
+      detail = _toolInputSummary(tc.name, tc.input);
+    }
     const label = _toolDisplayName(tc.name);
-    const detail = tc.result ? tc.result.summary : _toolInputSummary(tc.name, tc.input);
     itemsHtml += `<div class="chat-tool-item">
       <div class="chat-tool-left">
         <div class="row1">
@@ -238,7 +255,12 @@ function _renderToolWidget(msgWrap, toolCalls) {
   // Auto-expand while tools are in progress, preserve manual toggle otherwise.
   // Keep 'streaming' even after all tools complete - it's only removed on
   // first chat_chunk so the collapse fires at the right time.
-  if (!allDone) {
+  // Hydrated (isFinal) widgets skip the streaming class entirely \u2014 they're
+  // rendered after the response completed and should stay collapsed unless
+  // the user expands them.
+  if (isFinal) {
+    if (isOpen) widget.classList.add('open');
+  } else if (!allDone) {
     widget.classList.add('open', 'streaming');
   } else if (widget.classList.contains('streaming')) {
     widget.classList.add('open');
@@ -364,6 +386,7 @@ function _onGlobalToolEvent(data) {
   if (data.request_id !== _homeState.requestId) return;
   if (data.type === 'tool_call') {
     _homeState.currentToolCalls.push({
+      id: data.id,
       name: data.name,
       input: data.input,
       result: null,
@@ -372,9 +395,18 @@ function _onGlobalToolEvent(data) {
       _setAssistantProcessing(_homeState.currentMsgWrap, true, 'Using tools');
     }
   } else if (data.type === 'tool_result') {
-    const last = _homeState.currentToolCalls[_homeState.currentToolCalls.length - 1];
-    if (last) {
-      last.result = { success: data.success, summary: data.summary };
+    // Match the result to its call by id — required when tools execute in
+    // parallel and results return out of order. Fall back to the first
+    // still-pending call if no id is present (backward compat).
+    let target = null;
+    if (data.id != null) {
+      target = _homeState.currentToolCalls.find(tc => tc.id === data.id && !tc.result);
+    }
+    if (!target) {
+      target = _homeState.currentToolCalls.find(tc => !tc.result);
+    }
+    if (target) {
+      target.result = { success: data.success, summary: data.summary };
     }
   }
   if (_homeState.currentMsgWrap) {
@@ -489,7 +521,7 @@ async function switchConversation(convId) {
         if (msg.tool_calls) {
           try {
             const tcs = typeof msg.tool_calls === 'string' ? JSON.parse(msg.tool_calls) : msg.tool_calls;
-            if (tcs.length) _renderToolWidget(wrap, tcs);
+            if (tcs.length) _renderToolWidget(wrap, tcs, true);
           } catch {}
         }
       }

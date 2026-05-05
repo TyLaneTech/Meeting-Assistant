@@ -732,7 +732,30 @@ class AIAssistant:
             provider=provider, model=model,
         )
 
-    def generate_title(self, transcript: str, *, context: dict | None = None) -> str:
+    _SYSTEM_TITLE = (
+        "You generate ultra-short meeting titles. "
+        "Reply with ONLY 2-4 words in Title Case. "
+        "No punctuation, no quotes, no explanation.\n\n"
+        "Guidance:\n"
+        "- The transcript is the primary signal for what the meeting was about.\n"
+        "- If past meeting titles are provided, infer the user's naming style "
+        "(e.g. \"Product Standup\", \"Design Review\", \"1:1 with Alice\") and "
+        "match it when the signals indicate a recurring series.\n"
+        "- Meetings with the same participants AND similar day/time are "
+        "almost certainly the same recurring meeting — reuse or closely "
+        "mirror the existing title.\n"
+        "- One-off meetings with unfamiliar participants should get a fresh, "
+        "content-specific title.\n"
+        "- Prefer specificity over generic words like \"Meeting\" or \"Call\"."
+    )
+
+    def generate_title(
+        self,
+        transcript: str,
+        *,
+        context: dict | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
         """Return a short title for the meeting, or '' on failure/no content.
 
         ``context`` (optional) may include:
@@ -741,6 +764,10 @@ class AIAssistant:
           - ``similar_past_meetings``: list of dicts with ``title``,
             ``shared_speakers``, ``same_dow``, ``hour_delta``. Already sorted
             by relevance (most-similar first).
+
+        ``system_prompt`` (optional) overrides the built-in ``_SYSTEM_TITLE``.
+        The participant / past-meeting context block is still appended to the
+        user prompt regardless, so even custom prompts get the meeting context.
 
         When context is supplied the model is steered to match existing naming
         conventions for recurring meetings with the same participants / time.
@@ -797,20 +824,9 @@ class AIAssistant:
 
         # ── System + user messages ─────────────────────────────────────────
         system = (
-            "You generate ultra-short meeting titles. "
-            "Reply with ONLY 2-4 words in Title Case. "
-            "No punctuation, no quotes, no explanation.\n\n"
-            "Guidance:\n"
-            "- The transcript is the primary signal for what the meeting was about.\n"
-            "- If past meeting titles are provided, infer the user's naming style "
-            "(e.g. \"Product Standup\", \"Design Review\", \"1:1 with Alice\") and "
-            "match it when the signals indicate a recurring series.\n"
-            "- Meetings with the same participants AND similar day/time are "
-            "almost certainly the same recurring meeting — reuse or closely "
-            "mirror the existing title.\n"
-            "- One-off meetings with unfamiliar participants should get a fresh, "
-            "content-specific title.\n"
-            "- Prefer specificity over generic words like \"Meeting\" or \"Call\"."
+            system_prompt.strip()
+            if system_prompt and system_prompt.strip()
+            else self._SYSTEM_TITLE
         )
         user_parts = []
         if context_block:
@@ -1257,9 +1273,13 @@ class AIAssistant:
         on_tool_event: ToolEventCallback | None,
     ) -> dict:
         """Execute a single tool call and return an Anthropic tool_result block."""
-        # Notify frontend about the tool call
+        # Notify frontend about the tool call.  The id is the Anthropic
+        # tool_use_id, which the frontend uses to pair tool_result events with
+        # their originating tool_call — required when tools execute in
+        # parallel and results return out of order.
+        tu_id = tu["id"]
         if on_tool_event:
-            on_tool_event("tool_call", {"name": tu["name"], "input": tu["input"]})
+            on_tool_event("tool_call", {"id": tu_id, "name": tu["name"], "input": tu["input"]})
 
         # Try generic executor first
         if tool_executor:
@@ -1267,13 +1287,13 @@ class AIAssistant:
                 content, is_error, summary, extra = tool_executor(tu["name"], tu["input"])
                 result = {
                     "type": "tool_result",
-                    "tool_use_id": tu["id"],
+                    "tool_use_id": tu_id,
                     "content": content,
                 }
                 if is_error:
                     result["is_error"] = True
                 if on_tool_event:
-                    payload = {"name": tu["name"], "success": not is_error, "summary": summary}
+                    payload = {"id": tu_id, "name": tu["name"], "success": not is_error, "summary": summary}
                     if extra:
                         payload.update(extra)
                     on_tool_event("tool_result", payload)
@@ -1294,7 +1314,7 @@ class AIAssistant:
                 b64 = base64.b64encode(jpeg).decode()
                 if on_tool_event:
                     on_tool_event("tool_result", {
-                        "name": tu["name"], "success": True,
+                        "id": tu_id, "name": tu["name"], "success": True,
                         "summary": f"Captured screenshot at {ts:.1f}s", "image": b64,
                     })
                 # Tell the model the image URL so it can embed it in markdown
@@ -1303,7 +1323,7 @@ class AIAssistant:
                     text_msg += f" Embed in your response with: ![Screenshot at {ts:.1f}s]({url})"
                 return {
                     "type": "tool_result",
-                    "tool_use_id": tu["id"],
+                    "tool_use_id": tu_id,
                     "content": [
                         {"type": "text", "text": text_msg},
                         {"type": "image", "source": {
@@ -1314,12 +1334,12 @@ class AIAssistant:
             else:
                 if on_tool_event:
                     on_tool_event("tool_result", {
-                        "name": tu["name"], "success": False,
+                        "id": tu_id, "name": tu["name"], "success": False,
                         "summary": "Could not extract frame",
                     })
                 return {
                     "type": "tool_result",
-                    "tool_use_id": tu["id"],
+                    "tool_use_id": tu_id,
                     "content": "Could not extract frame - the timestamp may be out of range or no video is available.",
                     "is_error": True,
                 }
@@ -1327,7 +1347,7 @@ class AIAssistant:
         # Unknown tool
         if on_tool_event:
             on_tool_event("tool_result", {
-                "name": tu["name"], "success": False,
+                "id": tu_id, "name": tu["name"], "success": False,
                 "summary": f"Unknown tool: {tu['name']}",
             })
         return {
@@ -1387,12 +1407,15 @@ class AIAssistant:
                         cb = event.content_block
                         if getattr(cb, "type", "") == "server_tool_use" and on_tool_event:
                             on_tool_event("tool_call", {
+                                "id": getattr(cb, "id", None),
                                 "name": getattr(cb, "name", "web_search"),
                                 "input": getattr(cb, "input", {}),
                             })
                 response = stream.get_final_message()
 
-            # Emit tool_result events for any server-side tools (web search)
+            # Emit tool_result events for any server-side tools (web search).
+            # The id pairs each result with its originating server_tool_use
+            # block above — necessary when several searches run in parallel.
             if on_tool_event:
                 for block in response.content:
                     if getattr(block, "type", "") == "web_search_tool_result":
@@ -1402,6 +1425,7 @@ class AIAssistant:
                             if getattr(c, "type", "") == "web_search_result"
                         )
                         on_tool_event("tool_result", {
+                            "id": getattr(block, "tool_use_id", None),
                             "name": "web_search",
                             "success": True,
                             "summary": f"Found {n} result{'s' if n != 1 else ''}",
@@ -1450,7 +1474,7 @@ class AIAssistant:
             parsed_args = {}
 
         if on_tool_event:
-            on_tool_event("tool_call", {"name": tc_name, "input": parsed_args})
+            on_tool_event("tool_call", {"id": call_id, "name": tc_name, "input": parsed_args})
 
         # Try generic executor first
         if tool_executor:
@@ -1463,7 +1487,7 @@ class AIAssistant:
                     "output": result_text,
                 })
                 if on_tool_event:
-                    payload = {"name": tc_name, "success": not is_error, "summary": summary}
+                    payload = {"id": call_id, "name": tc_name, "success": not is_error, "summary": summary}
                     if extra:
                         payload.update(extra)
                     on_tool_event("tool_result", payload)
@@ -1481,7 +1505,7 @@ class AIAssistant:
                 })
                 if on_tool_event:
                     on_tool_event("tool_result", {
-                        "name": tc_name, "success": False, "summary": err_text,
+                        "id": call_id, "name": tc_name, "success": False, "summary": err_text,
                     })
                 return
 
@@ -1513,7 +1537,7 @@ class AIAssistant:
                 })
                 if on_tool_event:
                     on_tool_event("tool_result", {
-                        "name": tc_name, "success": True,
+                        "id": call_id, "name": tc_name, "success": True,
                         "summary": f"Captured screenshot at {ts:.1f}s", "image": b64,
                     })
             else:
@@ -1524,7 +1548,7 @@ class AIAssistant:
                 })
                 if on_tool_event:
                     on_tool_event("tool_result", {
-                        "name": tc_name, "success": False, "summary": "Could not extract frame",
+                        "id": call_id, "name": tc_name, "success": False, "summary": "Could not extract frame",
                     })
             return
 
@@ -1536,7 +1560,7 @@ class AIAssistant:
         })
         if on_tool_event:
             on_tool_event("tool_result", {
-                "name": tc_name, "success": False, "summary": f"Unknown tool: {tc_name}",
+                "id": call_id, "name": tc_name, "success": False, "summary": f"Unknown tool: {tc_name}",
             })
 
     def _tool_loop_openai(
@@ -1617,8 +1641,10 @@ class AIAssistant:
                             })
                         elif itype == "web_search_call" and not web_search_seen and on_tool_event:
                             web_search_seen = True
-                            on_tool_event("tool_call", {"name": "web_search", "input": {}})
+                            ws_id = getattr(item, "id", "") or "openai-websearch"
+                            on_tool_event("tool_call", {"id": ws_id, "name": "web_search", "input": {}})
                             on_tool_event("tool_result", {
+                                "id": ws_id,
                                 "name": "web_search",
                                 "success": True,
                                 "summary": "Web search performed",

@@ -259,6 +259,97 @@ def _clean_ellipses(text: str) -> str:
     return cleaned
 
 
+# Per-word-period collapse: a single Whisper call can return many tiny
+# Segment objects (one per sentence-boundary timestamp token), each carrying
+# its own trailing period.  Joined with spaces this produces output like
+# "And. Uh. It. Would. Not. Move. Ahead.".  The polluted text then enters
+# self._contexts[label] and is fed back as initial_prompt, so Whisper reinforces
+# the pattern on every subsequent call for that speaker — explaining why the
+# bug only manifests after a meeting has been running for a while.
+#
+# _repetition_ratio can't catch this (every word is unique), so we detect the
+# pattern directly: a high density of capitalized alphabetic tokens that each
+# end in a single period.  The capitalization check is what distinguishes the
+# bug pattern (every word capitalized, since Whisper treats each as a fresh
+# sentence) from legitimate prose (lowercase words ending sentences).
+_PERIOD_RATIO_TRIGGER = 0.70   # fraction of tokens that must look like "Word." to trigger
+_PERIOD_MIN_TOKENS    = 3      # texts shorter than this are left alone
+
+
+def _is_short_period_token(token: str) -> bool:
+    """True if *token* looks like a per-word artifact (e.g. 'Word.', 'Don\\'t.').
+
+    The signal is that Whisper, when in the per-word-period failure mode,
+    treats each word as a complete sentence — so every token starts with an
+    uppercase letter and ends in a single period.  Legitimate sentence-ending
+    words inside prose (e.g. "heavily.") are usually lowercase, which is what
+    keeps this from matching ordinary text.
+    """
+    if not token.endswith(".") or token.endswith(".."):
+        return False
+    if len(token) < 2:
+        return False
+    body = token[:-1].replace("'", "")
+    if not body.isalpha():
+        return False
+    return body[0].isupper()
+
+
+def _collapse_word_periods(text: str) -> str:
+    """Strip rogue per-word periods, preserving the final sentence terminator.
+
+    When Whisper enters the per-word-period failure mode, most of its output
+    tokens are short alphabetic words each ending in a period.  This function
+    detects that pattern and removes the trailing period from every matching
+    token except the last, so the displayed transcript reads as a normal
+    sentence and — just as importantly — the cleaned text doesn't re-poison
+    self._contexts[label] on the next flush.
+
+    Also applied to the prompt before each Whisper call, so an already-
+    poisoned context can't seed new bad output.
+
+    Two passes:
+      1. *Bulk* pollution — most of the text is the pattern (covers a fully
+         poisoned Whisper output or an entire long-running prompt).
+      2. *Tail* pollution — clean prefix followed by a run of ≥ N consecutive
+         short-period tokens at the end (covers the prompt during the early
+         stages of the snowball, before bulk dilution flips).
+    """
+    if "." not in text:
+        return text
+    tokens = text.split()
+    if len(tokens) < _PERIOD_MIN_TOKENS:
+        return text
+
+    last = len(tokens) - 1
+
+    def _strip_matches_in_range(start: int, end: int) -> str:
+        """Strip period from short-period tokens in [start, end), keep last token intact."""
+        cleaned = list(tokens)
+        for i in range(start, end):
+            if i < last and _is_short_period_token(cleaned[i]):
+                cleaned[i] = cleaned[i][:-1]
+        return " ".join(cleaned)
+
+    # Pass 1: bulk pollution
+    matches = sum(1 for t in tokens if _is_short_period_token(t))
+    if matches / len(tokens) >= _PERIOD_RATIO_TRIGGER:
+        return _strip_matches_in_range(0, len(tokens))
+
+    # Pass 2: tail pollution — walk back from the end while we keep seeing
+    # short-period tokens; if the run reaches _PERIOD_MIN_TOKENS, clean it.
+    run_start = len(tokens)
+    for i in range(len(tokens) - 1, -1, -1):
+        if _is_short_period_token(tokens[i]):
+            run_start = i
+        else:
+            break
+    if len(tokens) - run_start >= _PERIOD_MIN_TOKENS:
+        return _strip_matches_in_range(run_start, len(tokens))
+
+    return text
+
+
 def _strip_fragment_period(text: str) -> str:
     """Strip a trailing period from short fragments.
 
@@ -304,7 +395,13 @@ class Transcriber:
         self._thread: threading.Thread | None = None
         self.sample_rate: int | None = None
         self.channels: int | None = None
-        self._context = ""
+        # Per-speaker prompt context (label -> recent transcript text), fed
+        # back into Whisper as initial_prompt to maintain coherence across
+        # segments. Kept per-label so one speaker's bug pattern (per-word
+        # periods, hallucination loops) can't contaminate other speakers'
+        # prompts. The non-diarized path uses the audio source ("loopback",
+        # "mic") as the label, naturally giving a single shared bucket there.
+        self._contexts: dict[str, str] = {}
         self.device = _DEFAULT_DEVICE
         self.compute_type = _DEFAULT_COMPUTE_TYPE
         self.model_size = _DEFAULT_MODEL_SIZE
@@ -418,6 +515,9 @@ class Transcriber:
         """Load streaming diarization pipeline. Blocking - run in a thread."""
         from ml.diarizer import StreamingDiarizer
         self.diarizer = StreamingDiarizer(hf_token, device=device)
+        # Mirror diarizer speaker merges into our per-speaker prompt contexts
+        # so a merged speaker's prompt history follows their audio.
+        self.diarizer.on_merge_speakers = self._merge_contexts
 
     def reload_diarizer(self, hf_token: str, device: str) -> None:
         """Reload the diarizer on a different device. Blocking."""
@@ -433,7 +533,7 @@ class Transcriber:
             self._thread = None
         self.sample_rate = sample_rate
         self.channels = channels
-        self._context = ""
+        self._contexts.clear()
         self._diarizer_error_fired = False
         if self.diarizer is not None:
             self.diarizer.reset(next_label=next_speaker_label)
@@ -469,7 +569,7 @@ class Transcriber:
             # Configure transcriber state to match the file's audio format
             self.sample_rate = file_rate
             self.channels    = n_channels
-            self._context    = ""
+            self._contexts.clear()
             if self.diarizer is not None:
                 self.diarizer.reset()
 
@@ -625,13 +725,29 @@ class Transcriber:
         if len(audio) < _MIN_WHISPER_SAMPLES:
             return
 
+        # Per-speaker prompt context. Each label has its own bucket so a
+        # bug pattern in one speaker's prompt can't contaminate another's.
+        context = self._contexts.get(label, "")
+
         # Proactively clear context if it has itself become repetitive - this
         # prevents a contaminated prompt from seeding the next call.
-        prompt = self._context[-self.prompt_chars:]
+        prompt = context[-self.prompt_chars:]
         if prompt and _repetition_ratio(prompt) < _HALLUCINATION_THRESHOLD:
-            log.warn("transcriber", "Context contaminated by repetition - clearing")
-            self._context = ""
+            log.warn("transcriber", f"[{label}] Context contaminated by repetition - clearing")
+            self._contexts[label] = ""
+            context = ""
             prompt = ""
+
+        # Strip per-word periods from the prompt before sending to Whisper.
+        # If the stored context was poisoned by a previous flush, conditioning
+        # on it would make Whisper continue producing per-word-period output.
+        if prompt:
+            cleaned_prompt = _collapse_word_periods(prompt)
+            if cleaned_prompt != prompt:
+                log.warn("transcriber", f"[{label}] Prompt had per-word-period pattern - cleaned")
+                context = _collapse_word_periods(context)
+                self._contexts[label] = context
+                prompt = cleaned_prompt
 
         try:
             segments, _ = self.model.transcribe(
@@ -655,6 +771,13 @@ class Transcriber:
             if parts:
                 text = _strip_fragment_period(" ".join(parts))
                 text = _clean_ellipses(text)
+                # Collapse per-word periods (e.g. "And. Uh. It. Would.") into
+                # normal text. Done after _strip_fragment_period so the latter
+                # still handles the simple single-fragment case.
+                collapsed = _collapse_word_periods(text)
+                if collapsed != text:
+                    log.warn("transcriber", f"[{label}] Per-word-period pattern detected - cleaned")
+                    text = collapsed
                 # Strip known hallucination phrases (subtitle credits, etc.)
                 text = _clean_hallucinations(text)
                 if not text:
@@ -663,14 +786,14 @@ class Transcriber:
                 text = _dedup_sentences(text)
                 if not text:
                     log.warn("transcriber", f"[{label}] Sentence-loop detected - discarding")
-                    self._context = ""
+                    self._contexts[label] = ""
                     return
                 # Discard and clear context if output is a hallucination loop.
                 if _repetition_ratio(text) < _HALLUCINATION_THRESHOLD:
                     log.warn("transcriber", f"[{label}] Hallucination loop detected - discarding")
-                    self._context = ""
+                    self._contexts[label] = ""
                     return
-                self._context = (self._context + " " + text)[-self.prompt_chars * 2:]
+                self._contexts[label] = (context + " " + text)[-self.prompt_chars * 2:]
                 preview = text[:60] + ("…" if len(text) > 60 else "")
                 log.info("transcriber", f"[{label}] {preview!r}")
                 self.on_text_callback(text, label, start_time, end_time)
@@ -684,6 +807,22 @@ class Transcriber:
                 self._log_whisper_error(label, audio, use_vad, e)
         except Exception as e:
             self._log_whisper_error(label, audio, use_vad, e)
+
+    def _merge_contexts(self, keep_label: str, merge_label: str) -> None:
+        """Combine merge_label's prompt context into keep_label's bucket.
+
+        Wired as the diarizer's on_merge_speakers callback so that when the
+        user (or auto-merge logic) decides two diarized speakers are really
+        the same person, the merged speaker's recent transcript history
+        follows them into the kept label — Whisper's prompt for the kept
+        speaker keeps the richer context instead of starting cold.
+        """
+        merge_ctx = self._contexts.pop(merge_label, "")
+        if not merge_ctx:
+            return
+        keep_ctx = self._contexts.get(keep_label, "")
+        combined = (keep_ctx + " " + merge_ctx).strip()
+        self._contexts[keep_label] = combined[-self.prompt_chars * 2:]
 
     def _log_whisper_error(
         self,

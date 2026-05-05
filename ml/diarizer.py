@@ -383,6 +383,11 @@ class StreamingDiarizer:
         self._centroids: dict[str, dict[str, np.ndarray]] = {}
         self._next_label = 1
 
+        # Fired after a successful merge_speakers() so consumers (e.g. the
+        # transcriber's per-speaker prompt context) can mirror the merge.
+        # Signature: (keep_label, merge_label) -> None.
+        self.on_merge_speakers = None  # type: ignore[assignment]
+
         log.info("diarizer", f"Streaming diarizer ready on {self._dev}.")
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -480,6 +485,15 @@ class StreamingDiarizer:
         else:
             self._centroids[keep_label] = self._centroids[merge_label]
         del self._centroids[merge_label]
+        # Notify consumers so per-speaker state (e.g. transcriber prompt
+        # contexts) can mirror the merge.  Failures here must not break
+        # the caller — the centroid merge has already succeeded.
+        if self.on_merge_speakers is not None:
+            try:
+                self.on_merge_speakers(keep_label, merge_label)
+            except Exception:
+                log.error("diarizer", "on_merge_speakers callback failed:")
+                traceback.print_exc()
 
     # ── Private ───────────────────────────────────────────────────────────────
 

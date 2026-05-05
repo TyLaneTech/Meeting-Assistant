@@ -8,9 +8,11 @@
   <link rel="stylesheet" href="/static/fontAwesome/css/all.min.css">
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" id="hljs-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/morphdom@2/dist/morphdom-umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.min.js"></script>
   <script>
     // Apply saved theme synchronously (pre-paint) to avoid flash-of-wrong-theme.
     (function () {
@@ -124,6 +126,15 @@
             <svg viewBox="0 0 24 20" width="22" height="16">
               <rect x="1" y="1" width="22" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
               <rect x="15" y="5" width="5" height="10" rx="1" fill="currentColor" opacity=".7"/>
+            </svg>
+          </button>
+          <button class="pane-toggle-btn" id="pane-toggle-notes"
+                  onclick="togglePane(3)" title="Notes">
+            <svg viewBox="0 0 24 20" width="22" height="16">
+              <rect x="1" y="1" width="22" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+              <line x1="5" y1="6"  x2="14" y2="6"  stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".85"/>
+              <line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".7"/>
+              <line x1="5" y1="14" x2="11" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".55"/>
             </svg>
           </button>
         </div>
@@ -476,6 +487,131 @@
         </div>
       </div>
 
+      <div class="col-resize-handle" data-left="2" data-right="3"></div>
+
+      <!-- ── Notes ────────────────────────────────────────────────────── -->
+      <div class="col col-notes" style="display:none">
+
+        <!-- Full-pane drag-and-drop overlay -->
+        <div id="notes-drop-overlay" class="notes-drop-overlay" aria-hidden="true">
+          <div class="notes-drop-content">
+            <i class="fa-solid fa-paperclip notes-drop-icon"></i>
+            <p class="notes-drop-title">Drop to attach</p>
+          </div>
+        </div>
+
+        <div class="col-header">
+          <div class="col-actions left">
+            <span class="col-title">Notes</span>
+            <span class="badge notes-badge hidden" id="notes-status-badge">saving…</span>
+          </div>
+          <div class="col-actions right">
+            <button class="icon-btn" id="notes-copy-btn"
+                    title="Copy notes as plain text" onclick="copyNotesPlainText()"><i class="fa-duotone fa-copy"></i></button>
+            <button class="icon-btn" id="notes-export-btn"
+                    title="Download notes as HTML" onclick="downloadNotesHtml()"><i class="fa-solid fa-file-arrow-down"></i></button>
+            <button class="icon-btn" id="notes-attach-btn"
+                    title="Attach file or image" onclick="document.getElementById('notes-file-input').click()"><i class="fa-solid fa-paperclip"></i></button>
+            <button class="icon-btn" title="Clear notes" onclick="clearNotes()"><i class="fa-duotone fa-eraser"></i></button>
+            <input type="file" id="notes-file-input" multiple
+                   accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md,.json,.html,.htm,.xml,.zip,.rtf,.odt,.ods,.odp,.py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cpp,.c,.h,.cs,.rb,.php,.swift,.kt,.sh,.yml,.yaml,.toml,.ini"
+                   style="display:none"
+                   onchange="_notesHandleFileSelect(this.files); this.value='';">
+          </div>
+        </div>
+
+        <div class="notes-toolbar-wrap">
+          <div id="notes-toolbar" class="notes-toolbar">
+            <span class="ql-formats">
+              <select class="ql-header">
+                <option value="1"></option>
+                <option value="2"></option>
+                <option value="3"></option>
+                <option value="4"></option>
+                <option selected></option>
+              </select>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-bold" title="Bold (Ctrl+B)"></button>
+              <button class="ql-italic" title="Italic (Ctrl+I)"></button>
+              <button class="ql-underline" title="Underline (Ctrl+U)"></button>
+              <button class="ql-strike" title="Strikethrough"></button>
+            </span>
+            <span class="ql-formats">
+              <select class="ql-color" title="Text color">
+                <option selected></option>
+                <option value="#e6edf3"></option>
+                <option value="#8b949e"></option>
+                <option value="#f05541"></option>
+                <option value="#ff9f4e"></option>
+                <option value="#e3b341"></option>
+                <option value="#3fb950"></option>
+                <option value="#39c5cf"></option>
+                <option value="#58a6ff"></option>
+                <option value="#bc8cff"></option>
+                <option value="#f778ba"></option>
+              </select>
+              <select class="ql-background" title="Background color">
+                <option selected></option>
+                <option value="#e6edf3"></option>
+                <option value="#f05541"></option>
+                <option value="#ff9f4e"></option>
+                <option value="#e3b341"></option>
+                <option value="#3fb950"></option>
+                <option value="#39c5cf"></option>
+                <option value="#58a6ff"></option>
+                <option value="#bc8cff"></option>
+                <option value="#f778ba"></option>
+                <option value="#1f2630"></option>
+              </select>
+            </span>
+            <!-- Expanded alignment row: shown when toolbar has room, collapsed
+                 to a single picker (notes-align-collapsed) when narrow. Both
+                 are wired by Quill independently and toggle the same format. -->
+            <span class="ql-formats notes-align-expanded">
+              <button class="ql-align" value="" title="Align left"></button>
+              <button class="ql-align" value="center" title="Align center"></button>
+              <button class="ql-align" value="right" title="Align right"></button>
+              <button class="ql-align" value="justify" title="Justify"></button>
+            </span>
+            <span class="ql-formats notes-align-collapsed">
+              <select class="ql-align" title="Align">
+                <option selected></option>
+                <option value="center"></option>
+                <option value="right"></option>
+                <option value="justify"></option>
+              </select>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-list" value="ordered" title="Numbered list"></button>
+              <button class="ql-list" value="bullet" title="Bullet list"></button>
+              <button class="ql-list" value="check" title="Checklist"></button>
+              <button class="ql-indent" value="-1" title="Outdent"></button>
+              <button class="ql-indent" value="+1" title="Indent"></button>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-blockquote" title="Quote"></button>
+              <button class="ql-code-block" title="Code block"></button>
+              <button class="ql-link" title="Link"></button>
+            </span>
+            <span class="ql-formats">
+              <button class="ql-clean" title="Clear formatting"></button>
+            </span>
+          </div>
+        </div>
+
+        <div class="notes-body-wrap">
+          <div id="notes-editor" class="notes-editor"></div>
+          <div class="notes-empty-hint" id="notes-empty-hint">
+            <div class="notes-empty-stack">
+              <i class="fa-regular fa-pen-to-square notes-empty-icon"></i>
+              <p class="notes-empty-title">Take notes alongside the meeting</p>
+              <p class="notes-empty-sub">Type, paste images, or drop files anywhere in this pane.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div><!-- .workspace -->
   </div><!-- .main-area -->
 </div><!-- .app-layout -->
@@ -735,6 +871,11 @@
             <input type="checkbox" id="export-opt-chat" checked>
             <i class="fa-solid fa-comments export-opt-icon"></i>
             <div class="export-opt-text"><span class="export-opt-name">Chat history</span><span class="export-opt-desc">Q&A messages, screenshots, and attachments</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-notes" checked>
+            <i class="fa-solid fa-pen-to-square export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Notes</span><span class="export-opt-desc">Rich-text notes plus inline images and attached files</span></div>
           </label>
           <label class="export-option">
             <input type="checkbox" id="export-opt-speakers" checked>

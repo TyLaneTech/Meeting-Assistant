@@ -30,6 +30,7 @@ from ml.transcriber import (
     _repetition_ratio,
     _clean_ellipses,
     _clean_hallucinations,
+    _collapse_word_periods,
     _dedup_sentences,
 )
 
@@ -370,6 +371,10 @@ class BatchTranscriber:
                 if not text:
                     continue
                 text = _clean_ellipses(text)
+                collapsed = _collapse_word_periods(text)
+                if collapsed != text:
+                    log.warn("batch", f"[{speaker}] Per-word-period pattern detected - cleaned")
+                    text = collapsed
                 text = _clean_hallucinations(text)
                 if not text:
                     continue

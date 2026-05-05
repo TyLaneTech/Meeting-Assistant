@@ -31,3 +31,9 @@ Postponed ideas and feature plans. Not yet scheduled for implementation.
 ### Open questions
 - Should the text-embedding model (MiniLM, ~80 MB) also be unloaded, or left alone since it's small and loaded on demand anyway?
 - Default threshold: 30 min feels safe. Off by default so existing users aren't surprised.
+
+---
+
+## ~~Notes pane: export/import bundling~~ — done
+
+The export zip now bundles `notes_attachments/<file>` for every file in `storage/data/notes/<session_id>/`, gated on the new `notes` checkbox in the export modal. On import the directory is restored under the new session id and the notes Delta has its `/api/sessions/<old>/notes/attachments/` URLs rewritten to the new id, mirroring the existing screenshot-URL rewrite.

@@ -218,26 +218,75 @@ function _saveLayoutCache(updates) {
 }
 
 /* ── Pane toggle & column ordering ────────────────────────────────────────── */
-let _paneVisible = [true, true, true]; // indexed by column: [transcript, summary, chat]
-const _COL_NAMES = ['Transcript', 'Summary', 'Chat'];
+// Indexed by column: [transcript, summary, chat, notes]. Notes is opt-in
+// (off by default) so existing layouts continue to render three columns.
+const _PANE_COUNT = 4;
+let _paneVisible = [true, true, true, false];
+const _COL_NAMES = ['Transcript', 'Summary', 'Chat', 'Notes'];
+
+// Migrate legacy 3-element arrays from cache/localStorage into the 4-element shape.
+function _normalizePaneArr(arr, fillTail) {
+  if (!Array.isArray(arr)) return null;
+  const out = arr.slice(0, _PANE_COUNT);
+  while (out.length < _PANE_COUNT) out.push(fillTail);
+  return out;
+}
 
 // Visual column order - maps position (left→right) to column index.
 // Seeded from localStorage cache so the first paint uses the saved order.
 let _colOrder = (() => {
   const lc = _getLayoutCache();
-  return (Array.isArray(lc.col_order) && lc.col_order.length === 3)
-    ? lc.col_order
-    : [0, 1, 2];
+  const stored = _normalizePaneArr(lc.col_order, null);
+  if (stored && stored.every(v => typeof v === 'number')) {
+    // Ensure all column indices present (auto-append missing ones at the end)
+    const seen = new Set(stored);
+    for (let i = 0; i < _PANE_COUNT; i++) if (!seen.has(i)) stored.push(i);
+    return stored.slice(0, _PANE_COUNT);
+  }
+  return [0, 1, 2, 3];
 })();
 
+// The three "positional" toggle buttons (transcript-shaped left rect,
+// summary-shaped middle rect, chat-shaped right rect) keep a FIXED visual
+// order. Each one targets whichever non-notes column is currently at the
+// matching relative position (left/middle/right). The Notes button is the
+// only one that floats — it slots in at whatever position the notes column
+// occupies in _colOrder.
+const _POSITIONAL_TOGGLE_BTN_IDS = [
+  'pane-toggle-transcript',  // leftmost non-notes column
+  'pane-toggle-summary',     // middle non-notes column
+  'pane-toggle-chat',        // rightmost non-notes column
+];
+const _NOTES_TOGGLE_BTN_ID = 'pane-toggle-notes';
+const _NOTES_COL_IDX = 3;
+
 function _syncToggleButtons() {
-  const btns = document.querySelectorAll('.pane-toggle-group .pane-toggle-btn');
-  _colOrder.forEach((colIdx, pos) => {
-    if (!btns[pos]) return;
-    btns[pos].onclick = () => togglePane(colIdx);
-    btns[pos].title = _COL_NAMES[colIdx];
-    btns[pos].classList.toggle('active', _paneVisible[colIdx]);
+  // Where does the notes column sit in the overall column order?
+  const notesPos = _colOrder.indexOf(_NOTES_COL_IDX);
+  // Slots available to the three positional buttons: all 4 toggle slots
+  // minus the one occupied by the notes button.
+  const positionalSlots = [0, 1, 2, 3].filter(p => p !== notesPos);
+  // Non-notes columns in their current visual order — drives which actual
+  // column each positional button controls + the dynamic tooltip.
+  const nonNotesOrder = _colOrder.filter(c => c !== _NOTES_COL_IDX);
+
+  _POSITIONAL_TOGGLE_BTN_IDS.forEach((id, i) => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    const colIdx = nonNotesOrder[i];
+    btn.style.order = String(positionalSlots[i]);
+    btn.onclick = () => togglePane(colIdx);
+    btn.title = _COL_NAMES[colIdx];
+    btn.classList.toggle('active', _paneVisible[colIdx]);
   });
+
+  const notesBtn = document.getElementById(_NOTES_TOGGLE_BTN_ID);
+  if (notesBtn) {
+    notesBtn.style.order = String(notesPos);
+    notesBtn.onclick = () => togglePane(_NOTES_COL_IDX);
+    notesBtn.title = _COL_NAMES[_NOTES_COL_IDX];
+    notesBtn.classList.toggle('active', _paneVisible[_NOTES_COL_IDX]);
+  }
 }
 
 function togglePane(idx) {
@@ -249,6 +298,16 @@ function togglePane(idx) {
   _syncToggleButtons();
   _applyPaneLayout();
   _savePaneVisible();
+
+  // Notes pane needs a one-shot init the first time it becomes visible
+  if (idx === 3 && _paneVisible[3]) {
+    _ensureNotesEditor();
+    // Quill measures geometry on attach; if the column was display:none
+    // during construction the toolbar/editor heights can be wrong.
+    requestAnimationFrame(() => {
+      try { if (_quill) _quill.update('silent'); } catch (_) {}
+    });
+  }
 }
 
 function _savePaneVisible() {
@@ -266,20 +325,18 @@ function _loadPaneVisible(sessionId) {
     const raw = localStorage.getItem(`ma-panes:${sessionId}`)
              || localStorage.getItem('ma-panes:default');
     if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr) && arr.length === 3) {
-        // Ensure at least one pane is visible
-        if (arr.some(Boolean)) {
-          _paneVisible = arr;
-          _syncToggleButtons();
-          _applyPaneLayout();
-          return;
-        }
+      const arr = _normalizePaneArr(JSON.parse(raw), false);
+      if (arr && arr.some(Boolean)) {
+        _paneVisible = arr;
+        _syncToggleButtons();
+        _applyPaneLayout();
+        if (_paneVisible[3]) _ensureNotesEditor();
+        return;
       }
     }
   } catch (_) {}
-  // Fallback: show all
-  _paneVisible = [true, true, true];
+  // Fallback: show transcript+summary+chat, hide notes (legacy default)
+  _paneVisible = [true, true, true, false];
   _syncToggleButtons();
   _applyPaneLayout();
 }
@@ -296,7 +353,8 @@ function _applyPaneLayout() {
     workspace.querySelector('.col-transcript'),
     workspace.querySelector('.col-summary'),
     workspace.querySelector('.col-chat'),
-  ];
+    workspace.querySelector('.col-notes'),
+  ].filter(Boolean);
   const handles = Array.from(workspace.querySelectorAll('.col-resize-handle'));
 
   // Visible columns in visual (left→right) order
@@ -344,9 +402,9 @@ function _applyPaneLayout() {
 // Seeded from localStorage cache immediately so the IIFE below uses the right values.
 let _colProportions = (() => {
   const lc = _getLayoutCache();
-  return (Array.isArray(lc.col_proportions) && lc.col_proportions.length === 3)
-    ? lc.col_proportions
-    : [1, 1.1, 1.1];
+  const stored = _normalizePaneArr(lc.col_proportions, 1.0);
+  if (stored && stored.every(v => typeof v === 'number' && v > 0)) return stored;
+  return [1, 1.1, 1.1, 1.0];
 })();
 
 function recalcColWidths() {
@@ -371,10 +429,10 @@ function recalcColWidths() {
     const vis = getVisibleIndices();
     const visHandles = Math.max(0, vis.length - 1);
     const total = workspace.offsetWidth - HANDLE_PX * visHandles;
-    const visFracs = vis.map(i => _colProportions[i]);
+    const visFracs = vis.map(i => _colProportions[i] || 1);
     const fracSum = visFracs.reduce((a, b) => a + b, 0);
-    // Return full 3-element array; hidden columns get 0
-    const result = [0, 0, 0];
+    // Return full per-column array; hidden columns get 0
+    const result = new Array(_PANE_COUNT).fill(0);
     vis.forEach((ci, vi) => {
       result[ci] = Math.max(MIN_COL_PX, Math.round(total * visFracs[vi] / fracSum));
     });
@@ -452,6 +510,7 @@ function recalcColWidths() {
     workspace.querySelector('.col-transcript'),
     workspace.querySelector('.col-summary'),
     workspace.querySelector('.col-chat'),
+    workspace.querySelector('.col-notes'),
   ].filter(Boolean);
   if (!colEls.length) return;
 
@@ -709,13 +768,22 @@ async function loadPreferences() {
     const sb = document.getElementById('sidebar');
     if (sb && state.sidebarOpen) sb.style.width = _prefs.sidebar_width + 'px';
   }
-  // Apply column proportions and order
-  if (Array.isArray(_prefs.col_proportions) && _prefs.col_proportions.length === 3) {
-    _colProportions = _prefs.col_proportions;
+  // Apply column proportions and order. Migrate legacy 3-element arrays
+  // saved before the Notes pane shipped by appending sensible defaults.
+  if (Array.isArray(_prefs.col_proportions)) {
+    const norm = _normalizePaneArr(_prefs.col_proportions, 1.0);
+    if (norm) _colProportions = norm;
   }
-  if (Array.isArray(_prefs.col_order) && _prefs.col_order.length === 3) {
-    _colOrder = _prefs.col_order;
-    _syncToggleButtons();
+  if (Array.isArray(_prefs.col_order)) {
+    const norm = _normalizePaneArr(_prefs.col_order, null);
+    if (norm) {
+      // Append any column indices missing from the saved order
+      const seen = new Set(norm.filter(v => typeof v === 'number'));
+      const out = norm.filter(v => typeof v === 'number');
+      for (let i = 0; i < _PANE_COUNT; i++) if (!seen.has(i)) out.push(i);
+      _colOrder = out.slice(0, _PANE_COUNT);
+      _syncToggleButtons();
+    }
   }
   // Apply sidebar collapsed state on load.
   const sidebar = document.getElementById('sidebar');
@@ -752,9 +820,10 @@ async function loadPreferences() {
     if (lc.theme_custom)  _prefs.theme_custom  = lc.theme_custom;
   }
   _syncThemeUI();
-  // Populate the global chat/summary system-prompt textareas (if rendered)
+  // Populate the global chat/summary/title system-prompt textareas (if rendered)
   _syncGlobalChatPromptUI();
   _syncGlobalSummaryPromptUI();
+  _syncGlobalTitlePromptUI();
   // Apply saved sidebar filter default (if any) on top of session list
   try { _loadSidebarFilterDefault(); } catch (_) {}
   // Refresh session-override badge (no-op on home page)
@@ -1449,6 +1518,14 @@ function _closeSidebarFilter() {
   if (_sidebarFilterResizeObserver) {
     _sidebarFilterResizeObserver.disconnect();
     _sidebarFilterResizeObserver = null;
+  }
+  // If the user closes the popover while the active filter is empty AND a
+  // saved default exists, drop the saved default too. "Clear + Done" is the
+  // natural way to fully reset, so we shouldn't keep silently re-applying
+  // the old default the next time the app loads.
+  if (!_filterIsActive(_sidebarFilter) && _filterIsActive(_sidebarFilterDefault)) {
+    _sidebarFilterDefault = { ..._SIDEBAR_FILTER_DEFAULTS };
+    savePref('sidebar_filter_default', null);
   }
 }
 
@@ -2167,42 +2244,10 @@ function _renderSidebar() {
     return;
   }
 
-  // ── Filter active: bypass folder hierarchy, show a flat sorted list ──
-  if (filterActive) {
-    const fragmentF = document.createDocumentFragment();
-    const ordered = (_sidebarFilter.sortBy && _sidebarFilter.sortBy !== 'date_desc')
-      ? sessions
-      : [...sessions].sort((a, b) => b.started_at.localeCompare(a.started_at));
-    // For the default "newest first" sort, group by date the same way the
-    // ungrouped pane does so the result still feels like the sidebar.
-    if (_sidebarFilter.sortBy === 'date_desc') {
-      const groups = groupByDate(ordered);
-      for (const [label, items] of groups) {
-        const groupEl = document.createElement('div');
-        groupEl.className = 'session-group';
-        groupEl.textContent = label;
-        fragmentF.appendChild(groupEl);
-        items.forEach(s => {
-          const el = _makeSessionEl(s);
-          _attachSessionDragHandlers(el, s);
-          fragmentF.appendChild(el);
-        });
-      }
-    } else {
-      ordered.forEach(s => {
-        const el = _makeSessionEl(s);
-        _attachSessionDragHandlers(el, s);
-        fragmentF.appendChild(el);
-      });
-    }
-    list.innerHTML = '';
-    list.appendChild(fragmentF);
-    _updateBulkBar();
-    _updateActiveFolderHighlights();
-    return;
-  }
-
-  // Build lookup structures
+  // Build lookup structures.
+  // Sessions are already filtered by `_applySidebarFilterToSessions(...)`,
+  // so any folder whose subtree contains zero of these sessions has no
+  // matches under the active filter and gets pruned during render.
   const childMap = _buildChildMap(folders);
   const sessionsByFolder = new Map();
   for (const s of sessions) {
@@ -2210,16 +2255,22 @@ function _renderSidebar() {
     if (!sessionsByFolder.has(key)) sessionsByFolder.set(key, []);
     sessionsByFolder.get(key).push(s);
   }
-  // Sort sessions within each folder by sort_order
-  for (const [, arr] of sessionsByFolder) {
-    arr.sort((a, b) => a.sort_order - b.sort_order);
+  // Within-folder ordering: when no filter is active, honor the user's
+  // manual sort_order from drag-drop. When a filter is active, the filtered
+  // session list arrives pre-sorted by the user's chosen sortBy — preserve
+  // that order inside each folder.
+  if (!filterActive) {
+    for (const [, arr] of sessionsByFolder) {
+      arr.sort((a, b) => a.sort_order - b.sort_order);
+    }
   }
 
   const folderIds = new Set(folders.map(f => f.id));
   const fragment = document.createDocumentFragment();
 
-  // Render folder tree recursively from top-level
-  _renderFolderSubtree(null, 0, fragment, childMap, sessionsByFolder, folderIds);
+  // Render folder tree recursively from top-level. Pass filterActive so the
+  // recursion can prune empty branches and force-expand matching folders.
+  _renderFolderSubtree(null, 0, fragment, childMap, sessionsByFolder, folderIds, filterActive);
 
   // Ungrouped sessions (no folder or deleted folder) - also acts as a drop
   // target to remove sessions from folders.
@@ -2228,7 +2279,11 @@ function _renderSidebar() {
 
   const ungrouped = sessions.filter(s => !s.folder_id || !folderIds.has(s.folder_id));
   if (ungrouped.length) {
-    ungrouped.sort((a, b) => b.started_at.localeCompare(a.started_at));
+    // Preserve filter sort order when a filter is active; otherwise default
+    // to newest-first like the rest of the sidebar always has.
+    if (!filterActive) {
+      ungrouped.sort((a, b) => b.started_at.localeCompare(a.started_at));
+    }
     const groups = groupByDate(ungrouped);
     for (const [label, items] of groups) {
       const groupEl = document.createElement('div');
@@ -2320,11 +2375,18 @@ function _updateActiveFolderHighlights() {
   });
 }
 
-function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds) {
+function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds, filterActive) {
   const children = childMap.get(parentId) || [];
   for (const folder of children) {
     const folderSessions = sessionsByFolder.get(folder.id) || [];
     const totalCount = _countSessionsRecursive(folder.id, childMap, sessionsByFolder);
+    // Prune empty branches under an active filter — folders whose entire
+    // subtree was filtered out shouldn't take up space. Without a filter,
+    // empty folders render normally (with the "Drop sessions here" hint).
+    if (filterActive && totalCount === 0) continue;
+    // Always honor the user's saved expand/collapse state; filters never
+    // force-expand a folder. Empty folders are pruned above, so a collapsed
+    // folder will only appear when it actually contains matches.
     const collapsed = _sidebarCollapsed.has(folder.id);
 
     const folderEl = document.createElement('div');
@@ -2382,7 +2444,7 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
       body.className = 'folder-body';
 
       // Render child folders first
-      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds);
+      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds, filterActive);
 
       if (folderSessions.length === 0 && !(childMap.get(folder.id) || []).length) {
         body.innerHTML += '<div class="folder-empty">Drop sessions here</div>';
@@ -3576,12 +3638,21 @@ function connectSSE(afterSegId = 0) {
     const wrap = state.chatCursor.closest('.chat-msg');
     if (!wrap) return;
     if (d.type === 'tool_call') {
-      state.chatToolCalls.push({ name: d.name, input: d.input, result: null });
+      state.chatToolCalls.push({ id: d.id, name: d.name, input: d.input, result: null });
       _renderToolWidget(wrap, state.chatToolCalls);
       _setAssistantProcessing(wrap, true, 'Using ' + _toolDisplayName(d.name) + '…');
     } else if (d.type === 'tool_result') {
-      const last = state.chatToolCalls[state.chatToolCalls.length - 1];
-      if (last) last.result = { success: d.success, summary: d.summary, image: d.image || null };
+      // Match the result to its call by id — required when tools execute in
+      // parallel and results return out of order. Fall back to the first
+      // still-pending call if no id is present (backward compat).
+      let target = null;
+      if (d.id != null) {
+        target = state.chatToolCalls.find(tc => tc.id === d.id && !tc.result);
+      }
+      if (!target) {
+        target = state.chatToolCalls.find(tc => !tc.result);
+      }
+      if (target) target.result = { success: d.success, summary: d.summary, image: d.image || null };
       _renderToolWidget(wrap, state.chatToolCalls);
     }
     scrollChatToBottom();
@@ -3884,6 +3955,19 @@ function onStatus(d) {
         if (pendingPrompt !== null) {
           localStorage.setItem('summary-prompt:' + d.session_id, pendingPrompt);
           localStorage.removeItem('summary-prompt:new');
+        }
+      }
+      // Bind the Notes editor to the new session.  For a brand-new recording
+      // there are no saved notes yet; for a resumed session we fetch them so
+      // the user can keep adding to what they had before.
+      if (_notesSessionBound !== d.session_id) {
+        if (d.resumed) {
+          fetch(`/api/sessions/${d.session_id}/notes`)
+            .then(r => r.ok ? r.json() : null)
+            .then(p => _notesApplyForSession(d.session_id, p && p.delta ? p : null))
+            .catch(() => _notesApplyForSession(d.session_id, null));
+        } else {
+          _notesApplyForSession(d.session_id, null);
         }
       }
       // Update URL to reflect the active session
@@ -10150,7 +10234,7 @@ function createAssistantBubble() {
 }
 
 /* ── Tool-call collapsible widget ────────────────────────────────────────── */
-function _renderToolWidget(msgWrap, toolCalls) {
+function _renderToolWidget(msgWrap, toolCalls, isFinal = false) {
   let widget = msgWrap.querySelector('.chat-tool-widget');
   if (!widget) {
     widget = document.createElement('div');
@@ -10160,15 +10244,33 @@ function _renderToolWidget(msgWrap, toolCalls) {
   }
   const count = toolCalls.length;
   const doneCount = toolCalls.filter(tc => tc.result).length;
-  const allDone = doneCount === count;
+  // isFinal=true is used by the hydration path (loading saved messages from
+  // the DB). The response has already completed, so any tool entry whose
+  // result wasn't persisted (older sessions saved before the parallel-tool
+  // pairing fix) must still render as "completed" — the spinner state would
+  // be permanently stuck otherwise.
+  const allDone = isFinal || doneCount === count;
   const isOpen = widget.classList.contains('open');
 
   let itemsHtml = '';
   for (const tc of toolCalls) {
-    const icon = !tc.result ? '⏳' : tc.result.success ? '✓' : '✗';
-    const iconCls = !tc.result ? 'pending' : tc.result.success ? 'success' : 'error';
+    const hasResult = !!tc.result;
+    let icon, iconCls, detail;
+    if (hasResult) {
+      icon = tc.result.success ? '✓' : '✗';
+      iconCls = tc.result.success ? 'success' : 'error';
+      detail = tc.result.summary;
+    } else if (isFinal) {
+      // Response completed but this entry's result was never persisted.
+      icon = '✓';
+      iconCls = 'success';
+      detail = '(no details saved)';
+    } else {
+      icon = '⏳';
+      iconCls = 'pending';
+      detail = _toolInputSummary(tc.name, tc.input);
+    }
     const label = _toolDisplayName(tc.name);
-    const detail = tc.result ? tc.result.summary : _toolInputSummary(tc.name, tc.input);
     const thumb = tc.result?.image
       ? `<img class="chat-tool-thumb" src="data:image/jpeg;base64,${tc.result.image}" alt="screenshot thumbnail">`
       : '';
@@ -10200,7 +10302,12 @@ function _renderToolWidget(msgWrap, toolCalls) {
   // Auto-expand while tools are in progress, preserve manual toggle otherwise.
   // Keep 'streaming' even after all tools complete - it's only removed on
   // first chat_chunk so the collapse fires at the right time.
-  if (!allDone) {
+  // Hydrated (isFinal) widgets skip the streaming class entirely — they're
+  // rendered after the response completed and should stay collapsed unless
+  // the user expands them.
+  if (isFinal) {
+    if (isOpen) widget.classList.add('open');
+  } else if (!allDone) {
     widget.classList.add('open', 'streaming');
   } else if (widget.classList.contains('streaming')) {
     widget.classList.add('open');
@@ -10376,9 +10483,10 @@ async function clearChat() {
   }).catch(() => {});
 }
 
-/* ── Chat & Summary system prompts (global defaults + per-session overrides) ─ */
-let _builtinChatPrompt = '';        // fetched once; used for "Load built-in"
-let _builtinSummaryPrompt = '';     // ditto
+/* ── Chat / Summary / Title system prompts (global + per-session overrides) ── */
+let _builtinChatPrompt = '';        // fetched once; used for "Reset to original"
+let _builtinSummaryPrompt = '';
+let _builtinTitlePrompt = '';
 let _sessionChatPrompt = null;      // current session's chat override (null = none)
 let _sessionSummaryPrompt = null;   // current session's summary override (null = none)
 
@@ -10400,6 +10508,15 @@ async function _fetchBuiltinSummaryPrompt() {
   return _builtinSummaryPrompt;
 }
 
+async function _fetchBuiltinTitlePrompt() {
+  if (_builtinTitlePrompt) return _builtinTitlePrompt;
+  try {
+    const r = await fetch('/api/title/default-prompt').then(r => r.json());
+    _builtinTitlePrompt = r.prompt || '';
+  } catch { _builtinTitlePrompt = ''; }
+  return _builtinTitlePrompt;
+}
+
 // Pre-populate the System Prompts textareas: if the user has saved a custom
 // version, show it; otherwise show the built-in so the textarea is never blank.
 async function _syncGlobalChatPromptUI() {
@@ -10411,6 +10528,7 @@ async function _syncGlobalChatPromptUI() {
   } else {
     ta.value = await _fetchBuiltinChatPrompt();
   }
+  _refreshPromptSectionTags();
 }
 
 async function _syncGlobalSummaryPromptUI() {
@@ -10422,6 +10540,19 @@ async function _syncGlobalSummaryPromptUI() {
   } else {
     ta.value = await _fetchBuiltinSummaryPrompt();
   }
+  _refreshPromptSectionTags();
+}
+
+async function _syncGlobalTitlePromptUI() {
+  const ta = document.getElementById('global-title-prompt');
+  if (!ta) return;
+  const saved = _prefs.title_system_prompt;
+  if (typeof saved === 'string' && saved.length) {
+    ta.value = saved;
+  } else {
+    ta.value = await _fetchBuiltinTitlePrompt();
+  }
+  _refreshPromptSectionTags();
 }
 
 async function resetGlobalChatPrompt() {
@@ -10438,6 +10569,35 @@ async function resetGlobalSummaryPrompt() {
   _markPromptsDirty();
 }
 
+async function resetGlobalTitlePrompt() {
+  const ta = document.getElementById('global-title-prompt');
+  if (!ta) return;
+  ta.value = await _fetchBuiltinTitlePrompt();
+  _markPromptsDirty();
+}
+
+/* Tag each collapsed prompt section with a "Custom" chip when the saved
+ * value differs from the built-in, so users can see at a glance which
+ * sections they've customized without having to expand each one. */
+function _refreshPromptSectionTags() {
+  const entries = [
+    ['global-chat-prompt-tag',    _prefs.chat_system_prompt],
+    ['global-summary-prompt-tag', _prefs.summary_system_prompt],
+    ['global-title-prompt-tag',   _prefs.title_system_prompt],
+  ];
+  for (const [id, val] of entries) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    if (typeof val === 'string' && val.length) {
+      el.textContent = 'Custom';
+      el.classList.add('custom');
+    } else {
+      el.textContent = '';
+      el.classList.remove('custom');
+    }
+  }
+}
+
 function _markPromptsDirty() {
   const st = document.getElementById('prompts-save-status');
   if (st) { st.textContent = 'Unsaved changes'; st.classList.add('dirty'); }
@@ -10446,18 +10606,23 @@ function _markPromptsDirty() {
 async function saveSystemPrompts() {
   const chatTa    = document.getElementById('global-chat-prompt');
   const summaryTa = document.getElementById('global-summary-prompt');
+  const titleTa   = document.getElementById('global-title-prompt');
   const chatRaw    = chatTa    ? chatTa.value    : '';
   const summaryRaw = summaryTa ? summaryTa.value : '';
+  const titleRaw   = titleTa   ? titleTa.value   : '';
 
   // If the textarea matches the built-in verbatim, persist an empty string
   // so the backend keeps using the latest built-in (in case it ever changes).
   const builtinChat    = await _fetchBuiltinChatPrompt();
   const builtinSummary = await _fetchBuiltinSummaryPrompt();
+  const builtinTitle   = await _fetchBuiltinTitlePrompt();
   const chatVal    = (chatRaw    === builtinChat)    ? '' : chatRaw;
   const summaryVal = (summaryRaw === builtinSummary) ? '' : summaryRaw;
+  const titleVal   = (titleRaw   === builtinTitle)   ? '' : titleRaw;
 
   _prefs.chat_system_prompt    = chatVal;
   _prefs.summary_system_prompt = summaryVal;
+  _prefs.title_system_prompt   = titleVal;
 
   const btn = document.getElementById('prompts-save-btn');
   const st  = document.getElementById('prompts-save-status');
@@ -10469,10 +10634,12 @@ async function saveSystemPrompts() {
       body: JSON.stringify({
         chat_system_prompt:    chatVal,
         summary_system_prompt: summaryVal,
+        title_system_prompt:   titleVal,
       }),
     });
     _syncGlobalChatPromptUI();
     _syncGlobalSummaryPromptUI();
+    _syncGlobalTitlePromptUI();
     if (st) { st.textContent = 'Saved'; st.classList.remove('dirty'); st.classList.add('saved'); }
     setTimeout(() => { if (st) { st.textContent = ''; st.classList.remove('saved'); } }, 1800);
   } catch (e) {
@@ -10484,7 +10651,7 @@ async function saveSystemPrompts() {
 
 // Wire dirty-tracking on the System Prompts tab textareas (auto-save was removed).
 document.addEventListener('DOMContentLoaded', () => {
-  ['global-chat-prompt', 'global-summary-prompt'].forEach(id => {
+  ['global-chat-prompt', 'global-summary-prompt', 'global-title-prompt'].forEach(id => {
     const ta = document.getElementById(id);
     if (ta) ta.addEventListener('input', _markPromptsDirty);
   });
@@ -10946,14 +11113,24 @@ function _renderBubbleAttachments(bodyEl, attachments) {
 
   if (chatCol && overlay) {
     let dragCounter = 0;
+    const NOTES_MIME = 'application/x-notes-embed';
+
+    const hasFiles = e =>
+      Array.from(e.dataTransfer?.types || []).includes('Files');
+    const hasNotesEmbed = e =>
+      Array.from(e.dataTransfer?.types || []).includes(NOTES_MIME);
+    const isAttachable = e => hasFiles(e) || hasNotesEmbed(e);
 
     const showOverlay = (e) => {
-      // Update hint with file count when the browser exposes it
-      const count = e.dataTransfer?.items?.length;
-      if (hint && count) {
-        hint.textContent = count === 1 ? '1 file ready to attach' : `${count} files ready to attach`;
-      } else if (hint) {
-        hint.textContent = 'Images · PDFs · text files';
+      if (hasNotesEmbed(e) && !hasFiles(e)) {
+        if (hint) hint.textContent = 'Drop to attach from notes';
+      } else {
+        const count = e.dataTransfer?.items?.length;
+        if (hint && count) {
+          hint.textContent = count === 1 ? '1 file ready to attach' : `${count} files ready to attach`;
+        } else if (hint) {
+          hint.textContent = 'Images · PDFs · text files';
+        }
       }
       overlay.setAttribute('aria-hidden', 'false');
       overlay.classList.add('active');
@@ -10965,7 +11142,7 @@ function _renderBubbleAttachments(bodyEl, attachments) {
     };
 
     chatCol.addEventListener('dragenter', e => {
-      if (!e.dataTransfer?.types?.includes('Files')) return;
+      if (!isAttachable(e)) return;
       e.preventDefault();
       if (++dragCounter === 1) showOverlay(e);
     });
@@ -10978,15 +11155,109 @@ function _renderBubbleAttachments(bodyEl, attachments) {
     });
 
     chatCol.addEventListener('dragover', e => {
-      if (e.dataTransfer?.types?.includes('Files')) e.preventDefault();
+      if (isAttachable(e)) {
+        e.preventDefault();
+        if (e.dataTransfer) {
+          e.dataTransfer.dropEffect = hasFiles(e) ? 'copy' : 'copy';
+        }
+      }
     });
 
     chatCol.addEventListener('drop', e => {
+      // Notes embed drag takes priority — the dataTransfer carries our
+      // internal MIME with URL/meta we can re-upload as a chat attachment.
+      const notesRaw = (() => {
+        try { return e.dataTransfer?.getData(NOTES_MIME) || ''; }
+        catch (_) { return ''; }
+      })();
+      if (notesRaw) {
+        e.preventDefault();
+        dragCounter = 0;
+        hideOverlay();
+        let payload = null;
+        try { payload = JSON.parse(notesRaw); } catch (_) {}
+        if (payload) _attachNotesEmbedToChat(payload);
+        return;
+      }
       e.preventDefault();
       dragCounter = 0;
       hideOverlay();
       if (e.dataTransfer?.files?.length) _handleFileSelect(e.dataTransfer.files);
     });
+  }
+}
+
+/* Re-upload a notes attachment (or inline image) as a chat attachment. The
+ * notes pane stores files at /api/sessions/<sid>/notes/attachments/<stored>;
+ * the chat pane needs its own copy under /api/chat/attachment/<stored>.
+ * Fetching + re-uploading keeps the two systems decoupled and means each
+ * chat message references a stable, independent server-side file. */
+async function _attachNotesEmbedToChat(payload) {
+  if (!state.sessionId) {
+    flashStatus('Open a session first');
+    return;
+  }
+  const url = payload?.url;
+  if (!url) {
+    flashStatus("Couldn't read attachment");
+    return;
+  }
+  // Show an immediate "uploading" preview so the user gets feedback.
+  const preview = document.getElementById('chat-attach-preview');
+  preview?.classList.remove('hidden');
+  const placeholder = document.createElement('div');
+  placeholder.className = 'chat-attach-item uploading';
+  const isImage = (payload.kind === 'image') ||
+    (payload.mime && payload.mime.startsWith('image/'));
+  if (isImage) {
+    const img = document.createElement('img');
+    // For server-stored attachments the URL works directly. For pasted-but-
+    // unsaved blob URLs the image still renders since blobs survive across
+    // panes within the same document.
+    img.src = url;
+    placeholder.appendChild(img);
+  } else {
+    const icon = document.createElement('i');
+    icon.className = 'fa-solid fa-file';
+    icon.style.fontSize = '14px';
+    placeholder.appendChild(icon);
+  }
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'attach-name';
+  nameSpan.textContent = payload.filename || (isImage ? 'image' : 'file');
+  placeholder.appendChild(nameSpan);
+  preview?.appendChild(placeholder);
+
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('Fetch failed: ' + resp.status);
+    const blob = await resp.blob();
+    const filename = payload.filename || _filenameFromUrl(url) ||
+      (isImage ? 'image.png' : 'file');
+    const file = new File([blob], filename, {
+      type: payload.mime || blob.type || 'application/octet-stream',
+    });
+    // Hand off to the existing upload path. It builds its own preview tile,
+    // so we tear down the placeholder once it spawns its replacement.
+    placeholder.remove();
+    _refreshAttachPreview();
+    _uploadAttachment(file);
+  } catch (err) {
+    console.error('Notes→chat attach failed', err);
+    placeholder.classList.add('upload-error');
+    placeholder.classList.remove('uploading');
+    placeholder.title = 'Attach failed: ' + (err.message || 'unknown');
+    setTimeout(() => { placeholder.remove(); _refreshAttachPreview(); }, 3000);
+  }
+}
+
+function _filenameFromUrl(url) {
+  try {
+    const u = new URL(url, window.location.origin);
+    const last = u.pathname.split('/').filter(Boolean).pop() || '';
+    return decodeURIComponent(last);
+  } catch (_) {
+    return '';
   }
 }
 
@@ -11143,6 +11414,9 @@ async function loadSession(sessionId) {
     badge.classList.remove('hidden');
   }
 
+  // Restore rich-text notes (Quill Delta). data.notes may be null/missing.
+  _notesApplyForSession(sessionId, data.notes || null);
+
   if (data.chat_messages?.length) {
     document.getElementById('chat-messages').innerHTML = '';
     for (const m of data.chat_messages) {
@@ -11166,7 +11440,7 @@ async function loadSession(sessionId) {
         const tcRaw = m.tool_calls;
         if (tcRaw) {
           const tcs = typeof tcRaw === 'string' ? JSON.parse(tcRaw) : tcRaw;
-          if (tcs?.length && wrap) _renderToolWidget(wrap, tcs);
+          if (tcs?.length && wrap) _renderToolWidget(wrap, tcs, true);
         }
       }
     }
@@ -11482,6 +11756,8 @@ function clearAll() {
     '<p class="empty-hint">An auto-updating summary will appear here as the meeting progresses.</p>';
   document.getElementById('chat-messages').innerHTML =
     '<p class="empty-hint">Ask questions about the meeting here.</p>';
+  // Reset the Notes editor (no save — clearAll is for navigating away from a session)
+  if (typeof _notesResetForSessionChange === 'function') _notesResetForSessionChange();
   state.aiChatBusy = false;
   _setChatBusy(false);
   _clearAttachments();
@@ -11492,6 +11768,935 @@ function clearAll() {
   state.chatBuffer       = '';
   state.chatToolCalls    = [];
   destroyPlayback();
+}
+
+/* ── Notes pane: Quill rich-text editor + inline attachments ────────────── */
+let _quill = null;
+let _notesSessionBound = null;       // session_id whose contents are in the editor
+let _notesDirty = false;
+let _notesSaveTimer = null;
+let _notesSuppressChange = false;    // skip autosave during programmatic updates
+let _notesPendingPayload = null;     // delta arriving before editor exists
+let _notesPlaceholderSeq = 0;
+let _notesNeedsBindOnInit = false;
+
+function _ensureNotesEditor() {
+  if (_quill) return _quill;
+  const editorEl  = document.getElementById('notes-editor');
+  const toolbarEl = document.getElementById('notes-toolbar');
+  if (!editorEl || !toolbarEl) return null;
+  if (typeof Quill === 'undefined') return null;  // CDN load failed; gracefully no-op
+
+  _registerNoteFileBlot();
+  _allowBlobImageUrls();
+
+  _quill = new Quill(editorEl, {
+    theme: 'snow',
+    modules: {
+      toolbar: { container: toolbarEl },
+      history: { delay: 750, maxStack: 200, userOnly: true },
+    },
+    formats: [
+      'header', 'bold', 'italic', 'underline', 'strike',
+      'color', 'background', 'list', 'indent', 'blockquote',
+      'code-block', 'code', 'link', 'align', 'image', 'note-file',
+    ],
+  });
+
+  _quill.on('text-change', (_delta, _old, source) => {
+    _refreshNotesEmptyHint();
+    if (_notesSuppressChange) return;
+    if (source !== 'user') return;
+    _notesDirty = true;
+    _scheduleNotesSave();
+  });
+
+  _registerNoteFileClipboardMatcher(_quill);
+  _wireNotesDropAndPaste(editorEl);
+
+  // Track focus so the document-level drop router knows when to claim drags
+  // away from the session-import overlay.
+  _quill.on('selection-change', range => {
+    _notesHasFocus = range !== null;
+  });
+
+  // Image interactions: single click selects + shows resize handles,
+  // double-click opens the lightbox.
+  editorEl.addEventListener('click', e => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    if (t.tagName === 'IMG' && t.closest('.ql-editor')) {
+      e.preventDefault();
+      e.stopPropagation();
+      _selectNotesImage(t);
+    }
+  });
+  editorEl.addEventListener('dblclick', e => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    if (t.tagName === 'IMG' && t.closest('.ql-editor')) {
+      e.preventDefault();
+      e.stopPropagation();
+      _deselectNotesImage();
+      if (typeof _openImageLightbox === 'function') _openImageLightbox(t.src);
+    }
+  });
+
+  // Apply any payload that arrived before the editor was ready
+  if (_notesNeedsBindOnInit) {
+    _notesNeedsBindOnInit = false;
+    if (_notesPendingPayload !== null) {
+      _applyNotesPayload(_notesPendingPayload);
+      _notesPendingPayload = null;
+    }
+    _notesSessionBound = state.sessionId || null;
+  }
+  _refreshNotesEmptyHint();
+  return _quill;
+}
+
+/* ── Image resize (click to select, drag a corner handle to resize) ──────── */
+let _notesActiveImage = null;
+let _notesResizeOverlay = null;
+let _notesResizeState = null;
+let _notesResizeRaf = 0;
+
+function _ensureNotesResizeOverlay() {
+  if (_notesResizeOverlay) return _notesResizeOverlay;
+  const ov = document.createElement('div');
+  ov.className = 'notes-img-resize-overlay';
+  ov.innerHTML = `
+    <div class="notes-img-handle" data-corner="tl"></div>
+    <div class="notes-img-handle" data-corner="tr"></div>
+    <div class="notes-img-handle" data-corner="bl"></div>
+    <div class="notes-img-handle" data-corner="br"></div>
+    <div class="notes-img-size-label" id="notes-img-size-label"></div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('mousedown', _onNotesResizeHandleDown);
+  _notesResizeOverlay = ov;
+  return ov;
+}
+
+function _selectNotesImage(img) {
+  _notesActiveImage = img;
+  const ov = _ensureNotesResizeOverlay();
+  ov.classList.add('active');
+  _positionNotesResizeOverlay();
+  // While active, keep overlay glued to the image (cheap rAF loop).
+  if (!_notesResizeRaf) {
+    const tick = () => {
+      if (!_notesActiveImage) { _notesResizeRaf = 0; return; }
+      _positionNotesResizeOverlay();
+      _notesResizeRaf = requestAnimationFrame(tick);
+    };
+    _notesResizeRaf = requestAnimationFrame(tick);
+  }
+}
+
+function _deselectNotesImage() {
+  _notesActiveImage = null;
+  if (_notesResizeOverlay) _notesResizeOverlay.classList.remove('active');
+  if (_notesResizeRaf) { cancelAnimationFrame(_notesResizeRaf); _notesResizeRaf = 0; }
+}
+
+function _positionNotesResizeOverlay() {
+  if (!_notesActiveImage || !_notesResizeOverlay) return;
+  const r = _notesActiveImage.getBoundingClientRect();
+  const ov = _notesResizeOverlay;
+  ov.style.left = (r.left + window.scrollX) + 'px';
+  ov.style.top = (r.top + window.scrollY) + 'px';
+  ov.style.width = r.width + 'px';
+  ov.style.height = r.height + 'px';
+}
+
+function _onNotesResizeHandleDown(e) {
+  if (!_notesActiveImage) return;
+  const corner = e.target?.dataset?.corner;
+  if (!corner) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const img = _notesActiveImage;
+  const startWidth  = img.clientWidth;
+  const startHeight = img.clientHeight;
+  const aspect = startHeight > 0 ? (startWidth / startHeight) : 1;
+  _notesResizeState = {
+    img, corner, startWidth, startHeight, aspect,
+    startX: e.clientX, startY: e.clientY,
+  };
+  document.body.classList.add('notes-img-resizing');
+  document.addEventListener('mousemove', _onNotesResizeMove);
+  document.addEventListener('mouseup', _onNotesResizeUp, { once: true });
+}
+
+function _onNotesResizeMove(e) {
+  const s = _notesResizeState;
+  if (!s) return;
+  // Right-side handles (tr/br) grow with positive dx; left-side (tl/bl) with negative dx.
+  const sign = (s.corner === 'tr' || s.corner === 'br') ? 1 : -1;
+  const dx = (e.clientX - s.startX) * sign;
+  const newWidth = Math.max(40, Math.round(s.startWidth + dx));
+  const newHeight = Math.max(20, Math.round(newWidth / s.aspect));
+  // Quill's image format whitelists width/height attributes, so setting them
+  // directly persists in getContents() — no formatText call needed.
+  s.img.setAttribute('width', String(newWidth));
+  s.img.setAttribute('height', String(newHeight));
+  const lbl = document.getElementById('notes-img-size-label');
+  if (lbl) lbl.textContent = `${newWidth} × ${newHeight}`;
+}
+
+function _onNotesResizeUp() {
+  document.removeEventListener('mousemove', _onNotesResizeMove);
+  document.body.classList.remove('notes-img-resizing');
+  if (_notesResizeState) {
+    _notesDirty = true;
+    _scheduleNotesSave();
+  }
+  _notesResizeState = null;
+}
+
+// Click outside / Escape deselects.
+document.addEventListener('mousedown', e => {
+  if (!_notesActiveImage) return;
+  const ov = _notesResizeOverlay;
+  if (ov && ov.contains(e.target)) return;
+  if (e.target === _notesActiveImage) return;
+  _deselectNotesImage();
+}, true);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && _notesActiveImage) _deselectNotesImage();
+});
+
+/* Quill's default Image blot sanitizes URLs to one of {http, https, data,
+ * blob}, but in practice blob: URLs get rejected and replaced with the
+ * "no-op" `//:0` placeholder — which renders as the browser's broken-image
+ * icon. We use blob URLs as the temporary src while an upload is in flight,
+ * so we override sanitize to pass them through. (data: and the server's
+ * /api/... paths still work as before.) */
+function _allowBlobImageUrls() {
+  if (window._noteImageSanitizePatched) return;
+  if (typeof Quill === 'undefined') return;
+  try {
+    const Image = Quill.import('formats/image');
+    Image.sanitize = function (url) {
+      if (typeof url !== 'string') return '//:0';
+      // Permit anything with a usable protocol or a relative/absolute path.
+      if (/^(https?:|data:|blob:|\/)/i.test(url)) return url;
+      return '//:0';
+    };
+    window._noteImageSanitizePatched = true;
+  } catch (_) {
+    // CDN load failed or API changed — fall through; worst case is a
+    // momentary broken-image icon, which we already had.
+  }
+}
+
+/* Teach Quill's clipboard module to round-trip our custom note-file blot.
+ * Without a matcher, copying a file chip (or a selection containing one)
+ * and pasting it back into the editor would drop the chip on the floor. */
+function _registerNoteFileClipboardMatcher(quill) {
+  if (!quill || !quill.clipboard) return;
+  if (typeof Quill === 'undefined') return;
+  let DeltaCtor;
+  try { DeltaCtor = Quill.import('delta'); } catch (_) { return; }
+  if (!DeltaCtor) return;
+  quill.clipboard.addMatcher('a.note-file', (node, delta) => {
+    const meta = {
+      id:       node.getAttribute('data-id') || '',
+      url:      node.getAttribute('href') || '',
+      filename: node.querySelector('.nf-name')?.textContent || '',
+      mime:     node.getAttribute('data-mime') || '',
+      size:     parseInt(node.getAttribute('data-size') || '0', 10) || 0,
+    };
+    return new DeltaCtor().insert({ 'note-file': meta });
+  });
+}
+
+function _registerNoteFileBlot() {
+  if (window._noteFileBlotRegistered) return;
+  if (typeof Quill === 'undefined') return;
+  const InlineEmbed = Quill.import('blots/embed');
+
+  class NoteFile extends InlineEmbed {
+    static create(value) {
+      const node = super.create(value);
+      const v = (value && typeof value === 'object') ? value : {};
+      const url      = v.url || '#';
+      const filename = v.filename || v.name || 'file';
+      const mime     = v.mime || '';
+      const size     = parseInt(v.size, 10) || 0;
+      const id       = v.id || '';
+      const kind     = _fileKindFor({ filename, mime });
+
+      node.setAttribute('href', url);
+      node.setAttribute('target', '_blank');
+      node.setAttribute('rel', 'noopener noreferrer');
+      node.setAttribute('contenteditable', 'false');
+      node.setAttribute('data-id', id);
+      node.setAttribute('data-mime', mime);
+      node.setAttribute('data-size', String(size));
+      node.setAttribute('data-kind', kind);
+
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'nf-icon';
+      iconSpan.innerHTML = `<i class="${_fileIconFor({ filename, mime, kind })}"></i>`;
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'nf-name';
+      nameSpan.textContent = filename;
+
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'nf-meta';
+      metaSpan.textContent = size > 0 ? _formatFileSize(size) : '';
+
+      node.appendChild(iconSpan);
+      node.appendChild(nameSpan);
+      if (metaSpan.textContent) node.appendChild(metaSpan);
+      return node;
+    }
+
+    static value(node) {
+      return {
+        id:       node.getAttribute('data-id') || '',
+        url:      node.getAttribute('href') || '',
+        filename: node.querySelector('.nf-name')?.textContent || '',
+        mime:     node.getAttribute('data-mime') || '',
+        size:     parseInt(node.getAttribute('data-size') || '0', 10) || 0,
+      };
+    }
+  }
+  NoteFile.blotName  = 'note-file';
+  NoteFile.tagName   = 'a';
+  NoteFile.className = 'note-file';
+  Quill.register(NoteFile, true);
+  window._noteFileBlotRegistered = true;
+}
+
+function _fileKindFor({ filename = '', mime = '' }) {
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+  const m = (mime || '').toLowerCase();
+  if (m.startsWith('image/'))             return 'image';
+  if (m.startsWith('audio/'))             return 'audio';
+  if (m.startsWith('video/'))             return 'video';
+  if (m === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (['doc', 'docx', 'odt', 'rtf'].includes(ext) ||
+      m.includes('wordprocessingml') || m.includes('msword')) return 'word';
+  if (['xls', 'xlsx', 'ods', 'csv', 'tsv', 'numbers'].includes(ext) ||
+      m.includes('spreadsheetml') || m.includes('ms-excel')) return 'excel';
+  if (['ppt', 'pptx', 'odp', 'key'].includes(ext) ||
+      m.includes('presentationml') || m.includes('powerpoint')) return 'ppt';
+  if (['zip', '7z', 'rar', 'tar', 'gz', 'bz2', 'xz'].includes(ext)) return 'archive';
+  if (['py', 'js', 'ts', 'tsx', 'jsx', 'java', 'c', 'h', 'cpp', 'cs', 'go', 'rs',
+       'rb', 'php', 'swift', 'kt', 'sh', 'bash', 'ps1', 'sql', 'html', 'htm',
+       'css', 'scss', 'sass', 'less', 'vue', 'svelte', 'r', 'lua', 'pl'].includes(ext)) return 'code';
+  if (['json', 'yml', 'yaml', 'toml', 'ini', 'env', 'xml'].includes(ext) ||
+      m === 'application/json' || m === 'application/xml') return 'data';
+  if (['txt', 'md', 'markdown', 'log'].includes(ext) ||
+      m.startsWith('text/')) return 'text';
+  return 'text';
+}
+
+function _fileIconFor({ filename = '', mime = '', kind } = {}) {
+  const k = kind || _fileKindFor({ filename, mime });
+  switch (k) {
+    case 'pdf':     return 'fa-solid fa-file-pdf';
+    case 'word':    return 'fa-solid fa-file-word';
+    case 'excel':   return 'fa-solid fa-file-excel';
+    case 'ppt':     return 'fa-solid fa-file-powerpoint';
+    case 'archive': return 'fa-solid fa-file-zipper';
+    case 'audio':   return 'fa-solid fa-file-audio';
+    case 'video':   return 'fa-solid fa-file-video';
+    case 'image':   return 'fa-regular fa-image';
+    case 'code':    return 'fa-solid fa-file-code';
+    case 'data':    return 'fa-solid fa-database';
+    case 'text':    return 'fa-solid fa-file-lines';
+  }
+  return 'fa-solid fa-file';
+}
+
+function _formatFileSize(bytes) {
+  if (!bytes || bytes <= 0) return '';
+  if (bytes < 1024)               return `${bytes} B`;
+  if (bytes < 1024 * 1024)        return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function _refreshNotesEmptyHint() {
+  const hint = document.getElementById('notes-empty-hint');
+  if (!hint || !_quill) return;
+  // Quill applies .ql-blank when contents are empty. We also want to hide the
+  // hint as soon as a placeholder/upload is in progress so it doesn't compete
+  // visually with the spinner.
+  const isBlank = _quill.root.classList.contains('ql-blank') &&
+                  !_quill.root.querySelector('.note-file, img');
+  hint.classList.toggle('visible', isBlank);
+}
+
+/* Apply a server-loaded payload (or null) to the editor for `sessionId`. */
+function _notesApplyForSession(sessionId, payload) {
+  // Cancel any pending save for the previous session
+  if (_notesSaveTimer) { clearTimeout(_notesSaveTimer); _notesSaveTimer = null; }
+  _notesDirty = false;
+  _notesSessionBound = sessionId || null;
+
+  // If the user hasn't opened the Notes pane yet, defer construction.
+  if (!_quill) {
+    _notesPendingPayload = payload;
+    _notesNeedsBindOnInit = true;
+    return;
+  }
+  _applyNotesPayload(payload);
+}
+
+function _applyNotesPayload(payload) {
+  if (!_quill) return;
+  _notesSuppressChange = true;
+  try {
+    if (payload && payload.delta) {
+      const ops = Array.isArray(payload.delta) ? payload.delta : payload.delta.ops;
+      _quill.setContents({ ops: Array.isArray(ops) ? ops : [] }, 'silent');
+    } else {
+      _quill.setText('', 'silent');
+    }
+  } finally {
+    _notesSuppressChange = false;
+  }
+  _quill.history.clear();
+  _refreshNotesEmptyHint();
+}
+
+/* Reset the editor when the user navigates to a different session. The
+ * caller (`clearAll`) is invoked before `loadSession` populates the new
+ * payload, so we just blank the contents here.
+ */
+function _notesResetForSessionChange() {
+  if (_notesSaveTimer) { clearTimeout(_notesSaveTimer); _notesSaveTimer = null; }
+  _notesDirty = false;
+  _notesSessionBound = null;
+  _notesPendingPayload = null;
+  if (!_quill) return;
+  _notesSuppressChange = true;
+  try { _quill.setText('', 'silent'); }
+  finally { _notesSuppressChange = false; }
+  _quill.history.clear();
+  _refreshNotesEmptyHint();
+  const badge = document.getElementById('notes-status-badge');
+  if (badge) badge.classList.add('hidden');
+}
+
+function _scheduleNotesSave() {
+  if (!state.sessionId) return;  // can't save without a session
+  if (_notesSaveTimer) clearTimeout(_notesSaveTimer);
+  const badge = document.getElementById('notes-status-badge');
+  if (badge) {
+    badge.textContent = 'saving…';
+    badge.classList.remove('hidden', 'saved');
+  }
+  _notesSaveTimer = setTimeout(() => _notesFlushSave(false), 800);
+}
+
+async function _notesFlushSave(showImmediate) {
+  if (!_quill || !state.sessionId) return;
+  // Saving for the wrong session would clobber its data — bail.
+  if (_notesSessionBound && _notesSessionBound !== state.sessionId) return;
+  _notesSaveTimer = null;
+  const delta = _quill.getContents();
+  const isEmpty = !delta || !delta.ops || delta.ops.length === 0 ||
+    (delta.ops.length === 1 && delta.ops[0].insert === '\n');
+  const payload = isEmpty ? { delta: null } : { delta };
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/notes`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    _notesDirty = false;
+    const badge = document.getElementById('notes-status-badge');
+    if (badge) {
+      badge.textContent = 'saved';
+      badge.classList.add('saved');
+      setTimeout(() => badge?.classList.add('hidden'), 1100);
+    }
+  } catch (err) {
+    console.error('Notes save failed', err);
+    const badge = document.getElementById('notes-status-badge');
+    if (badge) {
+      badge.textContent = 'save failed';
+      badge.classList.remove('saved');
+    }
+  }
+}
+
+// Flush any pending save when the page is about to unload
+window.addEventListener('beforeunload', () => {
+  if (_notesDirty && state.sessionId && _quill) {
+    try {
+      const delta = _quill.getContents();
+      const blob = new Blob([JSON.stringify({ delta })], { type: 'application/json' });
+      navigator.sendBeacon(`/api/sessions/${state.sessionId}/notes`, blob);
+    } catch (_) {}
+  }
+});
+
+/* Drag-and-drop + paste wiring ─────────────────────────────────────────── */
+const _NOTES_INTERNAL_DRAG_MIME = 'application/x-notes-embed';
+let _notesHasFocus = false;
+let _notesGlobalDropInited = false;
+
+/* Document-level drag router: while the notes editor has focus, claim file
+ * drags from anywhere on the page so the session-import overlay doesn't
+ * pop up and steal them. Listeners run in capture phase so they fire
+ * BEFORE the import handler (which is bubble-phase). */
+function _initNotesGlobalDropRouter() {
+  if (_notesGlobalDropInited) return;
+  _notesGlobalDropInited = true;
+  const overlay = document.getElementById('notes-drop-overlay');
+
+  const claim = () => _notesHasFocus && state.sessionId;
+
+  document.addEventListener('dragenter', e => {
+    if (!claim() || !_dtHasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (overlay) overlay.classList.add('active');
+  }, true);
+
+  document.addEventListener('dragover', e => {
+    if (!claim() || !_dtHasFiles(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }, true);
+
+  document.addEventListener('dragleave', e => {
+    if (!claim()) return;
+    // Only hide when the drag actually leaves the window (relatedTarget null).
+    if (!e.relatedTarget) {
+      if (overlay) overlay.classList.remove('active');
+    }
+  }, true);
+
+  document.addEventListener('drop', e => {
+    if (!claim()) return;
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (overlay) overlay.classList.remove('active');
+    _notesHandleFileSelect(e.dataTransfer.files, e);
+  }, true);
+}
+
+function _wireNotesDropAndPaste(editorEl) {
+  const col = document.querySelector('.col-notes');
+  const overlay = document.getElementById('notes-drop-overlay');
+  if (!col || !overlay) return;
+  _initNotesGlobalDropRouter();
+
+  let dragDepth = 0;
+  const isInternalDrag = e =>
+    Array.from(e.dataTransfer?.types || []).includes(_NOTES_INTERNAL_DRAG_MIME);
+
+  // Stop propagation on every drag event so the document-level session-import
+  // overlay doesn't pop up over the notes column and steal the drop. Treat
+  // internal embed drags (image/file rearrange) the same way — same overlay
+  // is fine, but no need for the file-types check since dataTransfer.types
+  // won't carry "Files" for an internal drag.
+  col.addEventListener('dragenter', e => {
+    if (!_dtHasFiles(e) && !isInternalDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth++;
+    overlay.classList.add('active');
+  });
+  col.addEventListener('dragover', e => {
+    if (!_dtHasFiles(e) && !isInternalDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = isInternalDrag(e) ? 'move' : 'copy';
+    }
+  });
+  col.addEventListener('dragleave', e => {
+    e.stopPropagation();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) overlay.classList.remove('active');
+  });
+  col.addEventListener('drop', e => {
+    e.stopPropagation();
+    dragDepth = 0;
+    overlay.classList.remove('active');
+    // Internal drag = rearranging an existing embed; takes precedence.
+    if (_handleInternalEmbedDrop(e)) return;
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    _notesHandleFileSelect(e.dataTransfer.files, e);
+  });
+
+  // Drag-to-rearrange: when an existing image/file chip starts dragging,
+  // tag the dataTransfer with our internal MIME + the source index so the
+  // drop handler knows to splice it into the new position.
+  editorEl.addEventListener('dragstart', e => {
+    const blotEl = _findEmbedRootInEditor(e.target);
+    if (!blotEl) return;
+    let blot;
+    try { blot = Quill.find(blotEl); } catch (_) {}
+    if (!blot || typeof _quill.getIndex !== 'function') return;
+    const idx = _quill.getIndex(blot);
+    if (idx < 0) return;
+    // Pull the embed payload too — when the drop lands in the chat panel
+    // we need the URL/metadata to re-upload the file as a chat attachment.
+    const ops = _quill.getContents(idx, 1).ops || [];
+    const op = ops[0];
+    let payload = { index: idx };
+    if (op?.insert?.image) {
+      payload.kind = 'image';
+      payload.url = op.insert.image;
+      // Read the on-screen <img> for filename/dimensions when blob URLs hide it.
+      if (blotEl.tagName === 'IMG') {
+        const alt = blotEl.getAttribute('alt') || '';
+        if (alt) payload.filename = alt;
+      }
+    } else if (op?.insert?.['note-file']) {
+      payload.kind = 'file';
+      Object.assign(payload, op.insert['note-file']);
+    }
+    try {
+      e.dataTransfer.setData(_NOTES_INTERNAL_DRAG_MIME, JSON.stringify(payload));
+      // copyMove so the chat panel can claim it as a copy while the notes
+      // panel still treats an internal drop as a move (rearrange).
+      e.dataTransfer.effectAllowed = 'copyMove';
+    } catch (_) {}
+    e.stopPropagation();
+  });
+
+  // Paste handler: intercept clipboard files BEFORE Quill so it doesn't
+  // inline data URLs (which would also bloat the saved Delta).
+  editorEl.addEventListener('paste', e => {
+    if (!e.clipboardData) return;
+    const files = [];
+    for (const item of e.clipboardData.items || []) {
+      if (item.kind === 'file') {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      _notesHandleFileSelect(files, e);
+    }
+  }, true);
+}
+
+/* Resolve a drag-event target to the embed root we want to move. */
+function _findEmbedRootInEditor(t) {
+  if (!(t instanceof HTMLElement)) return null;
+  if (!t.closest('.ql-editor')) return null;
+  if (t.tagName === 'IMG') return t;
+  if (t.classList?.contains('note-file')) return t;
+  const closest = t.closest?.('.note-file');
+  return closest || null;
+}
+
+/* If the drop carries our internal embed-drag payload, splice the embed to
+ * the new caret position. Returns true if it handled the drop. */
+function _handleInternalEmbedDrop(e) {
+  const raw = (() => {
+    try { return e.dataTransfer?.getData(_NOTES_INTERNAL_DRAG_MIME) || ''; }
+    catch (_) { return ''; }
+  })();
+  if (!raw) return false;
+  e.preventDefault();
+  let payload;
+  try { payload = JSON.parse(raw); } catch (_) { return true; }
+  const srcIdx = Number(payload?.index);
+  if (!Number.isFinite(srcIdx) || srcIdx < 0) return true;
+  const dropIdx = _quillIndexFromPoint(e.clientX, e.clientY);
+  if (dropIdx == null) return true;
+  // Same spot → no-op (dropIdx === srcIdx is "before self"; +1 is "after self").
+  if (dropIdx === srcIdx || dropIdx === srcIdx + 1) return true;
+
+  const ops = (_quill.getContents(srcIdx, 1).ops) || [];
+  const op = ops[0];
+  if (!op || !op.insert || typeof op.insert === 'string') return true;
+  const embedKey = Object.keys(op.insert)[0];
+  const embedValue = op.insert[embedKey];
+
+  _notesSuppressChange = true;
+  _quill.deleteText(srcIdx, 1, 'silent');
+  const adjusted = (dropIdx > srcIdx) ? dropIdx - 1 : dropIdx;
+  _quill.insertEmbed(adjusted, embedKey, embedValue, 'user');
+  _quill.setSelection(adjusted + 1, 0, 'silent');
+  _notesSuppressChange = false;
+  _notesDirty = true;
+  _scheduleNotesSave();
+  return true;
+}
+
+/* Map screen coords (e.clientX, e.clientY) to a Quill insertion index by
+ * asking the browser for the caret position at that point and reading it
+ * back via Quill's selection module. Returns null if outside the editor. */
+function _quillIndexFromPoint(x, y) {
+  if (!_quill) return null;
+  let range = null;
+  if (document.caretRangeFromPoint) {
+    range = document.caretRangeFromPoint(x, y);
+  } else if (document.caretPositionFromPoint) {
+    const pos = document.caretPositionFromPoint(x, y);
+    if (pos) {
+      range = document.createRange();
+      range.setStart(pos.offsetNode, pos.offset);
+      range.collapse(true);
+    }
+  }
+  if (!range) return _quill.getLength();
+  const editorRoot = _quill.root;
+  if (!editorRoot.contains(range.startContainer)) {
+    // Drop happened over the editor pane but outside the actual ql-editor
+    // (e.g. the empty area below the last paragraph) — append at the end.
+    return _quill.getLength();
+  }
+  const sel = window.getSelection();
+  if (!sel) return _quill.getLength();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  const r = _quill.getSelection();
+  return r ? r.index : _quill.getLength();
+}
+
+function _dtHasFiles(e) {
+  const t = e.dataTransfer;
+  if (!t) return false;
+  const types = t.types;
+  if (!types) return false;
+  return Array.from(types).includes('Files');
+}
+
+/* File-selection entry point — used by drop, paste, and the toolbar button. */
+async function _notesHandleFileSelect(files, originalEvent) {
+  if (!files || !files.length) return;
+  if (!state.sessionId) {
+    flashStatus('Start a recording or open a session first');
+    return;
+  }
+  _ensureNotesEditor();
+  if (!_quill) return;
+
+  // Determine the insertion index. For a drop, use the drop point so files
+  // land where the user let go. Otherwise (paste, toolbar), fall back to the
+  // current selection / end of doc.
+  let insertIndex = null;
+  const isDrop = originalEvent && originalEvent.type === 'drop'
+    && typeof originalEvent.clientX === 'number';
+  if (isDrop) {
+    insertIndex = _quillIndexFromPoint(originalEvent.clientX, originalEvent.clientY);
+  }
+  if (insertIndex == null) {
+    const sel = _quill.getSelection(true);
+    insertIndex = sel ? sel.index : _quill.getLength();
+  }
+
+  for (const file of Array.from(files)) {
+    const isImage = (file.type || '').startsWith('image/');
+    const placeholderId = 'pending-' + (++_notesPlaceholderSeq);
+
+    if (isImage) {
+      // Show the image immediately via a blob URL, then swap to the server
+      // URL once the upload completes. We track the embed by *index* (not by
+      // URL string), because Quill's image blot round-trips src through
+      // getAttribute() which may normalize the URL — leaving a Delta-side
+      // string match unable to find the embed.
+      const tempUrl = URL.createObjectURL(file);
+      const imageIndex = insertIndex;
+      _notesSuppressChange = true;
+      _quill.insertEmbed(imageIndex, 'image', tempUrl, 'user');
+      _quill.setSelection(imageIndex + 1, 0, 'silent');
+      _notesSuppressChange = false;
+      insertIndex += 1;
+
+      try {
+        const meta = await _notesUploadFile(file);
+        _notesSwapImageAt(imageIndex, tempUrl, meta.url);
+      } catch (err) {
+        console.error('Notes image upload failed', err);
+        flashStatus('Image upload failed');
+        // Leave the temp blob in place so the user doesn't lose context;
+        // mark the saved Delta as non-dirty since we never persisted it.
+      }
+    } else {
+      // Insert a chip in "uploading" state, then update with real metadata
+      const placeholderMeta = {
+        id: placeholderId,
+        filename: file.name,
+        mime: file.type || 'application/octet-stream',
+        size: file.size,
+        url: '#',
+      };
+      _notesSuppressChange = true;
+      _quill.insertEmbed(insertIndex, 'note-file', placeholderMeta, 'user');
+      _quill.setSelection(insertIndex + 1, 0, 'silent');
+      _notesSuppressChange = false;
+      insertIndex += 1;
+      const chipEl = _findFileChipDom(placeholderId);
+      if (chipEl) chipEl.classList.add('uploading');
+
+      try {
+        const meta = await _notesUploadFile(file);
+        _notesReplaceFileChip(placeholderId, meta);
+      } catch (err) {
+        console.error('Notes file upload failed', err);
+        const failedChip = _findFileChipDom(placeholderId);
+        if (failedChip) {
+          failedChip.classList.remove('uploading');
+          failedChip.classList.add('upload-error');
+          failedChip.title = 'Upload failed: ' + (err.message || 'Network error');
+        }
+        flashStatus('Attachment upload failed');
+      }
+    }
+  }
+  _notesDirty = true;
+  _scheduleNotesSave();
+}
+
+async function _notesUploadFile(file) {
+  if (!state.sessionId) throw new Error('No active session');
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch(`/api/sessions/${state.sessionId}/notes/attachments`, {
+    method: 'POST',
+    body: fd,
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.error || ('HTTP ' + r.status));
+  }
+  return r.json();
+}
+
+function _findFileChipDom(placeholderId) {
+  if (!_quill) return null;
+  return _quill.root.querySelector(`.note-file[data-id="${CSS.escape(placeholderId)}"]`);
+}
+
+/* Replace an in-document image at a known index. Mutating <img>.src directly
+ * would bypass Quill's internal model so the next getContents() would still
+ * serialize the old blob URL. We delete + re-insert at the same position so
+ * the Delta and DOM stay in sync. The blob URL is revoked only AFTER the
+ * server URL is in place, otherwise a failed swap would leave a revoked blob.
+ */
+function _notesSwapImageAt(index, oldBlobUrl, newSrc) {
+  if (!_quill) return;
+  const ops = _quill.getContents().ops || [];
+  // Verify the embed at this index is still an image (it should be, but the
+  // user may have edited the doc while the upload was in flight; in that
+  // case we fall back to a Delta-string match).
+  let walked = 0;
+  let foundIndex = -1;
+  for (const op of ops) {
+    if (typeof op.insert === 'string') {
+      walked += op.insert.length;
+    } else if (op.insert && typeof op.insert === 'object') {
+      if (walked === index && 'image' in op.insert) { foundIndex = walked; break; }
+      walked += 1;
+    }
+  }
+  if (foundIndex < 0) {
+    // Index drifted — fall back to URL match (best-effort).
+    foundIndex = _findEmbedIndex(op => op?.insert?.image === oldBlobUrl);
+  }
+  if (foundIndex < 0) return;
+  _notesSuppressChange = true;
+  _quill.deleteText(foundIndex, 1, 'silent');
+  _quill.insertEmbed(foundIndex, 'image', newSrc, 'silent');
+  _notesSuppressChange = false;
+  // Now safe to release the blob — the DOM no longer references it.
+  try { URL.revokeObjectURL(oldBlobUrl); } catch (_) {}
+}
+
+function _notesReplaceFileChip(placeholderId, meta) {
+  if (!_quill) return;
+  const idx = _findEmbedIndex(op => op?.insert?.['note-file']?.id === placeholderId);
+  if (idx < 0) return;
+  _notesSuppressChange = true;
+  _quill.deleteText(idx, 1, 'silent');
+  _quill.insertEmbed(idx, 'note-file', {
+    id: meta.id,
+    url: meta.url,
+    filename: meta.filename,
+    mime: meta.mime,
+    size: meta.size,
+  }, 'silent');
+  _notesSuppressChange = false;
+}
+
+function _findEmbedIndex(predicate) {
+  if (!_quill) return -1;
+  const ops = _quill.getContents().ops || [];
+  let index = 0;
+  for (const op of ops) {
+    if (typeof op.insert === 'string') {
+      index += op.insert.length;
+    } else if (op.insert && typeof op.insert === 'object') {
+      if (predicate(op)) return index;
+      index += 1;
+    }
+  }
+  return -1;
+}
+
+/* ── Toolbar action helpers ─────────────────────────────────────────────── */
+function copyNotesPlainText() {
+  if (!_quill) return;
+  const text = _quill.getText().trim();
+  if (!text) { flashStatus('Notes are empty'); return; }
+  navigator.clipboard.writeText(text).then(
+    () => flashStatus('Notes copied'),
+    () => flashStatus('Copy failed')
+  );
+}
+
+function downloadNotesHtml() {
+  if (!_quill) return;
+  // Get the HTML directly from the editor's root so file chips and images
+  // come along verbatim (semantic anchors are a portable file format).
+  const inner = _quill.root.innerHTML;
+  if (!inner || _quill.getText().trim().length === 0 && !inner.includes('<img') && !inner.includes('note-file')) {
+    flashStatus('Notes are empty'); return;
+  }
+  const title = (document.getElementById('topbar-session-title')?.textContent || 'Notes').trim() || 'Notes';
+  const safeTitle = title.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80);
+  const fullHtml = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.6;color:#222;max-width:800px;margin:32px auto;padding:0 16px}
+img{max-width:100%;border-radius:6px}
+a.note-file{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;background:#f1f3f5;border:1px solid #ced4da;border-radius:999px;color:#212529;text-decoration:none;font-size:13px;margin:2px}
+a.note-file:hover{background:#e9ecef}
+.nf-icon{display:inline-flex;width:22px;height:22px;background:#fff;border-radius:50%;border:1px solid #ced4da;align-items:center;justify-content:center}
+blockquote{border-left:3px solid #4c6ef5;background:#eef2ff;margin:8px 0;padding:6px 12px;border-radius:0 4px 4px 0}
+pre{background:#f8f9fa;border:1px solid #ced4da;border-radius:4px;padding:10px 12px;overflow:auto}
+code{background:#f1f3f5;border:1px solid #dee2e6;border-radius:3px;padding:0 4px;font-size:0.9em}
+</style>
+</head><body><h1>${escapeHtml(title)}</h1>${inner}</body></html>`;
+  const blob = new Blob([fullHtml], { type: 'text/html' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${safeTitle || 'notes'}.html`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  flashStatus('Notes exported');
+}
+
+function clearNotes() {
+  if (!_quill) return;
+  if (_quill.getText().trim().length === 0 &&
+      !_quill.root.querySelector('.note-file, img')) return;
+  if (!confirm('Clear all notes for this session? This cannot be undone.')) return;
+  _quill.setContents({ ops: [] }, 'user');
+  _quill.history.clear();
+  _refreshNotesEmptyHint();
+  _notesDirty = true;
+  _notesFlushSave(true);
 }
 
 function highlightCode(sel) {
@@ -11506,7 +12711,19 @@ function escapeHtml(s) {
 }
 
 function flashStatus(msg) {
-  const el   = document.getElementById('status-text');
+  // Mirror to the console so users debugging via DevTools can read full
+  // messages even when they're truncated in the small status pill, and
+  // catch ones that were too brief to read at all.
+  try {
+    const text = (msg && msg.toString) ? msg.toString() : String(msg);
+    if (/\b(error|fail|failed|denied|invalid|not found|timeout)\b/i.test(text)) {
+      console.error('[status]', text);
+    } else {
+      console.log('[status]', text);
+    }
+  } catch (_) {}
+  const el = document.getElementById('status-text');
+  if (!el) return;
   const prev = el.textContent;
   el.textContent = msg;
   setTimeout(() => { el.textContent = prev; }, 1800);
@@ -12786,6 +14003,10 @@ async function applyUpdate() {
       statusEl.textContent = 'Restarting...';
       btn.textContent = 'Restarting...';
       if (tbBtn) { tbBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restarting...'; }
+      // The server-side cache is keyed by HEAD and rebuilds automatically
+      // on next request, but flip the in-memory guard so when the user
+      // returns to the Changelog tab post-restart the new entries fetch.
+      _changelogLoaded = false;
       _pollUntilBack();
     }
   } catch (_) {
@@ -12844,6 +14065,7 @@ async function topbarApplyUpdate() {
       btn.title = `Update failed: ${data.error}`;
     } else {
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restarting...';
+      _changelogLoaded = false;
       _pollUntilBack();
     }
   } catch (_) {
@@ -12885,6 +14107,369 @@ function switchSettingsSection(btn) {
   document.querySelectorAll('.settings-panel').forEach(p => p.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById(btn.dataset.target).classList.add('active');
+  // Lazy-load the Changelog tab the first time it's opened so the git-log
+  // shell-out doesn't run on app startup or affect other tabs.
+  if (btn.dataset.target === 'section-changelog' && !_changelogLoaded) {
+    loadChangelog(false);
+  }
+}
+
+let _changelogLoaded = false;
+
+async function loadChangelog(force) {
+  const body = document.getElementById('changelog-body');
+  const meta = document.getElementById('changelog-meta');
+  const btn  = document.getElementById('changelog-refresh-btn');
+  if (!body) return;
+  if (btn) { btn.disabled = true; }
+  if (force) body.innerHTML = '<div class="changelog-empty">Refreshing…</div>';
+
+  try {
+    const url = '/api/changelog' + (force ? '?refresh=1' : '');
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || ('HTTP ' + resp.status));
+    }
+    const data = await resp.json();
+    _changelogLoaded = true;
+    _renderChangelog(data);
+    if (meta) {
+      meta.innerHTML = '';
+      if (data.generated_at) {
+        const when = document.createElement('span');
+        when.className = 'changelog-meta-when';
+        when.textContent = `Updated ${_formatChangelogDate(data.generated_at)}`;
+        meta.appendChild(when);
+      }
+      if (data.head) {
+        const head = document.createElement('span');
+        head.className = 'changelog-meta-hash';
+        head.textContent = data.head.slice(0, 7);
+        meta.appendChild(head);
+      }
+      const status = document.createElement('span');
+      status.className = 'changelog-meta-status' + (data.fresh ? ' fresh' : '');
+      status.innerHTML = `<i class="fa-solid fa-circle"></i> ${data.fresh ? 'Just refreshed' : 'Cached'}`;
+      meta.appendChild(status);
+    }
+  } catch (e) {
+    body.innerHTML = `<div class="changelog-error">${_escHtml(e.message || 'Failed to load changelog')}</div>`;
+    if (meta) meta.textContent = '';
+  } finally {
+    if (btn) { btn.disabled = false; }
+  }
+}
+
+function refreshChangelog() {
+  loadChangelog(true);
+}
+
+const _CHANGELOG_CAT_ICONS = {
+  feature:     'fa-solid fa-plus',
+  fix:         'fa-solid fa-wrench',
+  improvement: 'fa-solid fa-arrow-up',
+  refactor:    'fa-solid fa-shuffle',
+  removal:     'fa-solid fa-minus',
+  other:       'fa-solid fa-circle-dot',
+};
+
+function _renderChangelog(data) {
+  const body = document.getElementById('changelog-body');
+  const commits = (data && Array.isArray(data.commits)) ? data.commits : [];
+  if (!commits.length) {
+    body.innerHTML = '<div class="changelog-empty">No commits found.</div>';
+    return;
+  }
+  // Group consecutive commits by date so the user gets a date heading per
+  // chunk without rendering one per row.
+  const frag = document.createDocumentFragment();
+  let lastDate = null;
+  for (const c of commits) {
+    if (c.date !== lastDate) {
+      const h = document.createElement('div');
+      h.className = 'changelog-day';
+      h.textContent = _formatChangelogDate(c.date);
+      frag.appendChild(h);
+      lastDate = c.date;
+    }
+    frag.appendChild(_renderChangelogEntry(c));
+  }
+  body.replaceChildren(frag);
+}
+
+function _renderChangelogEntry(c) {
+  const row = document.createElement('div');
+  row.className = 'changelog-entry';
+  row.dataset.cat = c.category || 'other';
+
+  const icon = document.createElement('span');
+  icon.className = 'changelog-entry-icon';
+  icon.innerHTML = `<i class="${_CHANGELOG_CAT_ICONS[c.category] || _CHANGELOG_CAT_ICONS.other}"></i>`;
+
+  const content = document.createElement('div');
+  content.className = 'changelog-entry-content';
+
+  const subj = document.createElement('div');
+  subj.className = 'changelog-entry-subject';
+  subj.textContent = c.subject || '';
+  content.appendChild(subj);
+
+  const bodyText = (c.body || '').trim();
+  if (bodyText) {
+    const b = _renderChangelogBody(bodyText);
+    content.appendChild(b);
+    // Show the toggle only when the body actually overflows the collapsed
+    // height. Defer the measurement to the next paint so layout is final.
+    requestAnimationFrame(() => {
+      if (b.scrollHeight > b.clientHeight + 1) {
+        const t = document.createElement('button');
+        t.type = 'button';
+        t.className = 'changelog-entry-toggle';
+        t.textContent = 'Show more';
+        t.onclick = () => {
+          const expanded = row.classList.toggle('expanded');
+          t.textContent = expanded ? 'Show less' : 'Show more';
+        };
+        content.insertBefore(t, content.querySelector('.changelog-entry-foot'));
+      }
+    });
+  }
+
+  const foot = document.createElement('div');
+  foot.className = 'changelog-entry-foot';
+  foot.textContent = c.short || (c.hash || '').slice(0, 7);
+  content.appendChild(foot);
+
+  row.appendChild(icon);
+  row.appendChild(content);
+  return row;
+}
+
+/* Parse a free-form commit body into structured sections so sub-headings
+ * (lines that introduce a group of bullet points, like "Summary system
+ * prompt") render visually distinct from the bullet items beneath them. */
+function _parseChangelogBody(body) {
+  const lines = body.split('\n');
+  const sections = [];
+  let cur = null;
+  const ensure = () => {
+    if (!cur) cur = { heading: null, paras: [], items: [] };
+    return cur;
+  };
+  const flush = () => {
+    if (cur) sections.push(cur);
+    cur = null;
+  };
+  const isBullet = s => /^[-*•]\s+/.test(s);
+  const isContinuation = s => /^\s+\S/.test(s);
+
+  for (const raw of lines) {
+    const stripped = raw.trimEnd();
+    if (!stripped.trim()) {
+      flush();
+      continue;
+    }
+    if (isBullet(stripped)) {
+      const text = stripped.replace(/^[-*•]\s+/, '').trim();
+      ensure().items.push(text);
+    } else if (isContinuation(stripped) && cur && cur.items.length) {
+      // Indented wrap of the previous bullet — fold it back in.
+      cur.items[cur.items.length - 1] += ' ' + stripped.trim();
+    } else if (cur && (cur.items.length || cur.paras.length)) {
+      // Mid-section non-bullet: treat as a paragraph row.
+      cur.paras.push(stripped.trim());
+    } else {
+      // First non-blank line of a new section becomes its heading.
+      ensure().heading = stripped.trim();
+    }
+  }
+  flush();
+  return sections;
+}
+
+function _renderChangelogBody(bodyText) {
+  const wrap = document.createElement('div');
+  wrap.className = 'changelog-entry-body';
+  const sections = _parseChangelogBody(bodyText);
+  for (const sec of sections) {
+    const sEl = document.createElement('div');
+    sEl.className = 'changelog-section';
+    if (sec.heading) {
+      const h = document.createElement('div');
+      h.className = 'changelog-section-heading';
+      h.textContent = sec.heading;
+      sEl.appendChild(h);
+    }
+    for (const p of sec.paras) {
+      const pEl = document.createElement('p');
+      pEl.className = 'changelog-para';
+      pEl.textContent = p;
+      sEl.appendChild(pEl);
+    }
+    if (sec.items.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'changelog-bullets';
+      for (const it of sec.items) {
+        const li = document.createElement('li');
+        li.textContent = it;
+        ul.appendChild(li);
+      }
+      sEl.appendChild(ul);
+    }
+    wrap.appendChild(sEl);
+  }
+  // Fall back to the raw text if parsing produced nothing useful.
+  if (!wrap.childElementCount) {
+    const p = document.createElement('p');
+    p.className = 'changelog-para';
+    p.textContent = bodyText;
+    wrap.appendChild(p);
+  }
+  return wrap;
+}
+
+/* ── What's New popup ─────────────────────────────────────────────────────
+ * Shown automatically once when the running HEAD differs from what was
+ * last seen in this browser (i.e. the user just updated). On a fresh
+ * install the current HEAD is silently anchored so we don't pop up on
+ * first launch. The popup body is the latest commit's body parsed by
+ * the same _renderChangelogBody() the Changelog tab uses, so styling is
+ * shared and stays in sync with future commit-message conventions.
+ */
+const _WHATS_NEW_HEAD_KEY = 'ma:lastSeenChangelogHead';
+
+async function _checkWhatsNew() {
+  // Don't surprise the user mid-recording.
+  if (typeof state !== 'undefined' && state && state.isRecording) return;
+  let data;
+  try {
+    data = await fetch('/api/changelog').then(r => r.json());
+  } catch { return; }
+  if (!data || !Array.isArray(data.commits) || !data.commits.length) return;
+  const head = data.head || data.commits[0].hash || '';
+  if (!head) return;
+  let lastSeen = null;
+  try { lastSeen = localStorage.getItem(_WHATS_NEW_HEAD_KEY); } catch (_) {}
+  if (!lastSeen) {
+    // First load on this browser — anchor silently.
+    try { localStorage.setItem(_WHATS_NEW_HEAD_KEY, head); } catch (_) {}
+    return;
+  }
+  if (lastSeen === head) return;
+  _showWhatsNewPopup(data.commits[0]);
+  try { localStorage.setItem(_WHATS_NEW_HEAD_KEY, head); } catch (_) {}
+}
+
+function _showWhatsNewPopup(commit) {
+  if (!commit) return;
+  // Tear down any prior instance (e.g. preview button reopened).
+  document.querySelectorAll('.whats-new-overlay').forEach(el => el.remove());
+
+  const overlay = document.createElement('div');
+  overlay.className = 'whats-new-overlay';
+  overlay.setAttribute('role', 'presentation');
+
+  const cat = commit.category || 'other';
+  const dateLabel = _formatChangelogDate(commit.date);
+  const shortHash = (commit.short || (commit.hash || '').slice(0, 7)) || '';
+
+  overlay.innerHTML = `
+    <div class="whats-new-dialog" role="dialog" aria-modal="true" aria-labelledby="whats-new-title">
+      <div class="whats-new-hero" data-cat="${escapeHtml(cat)}">
+        <button class="whats-new-x" type="button" aria-label="Close">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+        <div class="whats-new-icon">
+          <img src="/static/images/logo.png" alt="" class="whats-new-logo">
+          <div class="whats-new-eyebrow">What's new in this update</div>
+        </div>
+        <div class="whats-new-subject" id="whats-new-title">${escapeHtml(commit.subject || '')}</div>
+        <div class="whats-new-meta">
+          <span class="whats-new-cat-tag">${escapeHtml(cat)}</span>
+          <span>${escapeHtml(dateLabel)}</span>
+          <span class="whats-new-hash">${escapeHtml(shortHash)}</span>
+        </div>
+      </div>
+      <div class="whats-new-body" id="whats-new-body"></div>
+      <div class="whats-new-actions">
+        <button class="whats-new-secondary" id="whats-new-changelog-btn" type="button">
+          <i class="fa-solid fa-clock-rotate-left"></i> View full changelog
+        </button>
+        <button class="whats-new-primary" id="whats-new-close-btn" type="button">Got it</button>
+      </div>
+    </div>`;
+
+  // Render body via the shared parser so heading/bullet styling matches the
+  // Changelog tab. If the commit has no body, show a friendly fallback.
+  const bodyEl = overlay.querySelector('#whats-new-body');
+  const bodyText = (commit.body || '').trim();
+  if (bodyText) {
+    bodyEl.appendChild(_renderChangelogBody(bodyText));
+  } else {
+    const p = document.createElement('p');
+    p.className = 'whats-new-empty';
+    p.textContent = 'Small under-the-hood changes — no detailed notes for this update.';
+    bodyEl.appendChild(p);
+  }
+
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    overlay.classList.remove('visible');
+    overlay.classList.add('closing');
+    setTimeout(() => overlay.remove(), 200);
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  // Click outside the dialog dismisses; clicks inside the dialog don't bubble here.
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('.whats-new-x').addEventListener('click', close);
+  overlay.querySelector('#whats-new-close-btn').addEventListener('click', close);
+  overlay.querySelector('#whats-new-changelog-btn').addEventListener('click', () => {
+    close();
+    if (typeof openSettings === 'function') {
+      openSettings();
+      // Wait for the settings panels to mount, then jump to the Changelog tab.
+      setTimeout(() => {
+        const navBtn = document.querySelector('.settings-nav-item[data-target="section-changelog"]');
+        if (navBtn) navBtn.click();
+      }, 60);
+    }
+  });
+  document.addEventListener('keydown', onKey);
+  // Trigger fade/scale-in on next paint.
+  requestAnimationFrame(() => overlay.classList.add('visible'));
+}
+
+/* Public hook for the "Preview What's New" demo button + console use. */
+window.previewWhatsNew = async function previewWhatsNew() {
+  try {
+    const data = await fetch('/api/changelog').then(r => r.json());
+    const commit = data && data.commits && data.commits[0];
+    if (!commit) {
+      flashStatus('No commits to preview');
+      return;
+    }
+    _showWhatsNewPopup(commit);
+  } catch (e) {
+    flashStatus('Preview failed: ' + (e.message || e));
+  }
+};
+
+function _formatChangelogDate(s) {
+  // Accepts "YYYY-MM-DD" or full ISO. Render as "Mon DD, YYYY" so the
+  // listing reads like a human changelog instead of a git log.
+  if (!s) return '';
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function _escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s ?? '');
+  return d.innerHTML;
 }
 
 async function setStartupLaunch(enabled) {
@@ -13768,6 +15353,7 @@ const _EXPORT_STEP_LABELS = {
   transcription:      'Transcription',
   summary:            'Summary',
   chat:               'Chat & screenshots',
+  notes:              'Notes & attachments',
   speakers:           'Speaker labels',
   speaker_embeddings: 'Voice fingerprints',
   audio:              'Audio (Opus compression)',
@@ -13826,7 +15412,7 @@ async function startExport() {
   if (!sid) return;
 
   const cats = [];
-  ['metadata', 'transcription', 'summary', 'chat', 'speakers', 'speaker_embeddings', 'audio', 'video']
+  ['metadata', 'transcription', 'summary', 'chat', 'notes', 'speakers', 'speaker_embeddings', 'audio', 'video']
     .forEach(cat => {
       const cb = document.getElementById('export-opt-' + cat);
       if (cb && cb.checked) cats.push(cat);
@@ -14121,6 +15707,10 @@ _apLoad().then(() => { try { _syncScreenToggle(); } catch {} });
 try { loadScreenDisplays(); } catch {}
 
 _startPeriodicUpdateCheck();
+
+// Fire-and-forget: if HEAD has changed since the last visit, surface the
+// What's New popup. Defer slightly so the page lands and renders first.
+setTimeout(() => { _checkWhatsNew().catch(() => {}); }, 800);
 
 if (!_isHomePage) {
   loadSummaryPrompt();

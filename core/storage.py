@@ -1,5 +1,6 @@
 """SQLite persistence for meeting sessions, transcripts, summaries, and chat."""
 import base64
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -114,6 +115,9 @@ def init_db() -> None:
             "ALTER TABLE sessions ADD COLUMN chat_system_prompt TEXT DEFAULT NULL",
             # Per-session summary system prompt override (NULL = use global/default)
             "ALTER TABLE sessions ADD COLUMN summary_system_prompt TEXT DEFAULT NULL",
+            # Rich-text notes (Quill Delta JSON). NULL = empty.
+            "ALTER TABLE sessions ADD COLUMN notes TEXT DEFAULT NULL",
+            "ALTER TABLE sessions ADD COLUMN notes_updated_at TEXT DEFAULT NULL",
             # Title lock: 1 = user manually set the title, auto-gen must skip this row
             "ALTER TABLE sessions ADD COLUMN title_user_set INTEGER NOT NULL DEFAULT 0",
             # Split rollback: sessions created from the same split share a group id
@@ -680,6 +684,44 @@ def set_session_summary_prompt(session_id: str, prompt: str | None) -> None:
         )
 
 
+def get_session_notes(session_id: str) -> dict | None:
+    """Return the rich-text notes (Quill Delta JSON) for a session, or None.
+
+    The stored value is a JSON-encoded Quill Delta. Returns the parsed dict,
+    or None if no notes exist.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT notes, notes_updated_at FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    if not row or not row["notes"]:
+        return None
+    try:
+        return {
+            "delta": json.loads(row["notes"]),
+            "updated_at": row["notes_updated_at"],
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def set_session_notes(session_id: str, delta: dict | list | None) -> None:
+    """Store the rich-text notes (Quill Delta) for a session. Pass None to clear.
+
+    The Delta may be a dict ({"ops": [...]}) or a list of ops. Stored as JSON.
+    """
+    if delta is None:
+        encoded = None
+    else:
+        encoded = json.dumps(delta, ensure_ascii=False)
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET notes = ?, notes_updated_at = ? WHERE id = ?",
+            (encoded, _now() if encoded else None, session_id),
+        )
+
+
 def update_session_times(session_id: str, started_at: str | None = None, ended_at: str | None = None) -> None:
     """Update session timestamps.  Pass None to leave a value unchanged."""
     sets = []
@@ -896,6 +938,14 @@ def delete_session(session_id: str) -> None:
     if video_path.exists():
         try:
             video_path.unlink()
+        except OSError:
+            pass
+    # Notes attachments live in data_dir()/notes/<session_id>/
+    notes_dir = paths.data_dir() / "notes" / session_id
+    if notes_dir.exists():
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(notes_dir, ignore_errors=True)
         except OSError:
             pass
 
@@ -1172,7 +1222,8 @@ def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
 def get_session(session_id: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, title, started_at, ended_at FROM sessions WHERE id = ?",
+            "SELECT id, title, started_at, ended_at, notes, notes_updated_at "
+            "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if not row:
@@ -1199,8 +1250,18 @@ def get_session(session_id: str) -> dict | None:
             (session_id,),
         ).fetchall()
 
+    notes_payload = None
+    if row["notes"]:
+        try:
+            notes_payload = {
+                "delta": json.loads(row["notes"]),
+                "updated_at": row["notes_updated_at"],
+            }
+        except (TypeError, ValueError):
+            notes_payload = None
+
     return {
-        **dict(row),
+        **{k: row[k] for k in ("id", "title", "started_at", "ended_at")},
         "segments": [
             {"id": r["id"], "text": r["text"], "source": r["source"],
              "start_time": r["start_time"], "end_time": r["end_time"],
@@ -1215,6 +1276,7 @@ def get_session(session_id: str) -> dict | None:
             {"speaker_key": r["speaker_key"], "name": r["name"], "color": r["color"]}
             for r in speaker_labels
         ],
+        "notes": notes_payload,
     }
 
 
@@ -1580,12 +1642,13 @@ def export_session_data(session_id: str, include: set[str] | None = None) -> dic
     Media files (audio/video) are handled by the caller since they are large
     binary files that go straight into the zip.
     """
-    all_cats = {"metadata", "transcription", "summary", "chat", "speakers", "speaker_embeddings"}
+    all_cats = {"metadata", "transcription", "summary", "chat", "speakers", "speaker_embeddings", "notes"}
     cats = all_cats if include is None else (include & all_cats)
 
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, title, started_at, ended_at, folder_id FROM sessions WHERE id = ?",
+            "SELECT id, title, started_at, ended_at, folder_id, notes, notes_updated_at "
+            "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if not row:
@@ -1603,6 +1666,15 @@ def export_session_data(session_id: str, include: set[str] | None = None) -> dic
                 "started_at": row["started_at"],
                 "ended_at": row["ended_at"],
             }
+
+        if "notes" in cats and row["notes"]:
+            try:
+                pkg["notes"] = {
+                    "delta": json.loads(row["notes"]),
+                    "updated_at": row["notes_updated_at"],
+                }
+            except (TypeError, ValueError):
+                pass
 
         if "transcription" in cats:
             segments = conn.execute(
@@ -1736,6 +1808,19 @@ def import_session_data(pkg: dict) -> str:
                 "INSERT INTO speaker_labels (session_id, speaker_key, name, color) VALUES (?, ?, ?, ?)",
                 (sid, label["speaker_key"], label.get("name", label["speaker_key"]), label.get("color")),
             )
+
+        # Rich-text notes (Quill Delta)
+        notes_payload = pkg.get("notes")
+        if isinstance(notes_payload, dict) and notes_payload.get("delta") is not None:
+            try:
+                conn.execute(
+                    "UPDATE sessions SET notes = ?, notes_updated_at = ? WHERE id = ?",
+                    (json.dumps(notes_payload["delta"], ensure_ascii=False),
+                     notes_payload.get("updated_at") or now,
+                     sid),
+                )
+            except (TypeError, ValueError):
+                pass
 
         # FTS: index title
         if title and title.strip():

@@ -40,6 +40,12 @@
         <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-microchip"></i><span>System</span>
         </button>
+        {# Pinned to the bottom of the nav via margin-top:auto in CSS so any
+           future tabs slot above it without re-anchoring. #}
+        <button class="settings-nav-item settings-nav-item-pinned"
+                data-target="section-changelog" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-clock-rotate-left"></i><span>Changelog</span>
+        </button>
       </nav>
 
       <!-- ── Content panels ──────────────────────────────────────── -->
@@ -121,38 +127,73 @@
         <!-- System Prompts -->
         <div class="settings-panel" id="section-prompts">
           <p class="settings-row-desc" style="margin:0 0 12px;font-size:12px;color:var(--fg-muted)">
-            Default system prompts used by the AI for chat and summarization.
-            Edit them freely; per-session overrides take precedence when set.
-            Click <strong>Save</strong> at the bottom to apply your changes.
+            Default system prompts used by the AI for chat, summarization, and
+            session naming. Click each section to expand. Per-session overrides
+            take precedence when set. Click <strong>Save</strong> at the bottom
+            to apply your changes.
           </p>
 
-          <div class="settings-group-title">Chat System Prompt</div>
-          <div class="settings-group">
-            <div class="settings-key-row">
-              <div class="settings-key-header">
-                <span class="settings-row-label">Default prompt</span>
-                <button class="settings-key-link" onclick="resetGlobalChatPrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to original</button>
+          {# Each section uses native <details>/<summary> so they're keyboard
+             accessible and toggle without any JS. Default = collapsed. #}
+          <details class="prompt-section">
+            <summary class="prompt-section-summary">
+              <i class="fa-solid fa-chevron-right prompt-section-chevron"></i>
+              <span class="prompt-section-title">Chat System Prompt</span>
+              <span class="prompt-section-tag" id="global-chat-prompt-tag"></span>
+            </summary>
+            <div class="settings-group">
+              <div class="settings-key-row">
+                <div class="settings-key-header">
+                  <span class="settings-row-label">Default prompt</span>
+                  <button class="settings-key-link" onclick="resetGlobalChatPrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to original</button>
+                </div>
+                <textarea id="global-chat-prompt" class="chat-prompt-textarea"
+                          rows="10" spellcheck="false"
+                          placeholder="Loading default…"></textarea>
+                <div class="settings-row-desc">Applied to every chat session unless overridden via the chat panel's <i class="fa-solid fa-sliders"></i> button. Transcript and meeting context are always appended automatically.</div>
               </div>
-              <textarea id="global-chat-prompt" class="chat-prompt-textarea"
-                        rows="10" spellcheck="false"
-                        placeholder="Loading default…"></textarea>
-              <div class="settings-row-desc">Applied to every chat session unless overridden via the chat panel's <i class="fa-solid fa-sliders"></i> button. Transcript and meeting context are always appended automatically.</div>
             </div>
-          </div>
+          </details>
 
-          <div class="settings-group-title">Summary System Prompt</div>
-          <div class="settings-group">
-            <div class="settings-key-row">
-              <div class="settings-key-header">
-                <span class="settings-row-label">Default prompt</span>
-                <button class="settings-key-link" onclick="resetGlobalSummaryPrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to original</button>
+          <details class="prompt-section">
+            <summary class="prompt-section-summary">
+              <i class="fa-solid fa-chevron-right prompt-section-chevron"></i>
+              <span class="prompt-section-title">Summary System Prompt</span>
+              <span class="prompt-section-tag" id="global-summary-prompt-tag"></span>
+            </summary>
+            <div class="settings-group">
+              <div class="settings-key-row">
+                <div class="settings-key-header">
+                  <span class="settings-row-label">Default prompt</span>
+                  <button class="settings-key-link" onclick="resetGlobalSummaryPrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to original</button>
+                </div>
+                <textarea id="global-summary-prompt" class="chat-prompt-textarea"
+                          rows="10" spellcheck="false"
+                          placeholder="Loading default…"></textarea>
+                <div class="settings-row-desc">Defines how the summarizer structures and writes summaries. Per-session overrides and custom instructions are configured inline from the Summary column's <i class="fa-solid fa-gear"></i> button.</div>
               </div>
-              <textarea id="global-summary-prompt" class="chat-prompt-textarea"
-                        rows="10" spellcheck="false"
-                        placeholder="Loading default…"></textarea>
-              <div class="settings-row-desc">Defines how the summarizer structures and writes summaries. Per-session overrides and custom instructions are configured inline from the Summary column's <i class="fa-solid fa-gear"></i> button.</div>
             </div>
-          </div>
+          </details>
+
+          <details class="prompt-section">
+            <summary class="prompt-section-summary">
+              <i class="fa-solid fa-chevron-right prompt-section-chevron"></i>
+              <span class="prompt-section-title">Session Title System Prompt</span>
+              <span class="prompt-section-tag" id="global-title-prompt-tag"></span>
+            </summary>
+            <div class="settings-group">
+              <div class="settings-key-row">
+                <div class="settings-key-header">
+                  <span class="settings-row-label">Default prompt</span>
+                  <button class="settings-key-link" onclick="resetGlobalTitlePrompt()"><i class="fa-solid fa-rotate-left"></i> Reset to original</button>
+                </div>
+                <textarea id="global-title-prompt" class="chat-prompt-textarea"
+                          rows="10" spellcheck="false"
+                          placeholder="Loading default…"></textarea>
+                <div class="settings-row-desc">Used when an auto-generated title is created at the end of a recording (and for new Global Chat conversations). Participants and similar past meeting titles are always appended as context to keep recurring meetings consistent.</div>
+              </div>
+            </div>
+          </details>
 
           <div class="prompts-save-bar">
             <span class="prompts-save-status" id="prompts-save-status"></span>
@@ -449,6 +490,33 @@
               </div>
               <button class="btn-settings-action" id="check-update-btn" onclick="checkForUpdates()">Check for Updates</button>
             </div>
+          </div>
+        </div>
+
+        <!-- Changelog -->
+        <div class="settings-panel" id="section-changelog">
+          <div class="changelog-header">
+            <div class="changelog-header-text">
+              <div class="changelog-title">
+                <i class="fa-solid fa-clock-rotate-left changelog-title-icon"></i>
+                <span>Recent updates</span>
+              </div>
+              <div class="changelog-meta" id="changelog-meta"></div>
+            </div>
+            <div class="changelog-header-actions">
+              <button class="btn-settings-action btn-settings-secondary"
+                      onclick="previewWhatsNew()"
+                      title="Preview the What's New popup using the latest commit">
+                <i class="fa-solid fa-eye"></i> Show popup
+              </button>
+              <button class="btn-settings-action" id="changelog-refresh-btn"
+                      onclick="refreshChangelog()" title="Re-parse git history">
+                <i class="fa-solid fa-rotate"></i> Refresh
+              </button>
+            </div>
+          </div>
+          <div class="changelog-body" id="changelog-body">
+            <div class="changelog-empty">Loading…</div>
           </div>
         </div>
 
