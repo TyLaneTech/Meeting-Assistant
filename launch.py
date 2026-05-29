@@ -733,7 +733,7 @@ def main():
 
     # Cloudflare WARP's TLS inspection breaks pip/uv (untrusted CA).
     # Disconnect before package installs, reconnect after (git/HF need it).
-    from core.network import warp_disconnect, warp_reconnect
+    from core.network import warp_disconnect
     warp_disconnect()
 
     # PyTorch - only install/replace when the installed variant doesn't match
@@ -798,8 +798,12 @@ def main():
     _section("MODELS")
     _predownload_models()
 
-    # Reconnect WARP - git fetch for update checks needs it.
-    warp_reconnect()
+    # Leave WARP disconnected through app startup. Models are already cached
+    # (above), so the app needs no network to start, and skipping WARP's TLS
+    # inspection shaves a little off startup. If a corporate always-on policy
+    # reconnects WARP anyway, that's fine now: core.config trusts WARP's CA via
+    # the OS store (truststore), so HTTPS still verifies. The update-check
+    # endpoint reconnects on demand via core.network.warp_reconnect().
 
     # ── FFmpeg ────────────────────────────────────────────────────────────────
     _section("FFMPEG")
@@ -853,9 +857,18 @@ def main():
     print(SEP_HEAVY)
     print()
 
+    # Force HF Hub offline so runtime model loaders (pyannote, transformers,
+    # faster-whisper) load straight from the cache the pre-download populated,
+    # skipping online revision checks entirely. This is a speed/robustness
+    # fast-path; truststore (core.config) is what actually makes online TLS
+    # work when a model isn't cached or WARP reconnects.
+    child_env = os.environ.copy()
+    child_env["HF_HUB_OFFLINE"] = "1"
+    child_env["TRANSFORMERS_OFFLINE"] = "1"
+
     result = subprocess.run(
         [sys.executable, "-u", "-X", "faulthandler", "app.py"],
-        stderr=subprocess.PIPE, text=True,
+        stderr=subprocess.PIPE, text=True, env=child_env,
     )
     if result.returncode != 0:
         print()

@@ -4507,6 +4507,36 @@ function openSpeakerManager() {
   document.getElementById('speaker-manager-overlay').classList.remove('hidden');
   _syncSpeakerDraftFromSelection();
   renderSpeakerManager();
+  _cleanupPaintQuickBadge();
+  // Default to the Cleanup tab when the session has unlabeled speakers —
+  // that's the most common reason someone opens this dialog with many
+  // diarized speakers, and it saves a click.
+  const initialTab = _hasUnlabeledSpeakers() ? 'cleanup' : 'manage';
+  switchSpeakerManagerTab(initialTab);
+}
+
+function _countUnlabeledSpeakers() {
+  try {
+    if (!state.sessionId || typeof _getSortedSpeakerProfiles !== 'function') return 0;
+    return _getSortedSpeakerProfiles().filter(p => {
+      if (_isCustomSpeakerKey(p.speaker_key)) return false;
+      return !_sessionLinks[p.speaker_key];
+    }).length;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function _hasUnlabeledSpeakers() {
+  return _countUnlabeledSpeakers() > 0;
+}
+
+function _cleanupPaintQuickBadge() {
+  const badge = document.getElementById('speaker-cleanup-badge');
+  if (!badge) return;
+  const n = _countUnlabeledSpeakers();
+  if (n > 0) { badge.hidden = false; badge.textContent = String(n); }
+  else { badge.hidden = true; }
 }
 
 function closeSpeakerManager() {
@@ -4516,6 +4546,1119 @@ function closeSpeakerManager() {
 function closeSpeakerManagerOnOverlay(event) {
   if (event.target.id === 'speaker-manager-overlay') closeSpeakerManager();
 }
+
+/* ── Speaker cleanup view ─────────────────────────────────────────────────────
+ * Drag-and-drop interface for bulk speaker re-labeling. Pulls clusters from
+ * /api/sessions/{sid}/speaker_clusters, lets the user rearrange members
+ * between cards (or create new clusters via the +New zone), then POSTs the
+ * final layout to /apply which retrains affected library profiles.
+ *
+ * State is kept entirely client-side until Apply is hit. We carry per-member
+ * embeddings (256 floats, base64) and the full library (with centroids) so we
+ * can recompute suggestions instantly on every drop without round-tripping.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+let _cleanupState = null;
+// { sessionId, clusters: [...], noiseKeys: Set, library: [...], thresholds, originalSnapshot, dirty }
+let _cleanupActiveTab = 'manage';
+let _cleanupDragKey = null;
+let _cleanupExpandedKeys = new Set();
+let _cleanupNoiseExpanded = false;
+let _cleanupPreviewStop = null;  // { btn, timer }
+
+function switchSpeakerManagerTab(tab) {
+  _cleanupActiveTab = tab;
+  document.querySelectorAll('.speaker-manager-tab').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === tab);
+  });
+  document.querySelectorAll('[data-tab-view]').forEach(el => {
+    el.hidden = el.dataset.tabView !== tab;
+  });
+  if (tab === 'cleanup' && !_cleanupState) {
+    loadSpeakerClusters();
+  }
+}
+
+function openSpeakerCleanupTab() {
+  openSpeakerManager();
+  switchSpeakerManagerTab('cleanup');
+}
+
+async function loadSpeakerClusters(force = false) {
+  const sid = state.sessionId;
+  if (!sid) return;
+  if (_cleanupState && !force && _cleanupState.sessionId === sid) {
+    renderSpeakerClusters();
+    return;
+  }
+  const loading = document.getElementById('cleanup-loading');
+  const grid = document.getElementById('cleanup-grid');
+  const noiseSection = document.getElementById('cleanup-noise-section');
+  if (loading) { loading.hidden = false; loading.querySelector('#cleanup-loading-text').textContent = 'Analyzing speakers…'; }
+  if (grid) grid.innerHTML = '';
+  if (noiseSection) noiseSection.hidden = true;
+  try {
+    const resp = await fetch(`/api/sessions/${sid}/speaker_clusters`);
+    const data = await resp.json();
+    if (!resp.ok) {
+      grid.innerHTML = `<div class="cleanup-help">Couldn't load clusters: ${data.error || resp.status}</div>`;
+      loading.hidden = true;
+      return;
+    }
+    _cleanupState = _cleanupBuildState(data);
+    if (loading) loading.hidden = true;
+    renderSpeakerClusters();
+    _cleanupUpdateBadge();
+  } catch (e) {
+    grid.innerHTML = `<div class="cleanup-help">Couldn't load clusters: ${e.message}</div>`;
+    if (loading) loading.hidden = true;
+  }
+}
+
+function reloadSpeakerClusters() {
+  if (_cleanupState && _cleanupState.dirty) {
+    if (!confirm('Discard unsaved changes and reload from disk?')) return;
+  }
+  loadSpeakerClusters(true);
+}
+
+function _cleanupBuildState(payload) {
+  // Decode all centroids once. We keep both labeled + unlabeled clusters in
+  // one homogenous list, plus a separate noise bucket.
+  const decode = b64 => {
+    if (!b64) return null;
+    const bin = atob(b64);
+    const buf = new ArrayBuffer(bin.length);
+    const view = new Uint8Array(buf);
+    for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i);
+    return new Float32Array(buf);
+  };
+
+  const buildMember = m => ({
+    speaker_key:   m.speaker_key,
+    name:          m.name,
+    color:         m.color,
+    segments:      m.segments || [],
+    segment_count: m.segment_count || (m.segments || []).length,
+    emb_count:     m.emb_count || 0,
+    centroid:      decode(m.centroid),
+    is_noise:      !!m.is_noise,
+    original_global_id: m.global_id || null,
+  });
+
+  const buildCluster = (c, kind) => ({
+    cluster_id: c.cluster_id,
+    kind,
+    global_id:  c.global_id || null,
+    new_name:   '',
+    name:       c.name || '',
+    color:      c.color || null,
+    members:    (c.members || []).map(buildMember),
+    suggestion: c.suggestion || null,
+    _dropped_suggestions: new Set(),  // global_ids the user rejected for this cluster
+  });
+
+  const labeled = (payload.labeled_clusters || []).map(c => buildCluster(c, 'labeled'));
+  const unlabeled = (payload.unlabeled_clusters || []).map(c => buildCluster(c, 'unlabeled'));
+  const clusters = [...labeled, ...unlabeled];
+
+  const noiseKeys = new Set();
+  const noiseMembers = new Map();  // speaker_key → member (kept separate so noise pills can be rendered)
+  (payload.noise_cluster?.members || []).forEach(m => {
+    noiseKeys.add(m.speaker_key);
+    noiseMembers.set(m.speaker_key, buildMember(m));
+  });
+
+  const library = (payload.library || []).map(g => ({
+    ...g,
+    centroid: decode(g.centroid),
+  }));
+
+  // Snapshot of original assignment for diffing on Apply.
+  const snapshot = {};
+  clusters.forEach(c => {
+    c.members.forEach(m => {
+      snapshot[m.speaker_key] = { cluster_id: c.cluster_id, is_noise: false };
+    });
+  });
+  noiseKeys.forEach(k => { snapshot[k] = { cluster_id: 'noise', is_noise: true }; });
+
+  return {
+    sessionId:  payload.session_id,
+    clusters,
+    noiseKeys,
+    noiseMembers,
+    library,
+    thresholds: payload.thresholds || { cluster: 0.7, suggest: 0.65, auto: 0.82 },
+    stats:      payload.stats || {},
+    originalSnapshot: snapshot,
+    dirty: false,
+  };
+}
+
+function _cleanupUpdateBadge() {
+  const badge = document.getElementById('speaker-cleanup-badge');
+  if (!badge || !_cleanupState) return;
+  const unlabeledCount = _cleanupState.clusters
+    .filter(c => c.kind === 'unlabeled')
+    .reduce((sum, c) => sum + c.members.length, 0);
+  if (unlabeledCount > 0) {
+    badge.hidden = false;
+    badge.textContent = String(unlabeledCount);
+  } else {
+    badge.hidden = true;
+  }
+}
+
+function _cleanupMarkDirty() {
+  if (!_cleanupState) return;
+  _cleanupState.dirty = true;
+  ['cleanup-apply-btn', 'cleanup-reset-btn'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = false;
+  });
+}
+
+function _cleanupRecomputeClusterCentroid(cluster) {
+  // Weighted by emb_count, L2-normalized.
+  const members = cluster.members.filter(m => m.centroid && !_cleanupState.noiseKeys.has(m.speaker_key));
+  if (!members.length) { cluster._centroid = null; return; }
+  const dim = members[0].centroid.length;
+  const sum = new Float32Array(dim);
+  let totalW = 0;
+  for (const m of members) {
+    const w = Math.max(m.emb_count, 1);
+    totalW += w;
+    for (let i = 0; i < dim; i++) sum[i] += m.centroid[i] * w;
+  }
+  if (totalW === 0) { cluster._centroid = null; return; }
+  let norm = 0;
+  for (let i = 0; i < dim; i++) norm += sum[i] * sum[i];
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < dim; i++) sum[i] /= norm;
+  cluster._centroid = sum;
+}
+
+function _cleanupBestLibraryMatch(centroid, excludeGlobalIds) {
+  if (!centroid || !_cleanupState) return null;
+  let best = null;
+  for (const g of _cleanupState.library) {
+    if (!g.centroid) continue;
+    if (excludeGlobalIds.has(g.global_id)) continue;
+    let sim = 0;
+    for (let i = 0; i < centroid.length; i++) sim += centroid[i] * g.centroid[i];
+    if (!best || sim > best.similarity) {
+      best = {
+        global_id: g.global_id,
+        name: g.name,
+        color: g.color,
+        similarity: +sim.toFixed(3),
+        auto_apply: sim >= _cleanupState.thresholds.auto,
+      };
+    }
+  }
+  if (!best || best.similarity < _cleanupState.thresholds.suggest) return null;
+  return best;
+}
+
+function _cleanupUpdateSuggestion(cluster) {
+  // Profiles already used by OTHER labeled clusters in this session are not
+  // candidates — Antonio shouldn't be re-suggested for a cluster that's not
+  // already his.
+  const taken = new Set();
+  for (const c of _cleanupState.clusters) {
+    if (c.cluster_id !== cluster.cluster_id && c.global_id) taken.add(c.global_id);
+  }
+  if (cluster.global_id) taken.add(cluster.global_id);
+  cluster._dropped_suggestions.forEach(g => taken.add(g));
+  _cleanupRecomputeClusterCentroid(cluster);
+  cluster.suggestion = _cleanupBestLibraryMatch(cluster._centroid, taken);
+}
+
+function renderSpeakerClusters() {
+  const grid = document.getElementById('cleanup-grid');
+  const statsEl = document.getElementById('cleanup-stats');
+  if (!grid || !_cleanupState) return;
+  grid.innerHTML = '';
+
+  // Recompute centroids + suggestions for everything before render so any
+  // in-flight DnD reorderings are reflected.
+  _cleanupState.clusters.forEach(_cleanupUpdateSuggestion);
+
+  // Sort: labeled first (by segment count desc), then unlabeled (segment count desc).
+  const sorted = [..._cleanupState.clusters].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'labeled' ? -1 : 1;
+    const segCount = c => c.members.reduce((s, m) => s + m.segment_count, 0);
+    return segCount(b) - segCount(a);
+  });
+
+  for (const cluster of sorted) {
+    grid.appendChild(_cleanupRenderCluster(cluster));
+  }
+
+  // "+ New cluster" drop zone always present.
+  const newZone = document.createElement('div');
+  newZone.className = 'cleanup-new-cluster';
+  newZone.innerHTML = '<i class="fa-solid fa-plus"></i> Drop here to start a new cluster';
+  newZone.addEventListener('dragover', e => {
+    if (_cleanupDragKey) { e.preventDefault(); newZone.classList.add('drop-target'); }
+  });
+  newZone.addEventListener('dragleave', () => newZone.classList.remove('drop-target'));
+  newZone.addEventListener('drop', e => {
+    e.preventDefault();
+    newZone.classList.remove('drop-target');
+    if (_cleanupDragKey) _cleanupMoveMemberToNewCluster(_cleanupDragKey);
+  });
+  grid.appendChild(newZone);
+
+  // Noise section
+  const noiseSection = document.getElementById('cleanup-noise-section');
+  const noiseCountEl = document.getElementById('cleanup-noise-count');
+  const noiseMembersEl = document.getElementById('cleanup-noise-members');
+  if (noiseSection) {
+    const noiseList = Array.from(_cleanupState.noiseKeys)
+      .map(k => _cleanupGetMember(k))
+      .filter(Boolean);
+    if (noiseList.length === 0) {
+      noiseSection.hidden = true;
+      _cleanupNoiseExpanded = false;
+    } else {
+      noiseSection.hidden = false;
+      noiseSection.classList.toggle('expanded', _cleanupNoiseExpanded);
+      noiseCountEl.textContent = String(noiseList.length);
+      noiseMembersEl.hidden = !_cleanupNoiseExpanded;
+      noiseMembersEl.innerHTML = '';
+      noiseList.forEach(m => noiseMembersEl.appendChild(_cleanupRenderMember(m, null, /*inNoise*/ true)));
+    }
+  }
+
+  if (statsEl) {
+    const total  = _cleanupState.stats.speakers_total || 0;
+    const labeledCount = sorted.filter(c => c.kind === 'labeled').length;
+    const unlabeledCount = sorted.filter(c => c.kind === 'unlabeled' && c.members.length).length;
+    const noiseCount2 = _cleanupState.noiseKeys.size;
+    statsEl.innerHTML = `<strong>${labeledCount}</strong> labeled · <strong>${unlabeledCount}</strong> unlabeled · <strong>${total}</strong> speakers${noiseCount2 ? ` · <strong>${noiseCount2}</strong> noise` : ''}`;
+  }
+
+  // Enable confident button if any suggestion is ≥ auto threshold.
+  const confidentBtn = document.getElementById('cleanup-confident-btn');
+  if (confidentBtn) {
+    const hasConfident = _cleanupState.clusters.some(
+      c => !c.global_id && c.suggestion && c.suggestion.similarity >= _cleanupState.thresholds.auto,
+    );
+    confidentBtn.disabled = !hasConfident;
+  }
+  _cleanupUpdateBadge();
+}
+
+function _cleanupAllMembers() {
+  // Yields { key, member, cluster } for every (non-noise) cluster member.
+  const out = [];
+  for (const c of _cleanupState.clusters) {
+    for (const m of c.members) out.push({ key: m.speaker_key, member: m, cluster: c });
+  }
+  return out;
+}
+
+function _cleanupGetMember(speakerKey) {
+  // Return a member object regardless of where it lives (cluster or noise bucket).
+  const found = _cleanupFindMember(speakerKey);
+  if (found) return found.member;
+  return _cleanupState.noiseMembers.get(speakerKey) || null;
+}
+
+function _cleanupRenderCluster(cluster) {
+  const card = document.createElement('div');
+  card.className = `cleanup-cluster kind-${cluster.kind}`;
+  card.dataset.clusterId = cluster.cluster_id;
+  const visibleMembers = cluster.members.filter(m => !_cleanupState.noiseKeys.has(m.speaker_key));
+  if (!visibleMembers.length) card.classList.add('cluster-empty');
+
+  const header = document.createElement('div');
+  header.className = 'cleanup-cluster-header';
+  const swatch = document.createElement('span');
+  swatch.className = 'cleanup-cluster-swatch';
+  swatch.style.background = cluster.color || (visibleMembers[0]?.color) || '#6e7681';
+  header.appendChild(swatch);
+
+  const nameWrap = document.createElement('div');
+  nameWrap.className = 'cleanup-cluster-name';
+  if (cluster.kind === 'labeled') {
+    const span = document.createElement('span');
+    span.textContent = cluster.name || '(unnamed)';
+    nameWrap.appendChild(span);
+  } else {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = cluster.suggestion ? `e.g. ${cluster.suggestion.name}` : 'Name this cluster…';
+    input.value = cluster.new_name || '';
+    input.addEventListener('input', e => { cluster.new_name = e.target.value; _cleanupMarkDirty(); });
+    nameWrap.appendChild(input);
+  }
+  header.appendChild(nameWrap);
+
+  const count = document.createElement('span');
+  count.className = 'cleanup-cluster-count';
+  const segTotal = visibleMembers.reduce((s, m) => s + m.segment_count, 0);
+  count.textContent = `${visibleMembers.length} · ${segTotal} seg`;
+  header.appendChild(count);
+  card.appendChild(header);
+
+  // Library suggestion banner — only for unlabeled clusters with no chosen name yet.
+  if (cluster.suggestion && !cluster.global_id && cluster.kind === 'unlabeled' && !cluster.new_name) {
+    const sugg = document.createElement('div');
+    sugg.className = 'cleanup-suggestion';
+    const dot = document.createElement('span');
+    dot.className = 'cleanup-cluster-swatch';
+    dot.style.background = cluster.suggestion.color || '#58a6ff';
+    sugg.appendChild(dot);
+    const txt = document.createElement('span');
+    txt.innerHTML = `Sounds like <strong>${escapeHtml(cluster.suggestion.name)}</strong> <span class="sim">(${cluster.suggestion.similarity})</span>`;
+    sugg.appendChild(txt);
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'apply-btn';
+    applyBtn.textContent = 'Assign';
+    applyBtn.onclick = () => {
+      cluster.global_id = cluster.suggestion.global_id;
+      cluster.name = cluster.suggestion.name;
+      cluster.color = cluster.suggestion.color;
+      cluster.kind = 'labeled';
+      _cleanupMarkDirty();
+      renderSpeakerClusters();
+    };
+    const rejectBtn = document.createElement('button');
+    rejectBtn.textContent = 'Not this';
+    rejectBtn.onclick = () => {
+      cluster._dropped_suggestions.add(cluster.suggestion.global_id);
+      cluster.suggestion = null;
+      renderSpeakerClusters();
+    };
+    actions.appendChild(applyBtn);
+    actions.appendChild(rejectBtn);
+    sugg.appendChild(actions);
+    card.appendChild(sugg);
+  }
+
+  const memberRow = document.createElement('div');
+  memberRow.className = 'cleanup-members';
+  memberRow.dataset.clusterId = cluster.cluster_id;
+  memberRow.addEventListener('dragover', e => {
+    if (_cleanupDragKey) { e.preventDefault(); card.classList.add('drop-target'); }
+  });
+  memberRow.addEventListener('dragleave', () => card.classList.remove('drop-target'));
+  memberRow.addEventListener('drop', e => {
+    e.preventDefault();
+    card.classList.remove('drop-target');
+    if (_cleanupDragKey) _cleanupMoveMemberToCluster(_cleanupDragKey, cluster.cluster_id);
+  });
+  visibleMembers.forEach(m => memberRow.appendChild(_cleanupRenderMember(m, cluster, false)));
+  card.appendChild(memberRow);
+
+  return card;
+}
+
+function _cleanupRenderMember(member, cluster, inNoise) {
+  const pill = document.createElement('div');
+  pill.className = 'cleanup-member';
+  pill.dataset.speakerKey = member.speaker_key;
+  if (inNoise) pill.classList.add('is-noise');
+  if (_cleanupExpandedKeys.has(member.speaker_key)) pill.classList.add('expanded');
+  pill.draggable = true;
+  pill.addEventListener('dragstart', e => {
+    _cleanupDragKey = member.speaker_key;
+    pill.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', member.speaker_key); } catch (_) {}
+  });
+  pill.addEventListener('dragend', () => {
+    _cleanupDragKey = null;
+    pill.classList.remove('dragging');
+    document.querySelectorAll('.cleanup-cluster.drop-target, .cleanup-new-cluster.drop-target')
+      .forEach(el => el.classList.remove('drop-target'));
+  });
+
+  const row = document.createElement('div');
+  row.className = 'cleanup-member-row';
+
+  const dot = document.createElement('span');
+  dot.className = 'cleanup-member-dot';
+  dot.style.background = member.color || (cluster && cluster.color) || '#6e7681';
+  row.appendChild(dot);
+
+  const key = document.createElement('span');
+  key.className = 'cleanup-member-key';
+  key.textContent = member.speaker_key;
+  row.appendChild(key);
+
+  const seg = document.createElement('span');
+  seg.className = 'cleanup-member-segcount';
+  seg.textContent = `${member.segment_count}`;
+  row.appendChild(seg);
+
+  const noiseBtn = document.createElement('button');
+  noiseBtn.className = 'cleanup-member-noise-btn';
+  noiseBtn.title = inNoise ? 'Restore from noise' : 'Mark as noise';
+  noiseBtn.innerHTML = inNoise ? '<i class="fa-solid fa-rotate-left"></i>' : '<i class="fa-solid fa-volume-xmark"></i>';
+  noiseBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    _cleanupToggleNoise(member.speaker_key);
+  });
+  row.appendChild(noiseBtn);
+
+  if (member.segments.length > 0) {
+    const expandBtn = document.createElement('button');
+    expandBtn.className = 'cleanup-member-expand-btn';
+    expandBtn.title = 'Preview audio';
+    expandBtn.innerHTML = '<i class="fa-regular fa-circle-play"></i>';
+    expandBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (_cleanupExpandedKeys.has(member.speaker_key)) {
+        _cleanupExpandedKeys.delete(member.speaker_key);
+      } else {
+        _cleanupExpandedKeys.add(member.speaker_key);
+      }
+      pill.classList.toggle('expanded');
+    });
+    row.appendChild(expandBtn);
+  }
+
+  pill.appendChild(row);
+
+  if (member.segments.length > 0) {
+    const previews = document.createElement('div');
+    previews.className = 'cleanup-member-previews';
+    // Top 5 longest segments.
+    const ranked = [...member.segments]
+      .sort((a, b) => (b.end - b.start) - (a.end - a.start))
+      .slice(0, 5);
+    ranked.forEach(seg => {
+      const btn = document.createElement('button');
+      btn.className = 'cleanup-preview-btn';
+      const dur = seg.end - seg.start;
+      btn.innerHTML = `<i class="fa-solid fa-play"></i> ${_fmtTime(seg.start)} <span style="color:var(--fg-subtle)">${dur.toFixed(1)}s</span>`;
+      btn.addEventListener('click', e => { e.stopPropagation(); _cleanupPlaySegment(seg, btn); });
+      previews.appendChild(btn);
+    });
+    pill.appendChild(previews);
+  }
+
+  return pill;
+}
+
+function _fmtTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function _cleanupPlaySegment(seg, btn) {
+  const audio = document.getElementById('playback-audio');
+  if (!audio || !_cleanupState) return;
+
+  // Stop anything currently previewing.
+  if (_cleanupPreviewStop) {
+    try { _cleanupPreviewStop.btn.classList.remove('playing'); } catch (_) {}
+    if (_cleanupPreviewStop.timer) clearTimeout(_cleanupPreviewStop.timer);
+    _cleanupPreviewStop = null;
+  }
+
+  // Toggle off if same button clicked while playing.
+  if (audio.dataset.cleanupActive === String(seg.start)) {
+    audio.pause();
+    audio.dataset.cleanupActive = '';
+    return;
+  }
+
+  const src = `/api/sessions/${_cleanupState.sessionId}/audio`;
+  if (audio.src.indexOf(src) === -1) audio.src = src;
+
+  const start = seg.start;
+  const end = seg.end;
+  audio.dataset.cleanupActive = String(start);
+  btn.classList.add('playing');
+
+  const onMeta = () => {
+    audio.currentTime = start;
+    audio.play().catch(() => { btn.classList.remove('playing'); });
+  };
+  if (isFinite(audio.duration) && audio.duration > 0) {
+    onMeta();
+  } else {
+    audio.addEventListener('loadedmetadata', onMeta, { once: true });
+    audio.load();
+  }
+
+  const stopAt = () => {
+    if (audio.currentTime >= end) {
+      audio.pause();
+      btn.classList.remove('playing');
+      audio.dataset.cleanupActive = '';
+      audio.removeEventListener('timeupdate', stopAt);
+    }
+  };
+  audio.addEventListener('timeupdate', stopAt);
+
+  // Safety: hard stop after expected duration + 0.5s buffer.
+  const timer = setTimeout(() => {
+    audio.pause();
+    btn.classList.remove('playing');
+    audio.dataset.cleanupActive = '';
+    audio.removeEventListener('timeupdate', stopAt);
+  }, (end - start + 0.5) * 1000);
+
+  _cleanupPreviewStop = { btn, timer };
+}
+
+function _cleanupFindMember(speakerKey) {
+  for (const c of _cleanupState.clusters) {
+    const idx = c.members.findIndex(m => m.speaker_key === speakerKey);
+    if (idx >= 0) return { cluster: c, idx, member: c.members[idx] };
+  }
+  return null;
+}
+
+function _cleanupMoveMemberToCluster(speakerKey, destClusterId) {
+  const found = _cleanupFindMember(speakerKey);
+  if (!found) return;
+  if (found.cluster.cluster_id === destClusterId) return;
+  const dest = _cleanupState.clusters.find(c => c.cluster_id === destClusterId);
+  if (!dest) return;
+  const [member] = found.cluster.members.splice(found.idx, 1);
+  dest.members.push(member);
+  _cleanupState.noiseKeys.delete(speakerKey);  // moving out of noise
+  _cleanupGarbageCollectClusters();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupMoveMemberToNewCluster(speakerKey) {
+  const found = _cleanupFindMember(speakerKey);
+  if (!found) return;
+  // Don't create a new cluster if the speaker is already alone.
+  if (found.cluster.members.length === 1 && found.cluster.kind === 'unlabeled' && !found.cluster.global_id) return;
+  const [member] = found.cluster.members.splice(found.idx, 1);
+  const newId = `unlabeled:new:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+  _cleanupState.clusters.push({
+    cluster_id: newId,
+    kind: 'unlabeled',
+    global_id: null,
+    new_name: '',
+    name: '',
+    color: null,
+    members: [member],
+    suggestion: null,
+    _dropped_suggestions: new Set(),
+  });
+  _cleanupState.noiseKeys.delete(speakerKey);
+  _cleanupGarbageCollectClusters();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupGarbageCollectClusters() {
+  // Drop unlabeled clusters that are empty AND weren't originally labeled —
+  // labeled clusters with zero members are still meaningful (they signal
+  // "no longer assign anyone to this profile in this session").
+  _cleanupState.clusters = _cleanupState.clusters.filter(c => {
+    if (c.members.length > 0) return true;
+    if (c.kind === 'labeled') return true;  // keep so we can show "unassigned profile" affordance
+    return false;
+  });
+}
+
+function _cleanupToggleNoise(speakerKey) {
+  if (!_cleanupState) return;
+  if (_cleanupState.noiseKeys.has(speakerKey)) {
+    // Restore: move back into a fresh singleton cluster.
+    _cleanupState.noiseKeys.delete(speakerKey);
+    const member = _cleanupState.noiseMembers.get(speakerKey);
+    if (member) {
+      const newId = `unlabeled:restored:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+      _cleanupState.clusters.push({
+        cluster_id: newId,
+        kind: 'unlabeled',
+        global_id: null,
+        new_name: '',
+        name: '',
+        color: null,
+        members: [member],
+        suggestion: null,
+        _dropped_suggestions: new Set(),
+      });
+      _cleanupState.noiseMembers.delete(speakerKey);
+    }
+  } else {
+    // Mark noise: lift member out of its cluster, cache for possible restore.
+    const found = _cleanupFindMember(speakerKey);
+    if (found) {
+      const [member] = found.cluster.members.splice(found.idx, 1);
+      _cleanupState.noiseMembers.set(speakerKey, member);
+    }
+    _cleanupState.noiseKeys.add(speakerKey);
+    _cleanupGarbageCollectClusters();
+  }
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function toggleCleanupNoiseExpanded() {
+  _cleanupNoiseExpanded = !_cleanupNoiseExpanded;
+  renderSpeakerClusters();
+}
+
+function applyConfidentCleanupMatches() {
+  if (!_cleanupState) return;
+  const auto = _cleanupState.thresholds.auto;
+  let applied = 0;
+  for (const c of _cleanupState.clusters) {
+    if (c.kind !== 'unlabeled' || c.global_id) continue;
+    if (c.suggestion && c.suggestion.similarity >= auto) {
+      c.global_id = c.suggestion.global_id;
+      c.name = c.suggestion.name;
+      c.color = c.suggestion.color;
+      c.kind = 'labeled';
+      applied++;
+    }
+  }
+  if (applied) {
+    _cleanupMarkDirty();
+    renderSpeakerClusters();
+  }
+}
+
+function resetSpeakerCleanup() {
+  if (!confirm('Discard all unsaved changes?')) return;
+  loadSpeakerClusters(true);
+}
+
+async function applySpeakerCleanup() {
+  if (!_cleanupState || !_cleanupState.dirty) return;
+  const sid = _cleanupState.sessionId;
+  const applyBtn = document.getElementById('cleanup-apply-btn');
+  if (applyBtn) { applyBtn.disabled = true; applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Applying…'; }
+
+  const proposed = [];
+  for (const c of _cleanupState.clusters) {
+    // Skip empty clusters that aren't doing anything.
+    if (!c.members.length && c.kind !== 'labeled') continue;
+    const visible = c.members
+      .filter(m => !_cleanupState.noiseKeys.has(m.speaker_key))
+      .map(m => m.speaker_key);
+    proposed.push({
+      global_id: c.global_id || null,
+      new_name:  c.global_id ? null : (c.new_name || '').trim() || null,
+      color:     c.color || null,
+      member_keys: visible,
+    });
+  }
+  const noise_keys = Array.from(_cleanupState.noiseKeys);
+
+  try {
+    const resp = await fetch(`/api/sessions/${sid}/speaker_clusters/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clusters: proposed, noise_keys }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      alert(`Apply failed: ${data.error || resp.status}`);
+      if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply changes'; }
+      return;
+    }
+    // Refresh from server to pick up canonical names/links + show the new state.
+    _cleanupState = null;
+    await loadSpeakerClusters(true);
+    if (applyBtn) { applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply changes'; applyBtn.disabled = true; }
+    const reset = document.getElementById('cleanup-reset-btn');
+    if (reset) reset.disabled = true;
+    // Refresh transcript / sidebar speaker pills so they reflect new labels.
+    try {
+      if (typeof loadSession === 'function' && state.sessionId) await loadSession(state.sessionId);
+    } catch (_) {}
+    try {
+      if (typeof _tnRefreshSpeakerPills === 'function') _tnRefreshSpeakerPills();
+    } catch (_) {}
+  } catch (e) {
+    alert(`Apply failed: ${e.message}`);
+    if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply changes'; }
+  }
+}
+
+/* ── Cleanup video popup ────────────────────────────────────────────────────
+ * Independent draggable mini-player that floats above the speaker modal.
+ * Reuses the session's /api/sessions/{sid}/video endpoint but keeps a
+ * dedicated <video> element so we don't fight with the main video viewer.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+let _cleanupVideoLoadedFor = null;  // sessionId the popup's <video> is bound to
+let _cleanupVideoUserClosed = false;  // user explicitly closed → don't auto-reopen this session
+let _cleanupVideoPlayingFor = null; // segment id currently driving playback
+
+function _cleanupVideoEl() { return document.getElementById('cleanup-video'); }
+function _cleanupVideoPopupEl() { return document.getElementById('cleanup-video-popup'); }
+
+function _cleanupVideoAvailable() {
+  return typeof _videoAvailable !== 'undefined' && _videoAvailable && !!state.sessionId;
+}
+
+function _cleanupVideoEnsureLoaded() {
+  const video = _cleanupVideoEl();
+  if (!video || !_cleanupVideoAvailable()) return false;
+  if (_cleanupVideoLoadedFor !== state.sessionId) {
+    video.src = `/api/sessions/${state.sessionId}/video`;
+    video.load();
+    _cleanupVideoLoadedFor = state.sessionId;
+    video.addEventListener('timeupdate', _cleanupVideoUpdateTime);
+  }
+  return true;
+}
+
+function _cleanupVideoUpdateTime() {
+  const video = _cleanupVideoEl();
+  const lbl = document.getElementById('cleanup-video-time');
+  if (!video || !lbl) return;
+  const t = video.currentTime + (typeof _videoOffset === 'number' ? _videoOffset : 0);
+  lbl.textContent = _fmtTime(t);
+}
+
+function _cleanupVideoApplySavedPosition() {
+  const popup = _cleanupVideoPopupEl();
+  if (!popup) return;
+  const pos = (typeof _prefs !== 'undefined' && _prefs.cleanup_video_pos) || null;
+  if (pos && typeof pos === 'object'
+      && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+    popup.style.left   = `${pos.left}px`;
+    popup.style.top    = `${pos.top}px`;
+    popup.style.right  = 'auto';
+    if (Number.isFinite(pos.width))  popup.style.width  = `${pos.width}px`;
+    if (Number.isFinite(pos.height)) popup.style.height = `${pos.height}px`;
+    return;
+  }
+  // No saved position — anchor to the LEFT of the speaker manager dialog so
+  // the user can see both panes at once. Fall back to top-right if there
+  // isn't enough room on the left.
+  const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
+  const popupW = popup.offsetWidth  || 360;
+  const popupH = popup.offsetHeight || 240;
+  if (dialog) {
+    const dr = dialog.getBoundingClientRect();
+    const gap = 16;
+    const desiredLeft = dr.left - popupW - gap;
+    if (desiredLeft >= 8) {
+      popup.style.left  = `${desiredLeft}px`;
+      popup.style.top   = `${Math.max(8, dr.top)}px`;
+      popup.style.right = 'auto';
+      return;
+    }
+    // Not enough room on the left — try the right side of the dialog.
+    const rightLeft = dr.right + gap;
+    if (rightLeft + popupW <= window.innerWidth - 8) {
+      popup.style.left  = `${rightLeft}px`;
+      popup.style.top   = `${Math.max(8, dr.top)}px`;
+      popup.style.right = 'auto';
+      return;
+    }
+  }
+  // Default: stay top-right via the CSS rule (right: 24px, top: 80px).
+}
+
+function _cleanupVideoSavePosition() {
+  const popup = _cleanupVideoPopupEl();
+  if (!popup) return;
+  const r = popup.getBoundingClientRect();
+  if (typeof savePref === 'function') {
+    savePref('cleanup_video_pos', {
+      left: r.left, top: r.top, width: r.width, height: r.height,
+    });
+  }
+}
+
+function _cleanupVideoSyncToggleBtn() {
+  const btn = document.getElementById('cleanup-video-toggle');
+  if (!btn) return;
+  const popup = _cleanupVideoPopupEl();
+  const shown = popup && !popup.hidden;
+  btn.classList.toggle('active', !!shown);
+  btn.disabled = !_cleanupVideoAvailable();
+  if (!_cleanupVideoAvailable()) {
+    btn.title = 'No screen recording for this session';
+  } else {
+    btn.title = shown ? 'Hide recording preview' : 'Show recording preview';
+  }
+}
+
+function showCleanupVideoPopup() {
+  if (!_cleanupVideoAvailable()) return;
+  const popup = _cleanupVideoPopupEl();
+  if (!popup) return;
+  if (!_cleanupVideoEnsureLoaded()) return;
+  popup.hidden = false;  // unhide first so offsetWidth/Height read correctly
+  _cleanupVideoApplySavedPosition();
+  _cleanupVideoEnsureDragWired();
+  _cleanupVideoUserClosed = false;
+  if (typeof savePref === 'function') savePref('cleanup_video_open', true);
+  _cleanupVideoSyncToggleBtn();
+}
+
+function closeCleanupVideoPopup() {
+  const popup = _cleanupVideoPopupEl();
+  if (!popup) return;
+  popup.hidden = true;
+  const video = _cleanupVideoEl();
+  if (video) { try { video.pause(); } catch (_) {} }
+  _cvResetZoom();
+  _cleanupVideoUserClosed = true;
+  if (typeof savePref === 'function') savePref('cleanup_video_open', false);
+  _cleanupVideoSyncToggleBtn();
+}
+
+function toggleCleanupVideoPopup() {
+  const popup = _cleanupVideoPopupEl();
+  if (!popup) return;
+  if (popup.hidden) showCleanupVideoPopup();
+  else closeCleanupVideoPopup();
+}
+
+function _cleanupVideoPlaySegment(seg) {
+  if (!_cleanupVideoEnsureLoaded()) return false;
+  const popup = _cleanupVideoPopupEl();
+  if (popup.hidden) showCleanupVideoPopup();
+  const video = _cleanupVideoEl();
+  const noseek = document.getElementById('cleanup-video-noseek');
+  const offset = typeof _videoOffset === 'number' ? _videoOffset : 0;
+  const vStart = seg.start - offset;
+  const vEnd = seg.end - offset;
+  if (vEnd <= 0 || (isFinite(video.duration) && vStart >= video.duration)) {
+    if (noseek) noseek.hidden = false;
+    return true;  // we handled it (even if we couldn't seek)
+  }
+  if (noseek) noseek.hidden = true;
+  const target = Math.max(0, vStart);
+  const doPlay = () => {
+    try { video.currentTime = target; } catch (_) {}
+    video.play().catch(() => {});
+  };
+  if (isFinite(video.duration) && video.duration > 0) {
+    doPlay();
+  } else {
+    video.addEventListener('loadedmetadata', doPlay, { once: true });
+  }
+  // Stop at segment end (clamped to video duration).
+  const stopAt = () => {
+    if (video.currentTime >= Math.min(vEnd, isFinite(video.duration) ? video.duration : vEnd)) {
+      video.pause();
+      video.removeEventListener('timeupdate', stopAt);
+    }
+  };
+  video.addEventListener('timeupdate', stopAt);
+  _cleanupVideoPlayingFor = `${seg.id}:${seg.start}`;
+  return true;
+}
+
+// ── Drag + resize + zoom wiring (run once on first popup show) ──
+let _cleanupVideoDragWired = false;
+let _cvZoom = { scale: 1, tx: 0, ty: 0 };
+
+function _cvApplyZoom() {
+  const v = _cleanupVideoEl();
+  if (!v) return;
+  v.style.transformOrigin = '0 0';
+  v.style.transform = `translate(${_cvZoom.tx.toFixed(2)}px, ${_cvZoom.ty.toFixed(2)}px) scale(${_cvZoom.scale.toFixed(4)})`;
+  const body = v.closest('.cleanup-video-body');
+  if (body) body.classList.toggle('zoomed', _cvZoom.scale > 1.001);
+}
+
+function _cvClampPan() {
+  const v = _cleanupVideoEl();
+  const body = v?.closest('.cleanup-video-body');
+  if (!v || !body) return;
+  const br = body.getBoundingClientRect();
+  const scaledW = v.clientWidth  * _cvZoom.scale;
+  const scaledH = v.clientHeight * _cvZoom.scale;
+  const minTx = Math.min(0, br.width  - scaledW);
+  const minTy = Math.min(0, br.height - scaledH);
+  _cvZoom.tx = Math.max(minTx, Math.min(0, _cvZoom.tx));
+  _cvZoom.ty = Math.max(minTy, Math.min(0, _cvZoom.ty));
+}
+
+function _cvResetZoom() {
+  _cvZoom = { scale: 1, tx: 0, ty: 0 };
+  _cvApplyZoom();
+}
+
+function _cleanupVideoEnsureDragWired() {
+  if (_cleanupVideoDragWired) return;
+  _cleanupVideoDragWired = true;
+
+  const popup = _cleanupVideoPopupEl();
+  const header = document.getElementById('cleanup-video-header');
+  const resize = document.getElementById('cleanup-video-resize');
+  const video = _cleanupVideoEl();
+  const body = video?.closest('.cleanup-video-body');
+  if (!popup || !header || !resize || !video || !body) return;
+
+  // ── Drag-to-move popup ──
+  let dragStart = null;
+  header.addEventListener('mousedown', (e) => {
+    if (e.target.closest('.cleanup-video-close')) return;
+    if (e.button !== 0) return;
+    const r = popup.getBoundingClientRect();
+    dragStart = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+    popup.classList.add('dragging');
+    e.preventDefault();
+  });
+
+  // ── Drag-to-resize from bottom-right corner ──
+  let resizeStart = null;
+  resize.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    const r = popup.getBoundingClientRect();
+    resizeStart = { x: e.clientX, y: e.clientY, width: r.width, height: r.height };
+    e.preventDefault();
+    e.stopPropagation();
+  });
+
+  // ── Drag-to-pan when zoomed (left-click on video body) ──
+  let panStart = null;
+  body.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    if (_cvZoom.scale <= 1.001) return;  // no pan when not zoomed
+    panStart = { x: e.clientX, y: e.clientY, tx: _cvZoom.tx, ty: _cvZoom.ty };
+    body.classList.add('panning');
+    e.preventDefault();
+  });
+
+  // Shared mousemove
+  document.addEventListener('mousemove', (e) => {
+    if (dragStart) {
+      const dx = e.clientX - dragStart.x;
+      const dy = e.clientY - dragStart.y;
+      const left = Math.max(0, Math.min(window.innerWidth  - 80, dragStart.left + dx));
+      const top  = Math.max(0, Math.min(window.innerHeight - 40, dragStart.top  + dy));
+      popup.style.left  = `${left}px`;
+      popup.style.top   = `${top}px`;
+      popup.style.right = 'auto';
+    } else if (resizeStart) {
+      const w = Math.max(240, Math.min(window.innerWidth  - 40, resizeStart.width  + (e.clientX - resizeStart.x)));
+      const h = Math.max(180, Math.min(window.innerHeight - 40, resizeStart.height + (e.clientY - resizeStart.y)));
+      popup.style.width  = `${w}px`;
+      popup.style.height = `${h}px`;
+      _cvClampPan();
+      _cvApplyZoom();
+    } else if (panStart) {
+      _cvZoom.tx = panStart.tx + (e.clientX - panStart.x);
+      _cvZoom.ty = panStart.ty + (e.clientY - panStart.y);
+      _cvClampPan();
+      _cvApplyZoom();
+    }
+  });
+  document.addEventListener('mouseup', () => {
+    if (dragStart) {
+      dragStart = null;
+      popup.classList.remove('dragging');
+      _cleanupVideoSavePosition();
+    }
+    if (resizeStart) {
+      resizeStart = null;
+      _cleanupVideoSavePosition();
+    }
+    if (panStart) {
+      panStart = null;
+      body.classList.remove('panning');
+    }
+  });
+
+  // ── Mouse-wheel zoom centered at cursor ──
+  body.addEventListener('wheel', (e) => {
+    if (popup.hidden) return;
+    e.preventDefault();
+    const rect = body.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const oldScale = _cvZoom.scale;
+    // Exponential feel: ~5% per notch. Negative deltaY = zoom in.
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const newScale = Math.max(1, Math.min(8, oldScale * factor));
+    if (Math.abs(newScale - oldScale) < 1e-4) return;
+    const ratio = newScale / oldScale;
+    // Keep the content under the cursor fixed.
+    _cvZoom.tx = mx - (mx - _cvZoom.tx) * ratio;
+    _cvZoom.ty = my - (my - _cvZoom.ty) * ratio;
+    _cvZoom.scale = newScale;
+    _cvClampPan();
+    _cvApplyZoom();
+  }, { passive: false });
+
+  // Double-click resets zoom.
+  body.addEventListener('dblclick', (e) => {
+    if (_cvZoom.scale > 1.001) { e.preventDefault(); _cvResetZoom(); }
+  });
+}
+
+// Hook into existing _cleanupPlaySegment so when the video popup is open we
+// play the WAV (authoritative audio) AND seek the muted video alongside it.
+// Screen recordings frequently have no audio track, so we never rely on the
+// video for sound.
+const _origCleanupPlaySegment = _cleanupPlaySegment;
+_cleanupPlaySegment = function (seg, btn) {
+  _cleanupVideoEnsureDragWired();
+  const popup = _cleanupVideoPopupEl();
+  const videoOpen = popup && !popup.hidden && _cleanupVideoAvailable();
+  // Always run the WAV-based preview — it handles button toggling, stop-at-end
+  // logic, and works whether or not the video popup is open.
+  _origCleanupPlaySegment(seg, btn);
+  if (!videoOpen) return;
+  // Mirror the WAV's play/pause state on the muted video. The original
+  // function toggles audio.dataset.cleanupActive based on whether playback
+  // started or stopped — read it back to know which path we took.
+  const audio = document.getElementById('playback-audio');
+  const v = _cleanupVideoEl();
+  if (!v) return;
+  if (audio && audio.dataset.cleanupActive === String(seg.start)) {
+    _cleanupVideoPlaySegment(seg);
+  } else {
+    try { v.pause(); } catch (_) {}
+  }
+};
+
+// Reset auto-open flag when session changes (so a new session can opt-in again).
+const _cleanupSwitchTabOrig = switchSpeakerManagerTab;
+switchSpeakerManagerTab = function (tab) {
+  _cleanupSwitchTabOrig(tab);
+  if (tab === 'cleanup') {
+    _cleanupVideoSyncToggleBtn();
+  } else {
+    // Don't kill the popup when leaving the tab — let user keep it parked.
+  }
+};
+
+// Dirty guard — both for page unload and for the modal close handler.
+window.addEventListener('beforeunload', e => {
+  if (_cleanupState && _cleanupState.dirty) {
+    e.preventDefault();
+    e.returnValue = '';
+    return '';
+  }
+});
+
+// Wrap existing close handler to prompt on unsaved changes and to close
+// the floating video popup alongside the modal.
+const _origCloseSpeakerManager = closeSpeakerManager;
+closeSpeakerManager = function () {
+  if (_cleanupState && _cleanupState.dirty) {
+    if (!confirm('You have unsaved cleanup changes. Close anyway?')) return;
+    _cleanupState.dirty = false;
+  }
+  // Close the floating video popup too — it's part of the same workspace.
+  try {
+    const popup = document.getElementById('cleanup-video-popup');
+    if (popup && !popup.hidden) closeCleanupVideoPopup();
+  } catch (_) {}
+  _origCloseSpeakerManager();
+};
 
 // ── Fingerprint match toast ───────────────────────────────────────────────────
 
@@ -7992,7 +9135,10 @@ function fmtTime(s) {
 }
 
 function initPlayback(sessionId) {
-  _playbackAudio.src = `/api/sessions/${sessionId}/audio`;
+  // Cache-bust: after stop-resume-stop the WAV is appended on disk but the
+  // URL is unchanged, so the browser would replay its cached copy with the
+  // pre-resume length. Force a fresh fetch each call.
+  _playbackAudio.src = `/api/sessions/${sessionId}/audio?t=${Date.now()}`;
   _playbackAudio.load();
   _playbackActive = true;
   document.getElementById('playback-bar').classList.remove('hidden');
@@ -9258,6 +10404,16 @@ function destroyVideo() {
   _videoOffset = 0;
   _videoSeekPending = false;
   _cancelVideoSeek();
+  // Reset cleanup popup so it doesn't keep stale video from the previous session.
+  try {
+    const cv = document.getElementById('cleanup-video');
+    if (cv) { cv.pause(); cv.removeAttribute('src'); cv.load(); }
+    const popup = document.getElementById('cleanup-video-popup');
+    if (popup && !popup.hidden) popup.hidden = true;
+    _cleanupVideoLoadedFor = null;
+    _cleanupVideoUserClosed = false;
+    _cleanupVideoSyncToggleBtn();
+  } catch (_) {}
   // Exit fullscreen if we were in it
   if (_videoMode === 'fullscreen') setVideoMode('compact');
   resetVideoZoom();

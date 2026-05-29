@@ -10,6 +10,10 @@ import traceback
 from typing import Callable
 
 from core import log as log
+# Importing config injects truststore (OS trust store) into Python's TLS stack,
+# so provider clients created below trust corporate WARP's inspection CA. Kept
+# explicit here so TLS works regardless of module import order.
+from core import config as _config  # noqa: F401
 
 Callback = Callable[[str], None]
 ToolEventCallback = Callable[[str, dict], None]  # (event_type, payload) → None
@@ -391,15 +395,15 @@ class AIAssistant:
     def _make_client(self, provider: str):
         """Create the API client.  Returns None gracefully if no key is set."""
         try:
-            import httpx
-            # Disable SSL verification - corporate Cloudflare WARP injects a
-            # self-signed CA that breaks httpx's default cert validation.
-            http_client = httpx.Client(verify=False)
+            # TLS is verified against the OS trust store (truststore, injected by
+            # core.config), so corporate WARP's inspection CA is honoured without
+            # disabling certificate checks. The SDKs read the API key from the
+            # environment (ANTHROPIC_API_KEY / OPENAI_API_KEY).
             if provider == "openai":
                 from openai import OpenAI
-                return OpenAI(http_client=http_client)
+                return OpenAI()
             import anthropic
-            return anthropic.Anthropic(http_client=http_client)
+            return anthropic.Anthropic()
         except Exception as e:
             print(f"[ai] Could not initialise {provider} client: {e}")
             return None

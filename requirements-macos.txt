@@ -2,6 +2,12 @@
 anthropic>=0.40.0
 openai>=1.0.0
 
+# ── TLS trust (corporate proxies / Cloudflare WARP) ──────────────────────────
+# Verifies HTTPS against the OS certificate store instead of certifi, so a
+# corporate TLS-inspection CA (WARP/Zero Trust) is trusted without disabling
+# verification. core/config.py calls truststore.inject_into_ssl() at startup.
+truststore>=0.9.1
+
 # ── Transcription (Windows / CUDA / CPU) ─────────────────────────────────────
 # faster-whisper is the engine on Windows. On macOS we use mlx-whisper instead
 # (Metal-accelerated via Apple's MLX framework); faster-whisper has no Metal

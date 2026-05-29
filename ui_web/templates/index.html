@@ -618,6 +618,28 @@
 
 <audio id="playback-audio" preload="auto"></audio>
 
+<!-- ── Speaker cleanup floating video popup ────────────────────────────────
+     Independent draggable mini-player. Lives at body level so it floats
+     above the speaker manager modal and isn't clipped by overflow. -->
+<div class="cleanup-video-popup" id="cleanup-video-popup" hidden>
+  <div class="cleanup-video-header" id="cleanup-video-header" title="Drag to move">
+    <i class="fa-solid fa-grip-vertical cleanup-video-grip"></i>
+    <span class="cleanup-video-title">Recording</span>
+    <span class="cleanup-video-time" id="cleanup-video-time">--:--</span>
+    <button class="cleanup-video-close" onclick="closeCleanupVideoPopup()" title="Close">
+      <i class="fa-solid fa-xmark"></i>
+    </button>
+  </div>
+  <div class="cleanup-video-body">
+    <video id="cleanup-video" playsinline preload="metadata" muted></video>
+    <div class="cleanup-video-noseek" id="cleanup-video-noseek" hidden>
+      <i class="fa-solid fa-video-slash"></i>
+      <span>Segment falls outside recorded video</span>
+    </div>
+  </div>
+  <div class="cleanup-video-resize" id="cleanup-video-resize" title="Drag to resize"></div>
+</div>
+
 <div class="overlay hidden" id="speaker-manager-overlay" onclick="closeSpeakerManagerOnOverlay(event)">
   <div class="dialog speaker-manager-dialog">
     <div class="speaker-manager-header">
@@ -626,8 +648,18 @@
       <button class="icon-btn speaker-manager-close" onclick="closeSpeakerManager()"><i class="fa-solid fa-xmark"></i></button>
     </div>
 
+    <div class="speaker-manager-tabs" id="speaker-manager-tabs">
+      <button type="button" class="speaker-manager-tab active" data-tab="manage" onclick="switchSpeakerManagerTab('manage')">
+        <i class="fa-regular fa-rectangle-list"></i> Manage
+      </button>
+      <button type="button" class="speaker-manager-tab" data-tab="cleanup" onclick="switchSpeakerManagerTab('cleanup')">
+        <i class="fa-solid fa-broom"></i> Cleanup
+        <span class="speaker-manager-tab-badge" id="speaker-cleanup-badge" hidden></span>
+      </button>
+    </div>
+
     <span class="speaker-editor-hint" id="speaker-editor-hint">Click · Ctrl multi · Shift range</span>
-    <div class="speaker-manager-body">
+    <div class="speaker-manager-body" data-tab-view="manage">
       <div class="speaker-color-grid" id="speaker-color-grid"></div>
       <div class="speaker-manager-list" id="speaker-manager-list"></div>
       <div class="speaker-editor">
@@ -644,6 +676,51 @@
           </div>
           <button class="speaker-manager-btn speaker-manager-btn-ghost fp-lib-btn" onclick="openFingerprintPanel()" title="Manage cross-session voice profiles"><i class="fa-solid fa-waveform-lines"></i> Voice Library</button>
         </div>
+      </div>
+    </div>
+
+    <!-- ── Cleanup view (drag-drop cluster rectification) ─────────────────── -->
+    <div class="speaker-cleanup-body" data-tab-view="cleanup" hidden>
+      <div class="cleanup-toolbar">
+        <div class="cleanup-stats" id="cleanup-stats">Loading clusters…</div>
+        <div class="cleanup-actions">
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-video-toggle" onclick="toggleCleanupVideoPopup()" title="Show recording preview">
+            <i class="fa-solid fa-video"></i>
+          </button>
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-reload-btn" onclick="reloadSpeakerClusters()" title="Reload from disk">
+            <i class="fa-solid fa-arrows-rotate"></i>
+          </button>
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-confident-btn" onclick="applyConfidentCleanupMatches()" disabled>
+            <i class="fa-solid fa-wand-magic-sparkles"></i> Apply confident
+          </button>
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-reset-btn" onclick="resetSpeakerCleanup()" disabled>
+            Reset
+          </button>
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-primary" id="cleanup-apply-btn" onclick="applySpeakerCleanup()" disabled>
+            <i class="fa-solid fa-check"></i> Apply changes
+          </button>
+        </div>
+      </div>
+
+      <div class="cleanup-loading" id="cleanup-loading" hidden>
+        <div class="cleanup-spinner"></div>
+        <div class="cleanup-loading-text" id="cleanup-loading-text">Analyzing speakers…</div>
+      </div>
+
+      <div class="cleanup-grid" id="cleanup-grid"></div>
+
+      <div class="cleanup-noise-section" id="cleanup-noise-section" hidden>
+        <button type="button" class="cleanup-noise-toggle" onclick="toggleCleanupNoiseExpanded()">
+          <i class="fa-solid fa-volume-xmark"></i>
+          <span id="cleanup-noise-count">0</span> marked as noise
+          <i class="fa-solid fa-chevron-down cleanup-noise-chevron" id="cleanup-noise-chevron"></i>
+        </button>
+        <div class="cleanup-noise-members" id="cleanup-noise-members" hidden></div>
+      </div>
+
+      <div class="cleanup-help">
+        <i class="fa-regular fa-circle-info"></i>
+        Drag speakers between cards to fix mislabeled segments. Drop on <em>+ New cluster</em> to split off. Click a speaker to preview audio.
       </div>
     </div>
   </div>

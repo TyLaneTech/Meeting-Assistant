@@ -4,6 +4,7 @@ Captures system audio output (loopback) AND the default microphone input,
 mixing both streams into a single mono feed for transcription.
 """
 import collections
+import os
 import queue
 import re
 import subprocess
@@ -18,6 +19,43 @@ from scipy.signal import resample_poly
 
 from core import log as log
 from capture_audio.wav_writer import WavWriter
+
+# ── INPUT_DEBUG ──────────────────────────────────────────────────────────
+# Verbose tracing of every input stream and the mixer that joins them.
+# Enable by setting the env var INPUT_DEBUG=1 before launching the app
+# (or flip the default below to True for a permanent on-state during
+# debugging). Output is throttled per metric to ~once per second so the
+# log stays readable. Leaves no stone unturned: per-chunk byte counts,
+# RMS / peak, queue depths, ffmpeg stderr in real time, mixer routing
+# decisions, AEC state, and gating reasons.
+INPUT_DEBUG = os.environ.get("INPUT_DEBUG", "0").strip() not in ("", "0", "false", "False")
+
+
+def _idbg(msg: str) -> None:
+    if INPUT_DEBUG:
+        log.info("input-debug", msg)
+
+
+class _Throttle:
+    """Per-key one-line-per-interval throttle for INPUT_DEBUG output."""
+    def __init__(self, interval: float = 1.0):
+        self.interval = interval
+        self._last: dict[str, float] = {}
+
+    def ready(self, key: str) -> bool:
+        if not INPUT_DEBUG:
+            return False
+        now = time.monotonic()
+        if now - self._last.get(key, 0.0) >= self.interval:
+            self._last[key] = now
+            return True
+        return False
+
+    def reset(self, key: str | None = None) -> None:
+        if key is None:
+            self._last.clear()
+        else:
+            self._last.pop(key, None)
 
 # FFT window size for the spectrum visualizer.  2048 samples ≈ 43 ms at 48 kHz,
 # giving ~23 Hz frequency resolution.  The deque keeps the most recent window
@@ -74,6 +112,15 @@ class AudioCapture:
         self.loopback_level: float = 0.0
         self.mic_level: float = 0.0
 
+        # Device names + first-valid-audio flags. The capture loops emit a
+        # one-shot "Verified audio device ..." log line as soon as a non-zero
+        # PCM chunk arrives, so we can tell at-a-glance whether each stream
+        # actually produced audio (vs. opening successfully and going silent).
+        self._loopback_device_name: str = ""
+        self._mic_device_name: str = ""
+        self._loopback_verified: bool = False
+        self._mic_verified: bool = False
+
         # User-controlled gain multipliers (1.0 = no change, persisted via localStorage)
         self.loopback_gain: float = 1.0
         self.mic_gain: float = 1.0
@@ -104,6 +151,24 @@ class AudioCapture:
         # FFmpeg subprocess mic capture (mic_index=-3)
         self._ffmpeg_proc: subprocess.Popen | None = None
         self._ffmpeg_mic_name: str | None = None
+        self._ffmpeg_stderr_thread: threading.Thread | None = None
+
+        # INPUT_DEBUG bookkeeping. Counters are advanced from the capture
+        # threads and the mixer; the throttle ensures we emit summaries at
+        # most once per second per key so the log isn't drowned.
+        self._idbg_throttle = _Throttle(interval=1.0)
+        self._idbg_lb_bytes = 0
+        self._idbg_mic_bytes = 0
+        self._idbg_lb_chunks = 0
+        self._idbg_mic_chunks = 0
+        self._idbg_lb_zero_chunks = 0
+        self._idbg_mic_zero_chunks = 0
+        self._idbg_mic_inject_bytes = 0
+        self._idbg_mix_src_counts: dict[str, int] = {"loopback": 0, "mic": 0, "both": 0}
+        self._idbg_mix_emitted = 0
+        self._idbg_audio_q_full_drops = 0
+        self._idbg_mic_q_full_drops = 0
+        self._idbg_lb_q_full_drops = 0
 
     # ── Device discovery ──────────────────────────────────────────────────────
 
@@ -248,6 +313,29 @@ class AudioCapture:
             lb_info = self._find_loopback_device()
         self.sample_rate = int(lb_info["defaultSampleRate"])
         self._loopback_channels = max(1, lb_info["maxInputChannels"])
+        self._loopback_device_name = lb_info["name"]
+        self._loopback_verified = False
+        self._mic_verified = False
+        if INPUT_DEBUG:
+            log.info("input-debug", "INPUT_DEBUG enabled - verbose audio tracing on")
+            log.info("input-debug",
+                     f"loopback_index={loopback_index!r} mic_index={mic_index!r} "
+                     f"ffmpeg_mic_name={ffmpeg_mic_name!r}")
+            log.info("input-debug",
+                     f"loopback dev: name='{lb_info['name']}' index={lb_info.get('index')} "
+                     f"defaultSampleRate={lb_info.get('defaultSampleRate')} "
+                     f"maxIn={lb_info.get('maxInputChannels')} "
+                     f"hostApi={lb_info.get('hostApi')}")
+            self._idbg_throttle.reset()
+            self._idbg_lb_bytes = self._idbg_mic_bytes = 0
+            self._idbg_lb_chunks = self._idbg_mic_chunks = 0
+            self._idbg_lb_zero_chunks = self._idbg_mic_zero_chunks = 0
+            self._idbg_mic_inject_bytes = 0
+            self._idbg_mix_src_counts = {"loopback": 0, "mic": 0, "both": 0}
+            self._idbg_mix_emitted = 0
+            self._idbg_audio_q_full_drops = 0
+            self._idbg_mic_q_full_drops = 0
+            self._idbg_lb_q_full_drops = 0
         log.info("audio", f"Loopback: '{lb_info['name']}' @ {self.sample_rate} Hz, "
                           f"{self._loopback_channels} ch")
         self._loopback_stream = self._pa.open(
@@ -272,40 +360,71 @@ class AudioCapture:
                 log.warn("audio", "No DirectShow mic device name provided for ffmpeg capture")
                 mic_info = None
             else:
-                self._mic_rate     = 48000
-                self._mic_channels = 1
-                self._has_mic      = True
-                self._ffmpeg_mic_name = ffmpeg_mic_name
-                if self._mic_rate != self.sample_rate:
-                    g = gcd(self.sample_rate, self._mic_rate)
-                    self._resample_up   = self.sample_rate // g
-                    self._resample_down = self._mic_rate    // g
-                cmd = [
-                    ffmpeg_path,
-                    "-f", "dshow",
-                    "-rtbufsize", "32k",         # small DirectShow buffer for low latency
-                    "-audio_buffer_size", "40",   # dshow audio buffer in ms (default ~500)
-                    "-i", f"audio={ffmpeg_mic_name}",
-                    "-f", "s16le",
-                    "-acodec", "pcm_s16le",
-                    "-ar", str(self._mic_rate),
-                    "-ac", "1",
-                    "-fflags", "+nobuffer",       # minimize internal buffering
-                    "-flags", "+low_delay",
-                    "-loglevel", "error",
-                    "pipe:1",
-                ]
-                log.info("audio", f"Mic: ffmpeg dshow '{ffmpeg_mic_name}' @ {self._mic_rate} Hz, 1 ch")
-                self._ffmpeg_proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                mic_info = None   # skip the WASAPI-open block below
+                # Re-resolve the saved name against the live dshow device list.
+                # The friendly name we persisted may have shifted (driver update,
+                # USB re-enumeration) or the device may be gone entirely. Doing
+                # this here — instead of trusting the caller's stale string —
+                # turns "ffmpeg silently records nothing" into a clean failure
+                # or an automatic retarget onto the same physical device.
+                resolved, reason = resolve_dshow_mic_name(ffmpeg_mic_name)
+                if resolved is None:
+                    log.warn("audio", f"Mic '{ffmpeg_mic_name}' not found in dshow "
+                                      f"device list ({reason}) - capturing loopback only")
+                    mic_info = None
+                else:
+                    if resolved != ffmpeg_mic_name:
+                        log.info("audio", f"Mic name re-resolved: '{ffmpeg_mic_name}' "
+                                          f"-> '{resolved}' ({reason})")
+                    ffmpeg_mic_name = resolved
+                    self._mic_rate     = 48000
+                    self._mic_channels = 1
+                    self._has_mic      = True
+                    self._ffmpeg_mic_name = ffmpeg_mic_name
+                    self._mic_device_name = ffmpeg_mic_name
+                    if self._mic_rate != self.sample_rate:
+                        g = gcd(self.sample_rate, self._mic_rate)
+                        self._resample_up   = self.sample_rate // g
+                        self._resample_down = self._mic_rate    // g
+                    cmd = [
+                        ffmpeg_path,
+                        "-f", "dshow",
+                        "-rtbufsize", "32k",         # small DirectShow buffer for low latency
+                        "-audio_buffer_size", "40",   # dshow audio buffer in ms (default ~500)
+                        "-i", f"audio={ffmpeg_mic_name}",
+                        "-f", "s16le",
+                        "-acodec", "pcm_s16le",
+                        "-ar", str(self._mic_rate),
+                        "-ac", "1",
+                        "-fflags", "+nobuffer",       # minimize internal buffering
+                        "-flags", "+low_delay",
+                        "-loglevel", "error",
+                        "pipe:1",
+                    ]
+                    log.info("audio", f"Mic: ffmpeg dshow '{ffmpeg_mic_name}' @ {self._mic_rate} Hz, 1 ch")
+                    if INPUT_DEBUG:
+                        log.info("input-debug", "ffmpeg cmd: " + " ".join(
+                            f'"{a}"' if " " in a else a for a in cmd))
+                    self._ffmpeg_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    if INPUT_DEBUG:
+                        log.info("input-debug",
+                                 f"ffmpeg pid={self._ffmpeg_proc.pid} started; "
+                                 f"continuous stderr drain thread spawning")
+                        self._ffmpeg_stderr_thread = threading.Thread(
+                            target=self._ffmpeg_stderr_drain,
+                            args=(self._ffmpeg_proc,),
+                            daemon=True,
+                        )
+                        self._ffmpeg_stderr_thread.start()
+                    mic_info = None   # skip the WASAPI-open block below
         elif mic_index == -2:
             # Browser mic - no WASAPI stream; audio arrives via inject_mic_data()
             self._mic_rate     = 48000   # browser AudioContext default
             self._mic_channels = 1
             self._has_mic      = True
+            self._mic_device_name = "browser (getUserMedia)"
             if self._mic_rate != self.sample_rate:
                 g = gcd(self.sample_rate, self._mic_rate)
                 self._resample_up   = self.sample_rate // g
@@ -336,6 +455,7 @@ class AudioCapture:
                     frames_per_buffer=self._mic_buf_size,
                 )
                 self._has_mic = True
+                self._mic_device_name = mic_info["name"]
                 if self._mic_rate != self.sample_rate:
                     g = gcd(self.sample_rate, self._mic_rate)
                     self._resample_up = self.sample_rate // g
@@ -474,16 +594,72 @@ class AudioCapture:
         /api/audio/mic-chunk, which calls this method on the active capture.
         """
         if self.is_running and self._has_mic:
+            if not self._mic_verified and data and data.strip(b"\x00"):
+                self._mic_verified = True
+                log.info("audio", f"Verified audio device "
+                                  f"(microphone): {self._mic_device_name}")
+            if INPUT_DEBUG:
+                nsamp, peak, rms = self._chunk_stats(data)
+                self._idbg_mic_inject_bytes += len(data)
+                if self._idbg_throttle.ready("inject_mic"):
+                    log.info("input-debug",
+                             f"mic(inject) rd: bytes_total={self._idbg_mic_inject_bytes} "
+                             f"last_n={nsamp} peak={peak} rms={rms:.4f} "
+                             f"q={self._mic_q.qsize()}/{self._mic_q.maxsize}")
             try:
                 self._mic_q.put_nowait(data)
             except queue.Full:
-                pass   # drop rather than block
+                if INPUT_DEBUG:
+                    self._idbg_mic_q_full_drops += 1
+                    if self._idbg_throttle.ready("mic_q_full_inject"):
+                        log.warn("input-debug",
+                                 f"mic queue FULL on inject — dropped "
+                                 f"(total drops={self._idbg_mic_q_full_drops})")
 
     # ── Capture threads ───────────────────────────────────────────────────────
+
+    def _ffmpeg_stderr_drain(self, proc: subprocess.Popen) -> None:
+        """Continuously surface ffmpeg's stderr while INPUT_DEBUG is on.
+
+        Without this, ffmpeg's stderr is only read after the process exits
+        (see _ffmpeg_capture_loop's finally block) — which means a silently
+        failing dshow capture leaves no breadcrumbs. With INPUT_DEBUG on we
+        run this in a side thread so every line lands in the log in real
+        time, including non-fatal warnings ffmpeg emits while still alive.
+        """
+        try:
+            while self.is_running and proc and proc.poll() is None:
+                line = proc.stderr.readline() if proc.stderr else b""
+                if not line:
+                    break
+                txt = line.decode("utf-8", errors="replace").rstrip()
+                if txt:
+                    log.info("input-debug", f"ffmpeg[{proc.pid}] {txt}")
+        except Exception:
+            if self.is_running:
+                log.warn("input-debug",
+                         f"ffmpeg stderr drain crashed:\n{traceback.format_exc()}")
+
+    @staticmethod
+    def _chunk_stats(data: bytes) -> tuple[int, int, float]:
+        """Return (n_samples, peak_abs, rms) for an Int16 PCM byte buffer."""
+        if not data:
+            return 0, 0, 0.0
+        arr = np.frombuffer(data, dtype=np.int16)
+        if arr.size == 0:
+            return 0, 0, 0.0
+        peak = int(np.abs(arr).max())
+        rms  = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+        return arr.size, peak, rms
 
     def _capture_loop(self, stream, out_queue: queue.Queue,
                       buf_size: int = 0) -> None:
         chunk = buf_size or self.CHUNK_SIZE
+        # Identify which stream this thread is servicing so the one-shot
+        # "Verified audio device" log line can name the right device. We
+        # compare object identity rather than passing a label arg to keep
+        # the existing call sites unchanged.
+        is_loopback = stream is self._loopback_stream
         while self.is_running:
             try:
                 # Read however many frames WASAPI has ready, clamped to a
@@ -501,10 +677,58 @@ class AudioCapture:
                     # with the device period and won't underrun.
                     n = chunk
                 data = stream.read(n, exception_on_overflow=False)
+                if is_loopback:
+                    if not self._loopback_verified and data and data.strip(b"\x00"):
+                        self._loopback_verified = True
+                        log.info("audio", f"Verified audio device "
+                                          f"(desktop/loopback): {self._loopback_device_name}")
+                else:
+                    if not self._mic_verified and data and data.strip(b"\x00"):
+                        self._mic_verified = True
+                        log.info("audio", f"Verified audio device "
+                                          f"(microphone): {self._mic_device_name}")
+                if INPUT_DEBUG:
+                    nsamp, peak, rms = self._chunk_stats(data)
+                    if is_loopback:
+                        self._idbg_lb_bytes += len(data)
+                        self._idbg_lb_chunks += 1
+                        if peak == 0:
+                            self._idbg_lb_zero_chunks += 1
+                        if self._idbg_throttle.ready("cap_lb"):
+                            log.info("input-debug",
+                                     f"loopback rd: chunks={self._idbg_lb_chunks} "
+                                     f"bytes={self._idbg_lb_bytes} "
+                                     f"zero_chunks={self._idbg_lb_zero_chunks} "
+                                     f"last_n={nsamp} peak={peak} rms={rms:.4f} "
+                                     f"q={out_queue.qsize()}/{out_queue.maxsize}")
+                    else:
+                        self._idbg_mic_bytes += len(data)
+                        self._idbg_mic_chunks += 1
+                        if peak == 0:
+                            self._idbg_mic_zero_chunks += 1
+                        if self._idbg_throttle.ready("cap_mic"):
+                            log.info("input-debug",
+                                     f"mic(WASAPI) rd: chunks={self._idbg_mic_chunks} "
+                                     f"bytes={self._idbg_mic_bytes} "
+                                     f"zero_chunks={self._idbg_mic_zero_chunks} "
+                                     f"last_n={nsamp} peak={peak} rms={rms:.4f} "
+                                     f"q={out_queue.qsize()}/{out_queue.maxsize}")
                 try:
                     out_queue.put_nowait(data)
                 except queue.Full:
-                    pass
+                    if INPUT_DEBUG:
+                        if is_loopback:
+                            self._idbg_lb_q_full_drops += 1
+                            if self._idbg_throttle.ready("lb_q_full"):
+                                log.warn("input-debug",
+                                         f"loopback queue FULL — dropped chunk "
+                                         f"(total drops={self._idbg_lb_q_full_drops})")
+                        else:
+                            self._idbg_mic_q_full_drops += 1
+                            if self._idbg_throttle.ready("mic_q_full"):
+                                log.warn("input-debug",
+                                         f"mic queue FULL — dropped chunk "
+                                         f"(total drops={self._idbg_mic_q_full_drops})")
             except Exception:
                 if not self.is_running:
                     break
@@ -519,11 +743,38 @@ class AudioCapture:
             while self.is_running and proc and proc.poll() is None:
                 data = proc.stdout.read(read_size)
                 if not data:
+                    if INPUT_DEBUG:
+                        log.warn("input-debug",
+                                 f"ffmpeg stdout returned empty — process "
+                                 f"poll={proc.poll() if proc else 'n/a'}")
                     break
+                if not self._mic_verified and data.strip(b"\x00"):
+                    self._mic_verified = True
+                    log.info("audio", f"Verified audio device "
+                                      f"(microphone): {self._mic_device_name}")
+                if INPUT_DEBUG:
+                    nsamp, peak, rms = self._chunk_stats(data)
+                    self._idbg_mic_bytes += len(data)
+                    self._idbg_mic_chunks += 1
+                    if peak == 0:
+                        self._idbg_mic_zero_chunks += 1
+                    if self._idbg_throttle.ready("cap_mic_ffmpeg"):
+                        log.info("input-debug",
+                                 f"mic(ffmpeg) rd: chunks={self._idbg_mic_chunks} "
+                                 f"bytes={self._idbg_mic_bytes} "
+                                 f"zero_chunks={self._idbg_mic_zero_chunks} "
+                                 f"last_n={nsamp} peak={peak} rms={rms:.4f} "
+                                 f"q={self._mic_q.qsize()}/{self._mic_q.maxsize} "
+                                 f"pid={proc.pid} poll={proc.poll()}")
                 try:
                     self._mic_q.put_nowait(data)
                 except queue.Full:
-                    pass
+                    if INPUT_DEBUG:
+                        self._idbg_mic_q_full_drops += 1
+                        if self._idbg_throttle.ready("mic_q_full_ffmpeg"):
+                            log.warn("input-debug",
+                                     f"mic queue FULL — dropped chunk "
+                                     f"(total drops={self._idbg_mic_q_full_drops})")
         except Exception:
             if self.is_running:
                 log.warn("audio", f"ffmpeg mic capture error:\n{traceback.format_exc()}")
@@ -618,6 +869,18 @@ class AudioCapture:
         _aec_lb_buf  = np.array([], dtype=np.float32)
         _aec_out_buf = np.array([], dtype=np.float32)
 
+        # ── Wall-clock pacing ────────────────────────────────────────────────
+        # Emit exactly one CHUNK_SIZE-sized mixed chunk per wall-clock period
+        # (CHUNK_SIZE / sample_rate seconds). Without this, mic and loopback
+        # arrive in independent bursts and the mixer emits a fresh chunk for
+        # whichever stream's data lands first, producing 2× real-time output
+        # when both are active — choppy/distorted audio and audio_queue overrun.
+        # With wall-clock pacing, one tick = one chunk = one slice of real time,
+        # regardless of whether one or both queues happen to have data right then.
+        chunk_dur = self.CHUNK_SIZE / float(self.sample_rate or 48000)
+        next_emit_time = 0.0   # set on first available data so we don't emit
+                               # a long stretch of silence before audio starts
+
         while self.is_running:
             try:
                 got_data = False
@@ -649,8 +912,34 @@ class AudioCapture:
                     except queue.Empty:
                         pass
 
-                # Flatten the part lists into contiguous arrays only when we
-                # have enough data to emit chunks (amortizes the copy cost).
+                # Bootstrap the emit clock the first time data appears, so we
+                # don't fire a stretch of silence before either stream has
+                # produced anything. Check the parts lists (raw drained data)
+                # rather than the buffer here — the buffer hasn't been built yet.
+                now = time.monotonic()
+                if next_emit_time == 0.0:
+                    if lb_len > 0 or mic_len > 0:
+                        next_emit_time = now
+                    else:
+                        time.sleep(0.005)
+                        continue
+
+                # If we're behind by more than 0.5s (e.g. system was paused),
+                # reset the clock instead of dumping a wall of catch-up audio.
+                if now - next_emit_time > 0.5:
+                    next_emit_time = now
+
+                # If it's not yet time to emit, sleep and loop. Crucially we
+                # do NOT touch the parts lists here — earlier code that
+                # concatenated parts into a temporary `mic_buf` on every
+                # iteration silently dropped the data on sleep iterations
+                # (the buffer went out of scope before being consumed).
+                if now < next_emit_time:
+                    time.sleep(min(0.002, next_emit_time - now))
+                    continue
+
+                # Now we're actually emitting. Flatten the part lists into
+                # contiguous arrays for this single-chunk consumption.
                 if lb_parts and lb_len >= self.CHUNK_SIZE:
                     lb_buf = np.concatenate(lb_parts)
                     lb_parts.clear()
@@ -665,42 +954,59 @@ class AudioCapture:
                 else:
                     mic_buf = np.array([], dtype=np.float32)
 
-                # Emit mixed chunks whenever loopback has enough data
+                # Emit exactly ONE chunk per wall-clock tick, taking whatever
+                # is in the buffers right now. Each side that has ≥CHUNK_SIZE
+                # contributes its real samples; the side that doesn't is
+                # zero-filled. This decouples emission rate from the burstiness
+                # of either source — mic and loopback can arrive in independent
+                # bursts and the output still tracks real time exactly.
                 lb_pos = 0
                 mic_pos = 0
-                while lb_pos + self.CHUNK_SIZE <= len(lb_buf):
-                    lb_chunk = np.clip(
-                        lb_buf[lb_pos:lb_pos + self.CHUNK_SIZE] * self.loopback_gain,
-                        -1.0, 1.0,
-                    )
-                    lb_pos += self.CHUNK_SIZE
+                _zero_chunk = np.zeros(self.CHUNK_SIZE, dtype=np.float32)
+                next_emit_time += chunk_dur
+                # Single-iteration emit (kept as a `while False`-style block
+                # via `if`/`pass` only to preserve the existing nested
+                # structure below; we always emit exactly one chunk per tick).
+                if True:
+                    have_lb  = lb_pos + self.CHUNK_SIZE <= len(lb_buf)
+                    have_mic = self._has_mic and mic_pos + self.CHUNK_SIZE <= len(mic_buf)
 
-                    # AGC for loopback
-                    if self.agc_loopback_enabled:
-                        lb_chunk, _agc_lb_env, _g, _gated = self._agc_apply(
-                            lb_chunk, _agc_lb_env, self.agc_target_rms,
-                            self.agc_max_gain, self.agc_gate_threshold,
-                            self.sample_rate or 48000,
+                    # ── Loopback chunk ──────────────────────────────────────
+                    if have_lb:
+                        lb_chunk = np.clip(
+                            lb_buf[lb_pos:lb_pos + self.CHUNK_SIZE] * self.loopback_gain,
+                            -1.0, 1.0,
                         )
-                        self.agc_lb_gain = _g
-                        self.agc_lb_envelope = _agc_lb_env
-                        self.agc_lb_gated = _gated
+                        lb_pos += self.CHUNK_SIZE
+                        if self.agc_loopback_enabled:
+                            lb_chunk, _agc_lb_env, _g, _gated = self._agc_apply(
+                                lb_chunk, _agc_lb_env, self.agc_target_rms,
+                                self.agc_max_gain, self.agc_gate_threshold,
+                                self.sample_rate or 48000,
+                            )
+                            self.agc_lb_gain = _g
+                            self.agc_lb_envelope = _agc_lb_env
+                            self.agc_lb_gated = _gated
+                        else:
+                            self.agc_lb_gain = 1.0
+                            self.agc_lb_gated = True
+                        lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
+                        self.loopback_level = lb_rms
+                        self._lb_fft_buf.extend(lb_chunk.tolist())
                     else:
+                        lb_chunk = _zero_chunk
+                        lb_rms = 0.0
+                        self.loopback_level = 0.0
                         self.agc_lb_gain = 1.0
                         self.agc_lb_gated = True
 
-                    lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
-                    self.loopback_level = lb_rms
-                    self._lb_fft_buf.extend(lb_chunk.tolist())
-
-                    if self._has_mic and mic_pos + self.CHUNK_SIZE <= len(mic_buf):
+                    # ── Mic chunk ───────────────────────────────────────────
+                    if have_mic:
                         mic_chunk = np.clip(
                             mic_buf[mic_pos:mic_pos + self.CHUNK_SIZE] * self.mic_gain,
                             -1.0, 1.0,
                         )
                         mic_pos += self.CHUNK_SIZE
-
-                        # AGC for microphone
                         if self.agc_mic_enabled:
                             mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(
                                 mic_chunk, _agc_mic_env, self.agc_target_rms,
@@ -713,86 +1019,101 @@ class AudioCapture:
                         else:
                             self.agc_mic_gain = 1.0
                             self.agc_mic_gated = True
-
                         mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
-
-                        # ── WebRTC AEC: clean echo from mic using loopback as reference ──
-                        if self.echo_cancel_enabled:
-                            # Lazy-init the AEC processor (or re-init on sample rate change)
-                            if _aec_processor is None or _aec_frame_size == 0:
-                                try:
-                                    from aec_audio_processing import AudioProcessor
-                                    _aec_processor = AudioProcessor(
-                                        enable_aec=True, enable_ns=False, enable_agc=False,
-                                    )
-                                    sr = self.sample_rate or 16000
-                                    _aec_processor.set_stream_format(sr, 1)
-                                    _aec_processor.set_reverse_stream_format(sr, 1)
-                                    _aec_frame_size = _aec_processor.get_frame_size()
-                                    log.info("audio", f"WebRTC AEC initialised @ {sr} Hz, "
-                                                      f"frame={_aec_frame_size} samples")
-                                except Exception:
-                                    traceback.print_exc()
-                                    _aec_processor = None
-
-                            if _aec_processor is not None:
-                                # Accumulate samples for AEC processing (needs exact 10 ms frames)
-                                _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
-                                _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
-
-                                cleaned_parts: list[np.ndarray] = []
-                                while (len(_aec_mic_buf) >= _aec_frame_size
-                                       and len(_aec_lb_buf) >= _aec_frame_size):
-                                    mf = _aec_mic_buf[:_aec_frame_size]
-                                    lf = _aec_lb_buf[:_aec_frame_size]
-                                    _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
-                                    _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
-
-                                    lb_i16 = (lf * 32767).astype(np.int16).tobytes()
-                                    mic_i16 = (mf * 32767).astype(np.int16).tobytes()
-                                    _aec_processor.process_reverse_stream(lb_i16)
-                                    result = _aec_processor.process_stream(mic_i16)
-                                    cleaned_parts.append(
-                                        np.frombuffer(result, dtype=np.int16)
-                                          .astype(np.float32) / 32768.0
-                                    )
-
-                                # Append cleaned frames to output buffer
-                                if cleaned_parts:
-                                    _aec_out_buf = np.concatenate(
-                                        (_aec_out_buf, *cleaned_parts)
-                                    )
-
-                                # Pull a CHUNK_SIZE piece from the output buffer
-                                if len(_aec_out_buf) >= self.CHUNK_SIZE:
-                                    mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
-                                    _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
-                                    mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
-                                # else: not enough cleaned audio yet - use the original mic_chunk
-                        elif _aec_processor is not None:
-                            # Echo cancellation was just disabled - tear down
-                            _aec_processor = None
-                            _aec_frame_size = 0
-                            _aec_mic_buf = np.array([], dtype=np.float32)
-                            _aec_lb_buf  = np.array([], dtype=np.float32)
-                            _aec_out_buf = np.array([], dtype=np.float32)
-
-                        # Source gating - decides which stream to send to the transcriber
-                        if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
-                            src = "loopback"
-                            mixed = lb_chunk
-                        elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
-                            src = "mic"
-                            mixed = mic_chunk
-                        else:
-                            src = "both"
-                            mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
                     else:
+                        mic_chunk = _zero_chunk
+                        mic_rms = 0.0
                         self.mic_level = 0.0
-                        mixed = lb_chunk
+                        self.agc_mic_gain = 1.0
+                        self.agc_mic_gated = True
+
+                    # ── WebRTC AEC: only meaningful when BOTH sides are real
+                    # this iteration. The reference signal (loopback) must be
+                    # in lock-step with the mic; feeding either side alone
+                    # desynchronises the buffers. When loopback is absent,
+                    # there's no echo to cancel anyway.
+                    if self.echo_cancel_enabled and have_lb and have_mic:
+                        if _aec_processor is None or _aec_frame_size == 0:
+                            try:
+                                from aec_audio_processing import AudioProcessor
+                                _aec_processor = AudioProcessor(
+                                    enable_aec=True, enable_ns=False, enable_agc=False,
+                                )
+                                sr = self.sample_rate or 16000
+                                _aec_processor.set_stream_format(sr, 1)
+                                _aec_processor.set_reverse_stream_format(sr, 1)
+                                _aec_frame_size = _aec_processor.get_frame_size()
+                                log.info("audio", f"WebRTC AEC initialised @ {sr} Hz, "
+                                                  f"frame={_aec_frame_size} samples")
+                            except Exception:
+                                traceback.print_exc()
+                                _aec_processor = None
+
+                        if _aec_processor is not None:
+                            _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
+                            _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
+                            cleaned_parts: list[np.ndarray] = []
+                            while (len(_aec_mic_buf) >= _aec_frame_size
+                                   and len(_aec_lb_buf) >= _aec_frame_size):
+                                mf = _aec_mic_buf[:_aec_frame_size]
+                                lf = _aec_lb_buf[:_aec_frame_size]
+                                _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
+                                _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
+                                lb_i16  = (lf * 32767).astype(np.int16).tobytes()
+                                mic_i16 = (mf * 32767).astype(np.int16).tobytes()
+                                _aec_processor.process_reverse_stream(lb_i16)
+                                result = _aec_processor.process_stream(mic_i16)
+                                cleaned_parts.append(
+                                    np.frombuffer(result, dtype=np.int16)
+                                      .astype(np.float32) / 32768.0
+                                )
+                            if cleaned_parts:
+                                _aec_out_buf = np.concatenate(
+                                    (_aec_out_buf, *cleaned_parts)
+                                )
+                            if len(_aec_out_buf) >= self.CHUNK_SIZE:
+                                mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
+                                _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
+                                mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
+                    elif (not self.echo_cancel_enabled) and _aec_processor is not None:
+                        # Echo cancellation was just disabled - tear down
+                        _aec_processor = None
+                        _aec_frame_size = 0
+                        _aec_mic_buf = np.array([], dtype=np.float32)
+                        _aec_lb_buf  = np.array([], dtype=np.float32)
+                        _aec_out_buf = np.array([], dtype=np.float32)
+
+                    # ── Mix: always sum. The previous "louder side wins"
+                    # gate was muting the mic the moment desktop audio got
+                    # loud, which is the opposite of what a meeting tool
+                    # should do. Both sources are clipped before summing
+                    # and the sum itself is clipped, so headroom is fine.
+                    if have_lb and have_mic:
+                        src = "both"
+                    elif have_mic:
+                        src = "mic"
+                    else:
                         src = "loopback"
+                    mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
+
+                    if INPUT_DEBUG:
+                        self._idbg_mix_src_counts[src] += 1
+                        self._idbg_mix_emitted += 1
+                        if self._idbg_throttle.ready("mix"):
+                            cnt = self._idbg_mix_src_counts
+                            log.info("input-debug",
+                                     f"mix: lb_rms={lb_rms:.4f} mic_rms={mic_rms:.4f} "
+                                     f"have_lb={have_lb} have_mic={have_mic} "
+                                     f"-> src={src} | "
+                                     f"emitted={self._idbg_mix_emitted} "
+                                     f"src_counts={cnt} "
+                                     f"audio_q={self.audio_queue.qsize()}/"
+                                     f"{self.audio_queue.maxsize} "
+                                     f"agc_lb={self.agc_lb_gain:.2f}/gated={self.agc_lb_gated} "
+                                     f"agc_mic={self.agc_mic_gain:.2f}/gated={self.agc_mic_gated} "
+                                     f"echo_cancel={self.echo_cancel_enabled}")
 
                     int16_bytes = (mixed * 32767).astype(np.int16).tobytes()
 
@@ -804,7 +1125,13 @@ class AudioCapture:
                     try:
                         self.audio_queue.put_nowait((src, int16_bytes, sample_offset))
                     except queue.Full:
-                        pass  # drop the chunk rather than blocking forever
+                        if INPUT_DEBUG:
+                            self._idbg_audio_q_full_drops += 1
+                            if self._idbg_throttle.ready("audio_q_full"):
+                                log.warn("input-debug",
+                                         f"audio_queue FULL — dropped chunk "
+                                         f"(total drops={self._idbg_audio_q_full_drops}, "
+                                         f"src={src})")
 
                 # Keep leftover samples (less than CHUNK_SIZE) for next iteration
                 if lb_pos < len(lb_buf):
@@ -824,8 +1151,10 @@ class AudioCapture:
                     mic_parts.clear()
                     mic_len = 0
 
-                if not got_data:
-                    time.sleep(0.005)
+                # Pacing sleep handled at top of loop via next_emit_time.
+                # We deliberately do NOT sleep here — if we just emitted a
+                # chunk and we're already past the next deadline (catch-up),
+                # we should immediately loop and emit another.
 
             except Exception:
                 # Log but never let the mixer thread die silently
@@ -1083,8 +1412,12 @@ def enumerate_dshow_audio_devices() -> list[dict]:
 
     devices: list[dict] = []
     for line in output.splitlines():
-        # Skip "Alternative name" lines which contain internal device IDs
+        # "Alternative name" lines follow the device line and carry the stable
+        # @device_cm_{GUID}\wave_{GUID} ID — attach to the last device.
         if "Alternative name" in line:
+            m = re.search(r'"(.+?)"', line)
+            if m and devices:
+                devices[-1]["alt_name"] = m.group(1)
             continue
         # Device lines look like: [in#0 @ ...] "Device Name" (audio)
         if "(audio)" not in line.lower():
@@ -1093,3 +1426,61 @@ def enumerate_dshow_audio_devices() -> list[dict]:
         if m:
             devices.append({"name": m.group(1)})
     return devices
+
+
+def resolve_dshow_mic_name(requested: str) -> tuple[str | None, str]:
+    """Re-resolve a saved DirectShow mic name against the current device list.
+
+    Device friendly names can change between sessions (driver updates, USB
+    re-enumeration) and devices can be unplugged entirely, so the name we
+    persisted may no longer match anything ffmpeg can open. This re-queries
+    ffmpeg's live device list and picks the best surviving match.
+
+    Resolution order:
+      1. Exact match on friendly name.
+      2. Exact match on the alternative (GUID) name — survives friendly-name
+         changes for the same physical device.
+      3. Case-insensitive friendly-name match.
+      4. Substring match (requested ⊂ candidate or candidate ⊂ requested).
+
+    Returns (resolved_name, reason). resolved_name is None if nothing matched.
+    The reason string is suitable for logging (e.g. "exact", "alt-name",
+    "substring", "no-match").
+    """
+    if not requested:
+        return None, "empty-request"
+    devices = enumerate_dshow_audio_devices()
+    if not devices:
+        return None, "enumeration-failed"
+
+    # 1. Exact friendly-name match
+    for d in devices:
+        if d.get("name") == requested:
+            return requested, "exact"
+
+    # 2. Alternative-name match: requested may itself be an alt name, or a
+    #    previously-resolved alt may still exist under a different friendly name.
+    for d in devices:
+        if d.get("alt_name") == requested:
+            return d["name"], "alt-name"
+
+    # 3. Case-insensitive
+    req_lower = requested.lower()
+    for d in devices:
+        if d.get("name", "").lower() == req_lower:
+            return d["name"], "case-insensitive"
+
+    # 4. Substring (prefer longest candidate name)
+    cand: list[tuple[int, str]] = []
+    for d in devices:
+        name = d.get("name", "")
+        if not name:
+            continue
+        nl = name.lower()
+        if req_lower in nl or nl in req_lower:
+            cand.append((len(name), name))
+    if cand:
+        cand.sort(reverse=True)
+        return cand[0][1], "substring"
+
+    return None, "no-match"

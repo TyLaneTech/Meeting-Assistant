@@ -11,6 +11,7 @@ Usage:
     db.add_embedding(global_id, session_id, speaker_key, emb, duration_sec)
     matches = db.find_matches(emb)                # [{global_id, name, similarity, ...}]
 """
+import base64
 import sqlite3
 import traceback
 import uuid
@@ -741,6 +742,74 @@ class SpeakerFingerprintDB:
                 "outliers_removed": len(outlier_ids),
                 "duplicates_removed": len(dedup_ids)}
 
+    # ── Unlabeled embedding storage (feeds the cleanup UI) ────────────────────
+
+    def add_unlabeled_embedding(
+        self,
+        session_id: str,
+        speaker_key: str,
+        embedding: np.ndarray,
+        duration_sec: float,
+    ) -> None:
+        """Persist an embedding for a speaker_key that isn't linked to a profile.
+
+        Powers the post-meeting cleanup UI's clustering pass — without this,
+        unlabeled speakers have no embeddings to cluster on once the live
+        recording ends.
+        """
+        with _conn(self._db_path) as c:
+            c.execute(
+                "INSERT INTO unlabeled_embeddings "
+                "(session_id, speaker_key, embedding, duration_sec, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, speaker_key, _emb_to_blob(embedding), duration_sec, _now()),
+            )
+
+    def get_unlabeled_embeddings(
+        self, session_id: str, speaker_key: str | None = None,
+    ) -> list[dict]:
+        """Return all unlabeled embeddings for a session (or one speaker_key)."""
+        with _conn(self._db_path) as c:
+            if speaker_key is None:
+                rows = c.execute(
+                    "SELECT id, speaker_key, embedding, duration_sec FROM unlabeled_embeddings "
+                    "WHERE session_id = ? ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT id, speaker_key, embedding, duration_sec FROM unlabeled_embeddings "
+                    "WHERE session_id = ? AND speaker_key = ? ORDER BY id",
+                    (session_id, speaker_key),
+                ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id":          r["id"],
+                "speaker_key": r["speaker_key"],
+                "embedding":   _blob_to_emb(r["embedding"]),
+                "duration":    r["duration_sec"],
+            })
+        return out
+
+    def clear_unlabeled_embeddings(
+        self, session_id: str, speaker_key: str | None = None,
+    ) -> int:
+        """Delete unlabeled embeddings (all for session, or for one speaker_key)."""
+        with _conn(self._db_path) as c:
+            if speaker_key is None:
+                cur = c.execute(
+                    "DELETE FROM unlabeled_embeddings WHERE session_id = ?",
+                    (session_id,),
+                )
+            else:
+                cur = c.execute(
+                    "DELETE FROM unlabeled_embeddings "
+                    "WHERE session_id = ? AND speaker_key = ?",
+                    (session_id, speaker_key),
+                )
+            return cur.rowcount
+
     def get_latest_embedding(self, global_id: str, session_id: str, speaker_key: str) -> np.ndarray | None:
         """Return the most recently added embedding for a given (session, speaker_key, global_id)."""
         with _conn(self._db_path) as c:
@@ -751,3 +820,604 @@ class SpeakerFingerprintDB:
                 (global_id, session_id, speaker_key),
             ).fetchone()
         return _blob_to_emb(row["embedding"]) if row else None
+
+    # ── Session cluster cleanup pipeline ──────────────────────────────────────
+
+    def _gather_session_speakers(self, session_id: str) -> list[dict]:
+        """Return one row per speaker_key in the session with label + segment info.
+
+        Includes speaker_keys that appear in transcript_segments but have no
+        speaker_labels row yet — reanalysis only writes labels for matched
+        speakers, so unlabeled ones (Speaker 4, 6, 7…) live only in the
+        segments table until the user names them.
+        """
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                """
+                WITH used_keys AS (
+                    SELECT DISTINCT source AS speaker_key
+                    FROM transcript_segments
+                    WHERE session_id = ?
+                      AND source IS NOT NULL
+                      AND source != ''
+                    UNION
+                    SELECT speaker_key FROM speaker_labels WHERE session_id = ?
+                )
+                SELECT uk.speaker_key,
+                       COALESCE(sl.name, uk.speaker_key)        AS name,
+                       sl.color,
+                       sl.global_id,
+                       COALESCE(sl.is_noise, 0)                  AS is_noise,
+                       gs.name  AS global_name,
+                       gs.color AS global_color
+                FROM used_keys uk
+                LEFT JOIN speaker_labels sl
+                  ON sl.session_id = ? AND sl.speaker_key = uk.speaker_key
+                LEFT JOIN global_speakers gs
+                  ON gs.id = sl.global_id
+                """,
+                (session_id, session_id, session_id),
+            ).fetchall()
+            speakers = []
+            for r in rows:
+                segs = c.execute(
+                    "SELECT id, start_time, end_time FROM transcript_segments "
+                    "WHERE session_id = ? AND source = ? ORDER BY start_time",
+                    (session_id, r["speaker_key"]),
+                ).fetchall()
+                if not segs:
+                    continue
+                speakers.append({
+                    "speaker_key":  r["speaker_key"],
+                    "name":         r["name"],
+                    "color":        r["color"],
+                    "global_id":    r["global_id"],
+                    "global_name":  r["global_name"],
+                    "global_color": r["global_color"],
+                    "is_noise":     bool(r["is_noise"]),
+                    "segments":     [dict(s) for s in segs],
+                })
+        return speakers
+
+    def _gather_speaker_embeddings(
+        self, session_id: str, speaker_key: str, global_id: str | None,
+    ) -> list[np.ndarray]:
+        """Return all stored embeddings for a (session, speaker_key).
+
+        Labeled speakers' embeddings live in speaker_embeddings (linked by
+        global_id). Unlabeled speakers' embeddings live in unlabeled_embeddings.
+        We check both so we don't lose history if the user has linked, unlinked,
+        and re-linked a key.
+        """
+        embs: list[np.ndarray] = []
+        with _conn(self._db_path) as c:
+            if global_id:
+                rows = c.execute(
+                    "SELECT embedding FROM speaker_embeddings "
+                    "WHERE session_id = ? AND speaker_key = ? AND global_id = ?",
+                    (session_id, speaker_key, global_id),
+                ).fetchall()
+                embs.extend(_blob_to_emb(r["embedding"]) for r in rows)
+            rows = c.execute(
+                "SELECT embedding FROM unlabeled_embeddings "
+                "WHERE session_id = ? AND speaker_key = ?",
+                (session_id, speaker_key),
+            ).fetchall()
+            embs.extend(_blob_to_emb(r["embedding"]) for r in rows)
+        return embs
+
+    def _backfill_embedding_from_wav(
+        self, session_id: str, speaker_key: str, segments: list[dict], wav_path: str,
+    ) -> np.ndarray | None:
+        """Re-extract a fresh embedding from this speaker_key's audio.
+
+        Used when a session pre-dates unlabeled_embeddings (so no embeddings
+        were ever persisted for this key) or the live pipeline dropped them.
+        Persists the result into unlabeled_embeddings so the next call is free.
+
+        Diarized segments are often shorter than MIN_DURATION_SEC, so we
+        concatenate the longest few until we have enough audio. Falls back
+        cleanly to None if total audio is still too short.
+        """
+        if not self._ready or not segments:
+            return None
+        import wave
+        from scipy import signal as scipy_signal
+
+        ranked = sorted(
+            segments,
+            key=lambda s: (s["end_time"] or 0) - (s["start_time"] or 0),
+            reverse=True,
+        )
+
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                rate = wf.getframerate()
+                channels = wf.getnchannels()
+                total_frames = wf.getnframes()
+                chunks: list[np.ndarray] = []
+                total_sec = 0.0
+                target_sec = max(_MIN_DURATION_SEC + 0.5, 4.0)
+                for seg in ranked:
+                    start = seg["start_time"] or 0.0
+                    end = seg["end_time"] or 0.0
+                    dur = end - start
+                    if dur <= 0:
+                        continue
+                    start_frame = int(start * rate)
+                    n_frames = int(dur * rate)
+                    if start_frame + n_frames > total_frames:
+                        n_frames = max(0, total_frames - start_frame)
+                    if n_frames <= 0:
+                        continue
+                    wf.setpos(start_frame)
+                    raw = wf.readframes(n_frames)
+                    if not raw:
+                        continue
+                    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                    if channels > 1:
+                        audio = audio.reshape(-1, channels).mean(axis=1)
+                    chunks.append(audio)
+                    total_sec += dur
+                    if total_sec >= target_sec:
+                        break
+            if not chunks or total_sec < _MIN_DURATION_SEC:
+                return None
+            audio = np.concatenate(chunks)
+            if rate != 16000:
+                audio = scipy_signal.resample_poly(audio, 16000, rate)
+            emb = self.extract_embedding(audio)
+            if emb is None:
+                return None
+            try:
+                self.add_unlabeled_embedding(session_id, speaker_key, emb, total_sec)
+            except Exception:
+                pass
+            return emb
+        except Exception:
+            log.warn("fingerprint", f"backfill failed for {speaker_key} in {session_id[:8]}")
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    def _agglomerative_clusters(
+        keys: list[str], centroids: list[np.ndarray], threshold: float,
+    ) -> list[list[int]]:
+        """Single-linkage agglomerative clustering on cosine similarity.
+
+        Returns a list of clusters; each cluster is a list of indices into ``keys``.
+        Cluster boundary: stop merging when the closest remaining pair has
+        cosine similarity below ``threshold``.
+        """
+        n = len(keys)
+        if n == 0:
+            return []
+        if n == 1:
+            return [[0]]
+        # Cluster assignment: index → cluster id
+        cluster_of = list(range(n))
+        members: dict[int, list[int]] = {i: [i] for i in range(n)}
+        embs = np.stack(centroids)
+        sims = embs @ embs.T
+
+        # Build candidate pairs above threshold, sorted descending by sim.
+        pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if sims[i, j] >= threshold:
+                    pairs.append((float(sims[i, j]), i, j))
+        pairs.sort(reverse=True)
+
+        for sim, i, j in pairs:
+            ci, cj = cluster_of[i], cluster_of[j]
+            if ci == cj:
+                continue
+            # Single-linkage: merge as soon as any cross-pair crosses threshold.
+            target, source = (ci, cj) if len(members[ci]) >= len(members[cj]) else (cj, ci)
+            for m in members[source]:
+                cluster_of[m] = target
+            members[target].extend(members[source])
+            del members[source]
+
+        return list(members.values())
+
+    def cluster_session_speakers(
+        self,
+        session_id: str,
+        wav_path: str | None = None,
+        cluster_threshold: float = 0.70,
+        suggest_threshold: float = 0.65,
+    ) -> dict:
+        """Cluster a session's speakers for the post-meeting cleanup UI.
+
+        Returns a payload with two cluster lists:
+          - ``labeled``: one cluster per linked global profile (members are the
+            speaker_keys that resolve to that profile).
+          - ``unlabeled``: agglomerative clusters of speaker_keys that aren't
+            linked to a profile, plus singletons for keys with no embedding.
+
+        Each member carries its per-key centroid (base64) so the client can
+        recompute cluster centroids + library suggestions instantly on drop.
+        """
+        speakers = self._gather_session_speakers(session_id)
+
+        # Step 1: collect or backfill an embedding pool per speaker_key.
+        backfilled_count = 0
+        for sp in speakers:
+            embs = self._gather_speaker_embeddings(
+                session_id, sp["speaker_key"], sp["global_id"],
+            )
+            if not embs and wav_path:
+                emb = self._backfill_embedding_from_wav(
+                    session_id, sp["speaker_key"], sp["segments"], wav_path,
+                )
+                if emb is not None:
+                    embs = [emb]
+                    backfilled_count += 1
+            sp["_embeddings"] = embs
+
+        # Step 2: per-key centroid (mean of embeddings, L2-normalized).
+        for sp in speakers:
+            embs = sp["_embeddings"]
+            if embs:
+                sp["_centroid"] = _normalize(np.stack(embs).mean(axis=0))
+                sp["emb_count"] = len(embs)
+            else:
+                sp["_centroid"] = None
+                sp["emb_count"] = 0
+
+        # Step 3: library suggestions per key (so client can mirror our logic).
+        def _suggestion_for(centroid: np.ndarray, exclude: set[str]) -> dict | None:
+            if centroid is None:
+                return None
+            matches = self.find_matches(
+                centroid, exclude_global_ids=exclude,
+                top_k=3, min_similarity=suggest_threshold,
+            )
+            return matches[0] if matches else None
+
+        # Step 4: build labeled clusters (grouped by global_id).
+        # Noise-flagged speakers never appear in regular clusters; they show
+        # up in the collapsed "Noise" section regardless of their global_id.
+        labeled_groups: dict[str, dict] = {}
+        for sp in speakers:
+            if sp["is_noise"]:
+                continue
+            gid = sp["global_id"]
+            if not gid:
+                continue
+            grp = labeled_groups.setdefault(gid, {
+                "cluster_id": f"profile:{gid}",
+                "kind":       "labeled",
+                "global_id":  gid,
+                "name":       sp["global_name"] or sp["name"],
+                "color":      sp["global_color"] or sp["color"],
+                "members":    [],
+            })
+            grp["members"].append(sp)
+
+        # Step 5: agglomerative clustering on unlabeled speakers with centroids.
+        unlabeled = [sp for sp in speakers if not sp["global_id"] and not sp["is_noise"]]
+        with_centroid = [sp for sp in unlabeled if sp["_centroid"] is not None]
+        without_centroid = [sp for sp in unlabeled if sp["_centroid"] is None]
+
+        clusters_idx = self._agglomerative_clusters(
+            [sp["speaker_key"] for sp in with_centroid],
+            [sp["_centroid"] for sp in with_centroid],
+            cluster_threshold,
+        )
+
+        unlabeled_clusters = []
+        for cluster_n, idxs in enumerate(clusters_idx, start=1):
+            members = [with_centroid[i] for i in idxs]
+            total_emb_count = sum(m["emb_count"] for m in members)
+            # Cluster centroid = emb_count-weighted mean of member centroids.
+            weighted = sum(m["_centroid"] * m["emb_count"] for m in members)
+            cluster_centroid = _normalize(weighted) if total_emb_count else members[0]["_centroid"]
+            suggestion = _suggestion_for(cluster_centroid, exclude=set(labeled_groups.keys()))
+            unlabeled_clusters.append({
+                "cluster_id": f"unlabeled:{cluster_n}",
+                "kind":       "unlabeled",
+                "global_id":  None,
+                "name":       None,
+                "color":      None,
+                "members":    members,
+                "_centroid":  cluster_centroid,
+                "suggestion": suggestion,
+            })
+
+        # Step 6: singletons for keys without any embedding (no clustering possible).
+        for sp in without_centroid:
+            unlabeled_clusters.append({
+                "cluster_id": f"unlabeled:orphan:{sp['speaker_key']}",
+                "kind":       "unlabeled",
+                "global_id":  None,
+                "name":       None,
+                "color":      None,
+                "members":    [sp],
+                "_centroid":  None,
+                "suggestion": None,
+            })
+
+        # Step 7: noise cluster (collapsed).
+        noise_members = [sp for sp in speakers if sp["is_noise"]]
+        noise_cluster = {
+            "cluster_id": "noise",
+            "kind":       "noise",
+            "global_id":  None,
+            "name":       "Noise",
+            "color":      "#6e7681",
+            "members":    noise_members,
+        } if noise_members else None
+
+        # Add per-labeled suggestions (so user sees "this profile might be
+        # better described as someone else" when their centroid has drifted).
+        for grp in labeled_groups.values():
+            embs_concat = []
+            for m in grp["members"]:
+                if m["_centroid"] is not None:
+                    embs_concat.append(m["_centroid"] * max(m["emb_count"], 1))
+            if embs_concat:
+                grp["_centroid"] = _normalize(np.sum(embs_concat, axis=0))
+            else:
+                grp["_centroid"] = None
+
+        # Step 8: serialize for transport.
+        def _ser_member(sp: dict) -> dict:
+            return {
+                "speaker_key": sp["speaker_key"],
+                "name":        sp["name"],
+                "color":       sp["color"],
+                "segments":    [
+                    {"id": s["id"], "start": s["start_time"], "end": s["end_time"]}
+                    for s in sp["segments"]
+                ],
+                "segment_count": len(sp["segments"]),
+                "emb_count":   sp["emb_count"],
+                "centroid":    base64.b64encode(sp["_centroid"].tobytes()).decode("ascii")
+                               if sp["_centroid"] is not None else None,
+                "is_noise":    sp["is_noise"],
+                "global_id":   sp["global_id"],
+            }
+
+        def _ser_cluster(grp: dict) -> dict:
+            out = {
+                "cluster_id": grp["cluster_id"],
+                "kind":       grp["kind"],
+                "global_id":  grp.get("global_id"),
+                "name":       grp.get("name"),
+                "color":      grp.get("color"),
+                "members":    [_ser_member(m) for m in grp["members"]],
+            }
+            if grp.get("_centroid") is not None:
+                out["centroid"] = base64.b64encode(grp["_centroid"].tobytes()).decode("ascii")
+            if "suggestion" in grp:
+                out["suggestion"] = grp["suggestion"]
+            return out
+
+        labeled_list = sorted(
+            labeled_groups.values(),
+            key=lambda g: sum(len(m["segments"]) for m in g["members"]),
+            reverse=True,
+        )
+        unlabeled_clusters.sort(
+            key=lambda g: sum(len(m["segments"]) for m in g["members"]),
+            reverse=True,
+        )
+
+        # Library snapshot with centroids — lets the client recompute
+        # similarity suggestions instantly when the user drags a pill between
+        # clusters, instead of round-tripping to the server on every drop.
+        library = []
+        with _conn(self._db_path) as c:
+            lib_rows = c.execute(
+                "SELECT id, name, color, emb_count, centroid FROM global_speakers "
+                "WHERE centroid IS NOT NULL ORDER BY lower(name)"
+            ).fetchall()
+        for r in lib_rows:
+            library.append({
+                "global_id": r["id"],
+                "name":      r["name"],
+                "color":     r["color"],
+                "emb_count": r["emb_count"],
+                "centroid":  base64.b64encode(r["centroid"]).decode("ascii"),
+            })
+
+        return {
+            "session_id":         session_id,
+            "labeled_clusters":   [_ser_cluster(g) for g in labeled_list],
+            "unlabeled_clusters": [_ser_cluster(g) for g in unlabeled_clusters],
+            "noise_cluster":      _ser_cluster(noise_cluster) if noise_cluster else None,
+            "library":            library,
+            "thresholds": {
+                "cluster":   cluster_threshold,
+                "suggest":   suggest_threshold,
+                "auto":      _AUTO_APPLY_THRESHOLD,
+            },
+            "stats": {
+                "speakers_total":   len(speakers),
+                "speakers_labeled": sum(1 for s in speakers if s["global_id"]),
+                "speakers_noise":   sum(1 for s in speakers if s["is_noise"]),
+                "embedding_backfills": backfilled_count,
+            },
+        }
+
+    # ── Apply corrections (the "Save" path of the cleanup UI) ─────────────────
+
+    def apply_cluster_corrections(
+        self,
+        session_id: str,
+        proposed: list[dict],
+        noise_keys: list[str] | None = None,
+    ) -> dict:
+        """Apply the user's cleanup decisions.
+
+        ``proposed`` is a list of clusters:
+            [{
+                "global_id": str | None,     # existing profile, or None
+                "new_name":  str | None,     # create a new profile with this name
+                "color":     str | None,     # optional override
+                "member_keys": [speaker_key, ...],
+            }, ...]
+
+        For each cluster:
+          - existing global_id → relink members; embeddings (labeled +
+            unlabeled) merge into that profile.
+          - new_name → create a profile, then relink as above.
+          - empty → unlink members (back to "Speaker N").
+
+        ``noise_keys`` get is_noise=1 on speaker_labels.
+
+        After all relinks, recompute touched profiles' centroids from scratch
+        (cheaper and safer than incremental updates given the bulk migration).
+        Then prune_embeddings() on each.
+        """
+        from core import storage  # late import — avoids circular import at boot
+        from capture_video import media_edit  # for wav lookup, used by backfill
+
+        noise_keys_set = set(noise_keys or [])
+        touched_profiles: set[str] = set()
+        created: list[dict] = []
+        relinked_members = 0
+        unlinked_members = 0
+
+        # Read current labels so we can diff.
+        current = {
+            sp["speaker_key"]: sp
+            for sp in self._gather_session_speakers(session_id)
+        }
+
+        # Pre-pass: figure out which profiles will need their centroid rebuilt.
+        for cluster in proposed:
+            target_gid = cluster.get("global_id")
+            if target_gid:
+                touched_profiles.add(target_gid)
+            for k in cluster.get("member_keys", []):
+                cur = current.get(k)
+                if cur and cur["global_id"]:
+                    touched_profiles.add(cur["global_id"])
+
+        # Pass 1: create new profiles from new_name clusters.
+        for cluster in proposed:
+            if cluster.get("global_id"):
+                continue
+            new_name = (cluster.get("new_name") or "").strip()
+            if not new_name:
+                continue
+            color = cluster.get("color")
+            gid = self.create_global_speaker(new_name, color=color)
+            cluster["global_id"] = gid
+            touched_profiles.add(gid)
+            created.append({"global_id": gid, "name": new_name})
+
+        # Pass 2: relink members + migrate unlabeled embeddings → speaker_embeddings.
+        with _conn(self._db_path) as c:
+            for cluster in proposed:
+                target_gid = cluster.get("global_id")
+                member_keys = [k for k in cluster.get("member_keys", []) if k not in noise_keys_set]
+                if target_gid:
+                    profile_row = c.execute(
+                        "SELECT name, color FROM global_speakers WHERE id = ?",
+                        (target_gid,),
+                    ).fetchone()
+                    if not profile_row:
+                        continue
+                    for k in member_keys:
+                        # UPSERT — reanalysis sessions often have segments for
+                        # speaker_keys with no speaker_labels row yet.
+                        c.execute(
+                            "INSERT INTO speaker_labels "
+                            "(session_id, speaker_key, name, color, global_id, is_noise) "
+                            "VALUES (?, ?, ?, ?, ?, 0) "
+                            "ON CONFLICT(session_id, speaker_key) DO UPDATE SET "
+                            "name=excluded.name, color=excluded.color, "
+                            "global_id=excluded.global_id, is_noise=0",
+                            (session_id, k, profile_row["name"], profile_row["color"], target_gid),
+                        )
+                        # Migrate any unlabeled embeddings for this key into
+                        # the labeled embedding table under the target profile.
+                        unlbl = c.execute(
+                            "SELECT id, embedding, duration_sec FROM unlabeled_embeddings "
+                            "WHERE session_id=? AND speaker_key=?",
+                            (session_id, k),
+                        ).fetchall()
+                        for ue in unlbl:
+                            c.execute(
+                                "INSERT INTO speaker_embeddings "
+                                "(global_id, session_id, speaker_key, embedding, duration_sec, created_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (target_gid, session_id, k, ue["embedding"],
+                                 ue["duration_sec"], _now()),
+                            )
+                        if unlbl:
+                            c.execute(
+                                "DELETE FROM unlabeled_embeddings WHERE session_id=? AND speaker_key=?",
+                                (session_id, k),
+                            )
+                        relinked_members += 1
+                else:
+                    # Empty cluster → unlink (back to plain Speaker N).
+                    for k in member_keys:
+                        cur = current.get(k)
+                        if cur and cur["global_id"]:
+                            # Move the existing labeled embeddings back to
+                            # unlabeled storage so they aren't lost.
+                            embs = c.execute(
+                                "SELECT embedding, duration_sec FROM speaker_embeddings "
+                                "WHERE session_id=? AND speaker_key=? AND global_id=?",
+                                (session_id, k, cur["global_id"]),
+                            ).fetchall()
+                            for e in embs:
+                                c.execute(
+                                    "INSERT INTO unlabeled_embeddings "
+                                    "(session_id, speaker_key, embedding, duration_sec, created_at) "
+                                    "VALUES (?, ?, ?, ?, ?)",
+                                    (session_id, k, e["embedding"], e["duration_sec"], _now()),
+                                )
+                            c.execute(
+                                "DELETE FROM speaker_embeddings "
+                                "WHERE session_id=? AND speaker_key=? AND global_id=?",
+                                (session_id, k, cur["global_id"]),
+                            )
+                        c.execute(
+                            "INSERT INTO speaker_labels "
+                            "(session_id, speaker_key, name, color, global_id, is_noise) "
+                            "VALUES (?, ?, ?, NULL, NULL, 0) "
+                            "ON CONFLICT(session_id, speaker_key) DO UPDATE SET "
+                            "global_id=NULL, is_noise=0",
+                            (session_id, k, k),
+                        )
+                        unlinked_members += 1
+
+            # Pass 3: noise flag (overrides cluster membership).
+            for k in noise_keys_set:
+                c.execute(
+                    "INSERT INTO speaker_labels "
+                    "(session_id, speaker_key, name, color, global_id, is_noise) "
+                    "VALUES (?, ?, ?, NULL, NULL, 1) "
+                    "ON CONFLICT(session_id, speaker_key) DO UPDATE SET "
+                    "is_noise=1, global_id=NULL",
+                    (session_id, k, k),
+                )
+
+        # Pass 4: rebuild touched profiles' centroids + prune outliers.
+        for gid in touched_profiles:
+            try:
+                self.recompute_centroid(gid)
+                self.prune_embeddings(gid)
+            except Exception:
+                log.warn("fingerprint", f"Centroid rebuild failed for {gid[:8]}")
+                traceback.print_exc()
+
+        log.info(
+            "fingerprint",
+            f"Cleanup applied: relinked={relinked_members}, unlinked={unlinked_members}, "
+            f"created={len(created)}, noise={len(noise_keys_set)}, profiles_rebuilt={len(touched_profiles)}",
+        )
+        return {
+            "created":          created,
+            "relinked":         relinked_members,
+            "unlinked":         unlinked_members,
+            "noise_marked":     len(noise_keys_set),
+            "profiles_touched": list(touched_profiles),
+        }

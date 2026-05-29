@@ -37,20 +37,29 @@ if not os.getenv("HF_TOKEN", "").strip():
 _MODEL_CACHE = str(Path(__file__).parent.parent / "storage" / "models")
 os.environ.setdefault("HF_HOME", _MODEL_CACHE)
 
-# Corporate Cloudflare WARP injects a self-signed CA for TLS inspection,
-# which breaks SSL verification for HuggingFace and other HTTPS requests.
-# Disable SSL verification so model downloads work regardless of WARP state.
-os.environ.setdefault("HF_HUB_DISABLE_SSL_VERIFY", "1")
-os.environ.setdefault("CURL_CA_BUNDLE", "")
-os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
-os.environ.setdefault("SSL_CERT_FILE", "")
-# httpx (used by Anthropic/OpenAI SDKs) respects this env var
-os.environ.setdefault("SSL_VERIFY", "0")
-
-import ssl as _ssl
+# ── TLS trust: verify against the OS certificate store ───────────────────────
+# Corporate networks (notably Cloudflare WARP / Zero Trust) perform TLS
+# inspection: they re-sign HTTPS traffic with a private root CA that IT installs
+# into the *operating system* trust store. Python's HTTP stack instead verifies
+# against the bundled certifi CA list, which has never heard of that private
+# root, so every HTTPS call fails with "self-signed certificate in certificate
+# chain" while WARP is connected. This is the backend httpx uses under
+# huggingface_hub and the Anthropic/OpenAI SDKs, so it breaks model
+# downloads, cache-revision checks, and provider API calls alike.
+#
+# truststore makes the stdlib ssl module verify against the OS trust store, so
+# the WARP CA (already trusted at the OS level on a managed machine) is honoured
+# everywhere in one place, WITHOUT disabling certificate verification. It must
+# run before any networking library creates an SSLContext; config is the first
+# project module app.py imports, so this is the right spot.
 try:
-    _ssl._create_default_https_context = _ssl._create_unverified_context
-except AttributeError:
+    import truststore as _truststore
+    _truststore.inject_into_ssl()
+except Exception:
+    # truststore may be absent on the very first launch (before requirements
+    # resolve) or fail to inject on an unusual platform. Recording still works
+    # offline from the pre-populated model cache; online features degrade
+    # gracefully rather than crashing this import.
     pass
 
 # Suppress HuggingFace symlinks warning on Windows (symlinks require Developer Mode
@@ -118,9 +127,9 @@ def ensure_env() -> None:
             "# Suppress HuggingFace symlinks warning on Windows (caching still works without them)",
             "HF_HUB_DISABLE_SYMLINKS_WARNING=1",
             "",
-            "# Set to 1 if model downloads fail with SSL certificate errors.",
-            "# This is common on corporate networks with SSL inspection proxies.",
-            "# HF_HUB_DISABLE_SSL_VERIFICATION=1",
+            "# Corporate TLS inspection (e.g. Cloudflare WARP) is handled",
+            "# automatically: HTTPS is verified against the OS certificate store,",
+            "# so the proxy's CA is trusted without any workaround here.",
             "",
             "# Server port (default: 6969)",
             "# PORT=6969",

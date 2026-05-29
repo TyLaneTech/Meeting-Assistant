@@ -1026,6 +1026,14 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
             fingerprint_db.add_embedding(existing_link, sid, speaker_key, emb, duration)
             return
 
+        # Persist for the post-meeting cleanup UI — without this, embeddings
+        # for unlabeled speakers would be discarded the moment _extract_and_match
+        # returns and the clustering UI would have nothing to work with.
+        try:
+            fingerprint_db.add_unlabeled_embedding(sid, speaker_key, emb, duration)
+        except Exception as e:
+            log.warn("fingerprint", f"add_unlabeled_embedding failed: {e}")
+
         excluded = dismissals.get(speaker_key, set()) | other_links
 
         # Diagnostic: pull top candidates regardless of threshold so we can see
@@ -1381,7 +1389,13 @@ def start_recording():
         _state["is_testing"]   = False
 
     if test_cap:
-        threading.Thread(target=test_cap.stop, daemon=True).start()
+        # Stop synchronously: the test capture's ffmpeg-dshow process is still
+        # holding the microphone, and DirectShow won't deliver audio to a
+        # second simultaneous open. Backgrounding the stop lets the new
+        # recording's ffmpeg launch while the old one is still tearing down,
+        # which produces a silent mic stream for ~3 seconds (and sometimes
+        # the entire session, if the race lands the wrong way).
+        test_cap.stop()
         _push("audio_test_status", {"testing": False})
 
     # Wait for any in-flight cleanup from a previous stop to finish before
@@ -4128,6 +4142,70 @@ def update_speaker_label(session_id: str):
     # ── End auto-link ──────────────────────────────────────────────────────────
 
     return jsonify({"ok": True, "speakers": updated_speakers})
+
+
+@app.route("/api/sessions/<session_id>/speaker_clusters", methods=["GET"])
+def get_speaker_clusters(session_id: str):
+    """Compute speaker clusters for the post-meeting cleanup UI.
+
+    Backfills missing embeddings from the session WAV on demand — that step
+    can take a few seconds for sessions with many unlabeled speakers, so the
+    client should show a loading indicator.
+    """
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+    if not fingerprint_db.ready:
+        return jsonify({"error": "Voice fingerprint model not ready"}), 503
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
+    try:
+        payload = fingerprint_db.cluster_session_speakers(
+            session_id,
+            wav_path=str(wav_path) if wav_path.exists() else None,
+        )
+        return jsonify(payload)
+    except Exception as e:
+        log.error("fingerprint", f"cluster_session_speakers failed: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sessions/<session_id>/speaker_clusters/apply", methods=["POST"])
+def apply_speaker_clusters(session_id: str):
+    """Apply user's cleanup decisions and retrain affected library profiles."""
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json(silent=True) or {}
+    proposed = data.get("clusters") or []
+    noise_keys = data.get("noise_keys") or []
+    if not isinstance(proposed, list):
+        return jsonify({"error": "clusters must be a list"}), 400
+
+    try:
+        result = fingerprint_db.apply_cluster_corrections(
+            session_id, proposed, noise_keys=noise_keys,
+        )
+    except Exception as e:
+        log.error("fingerprint", f"apply_cluster_corrections failed: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+    # Push a state refresh so the live UI picks up the new labels.
+    with _state_lock:
+        if _state["session_id"] == session_id:
+            for sp in storage.list_speaker_profiles(session_id):
+                _state["speaker_labels"][sp["speaker_key"]] = sp["name"]
+
+    for sp in storage.list_speaker_profiles(session_id):
+        _push("speaker_label", {
+            "session_id": session_id,
+            "speaker_key": sp["speaker_key"],
+            "name": sp["name"],
+            "color": sp["color"],
+        })
+
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/sessions/<session_id>/audio")

@@ -56,7 +56,10 @@ class FasterWhisperEngine(_EngineBase):
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
-        self._inner = WhisperModel(model_size, device=device, compute_type=compute_type)
+        self._inner = WhisperModel(
+            model_size, device=device, compute_type=compute_type,
+            local_files_only=True,
+        )
 
     def transcribe(self, audio, **kwargs):
         # Pass straight through — faster-whisper's signature is the canonical
@@ -77,7 +80,10 @@ class FasterWhisperEngine(_EngineBase):
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
-        self._inner = self._WhisperModel(model_size, device=device, compute_type=compute_type)
+        self._inner = self._WhisperModel(
+            model_size, device=device, compute_type=compute_type,
+            local_files_only=True,
+        )
 
 
 # ── mlx-whisper backend (macOS Apple Silicon) ───────────────────────────────

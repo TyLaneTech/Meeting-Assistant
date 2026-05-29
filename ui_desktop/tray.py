@@ -255,6 +255,7 @@ class MeetingTray:
                 enabled=lambda _: self._get_state().get("recording_ready", False),
             ),
             S("Settings...", self._open_settings),
+            S("Test Toast", self._test_toast),
             SEP,
             # ── Server ───────────────────────────────────────────────────
             S("Check for Updates", self._check_updates),
@@ -334,6 +335,16 @@ class MeetingTray:
             # goes through the same audio-initialisation path as a normal
             # session-page start (avoids DirectShow echo issues).
             webbrowser.open(f"{self._url}/session?autostart=1")
+
+    def _test_toast(self, icon=None, item=None) -> None:
+        """Fire a diagnostic system toast — verifies callbacks + visibility."""
+        try:
+            from ui_desktop import notifications
+            ok = notifications.send_test_toast()
+            if not ok:
+                print("[tray] Test toast failed to dispatch — see [notify] log lines above.")
+        except Exception as e:
+            print(f"[tray] Test toast error: {e}")
 
     def _quit(self, icon=None, item=None) -> None:
         self._on_quit(self._icon)

@@ -98,6 +98,23 @@ def init_db() -> None:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_emb_global  ON speaker_embeddings(global_id)",
             "CREATE INDEX IF NOT EXISTS idx_emb_session ON speaker_embeddings(session_id, speaker_key)",
+            # Unlabeled-speaker embeddings: feed the post-meeting cleanup UI's
+            # clustering pass. Populated live by _on_fingerprint_audio whenever
+            # an embedding is extracted for a speaker_key with no global_id,
+            # and backfilled from the session WAV when the cleanup view opens
+            # on an older session that pre-dates this table.
+            """CREATE TABLE IF NOT EXISTS unlabeled_embeddings (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT NOT NULL,
+                speaker_key  TEXT NOT NULL,
+                embedding    BLOB NOT NULL,
+                duration_sec REAL NOT NULL,
+                created_at   TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_unlbl_session ON unlabeled_embeddings(session_id, speaker_key)",
+            # Per-session noise flag: speakers marked noise are hidden from the
+            # cleanup view's main clusters and collapsed into a "Noise" group.
+            "ALTER TABLE speaker_labels ADD COLUMN is_noise INTEGER NOT NULL DEFAULT 0",
             # Session folders
             """CREATE TABLE IF NOT EXISTS folders (
                 id         TEXT PRIMARY KEY,
