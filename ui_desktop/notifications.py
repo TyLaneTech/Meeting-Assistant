@@ -123,6 +123,7 @@ def notify(
     actions: Optional[list[dict]] = None,
     image: Optional[Path | str] = None,
     duration: str = "short",
+    scenario: str = "",
 ) -> bool:
     """Show a system toast.
 
@@ -145,17 +146,38 @@ def notify(
     duration
         "short" (~5s) or "long" (~25s). Long toasts stay visible longer
         before sliding into the Action Center.
+    scenario
+        Windows-only. "" for a normal toast, or "reminder" / "important" /
+        "incomingcall" / "alarm" to raise priority. A "reminder" toast is
+        sticky (stays on screen until the user acts on it) and breaks through
+        "Priority only" Focus Assist / Do Not Disturb, which a normal toast
+        does not: during a meeting Windows often suppresses normal banners to
+        the Action Center silently. Reminder/alarm scenarios require at least
+        one action button (this toast has them).
 
     Returns
     -------
-    True if the platform notification API accepted the toast.
+    True if the platform notification API accepted the toast. Note this only
+    means Windows accepted it, not that a banner was shown: a suppressed
+    (Focus Assist / full-screen) normal toast still returns True while landing
+    silently in the Action Center. Raise ``scenario`` to fight that.
     """
     if sys.platform == "win32":
-        return _send_windows_toast(title, body, on_click=on_click, actions=actions or [], image=image, duration=duration)
+        return _send_windows_toast(title, body, on_click=on_click, actions=actions or [], image=image, duration=duration, scenario=scenario)
     if sys.platform == "darwin":
         return _send_macos_notification(title, body)
     log.warn("notify", f"Toast skipped: unsupported platform {sys.platform}")
     return False
+
+
+def _noop_dismiss(_arg: str) -> None:
+    """No-op callback for "dismiss" buttons (e.g. Not now / Keep recording).
+
+    A toast button with no on_click falls back to the toast-level on_click in
+    _on_activated, which for our toasts opens a page. Wiring a dismiss button to
+    this explicit no-op stops that fallback: clicking the button just closes the
+    toast (Windows dismisses any toast on activation) and does nothing else.
+    """
 
 
 def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
@@ -185,9 +207,37 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
         on_click=_open_session,
         actions=[
             {"label": "Stop recording", "arg": "stop", "on_click": _stop_recording},
-            {"label": "Keep recording", "arg": "keep"},
+            {"label": "Keep recording", "arg": "keep", "on_click": _noop_dismiss},
         ],
         duration="long",
+    )
+
+
+def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
+    """Offer to record a just-detected Zoom/Teams meeting.
+
+    The "Start recording" action opens the session page with ``autostart=1``
+    rather than POSTing /api/recording/start directly. All recordings must be
+    kicked off from the session page (the autostart path) to avoid the
+    DirectShow echo issue, so we route through the browser the same way the
+    home-page record button does.
+    """
+    base = server_url.rstrip("/")
+    start_url = f"{base}/session?autostart=1"
+
+    def _start(_arg: str) -> None:
+        webbrowser.open(start_url)
+
+    return notify(
+        f"{app_name} meeting detected",
+        "Want to record and transcribe it?",
+        on_click=_start,
+        actions=[
+            {"label": "Start recording", "arg": "start", "on_click": _start},
+            {"label": "Not now", "arg": "dismiss", "on_click": _noop_dismiss},
+        ],
+        duration="long",
+        scenario="reminder",
     )
 
 
@@ -222,10 +272,11 @@ def _send_windows_toast(
     actions: list[dict],
     image: Optional[Path | str],
     duration: str,
+    scenario: str = "",
 ) -> bool:
     try:
         from windows_toasts import (  # type: ignore[import-not-found]
-            Toast, ToastButton, ToastDisplayImage, ToastDuration,
+            Toast, ToastButton, ToastDisplayImage, ToastDuration, ToastScenario,
         )
     except ImportError as e:
         log.warn("notify", f"windows-toasts not installed ({e}). Run: pip install windows-toasts")
@@ -269,13 +320,28 @@ def _send_windows_toast(
         if body:
             text_fields.append(body)
 
-        toast = Toast(
+        toast_kwargs = dict(
             text_fields=text_fields,
             duration=ToastDuration.Long if duration == "long" else ToastDuration.Short,
             on_activated=_on_activated,
             on_failed=_on_failed,
             actions=toast_buttons,
         )
+        # A raised scenario (especially "reminder") makes the banner sticky and
+        # lets it break through "Priority only" Focus Assist / Do Not Disturb,
+        # which a normal toast cannot: during a meeting Windows otherwise drops
+        # the banner silently into the Action Center. Reminder/alarm scenarios
+        # require at least one action button, which our callers provide.
+        _scenarios = {
+            "reminder": ToastScenario.Reminder,
+            "important": ToastScenario.Important,
+            "incomingcall": ToastScenario.IncomingCall,
+            "alarm": ToastScenario.Alarm,
+        }
+        _sc = _scenarios.get(scenario.lower()) if scenario else None
+        if _sc is not None:
+            toast_kwargs["scenario"] = _sc
+        toast = Toast(**toast_kwargs)
 
         # Only attach an inline image when a caller explicitly passes one. We
         # deliberately do NOT default to the app logo: an inline

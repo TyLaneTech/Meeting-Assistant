@@ -39,6 +39,7 @@ from core import log as log
 from core import config as config
 from capture_video import media_edit as media_edit
 from ui_desktop import notifications as notifications
+from core import meeting_detect as meeting_detect
 from core import paths as paths
 from core import settings as settings
 from core import storage as storage
@@ -942,6 +943,73 @@ def _quiet_prompt_loop() -> None:
 
 
 threading.Thread(target=_quiet_prompt_loop, daemon=True).start()
+
+
+def _meeting_detect_loop() -> None:
+    """Offer to record when a Zoom/Teams meeting starts and nothing is recording.
+
+    Opt-in (settings.meeting_detect_enabled, default off). Polls every ~2s for a
+    live meeting (mic held by Zoom/Teams, or a Zoom meeting window). Fires once
+    per meeting on a debounced rising edge, never while a recording is active,
+    and re-arms only after the meeting has been gone for a grace period so it
+    does not nag during a single meeting.
+    """
+    consecutive = 0
+    prompted = False
+    clear_since: float | None = None
+    last_prompt_at = 0.0
+    REARM_AFTER_CLEAR_SEC = 45.0
+
+    while True:
+        time.sleep(2.0)
+        cfg = settings.load()
+        if not cfg.get("meeting_detect_enabled", False):
+            consecutive = 0
+            prompted = False
+            clear_since = None
+            continue
+
+        debounce = max(1, int(cfg.get("meeting_detect_debounce", 2)))
+        cooldown = max(0.0, float(cfg.get("meeting_detect_cooldown_sec", 90)))
+
+        try:
+            active = meeting_detect.detect_active_meeting()
+        except Exception as e:
+            log.warn("meetdetect", f"detection error: {e}")
+            active = None
+
+        now = time.monotonic()
+
+        if not active:
+            consecutive = 0
+            if clear_since is None:
+                clear_since = now
+            elif prompted and now - clear_since >= REARM_AFTER_CLEAR_SEC:
+                prompted = False  # meeting ended; re-arm for the next one
+            continue
+
+        # A meeting looks active.
+        clear_since = None
+        consecutive += 1
+        if consecutive < debounce or prompted:
+            continue
+        if last_prompt_at and now - last_prompt_at < cooldown:
+            continue
+
+        with _state_lock:
+            if _state["is_recording"]:
+                prompted = True  # already capturing this meeting; don't ask
+                continue
+
+        app_name = active.get("app") or "Meeting"
+        if notifications.send_meeting_detected_toast(app_name, _server_url):
+            prompted = True
+            last_prompt_at = now
+            log.info("meetdetect",
+                     f"Meeting-detected toast sent ({app_name}, {active.get('signal')})")
+
+
+threading.Thread(target=_meeting_detect_loop, daemon=True).start()
 
 
 # ── Speaker fingerprint helpers ───────────────────────────────────────────────

@@ -370,6 +370,25 @@
               <input type="number" id="quiet-prompt-cooldown" class="settings-number-input" min="0" max="1800" step="30" onchange="saveQuietReminderSettings()">
             </div>
           </div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Auto-Detect Meetings</div>
+                <div class="settings-row-desc">Offer to record when a Zoom or Teams meeting starts (Windows)</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="meeting-detect-enabled" onchange="saveMeetingDetectSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Detection Cooldown</div>
+                <div class="settings-row-desc">Minimum seconds between repeated meeting prompts</div>
+              </div>
+              <input type="number" id="meeting-detect-cooldown" class="settings-number-input" min="0" max="1800" step="15" onchange="saveMeetingDetectSettings()">
+            </div>
+          </div>
         </div>
 
         <!-- System -->
@@ -479,6 +498,24 @@
                 <button class="btn-settings-action" id="data-folder-pick-btn" onclick="pickDataFolder()">Choose…</button>
                 <button class="btn-settings-action btn-settings-secondary" id="data-folder-reset-btn" onclick="resetDataFolder()" style="display:none">Reset to default</button>
               </div>
+            </div>
+          </div>
+          <div class="settings-group-title">Network</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Auto-toggle Cloudflare WARP</div>
+                <div class="settings-row-desc">
+                  Briefly disconnect Cloudflare WARP around AI calls, model downloads,
+                  and update checks. Off by default. TLS is verified against the system
+                  trust store, so this is rarely needed; leaving it off keeps your VPN
+                  connection untouched.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="warp-toggle-enabled" onchange="saveWarpSettings()">
+                <span class="toggle-slider"></span>
+              </label>
             </div>
           </div>
           <div class="settings-group-title">Updates</div>

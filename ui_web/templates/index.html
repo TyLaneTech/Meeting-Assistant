@@ -256,7 +256,7 @@
 
         <div id="video-viewer" class="video-viewer hidden" data-video-mode="compact">
           <div class="video-viewport" id="video-viewport">
-            <video id="playback-video" class="playback-video" muted playsinline></video>
+            <video id="playback-video" class="playback-video" muted playsinline preload="auto"></video>
             <div class="video-zoom-hint hidden" id="video-zoom-hint">100%</div>
             <div class="video-toolbar" id="video-toolbar">
               <button class="video-tool-btn" id="video-btn-zoom-reset"
@@ -350,7 +350,7 @@
             </div>
             <button class="icon-btn" id="summary-prompt-toggle"
                     title="Custom summary instructions" onclick="toggleSummaryPrompt()"><i class="fa-solid fa-gear"></i></button>
-            <button class="icon-btn" title="Copy summary" onclick="copySummary()"><i class="fa-duotone fa-copy"></i></button>
+            <button class="icon-btn" id="btn-copy-summary" title="Copy summary…" onclick="openCopySummaryMenu(this)"><i class="fa-duotone fa-copy"></i></button>
             <button class="icon-btn" title="Refresh summary" onclick="triggerSummary()"><i class="fa-solid fa-rotate-right"></i></button>
           </div>
         </div>

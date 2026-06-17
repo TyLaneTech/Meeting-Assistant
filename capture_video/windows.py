@@ -338,11 +338,21 @@ class ScreenRecorder:
 
         self._frag_path = output_path + ".frag.mp4"
 
+        # Force a keyframe at least every ~2 seconds. libx264's default GOP is
+        # 250 *frames*, which at this low capture fps puts keyframes tens of
+        # seconds apart and makes the playback video slow and coarse to seek
+        # (the browser has to decode from a far-away keyframe). -force_key_frames
+        # is time-based, so it holds even when gdigrab delivers frames unevenly.
+        keyint = max(1, round(framerate * 2))
+
         cmd.extend([
             "-c:v", "libx264",
             "-preset", preset,
             "-crf", str(crf),
             "-pix_fmt", "yuv420p",
+            "-g", str(keyint),
+            "-keyint_min", str(max(1, round(framerate))),
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
             "-an",
             "-movflags", "frag_keyframe+empty_moov",
             self._frag_path,

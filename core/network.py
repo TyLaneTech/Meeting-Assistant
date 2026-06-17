@@ -5,6 +5,13 @@ Corporate WARP uses TLS inspection which breaks pip/uv downloads.
 Git operations require WARP connected for routing.  HuggingFace model
 downloads may fail with WARP in either state depending on timing.
 
+All toggling is gated behind the ``warp_toggle_enabled`` setting (System tab),
+which defaults to OFF. While it is off, warp_disconnect()/warp_reconnect() do
+nothing at all (not even a ``warp-cli status`` probe): TLS is verified against
+the OS trust store via truststore (core.config), so toggling is unnecessary and
+would needlessly clobber the user's VPN state. The strategy below applies only
+when the user has explicitly opted back in.
+
 Strategy:
 - launch.py toggles WARP off for pip, back on after.
 - Runtime model loads use _load_hf_pipeline() which tries the local cache
@@ -23,6 +30,25 @@ def _find_warp_cli() -> str:
     if _warp_cli is None:
         _warp_cli = shutil.which("warp-cli") or ""
     return _warp_cli
+
+
+def _toggling_enabled() -> bool:
+    """Whether the user has opted into automatic WARP toggling.
+
+    Default is OFF. TLS verification is handled by truststore (injected in
+    core.config), so the app no longer needs to flip WARP to reach providers,
+    git, or HuggingFace. While this returns False, warp_disconnect() and
+    warp_reconnect() are hard no-ops: no warp-cli command (not even ``status``)
+    is ever run. Opt back in via the System tab (settings.warp_toggle_enabled).
+
+    Fails safe to False: if the setting can't be read for any reason, leave WARP
+    untouched rather than risk clobbering the user's VPN state.
+    """
+    try:
+        from core import settings
+        return settings.get("warp_toggle_enabled", False) is True
+    except Exception:
+        return False
 
 
 def _is_connected() -> bool | None:
@@ -44,7 +70,13 @@ def _is_connected() -> bool | None:
 
 
 def warp_disconnect() -> bool:
-    """Disconnect WARP. Returns True on success or if already disconnected."""
+    """Disconnect WARP. Returns True on success or if already disconnected.
+
+    Hard no-op (returns True) unless the user enabled WARP auto-toggling; see
+    _toggling_enabled().
+    """
+    if not _toggling_enabled():
+        return True
     cli = _find_warp_cli()
     if not cli:
         return True
@@ -60,7 +92,13 @@ def warp_disconnect() -> bool:
 
 
 def warp_reconnect() -> bool:
-    """Reconnect WARP. Returns True on success or if already connected."""
+    """Reconnect WARP. Returns True on success or if already connected.
+
+    Hard no-op (returns True) unless the user enabled WARP auto-toggling; see
+    _toggling_enabled().
+    """
+    if not _toggling_enabled():
+        return True
     cli = _find_warp_cli()
     if not cli:
         return True

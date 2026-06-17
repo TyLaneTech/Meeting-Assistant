@@ -5064,6 +5064,13 @@ function _cleanupPlaySegment(seg, btn) {
     if (_cleanupPreviewStop.timer) clearTimeout(_cleanupPreviewStop.timer);
     _cleanupPreviewStop = null;
   }
+  // Detach any leftover segment-end handler. This element is the SHARED main
+  // playback-audio, so a stale handler bound to a previous segment's end would
+  // otherwise pause normal playback when the playhead crossed that old end.
+  if (audio._cleanupStopAt) {
+    audio.removeEventListener('timeupdate', audio._cleanupStopAt);
+    audio._cleanupStopAt = null;
+  }
 
   // Toggle off if same button clicked while playing.
   if (audio.dataset.cleanupActive === String(seg.start)) {
@@ -5091,14 +5098,19 @@ function _cleanupPlaySegment(seg, btn) {
     audio.load();
   }
 
+  const clearStop = () => {
+    audio.removeEventListener('timeupdate', stopAt);
+    if (audio._cleanupStopAt === stopAt) audio._cleanupStopAt = null;
+  };
   const stopAt = () => {
     if (audio.currentTime >= end) {
       audio.pause();
       btn.classList.remove('playing');
       audio.dataset.cleanupActive = '';
-      audio.removeEventListener('timeupdate', stopAt);
+      clearStop();
     }
   };
+  audio._cleanupStopAt = stopAt;
   audio.addEventListener('timeupdate', stopAt);
 
   // Safety: hard stop after expected duration + 0.5s buffer.
@@ -5106,7 +5118,7 @@ function _cleanupPlaySegment(seg, btn) {
     audio.pause();
     btn.classList.remove('playing');
     audio.dataset.cleanupActive = '';
-    audio.removeEventListener('timeupdate', stopAt);
+    clearStop();
   }, (end - start + 0.5) * 1000);
 
   _cleanupPreviewStop = { btn, timer };
@@ -5297,6 +5309,20 @@ let _cleanupVideoLoadedFor = null;  // sessionId the popup's <video> is bound to
 let _cleanupVideoUserClosed = false;  // user explicitly closed → don't auto-reopen this session
 let _cleanupVideoPlayingFor = null; // segment id currently driving playback
 
+// ── Cleanup floating-player sync state ──────────────────────────────────────
+// The popup's muted <video> is slaved to the SAME master audio (playback-audio)
+// that the cleanup segment preview drives, using the same soft-sync rules as
+// the main viewer: rate nudge for drift, guarded + throttled seeks with a
+// watchdog, and never play() while a seek is in flight. The audio's
+// cleanupActive flag alone bounds the segment, so the two stay locked and the
+// video can't stutter or replay a snippet on its own.
+let _cvPreviewing   = false; // a segment preview currently owns the popup video
+let _cvSegStartKey  = '';    // String(seg.start); matches audio.dataset.cleanupActive
+let _cvSeekPending  = false; // between currentTime= and its 'seeked'
+let _cvSeekWatchdog = 0;     // watchdog timer id for a stuck pending seek
+let _cvRAF          = 0;     // requestAnimationFrame id for the sync loop
+let _cvLastSeekAt   = 0;     // perf clock of the last throttled seek
+
 function _cleanupVideoEl() { return document.getElementById('cleanup-video'); }
 function _cleanupVideoPopupEl() { return document.getElementById('cleanup-video-popup'); }
 
@@ -5308,10 +5334,16 @@ function _cleanupVideoEnsureLoaded() {
   const video = _cleanupVideoEl();
   if (!video || !_cleanupVideoAvailable()) return false;
   if (_cleanupVideoLoadedFor !== state.sessionId) {
+    // Buffer ahead so seeking between segments rarely stalls. Same-origin, same
+    // URL as the main viewer, so the browser cache largely shares the bytes.
+    video.preload = 'auto';
     video.src = `/api/sessions/${state.sessionId}/video`;
     video.load();
     _cleanupVideoLoadedFor = state.sessionId;
+    // Stable named handlers, so re-adding on a later session swap is a no-op.
     video.addEventListener('timeupdate', _cleanupVideoUpdateTime);
+    video.addEventListener('seeked', _cvOnSeeked);
+    video.addEventListener('error', _cvOnError);
   }
   return true;
 }
@@ -5407,8 +5439,7 @@ function closeCleanupVideoPopup() {
   const popup = _cleanupVideoPopupEl();
   if (!popup) return;
   popup.hidden = true;
-  const video = _cleanupVideoEl();
-  if (video) { try { video.pause(); } catch (_) {} }
+  _cvStopPreview();
   _cvResetZoom();
   _cleanupVideoUserClosed = true;
   if (typeof savePref === 'function') savePref('cleanup_video_open', false);
@@ -5422,6 +5453,122 @@ function toggleCleanupVideoPopup() {
   else closeCleanupVideoPopup();
 }
 
+function _cvVideoTime(audioTime) {
+  const off = typeof _videoOffset === 'number' ? _videoOffset : 0;
+  return audioTime - off;
+}
+
+function _cvClampTarget(t) {
+  const v = _cleanupVideoEl();
+  t = Math.max(0, t);
+  const d = v ? v.duration : NaN;
+  if (isFinite(d) && d > 0) t = Math.min(t, d - 0.05);
+  return t;
+}
+
+function _cvOnSeeked() {
+  clearTimeout(_cvSeekWatchdog);
+  _cvSeekWatchdog = 0;
+  _cvSeekPending = false;
+  _cvAfterSeek();
+}
+function _cvOnError() {
+  clearTimeout(_cvSeekWatchdog);
+  _cvSeekWatchdog = 0;
+  _cvSeekPending = false;
+}
+
+// Resume the popup video once a seek has landed (real 'seeked', a no-op seek,
+// or the watchdog) - but only if the preview is still live and audio is playing.
+function _cvAfterSeek() {
+  const v = _cleanupVideoEl();
+  const audio = document.getElementById('playback-audio');
+  if (!v || !audio) return;
+  if (_cvPreviewing && !audio.paused && v.paused) v.play().catch(() => {});
+}
+
+// Guarded seek for the popup video. `force` bypasses the anti-spam throttle
+// (use for the initial segment seek); drift seeks pass force=false so they can
+// never machine-gun the decoder. Reuses the main controller's _VS tolerances.
+function _cvHardSeek(target, force) {
+  const v = _cleanupVideoEl();
+  if (!v) return false;
+  target = _cvClampTarget(target);
+  const now = _vsNow();
+  if (!force && (now - _cvLastSeekAt) < _VS.SEEK_MIN_MS) return false;
+  if (Math.abs(v.currentTime - target) < _VS.NOOP) { _cvAfterSeek(); return true; }
+  _cvLastSeekAt = now;
+  if (Math.abs(v.playbackRate - 1) > 1e-3) v.playbackRate = 1;
+  _cvSeekPending = true;
+  clearTimeout(_cvSeekWatchdog);
+  _cvSeekWatchdog = setTimeout(() => {
+    _cvSeekWatchdog = 0; _cvSeekPending = false; _cvAfterSeek();
+  }, _VS.WATCHDOG_MS);
+  try {
+    v.currentTime = target;
+  } catch (_) {
+    _cvSeekPending = false;
+    clearTimeout(_cvSeekWatchdog);
+    _cvSeekWatchdog = 0;
+  }
+  return true;
+}
+
+// Stop the current preview and park the popup video.
+function _cvStopPreview() {
+  _cvPreviewing = false;
+  _cvSegStartKey = '';
+  if (_cvRAF) { cancelAnimationFrame(_cvRAF); _cvRAF = 0; }
+  clearTimeout(_cvSeekWatchdog);
+  _cvSeekWatchdog = 0;
+  _cvSeekPending = false;
+  const v = _cleanupVideoEl();
+  if (v) {
+    try { v.pause(); } catch (_) {}
+    if (Math.abs(v.playbackRate - 1) > 1e-3) v.playbackRate = 1;
+  }
+}
+
+// Per-frame sync: track the master audio clock. The audio's cleanupActive flag
+// (set/cleared by the WAV preview) is the single source of truth for when the
+// segment is over, so audio and video start and stop locked together.
+function _cvSyncLoop() {
+  _cvRAF = 0;
+  if (!_cvPreviewing) return;
+  const v = _cleanupVideoEl();
+  const audio = document.getElementById('playback-audio');
+  if (!v || !audio) { _cvStopPreview(); return; }
+  const popup = _cleanupVideoPopupEl();
+  const stillPreview = popup && !popup.hidden
+    && audio.dataset.cleanupActive === _cvSegStartKey;
+  if (!stillPreview) { _cvStopPreview(); return; }  // ended / toggled off / switched
+
+  if (!_cvSeekPending) {
+    const base = audio.playbackRate || 1;
+    const expected = _cvClampTarget(_cvVideoTime(audio.currentTime));
+    if (audio.paused) {
+      // Mid-preview pause (e.g. still waiting on audio metadata): hold, but
+      // keep the loop alive so we resume in lockstep when audio starts.
+      if (!v.paused) v.pause();
+    } else {
+      const signed = v.currentTime - expected;     // + ahead of audio, - behind
+      const adrift = Math.abs(signed);
+      if (adrift >= _VS.HARD_DRIFT) {
+        if (_cvHardSeek(expected, false)) { _cvRAF = requestAnimationFrame(_cvSyncLoop); return; }
+      }
+      if (v.paused) v.play().catch(() => {});
+      let corr = 0;
+      if (adrift > _VS.IN_SYNC) {
+        corr = Math.max(-_VS.RATE_MAX,
+                        Math.min(_VS.RATE_MAX, (-signed / _VS.HARD_DRIFT) * _VS.RATE_MAX));
+      }
+      const want = base * (1 + corr);
+      if (Math.abs(v.playbackRate - want) > 1e-3) v.playbackRate = want;
+    }
+  }
+  _cvRAF = requestAnimationFrame(_cvSyncLoop);
+}
+
 function _cleanupVideoPlaySegment(seg) {
   if (!_cleanupVideoEnsureLoaded()) return false;
   const popup = _cleanupVideoPopupEl();
@@ -5433,28 +5580,35 @@ function _cleanupVideoPlaySegment(seg) {
   const vEnd = seg.end - offset;
   if (vEnd <= 0 || (isFinite(video.duration) && vStart >= video.duration)) {
     if (noseek) noseek.hidden = false;
+    _cvStopPreview();
     return true;  // we handled it (even if we couldn't seek)
   }
   if (noseek) noseek.hidden = true;
-  const target = Math.max(0, vStart);
-  const doPlay = () => {
-    try { video.currentTime = target; } catch (_) {}
-    video.play().catch(() => {});
-  };
-  if (isFinite(video.duration) && video.duration > 0) {
-    doPlay();
-  } else {
-    video.addEventListener('loadedmetadata', doPlay, { once: true });
+
+  // Retire any legacy per-video stop handler still attached from older builds;
+  // the audio clock bounds the segment now, so a video-time stop would fight it.
+  if (video._cvStopAt) {
+    video.removeEventListener('timeupdate', video._cvStopAt);
+    video._cvStopAt = null;
   }
-  // Stop at segment end (clamped to video duration).
-  const stopAt = () => {
-    if (video.currentTime >= Math.min(vEnd, isFinite(video.duration) ? video.duration : vEnd)) {
-      video.pause();
-      video.removeEventListener('timeupdate', stopAt);
-    }
-  };
-  video.addEventListener('timeupdate', stopAt);
+
+  _cvSegStartKey = String(seg.start);
+  _cvPreviewing = true;
+  _cvLastSeekAt = 0;
   _cleanupVideoPlayingFor = `${seg.id}:${seg.start}`;
+
+  const target = Math.max(0, vStart);
+  const startSync = () => {
+    if (!_cvPreviewing) return;   // preview was cancelled before metadata arrived
+    // Seek first; the persistent 'seeked' handler starts playback only once the
+    // frame has actually decoded (no play()-during-seek freeze), then the loop
+    // keeps the video locked to the audio clock.
+    _cvHardSeek(target, true);
+    if (_cvRAF) cancelAnimationFrame(_cvRAF);
+    _cvRAF = requestAnimationFrame(_cvSyncLoop);
+  };
+  if (isFinite(video.duration) && video.duration > 0) startSync();
+  else video.addEventListener('loadedmetadata', startSync, { once: true });
   return true;
 }
 
@@ -5620,7 +5774,7 @@ _cleanupPlaySegment = function (seg, btn) {
   if (audio && audio.dataset.cleanupActive === String(seg.start)) {
     _cleanupVideoPlaySegment(seg);
   } else {
-    try { v.pause(); } catch (_) {}
+    _cvStopPreview();
   }
 };
 
@@ -8966,13 +9120,30 @@ async function triggerSummary() {
   });
 }
 
-async function copySummary() {
+async function copySummary(stripTimestamps = false) {
   const el = document.getElementById('summary');
   if (!el || !el.textContent.trim()) return;
+
+  // For the "without timestamps" variant, read from a clone with the
+  // .timestamp-link pills removed. innerText needs a rendered layout to emit
+  // newlines between blocks, so the clone is briefly mounted off-screen (keeping
+  // its #summary id so it renders identically) and torn down afterwards.
+  let src = el;
+  let detach = null;
+  if (stripTimestamps) {
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('.timestamp-link').forEach(a => a.remove());
+    clone.setAttribute('aria-hidden', 'true');
+    clone.style.cssText = 'position:fixed;left:-99999px;top:0';
+    document.body.appendChild(clone);
+    src = clone;
+    detach = () => clone.remove();
+  }
+
   try {
     // Copy as rich text (HTML) so headings/lists/formatting are preserved on paste
-    const html = el.innerHTML;
-    const plain = el.innerText;
+    const html = src.innerHTML;
+    const plain = src.innerText;
     const blob = new Blob([html], { type: 'text/html' });
     const blobPlain = new Blob([plain], { type: 'text/plain' });
     await navigator.clipboard.write([
@@ -8981,18 +9152,75 @@ async function copySummary() {
         'text/plain': blobPlain,
       }),
     ]);
-    // Brief visual feedback on the button
-    const btn = el.closest('.col-summary').querySelector('[title="Copy summary"]');
-    if (btn) {
-      const orig = btn.innerHTML;
-      btn.innerHTML = '<i class="fa-solid fa-check"></i>';
-      setTimeout(() => { btn.innerHTML = orig; }, 1500);
-    }
+    _flashSummaryCopied();
   } catch {
     // Fallback: plain text
-    const plain = el.innerText;
-    await navigator.clipboard.writeText(plain);
+    await navigator.clipboard.writeText(src.innerText);
+  } finally {
+    if (detach) detach();
   }
+}
+
+// Brief green-check feedback on the summary copy button after a successful copy.
+function _flashSummaryCopied() {
+  const btn = document.getElementById('btn-copy-summary');
+  const icon = btn?.querySelector('i');
+  if (!icon) return;
+  icon.className = 'fa-solid fa-check';
+  icon.style.color = '#00b464';
+  clearTimeout(btn._copyTimer);
+  btn._copyTimer = setTimeout(() => {
+    icon.className = 'fa-duotone fa-copy';
+    icon.style.color = '';
+  }, 1500);
+}
+
+// Popout shown when the summary copy button is clicked, letting the user choose
+// whether to keep the [M:SS] timestamp pills. Reuses the .session-menu styling —
+// the app's shared "anchored dropdown" look.
+function openCopySummaryMenu(btn) {
+  // Clicking the button again toggles the menu closed.
+  if (document.getElementById('copy-summary-menu')) {
+    _closeCopySummaryMenu();
+    return;
+  }
+
+  const menu = document.createElement('div');
+  menu.className = 'session-menu';
+  menu.id = 'copy-summary-menu';
+
+  const withTs = document.createElement('div');
+  withTs.className = 'session-menu-item';
+  withTs.innerHTML = '<i class="fa-duotone fa-copy"></i>  Copy with timestamps';
+  withTs.addEventListener('click', ev => { ev.stopPropagation(); _closeCopySummaryMenu(); copySummary(false); });
+  menu.appendChild(withTs);
+
+  const withoutTs = document.createElement('div');
+  withoutTs.className = 'session-menu-item';
+  withoutTs.innerHTML = '<i class="fa-duotone fa-copy"></i>  Copy without timestamps';
+  withoutTs.addEventListener('click', ev => { ev.stopPropagation(); _closeCopySummaryMenu(); copySummary(true); });
+  menu.appendChild(withoutTs);
+
+  document.body.appendChild(menu);
+
+  // Drop down from the button, right-aligned, clamped to the viewport.
+  const rect = btn.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  let top  = rect.bottom + window.scrollY + 4;
+  let left = rect.right + window.scrollX - menuRect.width;
+  if (left < 4) left = 4;
+  if (top + menuRect.height > window.innerHeight + window.scrollY) {
+    top = rect.top + window.scrollY - menuRect.height - 4;  // flip above if no room below
+  }
+  menu.style.top  = top  + 'px';
+  menu.style.left = left + 'px';
+
+  setTimeout(() => document.addEventListener('click', _closeCopySummaryMenu, { once: true }), 0);
+}
+
+function _closeCopySummaryMenu() {
+  const m = document.getElementById('copy-summary-menu');
+  if (m) m.remove();
 }
 
 function toggleSummaryPrompt() {
@@ -9157,8 +9385,11 @@ function initPlayback(sessionId) {
 
   _playbackAudio.ontimeupdate = () => {
     const t = _playbackAudio.currentTime;
-    // Skip filtered-out segments during playback
-    if (!_playbackAudio.paused && _transcriptFilterActive()) {
+    // Skip filtered-out segments during playback. But never while a Speaker
+    // Cleanup preview owns the audio - skipping would yank the playhead (and
+    // the slaved popup video) off the segment the user is auditioning.
+    if (!_playbackAudio.paused && _transcriptFilterActive()
+        && !_playbackAudio.dataset.cleanupActive) {
       _skipFilteredAudio(t);
     }
     document.getElementById('playback-time').textContent = fmtTime(t);
@@ -9269,13 +9500,13 @@ function _skipFilteredAudio(t) {
     if (r.start > t) {
       _lastSkipTime = r.start;
       _playbackAudio.currentTime = r.start;
-      // Drive the video seek directly here rather than waiting for the
-      // drift-detection path in _syncVideoToAudio to notice. With the filter
-      // active the audio can jump faster than Chrome finishes a video seek,
-      // which left _videoSeekPending stuck and produced a "video loops a
-      // short snippet" symptom while audio kept skipping forward.
+      // Nudge the video toward the skip target with a THROTTLED seek. Dense
+      // filtering can jump the audio across many small gaps in quick
+      // succession; a throttled seek (plus the sync loop's rate correction)
+      // keeps the video close without machine-gunning the decoder, which is
+      // what produced the old "video loops a short snippet" symptom.
       if (_videoAvailable && _videoVisible) {
-        _seekVideoImmediate(_audioToVideoTime(r.start));
+        _hardSeek(_audioToVideoTime(r.start), false);
       }
       return;
     }
@@ -10367,9 +10598,15 @@ const _playbackVideo = document.getElementById('playback-video');
 function initVideo(sessionId, offset) {
   _videoOffset = offset || 0;
   const video = _playbackVideo;
+  // Buffer ahead so forward playback and seeks rarely stall waiting on disk.
+  video.preload = 'auto';
   video.src = `/api/sessions/${sessionId}/video`;
   video.load();
   _videoAvailable = true;
+  _lastHardSeekAt = 0;
+  _resumeAfterSeek = false;
+  _videoScrubbing = false;
+  _videoSeekPending = false;
 
   // Show the toggle button in the playback bar
   document.getElementById('playback-video-toggle').classList.remove('hidden');
@@ -10396,16 +10633,23 @@ function initVideo(sessionId, offset) {
 }
 
 function destroyVideo() {
+  _stopVideoSyncLoop();
   _playbackVideo.pause();
   _playbackVideo.removeAttribute('src');
   _playbackVideo.load();
+  _playbackVideo.playbackRate = 1;
   _videoAvailable = false;
   _videoVisible = false;
   _videoOffset = 0;
   _videoSeekPending = false;
+  _videoScrubbing = false;
+  _resumeAfterSeek = false;
+  clearTimeout(_videoSeekWatchdog);
+  _videoSeekWatchdog = 0;
   _cancelVideoSeek();
   // Reset cleanup popup so it doesn't keep stale video from the previous session.
   try {
+    _cvStopPreview();
     const cv = document.getElementById('cleanup-video');
     if (cv) { cv.pause(); cv.removeAttribute('src'); cv.load(); }
     const popup = document.getElementById('cleanup-video-popup');
@@ -10642,186 +10886,318 @@ function _audioToVideoTime(audioTime) {
   return Math.max(0, audioTime - _videoOffset);
 }
 
-// Video seek - cancels any in-flight seek before issuing a new one
-let _videoScrubbing = false;    // true while the user is dragging the seek bar
-let _videoSeekDebounce = 0;     // timeout id for debounced seek during scrub
-let _videoSeekPending = false;  // true between currentTime= and 'seeked' event
+/* ── Video/audio soft-sync controller ──────────────────────────────────────
+   The screen recording (muted <video>) is slaved to the meeting audio
+   (<audio>, the master clock). They are two independent media elements, and
+   the recording is a low-fps screencap whose keyframes can be many seconds
+   apart, so seeking it is slow and lands coarsely. Correcting ordinary drift
+   by re-seeking therefore oscillates: the decoder snaps back to a keyframe,
+   plays a moment, drifts, re-seeks... which is the "replays a short snippet
+   forever" symptom.
+
+   So instead we:
+     - let the video free-run and nudge its playbackRate to converge on the
+       audio clock for small / medium drift (no decode jump, perfectly smooth);
+     - hard-seek ONLY across genuine discontinuities (user seek/scrub, filter
+       skip, large stall), throttled so seeks can never spam the decoder;
+     - never strand a seek "pending" forever: every hard-seek arms a watchdog.
+   Tolerances are deliberately generous because the video is muted and purely
+   a visual reference, so sub-second offset is invisible. */
+const _VS = {
+  IN_SYNC:     0.15,   // |drift| under this -> run at exact master rate
+                       // (kept above the low-fps frame interval so the rate
+                       //  does not wobble as each decoded frame ticks)
+  HARD_DRIFT:  0.75,   // |drift| at/above this -> hard-seek (unless throttled)
+  RATE_MAX:    0.18,   // max +/-18% playbackRate nudge while converging
+  SEEK_MIN_MS: 350,    // min wall-time between throttled (drift) hard-seeks
+  WATCHDOG_MS: 2000,   // force-clear a stuck pending seek after this long
+  NOOP:        0.04,   // a seek within this of current time is a no-op
+};
+let _videoScrubbing        = false; // true while the user drags the seek bar
+let _videoSeekPending      = false; // between currentTime= and its 'seeked'
+let _videoSeekDebounce     = 0;     // debounce timer id (scrub preview seeks)
+let _videoSeekWatchdog     = 0;     // watchdog timer id for a pending seek
+let _videoRAF              = 0;     // requestAnimationFrame id for sync loop
+let _wasPlayingBeforeScrub = false;
+let _resumeAfterSeek       = false; // resume audio+video once next seek lands
+let _lastHardSeekAt        = 0;     // perf clock of last drift-correction seek
+
+function _vsNow() {
+  return (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now();
+}
+
+function _setPlayBtn(playing) {
+  const b = document.getElementById('playback-play');
+  if (b) b.innerHTML = playing
+    ? '<i class="fa-solid fa-pause"></i>'
+    : '<i class="fa-solid fa-play"></i>';
+}
+
+// Clamp a desired video time into the element's valid, seekable span.
+function _clampVideoTarget(t) {
+  t = Math.max(0, t);
+  const d = _playbackVideo ? _playbackVideo.duration : NaN;
+  if (isFinite(d) && d > 0) t = Math.min(t, d - 0.05);
+  return t;
+}
 
 function _cancelVideoSeek() {
   clearTimeout(_videoSeekDebounce);
   _videoSeekDebounce = 0;
-  // The next currentTime assignment naturally supersedes any in-flight seek
-  // — we don't need to do anything explicit here.
 }
 
-function _seekVideoImmediate(targetTime) {
-  _cancelVideoSeek();
-  // Skip no-op seeks: if we set currentTime to its current value, the
-  // browser doesn't fire 'seeked', and our pending flag would stick.
-  if (Math.abs(_playbackVideo.currentTime - targetTime) < 0.01) return;
+// Issue a real seek. `force` bypasses the anti-spam throttle (use for
+// user-driven seeks); drift-correction seeks pass force=false so they can
+// never fire faster than SEEK_MIN_MS. Returns true if the request was handled
+// (seek issued OR already on target), false if throttled (the caller then
+// falls back to rate correction).
+function _hardSeek(target, force) {
+  if (!_playbackVideo) return false;
+  target = _clampVideoTarget(target);
+  const now = _vsNow();
+  if (!force && (now - _lastHardSeekAt) < _VS.SEEK_MIN_MS) return false;
+  if (Math.abs(_playbackVideo.currentTime - target) < _VS.NOOP) {
+    // Already there: the browser will not fire 'seeked', so settle now. (This
+    // no-op case is what used to strand playback after releasing the scrubber.)
+    _afterSeekLanded();
+    return true;
+  }
+  _lastHardSeekAt = now;
+  // Reset any catch-up nudge so we resume at a clean master rate after landing.
+  const base = _playbackAudio.playbackRate || 1;
+  if (Math.abs(_playbackVideo.playbackRate - base) > 1e-3) _playbackVideo.playbackRate = base;
   _videoSeekPending = true;
-  _playbackVideo.currentTime = targetTime;
+  clearTimeout(_videoSeekWatchdog);
+  _videoSeekWatchdog = setTimeout(_videoSeekTimedOut, _VS.WATCHDOG_MS);
+  try {
+    _playbackVideo.currentTime = target;
+  } catch (_) {
+    _videoSeekPending = false;
+    clearTimeout(_videoSeekWatchdog);
+    _videoSeekWatchdog = 0;
+  }
+  return true;
 }
 
+// Back-compat alias still called from _skipFilteredAudio and elsewhere.
+function _seekVideoImmediate(targetTime) { _hardSeek(targetTime, true); }
+
+// Debounced seek used for scrub preview: show frames as the user drags
+// without firing a decode for every pixel of pointer movement.
 function _seekVideoDebounced(targetTime, delayMs) {
   _cancelVideoSeek();
-  _videoSeekDebounce = setTimeout(() => {
-    if (Math.abs(_playbackVideo.currentTime - targetTime) < 0.01) return;
-    _videoSeekPending = true;
-    _playbackVideo.currentTime = targetTime;
-  }, delayMs);
+  _videoSeekDebounce = setTimeout(() => { _hardSeek(targetTime, true); }, delayMs);
 }
 
-// Single persistent 'seeked' listener — clears the pending flag and resumes
-// playback after the decoder has actually landed on the new frame. This is
-// the fix for the preview-freeze: calling .play() immediately after setting
-// currentTime can land Chrome on a non-keyframe and freeze the rendered
-// image even though currentTime reports the new value.
+function _videoSeekTimedOut() {
+  _videoSeekWatchdog = 0;
+  _videoSeekPending = false;
+  _afterSeekLanded();
+}
+
+// Called whenever a seek has actually landed (real 'seeked', a no-op seek, or
+// the watchdog). Resumes transport if something was waiting on the landing.
+function _afterSeekLanded() {
+  if (_resumeAfterSeek) {
+    _resumeAfterSeek = false;
+    if (_playbackActive) { _playbackAudio.play().catch(() => {}); _setPlayBtn(true); }
+  }
+  if (_videoScrubbing) return;
+  if (!_videoAvailable || !_videoVisible) return;
+  if (!_playbackAudio.paused) {
+    if (_playbackVideo.paused) _playbackVideo.play().catch(() => {});
+    _startVideoSyncLoop();
+  }
+}
+
 // Home page has no playback-video element, so guard the listener attach.
 if (_playbackVideo) {
   _playbackVideo.addEventListener('seeked', () => {
+    clearTimeout(_videoSeekWatchdog);
+    _videoSeekWatchdog = 0;
     _videoSeekPending = false;
-    if (_videoScrubbing) return;  // scrub logic manages play state itself
-    if (!_videoAvailable || !_videoVisible) return;
-    if (!_playbackAudio.paused && _playbackVideo.paused) {
-      _playbackVideo.play().catch(() => {});
-    }
+    _afterSeekLanded();
+  });
+  // A decode/seek error must not leave the pending flag stuck forever.
+  _playbackVideo.addEventListener('error', () => {
+    clearTimeout(_videoSeekWatchdog);
+    _videoSeekWatchdog = 0;
+    _videoSeekPending = false;
   });
 }
 
-function _syncVideoToAudio() {
+// One correction step: mirror play/pause, hard-seek across discontinuities,
+// otherwise nudge playbackRate to converge on the audio clock.
+function _videoSyncOnce() {
   if (!_videoAvailable || !_videoVisible) return;
-  // Don't fight an in-flight seek — issuing a new currentTime mid-seek can
-  // chain decode requests faster than Chrome can deliver frames, freezing
-  // the preview on a stale frame.
-  if (_videoSeekPending) return;
-  const expected = _audioToVideoTime(_playbackAudio.currentTime);
-  const drift = Math.abs(_playbackVideo.currentTime - expected);
-  if (drift > 0.3) {
-    _seekVideoImmediate(expected);
+  if (_videoScrubbing || _videoSeekPending) return;
+  const v = _playbackVideo, a = _playbackAudio;
+  const base = a.playbackRate || 1;
+  const raw = a.currentTime - _videoOffset;   // unclamped video time
+  const dur = v.duration;
+  const beforeStart = raw < -0.05;            // audio is before the video began
+  const afterEnd    = isFinite(dur) && dur > 0 && raw >= dur - 0.05;
+
+  // Dead zones (audio paused, or audio outside the video's span): hold video.
+  if (a.paused || beforeStart || afterEnd) {
+    if (!v.paused) v.pause();
+    if (a.paused && !beforeStart && !afterEnd) {
+      // Keep the visible frame aligned to the audio playhead while paused.
+      const exp = _clampVideoTarget(raw);
+      if (Math.abs(v.currentTime - exp) > 0.34) _hardSeek(exp, true);
+    } else if (beforeStart && v.currentTime > 0.05) {
+      _hardSeek(0, true);
+    }
+    return;
   }
+
+  // Playing, and inside the video span.
+  const expected = _clampVideoTarget(raw);
+  const signed = v.currentTime - expected;    // + ahead of audio, - behind
+  const adrift = Math.abs(signed);
+
+  if (adrift >= _VS.HARD_DRIFT) {
+    // Big gap (filter skip / explicit seek / long stall). Try a throttled
+    // hard-seek; if throttled, fall through to a max rate nudge for now.
+    if (_hardSeek(expected, false)) return;
+  }
+
+  if (v.paused) v.play().catch(() => {});
+
+  let corr = 0;
+  if (adrift > _VS.IN_SYNC) {
+    // behind (signed < 0) -> speed up; ahead -> slow down. Proportional, capped.
+    corr = Math.max(-_VS.RATE_MAX,
+                    Math.min(_VS.RATE_MAX, (-signed / _VS.HARD_DRIFT) * _VS.RATE_MAX));
+  }
+  const want = base * (1 + corr);
+  if (Math.abs(v.playbackRate - want) > 1e-3) v.playbackRate = want;
 }
 
-// Wire up scrub detection on the seek bar
-let _wasPlayingBeforeScrub = false;
+// rAF-driven loop: smooth per-frame convergence, independent of the media
+// element's irregular 'timeupdate' cadence. Self-stops when audio pauses or
+// the viewer hides; (re)started on play / viewer-open / as a timeupdate safety.
+function _videoSyncLoop() {
+  _videoRAF = 0;
+  _videoSyncOnce();
+  if (_videoAvailable && _videoVisible && !_playbackAudio.paused) {
+    _videoRAF = requestAnimationFrame(_videoSyncLoop);
+  }
+}
+function _startVideoSyncLoop() {
+  if (!_videoRAF && _videoAvailable && _videoVisible) {
+    _videoRAF = requestAnimationFrame(_videoSyncLoop);
+  }
+}
+function _stopVideoSyncLoop() {
+  if (_videoRAF) { cancelAnimationFrame(_videoRAF); _videoRAF = 0; }
+}
+
+// Back-compat name used by initVideo / toggleVideoViewer / setVideoMode:
+// realign immediately and make sure the loop runs if we are playing.
+function _syncVideoToAudio() {
+  _videoSyncOnce();
+  if (_videoAvailable && _videoVisible && !_playbackAudio.paused) _startVideoSyncLoop();
+}
+
+// ── Scrub (dragging the seek bar) ──────────────────────────────────────────
 {
   const seekBar = document.getElementById('playback-seek');
   if (seekBar) {
-    seekBar.addEventListener('mousedown', () => {
+    const startScrub = () => {
+      if (_videoScrubbing) return;
       _videoScrubbing = true;
       _cancelVideoSeek();
-      // Pause both audio and video during scrub
+      _stopVideoSyncLoop();
       _wasPlayingBeforeScrub = !_playbackAudio.paused;
-      if (_wasPlayingBeforeScrub) {
-        _playbackAudio.pause();
-        document.getElementById('playback-play').innerHTML = '<i class="fa-solid fa-pause"></i>';
-      }
+      if (_wasPlayingBeforeScrub) { _playbackAudio.pause(); _setPlayBtn(true); }
       if (_videoAvailable && !_playbackVideo.paused) _playbackVideo.pause();
-    });
-    // Use window-level mouseup so we catch it even if cursor leaves the bar
-    window.addEventListener('mouseup', () => {
+    };
+    const endScrub = () => {
       if (!_videoScrubbing) return;
       _videoScrubbing = false;
       _cancelVideoSeek();
-      if (_videoAvailable && _videoVisible) {
-        // Seek video to final position, wait for frame to decode, then resume both
-        const target = _audioToVideoTime(_playbackAudio.currentTime);
-        _playbackVideo.currentTime = target;
-        if (_wasPlayingBeforeScrub) {
-          _playbackVideo.addEventListener('seeked', function onSeeked() {
-            _playbackVideo.removeEventListener('seeked', onSeeked);
-            _playbackAudio.play();
-            _playbackVideo.play().catch(() => {});
-          });
-        }
-      } else if (_wasPlayingBeforeScrub) {
-        // No video - just resume audio
-        _playbackAudio.play();
-      }
+      _resumeAfterSeek = _wasPlayingBeforeScrub;
       _wasPlayingBeforeScrub = false;
+      if (_videoAvailable) {
+        // _hardSeek settles the resume via _afterSeekLanded, including the
+        // no-op case that previously left playback stuck after release.
+        _hardSeek(_audioToVideoTime(_playbackAudio.currentTime), true);
+      } else if (_resumeAfterSeek) {
+        _resumeAfterSeek = false;
+        _playbackAudio.play().catch(() => {});
+        _setPlayBtn(true);
+      }
+    };
+    // Pointer events cover mouse, pen and touch in one path.
+    seekBar.addEventListener('pointerdown', startScrub);
+    window.addEventListener('pointerup', endScrub);
+    window.addEventListener('pointercancel', endScrub);
+    // Keyboard / programmatic value changes that never produced a pointerdown.
+    seekBar.addEventListener('change', () => {
+      if (_videoScrubbing || !_videoAvailable) return;
+      _hardSeek(_audioToVideoTime(parseFloat(seekBar.value)), true);
     });
   }
 }
 
-// Patch existing playback functions to keep video in sync
+// ── Keep the public playback controls in sync with the video ───────────────
 const _origTogglePlayback = togglePlayback;
 togglePlayback = function() {
-  _origTogglePlayback();
+  _origTogglePlayback();          // flips audio + play button
   if (!_videoAvailable || !_videoVisible) return;
-  if (_playbackAudio.paused) {
-    _playbackVideo.pause();
-  } else {
-    _syncVideoToAudio();
-    // The 'seeked' listener resumes play if _syncVideoToAudio kicked off
-    // a seek; only start now if nothing is pending.
-    if (!_videoSeekPending) _playbackVideo.play().catch(() => {});
-  }
+  if (_playbackAudio.paused) { _stopVideoSyncLoop(); _playbackVideo.pause(); }
+  else { _videoSyncOnce(); _startVideoSyncLoop(); }
 };
 
 const _origSeekPlayback = seekPlayback;
 seekPlayback = function(val) {
-  _origSeekPlayback(val);
-  if (_videoAvailable) {
-    if (_videoScrubbing) {
-      // During scrub: debounce - only seek after user pauses dragging for 100ms
-      _seekVideoDebounced(_audioToVideoTime(parseFloat(val)), 100);
-    } else {
-      // Direct seek (click on bar, or programmatic): immediate
-      _seekVideoImmediate(_audioToVideoTime(parseFloat(val)));
-    }
-  }
+  _origSeekPlayback(val);         // moves the audio (master) clock
+  if (!_videoAvailable) return;
+  const target = _audioToVideoTime(parseFloat(val));
+  if (_videoScrubbing) _seekVideoDebounced(target, 120);  // preview while dragging
+  else _hardSeek(target, true);                           // click / programmatic
 };
 
 const _origSeekToTime = seekToTime;
 seekToTime = function(t) {
-  _origSeekToTime(t);
-  if (_videoAvailable) {
-    _seekVideoImmediate(_audioToVideoTime(t));
-    // Play resumption is handled by the persistent 'seeked' listener so the
-    // video isn't told to play() while still seeking — that race is what
-    // freezes the preview on a stale frame after segment clicks.
-    if (_videoVisible && _playbackAudio.paused && !_playbackVideo.paused) {
-      _playbackVideo.pause();
-    }
-  }
+  _origSeekToTime(t);             // moves audio + starts playing (segment click)
+  if (!_videoAvailable) return;
+  _hardSeek(_audioToVideoTime(t), true);
+  if (_videoVisible && !_playbackAudio.paused) _startVideoSyncLoop();
 };
 
 const _origSetPlaybackSpeed = setPlaybackSpeed;
 setPlaybackSpeed = function(val) {
-  _origSetPlaybackSpeed(val);
+  _origSetPlaybackSpeed(val);     // sets audio (master) rate
+  // New base rate; the sync loop nudges around it. Set directly so a paused
+  // video also adopts the new rate immediately.
   if (_videoAvailable) _playbackVideo.playbackRate = parseFloat(val);
 };
 
-// Periodic drift correction - runs on audio's timeupdate
-_playbackAudio.addEventListener('timeupdate', () => {
-  if (_videoAvailable && _videoVisible && !_playbackAudio.paused && !_videoScrubbing) {
-    _syncVideoToAudio();
-    // Keep play state in sync (filter skipping can pause/seek audio).
-    // Skip while a seek is in flight — the 'seeked' listener will resume.
-    if (!_videoSeekPending && _playbackVideo.paused) {
-      _playbackVideo.play().catch(() => {});
-    }
-  }
-});
-
-// When audio ends, stop video too
-_playbackAudio.addEventListener('ended', () => {
-  if (_videoAvailable) _playbackVideo.pause();
-});
-
-// When audio is paused externally, pause video
-_playbackAudio.addEventListener('pause', () => {
-  if (_videoAvailable && _videoVisible) _playbackVideo.pause();
-});
-
-// When audio plays, play video
+// ── Mirror master (audio) transport onto the video ─────────────────────────
 _playbackAudio.addEventListener('play', () => {
   if (!_videoAvailable || !_videoVisible) return;
-  _syncVideoToAudio();
-  // If a seek is in flight, leave the play() call to the 'seeked' listener
-  // — calling .play() during a pending seek can lock the decoder onto a
-  // non-keyframe and freeze the preview.
-  if (!_videoSeekPending) _playbackVideo.play().catch(() => {});
+  _videoSyncOnce();
+  _startVideoSyncLoop();
+});
+_playbackAudio.addEventListener('pause', () => {
+  _stopVideoSyncLoop();
+  if (_videoAvailable) _playbackVideo.pause();
+});
+_playbackAudio.addEventListener('ended', () => {
+  _stopVideoSyncLoop();
+  if (_videoAvailable) _playbackVideo.pause();
+});
+// Safety net: if the rAF loop is somehow not running while we should be
+// syncing (e.g. it was cancelled by a tab switch), restart it. Cheap because
+// it only schedules a frame when none is pending.
+_playbackAudio.addEventListener('timeupdate', () => {
+  if (_videoAvailable && _videoVisible && !_playbackAudio.paused
+      && !_videoScrubbing && !_videoRAF) {
+    _startVideoSyncLoop();
+  }
 });
 
 /* ── Live screen preview ─────────────────────────────────────────────────── */
@@ -14617,6 +14993,8 @@ async function openSettings() {
     _applyToolOverrides();
     _updateSessionModelLabels();
     _renderQuietReminderSettings();
+    _renderMeetingDetectSettings();
+    _renderWarpSettings();
   } catch (_) {}
 
   // Startup toggle (Windows only - hidden on unsupported platforms)
@@ -14659,6 +15037,45 @@ function saveQuietReminderSettings() {
     quiet_prompt_audio_rms_threshold: parseFloat(document.getElementById('quiet-prompt-rms')?.value || '0.006'),
     quiet_prompt_require_no_transcript: document.getElementById('quiet-prompt-transcript')?.checked !== false,
     quiet_prompt_cooldown_sec: parseFloat(document.getElementById('quiet-prompt-cooldown')?.value || '120'),
+  };
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
+}
+
+function _renderMeetingDetectSettings() {
+  const enabled = document.getElementById('meeting-detect-enabled');
+  if (!enabled) return;
+  enabled.checked = _prefs.meeting_detect_enabled === true;
+  const cd = document.getElementById('meeting-detect-cooldown');
+  if (cd) cd.value = _prefs.meeting_detect_cooldown_sec ?? 90;
+}
+
+function saveMeetingDetectSettings() {
+  const updates = {
+    meeting_detect_enabled: document.getElementById('meeting-detect-enabled')?.checked === true,
+    meeting_detect_cooldown_sec: parseFloat(document.getElementById('meeting-detect-cooldown')?.value || '90'),
+  };
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
+}
+
+function _renderWarpSettings() {
+  const enabled = document.getElementById('warp-toggle-enabled');
+  if (!enabled) return;
+  enabled.checked = _prefs.warp_toggle_enabled === true;
+}
+
+function saveWarpSettings() {
+  const updates = {
+    warp_toggle_enabled: document.getElementById('warp-toggle-enabled')?.checked === true,
   };
   Object.assign(_prefs, updates);
   fetch('/api/preferences', {

@@ -63,6 +63,21 @@ DEFAULTS: dict = {
     "quiet_prompt_require_no_transcript": True,
     "quiet_prompt_cooldown_sec": 120,
 
+    # Meeting auto-detect (Zoom/Teams). Opt-in: when on, the app watches for a
+    # live meeting (mic held by Zoom/Teams, or a Zoom meeting window) and, if
+    # nothing is recording, toasts an offer to record. Default OFF.
+    "meeting_detect_enabled": False,
+    "meeting_detect_debounce": 2,          # consecutive ~2s polls before prompting
+    "meeting_detect_cooldown_sec": 90,     # min seconds between meeting prompts
+
+    # Cloudflare WARP auto-toggle. When ON, the app briefly disconnects WARP
+    # around package installs, model downloads, AI provider calls, and the
+    # update check (WARP's TLS inspection historically broke those). Default
+    # OFF: TLS is now verified against the OS trust store via truststore
+    # (core.config), so toggling is unnecessary and would clobber the user's
+    # VPN state. While OFF, core.network runs no warp-cli commands at all.
+    "warp_toggle_enabled": False,
+
     # Per-session video offsets (start time in screen recording aligned with
     # transcript t=0). Keyed by session_id. Replaces the legacy
     # `video_offset_<session_id>` flat-key scheme — `_migrate_video_offsets()`
