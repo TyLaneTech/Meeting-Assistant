@@ -4406,7 +4406,10 @@ function _ensureMeSpeakerStyles() {
 
 /** Promise-based name prompt for the microphone ("me") speaker. Resolves to
  *  the entered name (string), '' when the user skips, or null when cancelled
- *  (Escape / close / backdrop). Shared by the export and import flows. */
+ *  (Escape / close / backdrop). Shared by the export and import flows.
+ *  Pass opts.librarySpeakers ([{name, emb_count}], pre-filtered to exclude the
+ *  local "Me" profile) to add a "pick a saved speaker" dropdown that fills the
+ *  name field. */
 function _promptMeName(opts) {
   const o = opts || {};
   return new Promise(resolve => {
@@ -4433,6 +4436,14 @@ function _promptMeName(opts) {
                  value="${escapeHtml(o.value || '')}">
           <button id="me-name-save" class="me-speaker-primary" type="button">${escapeHtml(o.primaryLabel || 'Save name')}</button>
         </div>
+        ${(o.librarySpeakers && o.librarySpeakers.length) ? `
+        <div class="me-speaker-or">or pick from your saved speakers</div>
+        <div class="me-speaker-row">
+          <select id="me-name-select" class="me-speaker-input">
+            <option value="">Select a saved speaker…</option>
+            ${o.librarySpeakers.map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}${s.emb_count ? ` (${s.emb_count} voice samples)` : ''}</option>`).join('')}
+          </select>
+        </div>` : ''}
         <div class="me-speaker-actions">
           ${o.allowSkip ? `<button id="me-name-skip" class="me-speaker-skip" type="button">${escapeHtml(o.skipLabel || 'Skip')}</button>` : ''}
         </div>
@@ -4463,6 +4474,12 @@ function _promptMeName(opts) {
     overlay.addEventListener('click', e => { if (e.target === overlay) finish(null); });
     const skipBtn = overlay.querySelector('#me-name-skip');
     if (skipBtn) skipBtn.addEventListener('click', () => finish(''));
+    // Picking a saved speaker just fills the name field (the recipient can
+    // still tweak it); saving writes the name like any typed entry.
+    const selEl = overlay.querySelector('#me-name-select');
+    if (selEl) selEl.addEventListener('change', () => {
+      if (selEl.value) { input.value = selEl.value; input.focus(); }
+    });
     document.addEventListener('keydown', onKey);
     requestAnimationFrame(() => { overlay.classList.add('visible'); input.focus(); });
   });
@@ -18415,14 +18432,24 @@ async function _doImport(file) {
       try { meStatus = await fetch('/api/sessions/' + data.session_id + '/me-status').then(r => r.json()); }
       catch (_) { meStatus = null; }
       if (meStatus && meStatus.needs_name) {
+        // Offer the saved-speaker library as a shortcut, minus our own "Me"
+        // profile (the sender is never us, and tagging them as us would wrongly
+        // give them a "(You)" badge).
+        let lib = [];
+        try {
+          const all = await fetch('/api/fingerprint/speakers').then(r => r.json());
+          const meId = window._meSpeakerGlobalId || null;
+          lib = (Array.isArray(all) ? all : []).filter(s => s.id !== meId);
+        } catch (_) { lib = []; }
         const name = await _promptMeName({
           eyebrow: 'Name the speaker',
           title: 'Who recorded this?',
-          sub: 'This meeting\'s microphone speaker is labeled "You" (the sender\'s default). Enter their name so the transcript reads correctly on your end.',
+          sub: 'This meeting\'s microphone speaker is labeled "You" (the sender\'s default). Enter their name, or pick them from your saved speakers, so the transcript reads correctly on your end.',
           placeholder: 'e.g. Antonio Debouse',
           primaryLabel: 'Save name',
           allowSkip: true,
           skipLabel: 'Keep as "You"',
+          librarySpeakers: lib,
         });
         if (name) await _applyMeName(data.session_id, name);
       }
