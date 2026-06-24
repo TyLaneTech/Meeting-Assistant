@@ -1397,6 +1397,19 @@ def save_segment_source_override(segment_id: int, source_override: str | None) -
         )
 
 
+def session_has_source(session_id: str, source: str) -> bool:
+    """True if any segment in the session has the given *effective* source
+    (per-segment override if set, otherwise the captured source)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM transcript_segments "
+            "WHERE session_id = ? "
+            "AND COALESCE(NULLIF(source_override, ''), source) = ? LIMIT 1",
+            (session_id, source),
+        ).fetchone()
+    return row is not None
+
+
 def get_speaker_profile(session_id: str, speaker_key: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute(

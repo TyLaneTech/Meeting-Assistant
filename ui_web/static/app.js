@@ -4365,6 +4365,123 @@ function _maybeShowMeSpeakerPopup() {
   _showMeSpeakerPopup();
 }
 
+/** Inject the shared "me speaker" dialog styles once. Used by both the
+ *  onboarding popup and the export/import name prompt. */
+function _ensureMeSpeakerStyles() {
+  if (document.getElementById('me-speaker-style')) return;
+  const st = document.createElement('style');
+  st.id = 'me-speaker-style';
+  st.textContent = `
+      .me-speaker-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;
+        justify-content:center;background:rgba(0,0,0,.5);opacity:0;transition:opacity .18s ease;}
+      .me-speaker-overlay.visible{opacity:1;}
+      .me-speaker-dialog{position:relative;width:min(480px,92vw);background:var(--bg-elevated,#1c2128);
+        color:var(--text,#e6edf3);border:1px solid var(--border,#30363d);border-radius:14px;
+        padding:22px 22px 18px;box-shadow:0 18px 60px rgba(0,0,0,.5);
+        transform:scale(.97);transition:transform .18s ease;}
+      .me-speaker-overlay.visible .me-speaker-dialog{transform:scale(1);}
+      .me-speaker-x{position:absolute;top:12px;right:12px;background:none;border:none;color:var(--text-muted,#8b949e);
+        font-size:18px;cursor:pointer;padding:4px;border-radius:6px;}
+      .me-speaker-x:hover{background:var(--bg-subtle,#262c36);color:var(--text,#e6edf3);}
+      .me-speaker-head{display:flex;gap:12px;align-items:center;margin-bottom:10px;}
+      .me-speaker-head i{font-size:30px;color:var(--accent,#58a6ff);}
+      .me-speaker-eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted,#8b949e);}
+      .me-speaker-title{font-size:19px;font-weight:650;}
+      .me-speaker-sub{font-size:13px;line-height:1.5;color:var(--text-muted,#8b949e);margin:4px 0 16px;}
+      .me-speaker-label{font-size:12px;font-weight:600;color:var(--text-muted,#8b949e);display:block;margin-bottom:6px;}
+      .me-speaker-row{display:flex;gap:8px;margin-bottom:10px;}
+      .me-speaker-input{flex:1;min-width:0;background:var(--bg-subtle,#0d1117);color:var(--text,#e6edf3);
+        border:1px solid var(--border,#30363d);border-radius:8px;padding:9px 11px;font-size:14px;}
+      .me-speaker-primary,.me-speaker-secondary{border:none;border-radius:8px;padding:9px 14px;font-size:13px;
+        font-weight:600;cursor:pointer;white-space:nowrap;}
+      .me-speaker-primary{background:var(--accent,#2f81f7);color:#fff;}
+      .me-speaker-secondary{background:var(--bg-subtle,#262c36);color:var(--text,#e6edf3);border:1px solid var(--border,#30363d);}
+      .me-speaker-or{text-align:center;font-size:12px;color:var(--text-muted,#8b949e);margin:6px 0 10px;}
+      .me-speaker-warn{font-size:12px;color:var(--warn,#d29922);margin:0 0 8px;}
+      .me-speaker-actions{display:flex;justify-content:flex-end;margin-top:6px;}
+      .me-speaker-skip{background:none;border:none;color:var(--text-muted,#8b949e);font-size:13px;cursor:pointer;padding:6px 8px;}
+      .me-speaker-skip:hover{color:var(--text,#e6edf3);text-decoration:underline;}`;
+  document.head.appendChild(st);
+}
+
+/** Promise-based name prompt for the microphone ("me") speaker. Resolves to
+ *  the entered name (string), '' when the user skips, or null when cancelled
+ *  (Escape / close / backdrop). Shared by the export and import flows. */
+function _promptMeName(opts) {
+  const o = opts || {};
+  return new Promise(resolve => {
+    _ensureMeSpeakerStyles();
+    document.querySelectorAll('.me-name-overlay').forEach(el => el.remove());
+    const overlay = document.createElement('div');
+    overlay.className = 'me-speaker-overlay me-name-overlay';
+    overlay.setAttribute('role', 'presentation');
+    overlay.innerHTML = `
+      <div class="me-speaker-dialog" role="dialog" aria-modal="true">
+        <button class="me-speaker-x" type="button" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="me-speaker-head">
+          <i class="fa-solid fa-circle-user"></i>
+          <div>
+            <div class="me-speaker-eyebrow">${escapeHtml(o.eyebrow || 'Speaker name')}</div>
+            <div class="me-speaker-title">${escapeHtml(o.title || 'Name this speaker')}</div>
+          </div>
+        </div>
+        <p class="me-speaker-sub">${escapeHtml(o.sub || '')}</p>
+        <label class="me-speaker-label">Name</label>
+        <div class="me-speaker-row">
+          <input id="me-name-input" type="text" class="me-speaker-input"
+                 placeholder="${escapeHtml(o.placeholder || 'e.g. Alex Rivera')}"
+                 value="${escapeHtml(o.value || '')}">
+          <button id="me-name-save" class="me-speaker-primary" type="button">${escapeHtml(o.primaryLabel || 'Save name')}</button>
+        </div>
+        <div class="me-speaker-actions">
+          ${o.allowSkip ? `<button id="me-name-skip" class="me-speaker-skip" type="button">${escapeHtml(o.skipLabel || 'Skip')}</button>` : ''}
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      overlay.classList.remove('visible');
+      setTimeout(() => overlay.remove(), 180);
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    };
+    const input = overlay.querySelector('#me-name-input');
+    const save = () => {
+      const v = input.value.trim();
+      if (!v) { input.focus(); return; }
+      finish(v);
+    };
+    const onKey = e => {
+      if (e.key === 'Escape') { e.stopPropagation(); finish(null); }
+      else if (e.key === 'Enter' && document.activeElement === input) { e.preventDefault(); save(); }
+    };
+    overlay.querySelector('#me-name-save').addEventListener('click', save);
+    overlay.querySelector('.me-speaker-x').addEventListener('click', () => finish(null));
+    overlay.addEventListener('click', e => { if (e.target === overlay) finish(null); });
+    const skipBtn = overlay.querySelector('#me-name-skip');
+    if (skipBtn) skipBtn.addEventListener('click', () => finish(''));
+    document.addEventListener('keydown', onKey);
+    requestAnimationFrame(() => { overlay.classList.add('visible'); input.focus(); });
+  });
+}
+
+/** POST a real name for a session's microphone ("me") speaker. Returns true on
+ *  success. The backend renames the linked global profile retroactively for the
+ *  user's own recordings, or updates just this session's label for imported
+ *  foreign sessions. */
+async function _applyMeName(sessionId, name) {
+  try {
+    const r = await fetch(`/api/sessions/${sessionId}/me-name`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return r.ok;
+  } catch (_) { return false; }
+}
+
 /** First-run / change-identity dialog for the microphone "Me" speaker.
  *  Non-blocking overlay modelled on _showWhatsNewPopup. */
 async function _showMeSpeakerPopup() {
@@ -4418,42 +4535,7 @@ async function _showMeSpeakerPopup() {
       </div>
     </div>`;
 
-  // Minimal scoped styles (kept inline so no stylesheet change is required).
-  if (!document.getElementById('me-speaker-style')) {
-    const st = document.createElement('style');
-    st.id = 'me-speaker-style';
-    st.textContent = `
-      .me-speaker-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;
-        justify-content:center;background:rgba(0,0,0,.5);opacity:0;transition:opacity .18s ease;}
-      .me-speaker-overlay.visible{opacity:1;}
-      .me-speaker-dialog{position:relative;width:min(480px,92vw);background:var(--bg-elevated,#1c2128);
-        color:var(--text,#e6edf3);border:1px solid var(--border,#30363d);border-radius:14px;
-        padding:22px 22px 18px;box-shadow:0 18px 60px rgba(0,0,0,.5);
-        transform:scale(.97);transition:transform .18s ease;}
-      .me-speaker-overlay.visible .me-speaker-dialog{transform:scale(1);}
-      .me-speaker-x{position:absolute;top:12px;right:12px;background:none;border:none;color:var(--text-muted,#8b949e);
-        font-size:18px;cursor:pointer;padding:4px;border-radius:6px;}
-      .me-speaker-x:hover{background:var(--bg-subtle,#262c36);color:var(--text,#e6edf3);}
-      .me-speaker-head{display:flex;gap:12px;align-items:center;margin-bottom:10px;}
-      .me-speaker-head i{font-size:30px;color:var(--accent,#58a6ff);}
-      .me-speaker-eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted,#8b949e);}
-      .me-speaker-title{font-size:19px;font-weight:650;}
-      .me-speaker-sub{font-size:13px;line-height:1.5;color:var(--text-muted,#8b949e);margin:4px 0 16px;}
-      .me-speaker-label{font-size:12px;font-weight:600;color:var(--text-muted,#8b949e);display:block;margin-bottom:6px;}
-      .me-speaker-row{display:flex;gap:8px;margin-bottom:10px;}
-      .me-speaker-input{flex:1;min-width:0;background:var(--bg-subtle,#0d1117);color:var(--text,#e6edf3);
-        border:1px solid var(--border,#30363d);border-radius:8px;padding:9px 11px;font-size:14px;}
-      .me-speaker-primary,.me-speaker-secondary{border:none;border-radius:8px;padding:9px 14px;font-size:13px;
-        font-weight:600;cursor:pointer;white-space:nowrap;}
-      .me-speaker-primary{background:var(--accent,#2f81f7);color:#fff;}
-      .me-speaker-secondary{background:var(--bg-subtle,#262c36);color:var(--text,#e6edf3);border:1px solid var(--border,#30363d);}
-      .me-speaker-or{text-align:center;font-size:12px;color:var(--text-muted,#8b949e);margin:6px 0 10px;}
-      .me-speaker-warn{font-size:12px;color:var(--warn,#d29922);margin:0 0 8px;}
-      .me-speaker-actions{display:flex;justify-content:flex-end;margin-top:6px;}
-      .me-speaker-skip{background:none;border:none;color:var(--text-muted,#8b949e);font-size:13px;cursor:pointer;padding:6px 8px;}
-      .me-speaker-skip:hover{color:var(--text,#e6edf3);text-decoration:underline;}`;
-    document.head.appendChild(st);
-  }
+  _ensureMeSpeakerStyles();
 
   document.body.appendChild(overlay);
 
@@ -18133,6 +18215,28 @@ async function startExport() {
       if (cb && cb.checked) cats.push(cat);
     });
 
+  // Before exporting speaker labels, make sure the mic ("me") speaker has a
+  // real name. A still-default "You" is meaningless to whoever receives the
+  // file, so offer to name it (renamed retroactively) or export as-is.
+  if (cats.includes('speakers')) {
+    let meStatus = null;
+    try { meStatus = await fetch('/api/sessions/' + sid + '/me-status').then(r => r.json()); }
+    catch (_) { meStatus = null; }
+    if (meStatus && meStatus.needs_name) {
+      const name = await _promptMeName({
+        eyebrow: 'Before you export',
+        title: 'Add your name to the mic',
+        sub: 'Your microphone audio is exported under the default "You" label. Add your name so whoever you share this recording with can see who was speaking.',
+        placeholder: 'e.g. Alex Rivera',
+        primaryLabel: 'Save & export',
+        allowSkip: true,
+        skipLabel: 'Export as "You"',
+      });
+      if (name === null) return;            // cancelled: keep the options view
+      if (name) await _applyMeName(sid, name);
+    }
+  }
+
   // Switch to progress view
   document.getElementById('export-body-options').classList.add('hidden');
   document.getElementById('export-actions').classList.add('hidden');
@@ -18300,17 +18404,35 @@ async function _doImport(file) {
     icon.className = 'fa-solid fa-circle-check import-toast-icon';
     text.textContent = 'Imported: ' + (data.title || 'Meeting');
 
-    // Refresh sidebar and navigate to the imported session
+    // Refresh sidebar, then navigate to the imported session.
     refreshSidebar();
     if (data.session_id) {
-      setTimeout(() => {
-        if (_isHomePage) {
-          window.location.href = '/session?id=' + data.session_id;
-        } else {
-          history.pushState({}, '', '/session?id=' + data.session_id);
-          loadSession(data.session_id);
-        }
-      }, 600);
+      // The sender's mic ("me") speaker may still carry the default "You",
+      // which is meaningless on our end. Offer to name it (the sender) before
+      // opening the session. This only updates the imported session's label,
+      // never our own local "Me" identity.
+      let meStatus = null;
+      try { meStatus = await fetch('/api/sessions/' + data.session_id + '/me-status').then(r => r.json()); }
+      catch (_) { meStatus = null; }
+      if (meStatus && meStatus.needs_name) {
+        const name = await _promptMeName({
+          eyebrow: 'Name the speaker',
+          title: 'Who recorded this?',
+          sub: 'This meeting\'s microphone speaker is labeled "You" (the sender\'s default). Enter their name so the transcript reads correctly on your end.',
+          placeholder: 'e.g. Antonio Debouse',
+          primaryLabel: 'Save name',
+          allowSkip: true,
+          skipLabel: 'Keep as "You"',
+        });
+        if (name) await _applyMeName(data.session_id, name);
+      }
+
+      if (_isHomePage) {
+        window.location.href = '/session?id=' + data.session_id;
+      } else {
+        history.pushState({}, '', '/session?id=' + data.session_id);
+        loadSession(data.session_id);
+      }
     }
 
     setTimeout(() => toast.classList.add('hidden'), 3000);

@@ -1108,6 +1108,36 @@ def _set_me_speaker(global_id: str) -> dict | None:
     return {"global_id": prof["id"], "name": prof["name"], "color": prof.get("color")}
 
 
+# Microphone "Me" speaker names that count as the un-set default. A label
+# matching one of these means the recorder never put their real name to their
+# mic, so an export carries a meaningless "You" for whoever receives it.
+_DEFAULT_ME_NAMES = {"you", "me"}
+
+
+def _me_label_needs_name(session_id: str) -> dict:
+    """Inspect a session's microphone ("me") speaker label.
+
+    Returns {has_me, needs_name, current_name, linked}:
+      has_me       session has transcript attributed to the mic ("me") key
+      needs_name   the me label is still the un-set default ("You"/"Me"/blank)
+      current_name the stored label name (defaults to "You")
+      linked       the me key is linked to a local global profile (the user's
+                   own recording), so a rename should update that profile
+                   retroactively rather than just this one session's label
+    """
+    has_me = storage.session_has_source(session_id, ME_KEY)
+    prof = storage.get_speaker_profile(session_id, ME_KEY) or {}
+    raw = (prof.get("name") or "").strip()
+    linked = bool(fingerprint_db.ready and fingerprint_db.get_link(session_id, ME_KEY))
+    needs = has_me and (raw == "" or raw.lower() in _DEFAULT_ME_NAMES)
+    return {
+        "has_me": has_me,
+        "needs_name": needs,
+        "current_name": raw or "You",
+        "linked": linked,
+    }
+
+
 # ── Speaker fingerprint helpers ───────────────────────────────────────────────
 
 def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, session_id: str) -> None:
@@ -5700,6 +5730,59 @@ def skip_me_speaker():
     settings.put("me_speaker_prompt_dismissed", True)
     _push_status()
     return jsonify({"ok": True})
+
+
+@app.route("/api/sessions/<session_id>/me-status", methods=["GET"])
+def session_me_status(session_id: str):
+    """Whether this session's microphone ("me") speaker still carries the
+    un-set default name. Drives the name prompt shown at export and import."""
+    if storage.get_session(session_id) is None:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(_me_label_needs_name(session_id))
+
+
+@app.route("/api/sessions/<session_id>/me-name", methods=["POST"])
+def set_session_me_name(session_id: str):
+    """Assign a real name to a session's microphone ("me") speaker.
+
+    When the me key is linked to a local global profile (the user's own
+    recording) the global profile is renamed, so the change is retroactive
+    across all of their sessions. For an imported foreign session (no link)
+    only this session's label is updated, so the importer's own "Me" identity
+    is never touched."""
+    if storage.get_session(session_id) is None:
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+
+    global_id = fingerprint_db.get_link(session_id, ME_KEY) if fingerprint_db.ready else None
+    if global_id:
+        resolved = fingerprint_db.rename_global_speaker(global_id, name=name)
+        color = (resolved or {}).get("color")
+        # rename_global_speaker already updated every linked speaker_labels row;
+        # refresh live state + push SSE so open transcripts relabel instantly.
+        for label in fingerprint_db.get_linked_labels(global_id):
+            sid = label["session_id"]
+            with _state_lock:
+                if _state.get("session_id") == sid:
+                    _state["speaker_labels"][label["speaker_key"]] = name
+            _push("speaker_label", {"session_id": sid, "speaker_key": label["speaker_key"],
+                                    "name": name, "color": color})
+        # If this is the configured Me profile, refresh status so clients pick
+        # up the new name for the local "(You)" identity.
+        if settings.get("me_speaker_global_id") == global_id:
+            _push_status()
+    else:
+        saved = storage.save_speaker_label(session_id, ME_KEY, name=name)
+        color = saved.get("color")
+        with _state_lock:
+            if _state.get("session_id") == session_id:
+                _state["speaker_labels"][ME_KEY] = name
+        _push("speaker_label", {"session_id": session_id, "speaker_key": ME_KEY,
+                                "name": name, "color": color})
+    return jsonify({"ok": True, "name": name, "color": color})
 
 
 @app.route("/api/fingerprint/speakers/<global_id>/merge", methods=["POST"])
