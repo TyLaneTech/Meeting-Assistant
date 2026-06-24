@@ -378,6 +378,75 @@ def _repetition_ratio(text: str, n: int = _HALLUCINATION_NGRAM) -> float:
     return len(set(grams)) / len(grams)
 
 
+class _StreamAccumulator:
+    """Silence-gated audio buffer for one source stream.
+
+    Factored out of Transcriber._loop so the mic-only and desktop-only streams
+    (the "mic = Me" feature) can each run the identical accumulate/flush logic.
+    Buffers raw int16 PCM chunks, tracks sample offsets for wall-clock timing,
+    and calls ``on_flush(buffer, start_t, end_t)`` when speech is followed by a
+    long-enough pause (or the max buffer length is hit). Buffers that contain no
+    voice at all are dropped rather than transcribed.
+    """
+
+    def __init__(self, sample_rate, chunk_size, silence_threshold,
+                 silence_chunk_thresh, min_buffer_chunks, max_buffer_chunks,
+                 on_flush):
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.silence_threshold = silence_threshold
+        self.silence_chunk_thresh = silence_chunk_thresh
+        self.min_buffer_chunks = min_buffer_chunks
+        self.max_buffer_chunks = max_buffer_chunks
+        self.on_flush = on_flush
+        self.buffer: list[bytes] = []
+        self.silence_chunks = 0
+        self.had_voice = False
+        self.first_offset = -1
+        self.last_offset = -1
+
+    def feed(self, chunk: bytes, offset: int) -> None:
+        self.buffer.append(chunk)
+        if offset >= 0:
+            if self.first_offset < 0:
+                self.first_offset = offset
+            self.last_offset = offset
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32_768.0
+        rms = float(np.sqrt(np.mean(samples ** 2))) if len(samples) else 0.0
+        if rms < self.silence_threshold:
+            self.silence_chunks += 1
+        else:
+            self.silence_chunks = 0
+            self.had_voice = True
+
+        enough_audio = len(self.buffer) >= self.min_buffer_chunks
+        long_pause   = self.silence_chunks >= self.silence_chunk_thresh
+        hit_max      = len(self.buffer) >= self.max_buffer_chunks
+        if (enough_audio and long_pause) or hit_max:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        buf = self.buffer
+        had_voice = self.had_voice
+        if self.first_offset >= 0 and self.sample_rate:
+            start_t = self.first_offset / self.sample_rate
+            end_t   = (self.last_offset + self.chunk_size) / self.sample_rate
+        else:
+            start_t = end_t = 0.0
+        # Reset before invoking the (blocking) flush callback.
+        self.buffer = []
+        self.silence_chunks = 0
+        self.had_voice = False
+        self.first_offset = -1
+        self.last_offset = -1
+        # Pure-silence buffers (common on the mic stream when the user is quiet)
+        # are dropped — no point running Whisper over them.
+        if had_voice:
+            self.on_flush(buf, start_t, end_t)
+
+
 class Transcriber:
     TARGET_RATE = 16_000
     CHUNK_SIZE = 512           # Must match AudioCapture.CHUNK_SIZE
@@ -407,6 +476,11 @@ class Transcriber:
         self.model_size = _DEFAULT_MODEL_SIZE
         self._auto_model_config = True
         self.diarization_enabled = True  # Can be toggled via the UI
+        # When set (the "mic = Me" feature is on and the capture delivers
+        # per-source PCM), microphone audio is routed to a separate stream that
+        # is never diarized and always labelled with this reserved speaker key.
+        # See _loop_two_stream(). None -> legacy single mixed-stream behavior.
+        self.me_label: str | None = None
         self.fingerprint_callback: Callable | None = None
         # (speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None
         self.on_diarizer_error: Callable[[str], None] | None = None
@@ -625,12 +699,17 @@ class Transcriber:
         source: str,
         start_time: float = 0.0,
         end_time: float = 0.0,
+        force_no_diarize: bool = False,
     ) -> None:
-        """Orchestrate diarization (if available) then Whisper transcription."""
+        """Orchestrate diarization (if available) then Whisper transcription.
+
+        ``force_no_diarize`` is used by the microphone ("mic = Me") stream: the
+        audio is always the app user, so it skips the diarizer entirely and uses
+        ``source`` (the reserved Me key) as the segment label."""
         if not buffer or self.model is None:
             return
 
-        skip_diarizer = not self.diarization_enabled
+        skip_diarizer = force_no_diarize or not self.diarization_enabled
 
         try:
             audio = self._convert(buffer)
@@ -858,6 +937,67 @@ class Transcriber:
         log.info("whisper", "CPU fallback ready.")
 
     def _loop(self) -> None:
+        """Dispatch to the two-stream ("mic = Me") loop when a Me label is
+        configured, else the legacy single mixed-stream loop."""
+        if self.me_label:
+            self._loop_two_stream()
+        else:
+            self._loop_legacy()
+
+    def _loop_two_stream(self) -> None:
+        """Route per-source PCM (5-tuples from the capture mixer) into two
+        independent streams: the microphone stream is never diarized and is
+        always labelled with ``self.me_label`` (the app user); the desktop
+        stream is diarized exactly as the legacy path. Each stream flushes on
+        its own silence cadence; segments interleave by timestamp downstream.
+
+        Falls back gracefully: a non-per-source item (e.g. macOS capture that
+        doesn't split, or the feature mid-toggle) is fed to the desktop stream
+        so it is still transcribed/diarized."""
+        chunks_per_second    = self.sample_rate / self.CHUNK_SIZE
+        silence_chunk_thresh = int(self.silence_duration  * chunks_per_second)
+        min_buffer_chunks    = int(self.min_buffer_seconds * chunks_per_second)
+        max_buffer_chunks    = int(self.max_buffer_seconds * chunks_per_second)
+
+        def _mk(on_flush):
+            return _StreamAccumulator(
+                self.sample_rate, self.CHUNK_SIZE, self.silence_threshold,
+                silence_chunk_thresh, min_buffer_chunks, max_buffer_chunks, on_flush)
+
+        mic = _mk(lambda buf, s, e: self._transcribe(
+            buf, self.me_label, start_time=s, end_time=e, force_no_diarize=True))
+        desktop = _mk(lambda buf, s, e: self._transcribe(
+            buf, "loopback", start_time=s, end_time=e))
+
+        while self.is_running:
+            try:
+                item = self.audio_queue.get(timeout=0.5)
+                if isinstance(item, tuple) and len(item) == 5:
+                    _src, _mixed, sample_off, mic_bytes, lb_bytes = item
+                    if lb_bytes is not None:
+                        desktop.feed(lb_bytes, sample_off)
+                    if mic_bytes is not None:
+                        mic.feed(mic_bytes, sample_off)
+                else:
+                    # Defensive fallback for a non-per-source item.
+                    if isinstance(item, tuple) and len(item) == 3:
+                        _src, chunk, sample_off = item
+                    elif isinstance(item, tuple):
+                        _src, chunk = item
+                        sample_off = -1
+                    else:
+                        chunk, sample_off = item, -1
+                    desktop.feed(chunk, sample_off)
+            except queue.Empty:
+                # Genuine audio gap - flush both streams.
+                mic.flush()
+                desktop.flush()
+
+        # Final flush on shutdown.
+        mic.flush()
+        desktop.flush()
+
+    def _loop_legacy(self) -> None:
         buffer: list[bytes] = []
         source_counts: dict[str, int] = {}
         silence_chunks = 0
@@ -890,8 +1030,10 @@ class Transcriber:
         while self.is_running:
             try:
                 item = self.audio_queue.get(timeout=0.5)
-                if isinstance(item, tuple) and len(item) == 3:
-                    src, chunk, sample_off = item
+                if isinstance(item, tuple) and len(item) >= 3:
+                    # 3-tuple (legacy) or 5-tuple (per-source); use the mixed
+                    # chunk + offset and ignore any per-source fields here.
+                    src, chunk, sample_off = item[0], item[1], item[2]
                 elif isinstance(item, tuple):
                     src, chunk = item
                     sample_off = -1

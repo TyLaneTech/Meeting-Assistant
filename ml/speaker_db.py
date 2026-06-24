@@ -31,6 +31,12 @@ _AUTO_APPLY_THRESHOLD = 0.82   # cosine sim → apply silently
 _MIN_DURATION_SEC     = 2.5    # minimum audio before extracting embedding
 _EMB_DIM              = 256    # WeSpeaker embedding dimension
 
+# Reserved per-session speaker key for microphone audio (the app user). Segments
+# tagged with this key are always the "Me" speaker and are never diarized; the
+# key is excluded from all clustering/matching here. app.py re-exports this as
+# ME_KEY — keep them identical.
+ME_SPEAKER_KEY        = "me"
+
 _SPEAKER_PALETTE = [
     '#58a6ff', '#f47067', '#00b464', '#d2a8ff', '#f0883e', '#db61a2',
     '#e3b341', '#2dd4bf', '#a78bfa', '#79c0ff', '#ef6e4e', '#86e89d',
@@ -141,6 +147,10 @@ class SpeakerFingerprintDB:
         self._db_path = db_path
         self._ready   = False
         self._inference = None
+        # global_id of the "Me" speaker (microphone = app user). When set, this
+        # profile is kept embedding-free (centroid NULL) so it never participates
+        # in desktop diarization/matching/clustering. Set via set_me_id().
+        self._me_id: str | None = None
 
         self._backfill_colors()
 
@@ -501,6 +511,11 @@ class SpeakerFingerprintDB:
         duration_sec: float,
     ) -> None:
         """Store embedding and incrementally update centroid. All embeddings are kept."""
+        # The "Me" speaker (microphone = app user) must never accumulate
+        # embeddings — it has to stay out of desktop clustering/matching. This is
+        # a defensive backstop; callers should also skip fingerprinting Me audio.
+        if self._me_id is not None and global_id == self._me_id:
+            return
         now = _now()
         with _conn(self._db_path) as c:
             row = c.execute(
@@ -624,8 +639,41 @@ class SpeakerFingerprintDB:
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
+    def set_me_id(self, global_id: str | None) -> None:
+        """Register (or clear) the "Me" speaker's global_id. While set, this
+        profile is force-kept embedding-free so it can never match desktop
+        speakers. Call whenever the me_speaker_global_id setting changes."""
+        self._me_id = global_id or None
+
+    def purge_global_speaker_embeddings(self, global_id: str) -> int:
+        """Delete every voice embedding for a profile and NULL its centroid,
+        keeping the profile (and all its labels) intact. Used when a profile is
+        designated "Me": with a NULL centroid, find_matches (which only selects
+        ``WHERE centroid IS NOT NULL``) and the cleanup library snapshot both
+        skip it automatically. Returns the number of embeddings deleted."""
+        with _conn(self._db_path) as c:
+            cur = c.execute(
+                "DELETE FROM speaker_embeddings WHERE global_id = ?",
+                (global_id,),
+            )
+            deleted = cur.rowcount
+        # recompute_centroid with no rows left NULLs centroid + zeroes emb_count.
+        self.recompute_centroid(global_id)
+        log.info("fingerprint",
+                 f"Purged {deleted} embedding(s) from profile {global_id[:8]} (Me speaker)")
+        return deleted
+
     def recompute_centroid(self, global_id: str) -> None:
         """Full centroid recompute from all stored embeddings (used after merge/prune)."""
+        # The "Me" speaker must always stay embedding-free, even if a stray
+        # embedding slipped in: force the centroid NULL and bail.
+        if self._me_id is not None and global_id == self._me_id:
+            with _conn(self._db_path) as c:
+                c.execute(
+                    "UPDATE global_speakers SET centroid=NULL, emb_count=0, updated_at=? WHERE id=?",
+                    (_now(), global_id),
+                )
+            return
         with _conn(self._db_path) as c:
             rows = c.execute(
                 "SELECT embedding FROM speaker_embeddings WHERE global_id = ?",
@@ -860,8 +908,16 @@ class SpeakerFingerprintDB:
             ).fetchall()
             speakers = []
             for r in rows:
+                # Never surface the "Me" speaker (mic = app user) to the Speaker
+                # Cleanup tab: it must not be a cluster member, a noise candidate,
+                # or a re-clustering target. Exclude both the reserved key and the
+                # chosen Me profile id.
+                if r["speaker_key"] == ME_SPEAKER_KEY:
+                    continue
+                if self._me_id is not None and r["global_id"] == self._me_id:
+                    continue
                 segs = c.execute(
-                    "SELECT id, start_time, end_time FROM transcript_segments "
+                    "SELECT id, start_time, end_time, text FROM transcript_segments "
                     "WHERE session_id = ? AND source = ? ORDER BY start_time",
                     (session_id, r["speaker_key"]),
                 ).fetchall()
@@ -1169,7 +1225,17 @@ class SpeakerFingerprintDB:
                 "name":        sp["name"],
                 "color":       sp["color"],
                 "segments":    [
-                    {"id": s["id"], "start": s["start_time"], "end": s["end_time"]}
+                    {
+                        "id": s["id"],
+                        "start": s["start_time"],
+                        "end": s["end_time"],
+                        # A short transcript snippet per segment lets the cleanup
+                        # UI show *what each speaker said* — far more useful for
+                        # identifying who's who than bare timestamps. Truncated
+                        # to keep the clusters payload lean.
+                        "text": ((s["text"] or "").strip()[:160]
+                                 if "text" in s.keys() else ""),
+                    }
                     for s in sp["segments"]
                 ],
                 "segment_count": len(sp["segments"]),

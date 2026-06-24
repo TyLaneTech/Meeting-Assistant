@@ -1535,6 +1535,27 @@ button#sidebar-close-btn {
 
 .empty-hint { color: var(--fg-subtle); font-size: 13px; font-style: italic; margin-top: 6px; line-height: 1.6; }
 
+/* While the transcript streams in, sweep a brighter band across the hint text so
+   the pane reads as actively loading rather than frozen. Theme-aware (uses the
+   palette vars), pure compositor work (background-position), no layout. */
+.loading-hint {
+  background: linear-gradient(100deg,
+    var(--fg-subtle) 30%, var(--fg-muted) 50%, var(--fg-subtle) 70%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: loading-hint-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes loading-hint-shimmer {
+  from { background-position: 130% 0; }
+  to   { background-position: -130% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .loading-hint { animation: pulse 1.6s ease-in-out infinite; }
+}
+
 /* ── Summary prompt area ───────────────────────────────────────────────────── */
 .summary-prompt-area {
   padding: 10px 12px 12px 12px;
@@ -2018,7 +2039,9 @@ body.video-fullscreen .playback-bar {
   left: -2px;
   right: 0px;
   margin-left: 3px;
-  backdrop-filter: blur(2px);
+  /* No backdrop-filter: this element's top/height animate on every scroll
+     frame, and a live backdrop blur would re-sample + re-blur the backdrop
+     each frame (scroll jank). The semi-opaque background gives the same look. */
   border-radius: 3px;
   border: 1px solid rgba(88, 166, 255, 0.3);
   background: rgb(5 12 20 / 49%);
@@ -2585,7 +2608,11 @@ body.video-fullscreen .playback-bar {
   box-shadow: inset 0 0 0px 0px transparent;
   border-left-color: var(--seg-color, var(--accent-dim)) !important;
   /* transition-delay: 0.25s; */
-  transition: 0.75s;
+  /* Explicit list (not `all`): this is the most-repeated element in the app, so
+     `all` would arm transitions on every property and mass-animate every segment
+     on any incidental recalc. Excluding `filter` also makes the :hover brightness
+     instant (no animated-filter layer churn while the pointer sweeps the list). */
+  transition: box-shadow 0.75s, border-color 0.75s, background 0.75s;
   background: var(--surface2);
   border-radius: var(--radius-sm);
   border-bottom-color: transparent !important;
@@ -2599,7 +2626,7 @@ body.video-fullscreen .playback-bar {
 .transcript-segment[data-start]:hover { filter: brightness(1.15); }
 .transcript-segment.playing {
   /* background: rgb(255 255 255 / 14%); */
-  transition: 0.15s;
+  transition: box-shadow 0.15s, border-color 0.15s;
   box-shadow: inset 0 0 14px 0px #00000059;
   transition-delay: 0s;
   border-color: var(--seg-color, var(--accent-dim)) !important;
@@ -5545,9 +5572,27 @@ img#shutdown-icon.brand-icon {
   flex-direction: column;
   gap: 10px;
   padding: 10px 12px 14px;
-  max-height: 70vh;
-  overflow-y: auto;
+  max-height: 76vh;
+  overflow: hidden;          /* inner #cleanup-scroll owns the scrolling */
+  position: relative;        /* anchor for the floating selection bar */
+  text-align: left;
 }
+#cleanup-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  /* Reserve room so the floating selection bar never overlaps the last pills. */
+  padding-bottom: 64px;
+  scroll-padding-bottom: 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* When nothing is selected the bar is hidden, so the reserved space isn't needed. */
+.speaker-cleanup-body:not(.has-selection) #cleanup-scroll { padding-bottom: 8px; }
+#cleanup-scroll::-webkit-scrollbar { width: 8px; }
+#cleanup-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 /* High-specificity hide rules — the existing speaker-manager-body rule uses
    #speaker-manager-overlay so [hidden] alone loses the specificity battle. */
 #speaker-manager-overlay .speaker-cleanup-body[hidden],
@@ -5595,8 +5640,9 @@ img#shutdown-icon.brand-icon {
 
 .cleanup-grid {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
+  gap: 10px;
+  align-content: start;
 }
 
 .cleanup-cluster {
@@ -5946,10 +5992,245 @@ img#shutdown-icon.brand-icon {
 }
 .cleanup-video-resize:hover { opacity: 0.9; }
 
-#cleanup-video-toggle.active {
+#cleanup-video-toggle.active,
+#cleanup-heatmap-toggle.active {
   color: var(--accent, #58a6ff);
   background: rgba(88,166,255,0.1);
 }
+
+/* ═══ Speaker cleanup v2 polish ═══════════════════════════════════════════ */
+
+/* Give the dialog room to breathe while the cleanup tab is active. */
+#speaker-manager-overlay .speaker-manager-dialog.cleanup-active {
+  width: min(1200px, calc(100vw - 28px));
+}
+
+/* Idle prompt inside the floating video popup (so it's never a dead box). */
+.cleanup-video-idle {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; padding: 14px;
+  color: var(--fg-subtle); font-size: 12px; text-align: center;
+  pointer-events: none;
+}
+.cleanup-video-idle[hidden] { display: none; }
+.cleanup-video-idle i { font-size: 26px; opacity: 0.55; }
+
+/* ── Cluster cards ── */
+.cleanup-cluster { border-left: 3px solid var(--cluster-accent, var(--border)); }
+.cleanup-cluster-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cleanup-cluster-label.placeholder { color: var(--fg-muted); font-style: italic; font-weight: 500; }
+.cleanup-cluster-linked { color: var(--fg-subtle); font-size: 10px; flex-shrink: 0; }
+.cleanup-assign-btn {
+  appearance: none;
+  background: var(--accent, #58a6ff);
+  border: 1px solid var(--accent, #58a6ff);
+  color: #fff; border-radius: 6px;
+  padding: 3px 9px; font: inherit; font-size: 11px; font-weight: 600;
+  cursor: pointer; display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;
+}
+.cleanup-assign-btn:hover { filter: brightness(1.08); }
+.cleanup-assign-btn.is-set {
+  background: transparent; color: var(--fg-muted); border-color: var(--border); padding: 3px 7px;
+}
+.cleanup-assign-btn.is-set:hover { color: var(--fg); border-color: var(--fg-muted); }
+
+/* ── Suggestion chip ── */
+.cleanup-suggestion-row { display: flex; gap: 4px; align-items: stretch; }
+.cleanup-suggestion {
+  flex: 1; min-width: 0; appearance: none;
+  display: flex; align-items: center; gap: 6px;
+  background: rgba(88,166,255,0.08); border: 1px dashed rgba(88,166,255,0.4);
+  border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 11px; color: var(--fg);
+  cursor: pointer; text-align: left;
+}
+.cleanup-suggestion:hover { background: rgba(88,166,255,0.18); }
+.cleanup-suggestion .txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cleanup-suggestion .sim { color: var(--fg-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.cleanup-suggestion .sim.high { color: #3fb950; font-weight: 600; }
+.cleanup-suggestion-go { display: inline-flex; align-items: center; gap: 3px; color: var(--accent, #58a6ff); font-weight: 600; flex-shrink: 0; }
+.cleanup-suggestion-reject {
+  appearance: none; background: transparent; border: 1px solid var(--border);
+  color: var(--fg-subtle); border-radius: 6px; cursor: pointer; padding: 0 9px; font-size: 11px; flex-shrink: 0;
+}
+.cleanup-suggestion-reject:hover { color: var(--accent-red, #f47067); border-color: var(--accent-red, #f47067); }
+.cleanup-cluster-swatch.sm { width: 10px; height: 10px; border-radius: 3px; }
+
+/* ── Member pills (stacked rows, multi-select aware) ── */
+.cleanup-members { display: flex; flex-direction: column; gap: 4px; min-height: 30px; padding: 2px; border-radius: 6px; }
+.cleanup-member {
+  display: block; background: var(--surface3); border: 1px solid var(--border);
+  border-radius: 7px; color: var(--fg); cursor: grab; user-select: none;
+  max-width: 100%; overflow: hidden;
+  transition: border-color 0.12s, box-shadow 0.12s, background 0.12s;
+}
+.cleanup-member:hover { border-color: var(--fg-muted); }
+.cleanup-member.selected {
+  border-color: var(--accent, #58a6ff);
+  box-shadow: inset 0 0 0 1px var(--accent, #58a6ff);
+  background: rgba(88,166,255,0.09);
+}
+.cleanup-member.dragging { opacity: 0.4; }
+.cleanup-member.is-noise { opacity: 0.62; }
+.cleanup-member-row {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 8px; width: 100%; box-sizing: border-box; cursor: pointer;
+}
+.cleanup-member-grip { color: var(--fg-subtle); font-size: 10px; flex-shrink: 0; cursor: grab; }
+.cleanup-member-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.12); }
+.cleanup-member-main { display: flex; flex-direction: column; min-width: 0; flex: 1; line-height: 1.25; }
+.cleanup-member-key { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cleanup-member-meta { font-size: 10px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.cleanup-play-btn, .cleanup-member-expand-btn {
+  appearance: none; background: transparent; border: 0; color: var(--fg-subtle); cursor: pointer;
+  width: 23px; height: 23px; border-radius: 5px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 11px;
+}
+.cleanup-play-btn:hover, .cleanup-member-expand-btn:hover { color: var(--fg); background: var(--surface4, #21262d); }
+.cleanup-play-btn.playing { color: #fff; background: var(--accent, #58a6ff); }
+.cleanup-member-expand-btn i { transition: transform 0.18s; }
+.cleanup-member.expanded .cleanup-member-expand-btn i { transform: rotate(180deg); }
+
+/* ── Expandable detail (smooth height) ── */
+.cleanup-member-detail {
+  display: grid; grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s ease;
+  border-top: 1px solid transparent;
+}
+.cleanup-member.expanded .cleanup-member-detail {
+  grid-template-rows: 1fr; border-top-color: var(--border);
+}
+.cleanup-member-detail-inner { overflow: hidden; min-height: 0; }
+
+.cleanup-timeline {
+  position: relative; height: 16px; margin: 8px 8px 6px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.cleanup-tl-tick { position: absolute; top: 2px; bottom: 2px; min-width: 2px; border-radius: 2px; opacity: 0.85; cursor: pointer; }
+.cleanup-tl-tick:hover { opacity: 1; box-shadow: 0 0 0 1px var(--fg); }
+
+.cleanup-seg-list { display: flex; flex-direction: column; gap: 1px; padding: 0 8px 8px; }
+.cleanup-seg-row { display: flex; align-items: center; gap: 8px; padding: 3px 4px; border-radius: 4px; }
+.cleanup-seg-row:hover { background: var(--surface); }
+.cleanup-seg-play {
+  appearance: none; background: var(--surface3); border: 1px solid var(--border); color: var(--fg-muted);
+  width: 20px; height: 20px; border-radius: 5px; cursor: pointer; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 8px;
+}
+.cleanup-seg-play:hover { color: var(--fg); }
+.cleanup-seg-play.playing { background: var(--accent, #58a6ff); color: #fff; border-color: var(--accent, #58a6ff); }
+.cleanup-seg-time { font-size: 10px; color: var(--fg-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; width: 36px; }
+.cleanup-seg-text { font-size: 11px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.cleanup-seg-text.empty { color: var(--fg-subtle); font-style: italic; }
+.cleanup-seg-more { font-size: 10px; color: var(--fg-subtle); padding: 3px 4px 0; }
+
+/* ── Noise drop zone ── */
+.cleanup-noise-section.drop-target {
+  border: 1px dashed var(--accent-red, #f47067);
+  border-radius: 8px; background: rgba(244,112,103,0.07);
+}
+.cleanup-noise-section.empty { opacity: 0.75; }
+
+/* ── Drag ghost (multi-move) ── */
+.cleanup-drag-ghost {
+  position: absolute; top: -1000px; left: -1000px;
+  padding: 5px 11px; border-radius: 999px;
+  background: var(--accent, #58a6ff); color: #fff; font-size: 12px; font-weight: 600;
+}
+
+/* ── Floating selection action bar ── */
+.cleanup-selbar {
+  position: absolute; left: 12px; right: 12px; bottom: 12px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px;
+  background: var(--surface3); border: 1px solid var(--accent, #58a6ff);
+  border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+  z-index: 5; animation: cleanup-selbar-in 0.16s ease;
+}
+.cleanup-selbar[hidden] { display: none; }
+@keyframes cleanup-selbar-in { from { opacity: 0; transform: translateY(10px); } }
+.cleanup-selbar-count { font-size: 12px; font-weight: 600; color: var(--fg); white-space: nowrap; }
+.cleanup-selbar-actions { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+.cleanup-selbar-btn {
+  appearance: none; background: var(--surface); border: 1px solid var(--border); color: var(--fg);
+  border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 11px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+}
+.cleanup-selbar-btn:hover { border-color: var(--fg-muted); }
+.cleanup-selbar-btn.primary { background: var(--accent, #58a6ff); border-color: var(--accent, #58a6ff); color: #fff; }
+.cleanup-selbar-btn.primary:hover { filter: brightness(1.08); }
+.cleanup-selbar-btn.ghost { background: transparent; border-color: transparent; color: var(--fg-muted); }
+.cleanup-selbar-btn.ghost:hover { color: var(--fg); }
+.cleanup-selbar-btn.playing { background: var(--accent, #58a6ff); border-color: var(--accent, #58a6ff); color: #fff; }
+
+/* ── Voice-library picker popover ── */
+.cleanup-picker {
+  position: fixed; width: 300px; max-height: 380px;
+  background: var(--surface2, #161b22); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 16px 44px rgba(0,0,0,0.6);
+  z-index: 10060;     /* above the video popup (10050) */
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.cleanup-picker-search {
+  width: 100%; box-sizing: border-box; background: var(--surface); border: 0;
+  border-bottom: 1px solid var(--border); color: var(--fg); font: inherit; font-size: 12px;
+  padding: 9px 12px; outline: none;
+}
+.cleanup-picker-search::placeholder { color: var(--fg-subtle); }
+.cleanup-picker-subtitle {
+  font-size: 10.5px; color: var(--fg-subtle); padding: 6px 12px;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+  display: flex; align-items: center; gap: 6px; line-height: 1.4;
+}
+.cleanup-picker-subtitle i { color: var(--fg-muted); }
+.cleanup-picker-list { overflow-y: auto; max-height: 300px; padding: 4px; display: flex; flex-direction: column; gap: 2px; }
+.cleanup-picker-item {
+  appearance: none; background: transparent; border: 0; color: var(--fg);
+  display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 6px;
+  cursor: pointer; font: inherit; font-size: 12px; text-align: left; width: 100%;
+}
+.cleanup-picker-item:hover { background: var(--surface3); }
+.cleanup-picker-item.current { background: rgba(88,166,255,0.12); }
+.cleanup-picker-item.create { color: var(--accent, #58a6ff); font-weight: 600; }
+.cleanup-picker-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.12); }
+.cleanup-picker-item .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cleanup-picker-embs { font-size: 10px; color: var(--fg-subtle); background: var(--surface); border-radius: 999px; padding: 1px 6px; flex-shrink: 0; }
+.cleanup-picker-sim { font-size: 10px; color: var(--fg-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; min-width: 30px; text-align: right; }
+.cleanup-picker-sim.mid { color: var(--accent, #58a6ff); }
+.cleanup-picker-sim.high { color: #3fb950; font-weight: 600; }
+.cleanup-picker-go { font-size: 10px; color: var(--accent, #58a6ff); flex-shrink: 0; display: inline-flex; align-items: center; gap: 3px; }
+.cleanup-picker-empty { font-size: 11px; color: var(--fg-subtle); padding: 14px; text-align: center; line-height: 1.5; }
+.cleanup-picker-foot { border-top: 1px solid var(--border); padding: 4px; flex-shrink: 0; }
+.cleanup-picker-unassign {
+  appearance: none; background: transparent; border: 0; color: var(--fg-muted); width: 100%;
+  text-align: left; padding: 7px 8px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 11px;
+  display: flex; align-items: center; gap: 6px;
+}
+.cleanup-picker-unassign:hover { background: var(--surface3); color: var(--accent-red, #f47067); }
+
+/* ── Similarity heatmap ── */
+.cleanup-heatmap-wrap { display: flex; flex-direction: column; gap: 10px; padding-bottom: 6px; }
+.cleanup-heatmap-head { font-size: 11px; color: var(--fg-muted); line-height: 1.5; display: flex; gap: 6px; }
+.cleanup-heatmap-head i { color: var(--accent, #58a6ff); margin-top: 2px; }
+.cleanup-heatmap {
+  display: grid;
+  grid-template-columns: minmax(96px, max-content) repeat(var(--n, 1), minmax(30px, 1fr));
+  gap: 2px; align-items: stretch;
+}
+.cleanup-heat-colhead { display: flex; align-items: flex-end; justify-content: center; padding-bottom: 3px; min-height: 26px; min-width: 0; }
+.cleanup-heat-collabel { font-size: 9.5px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.cleanup-heat-rowhead { display: flex; align-items: center; gap: 5px; padding: 0 6px; min-width: 0; }
+.cleanup-heat-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.cleanup-heat-rowlabel { font-size: 10px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cleanup-heat-cell {
+  display: flex; align-items: center; justify-content: center; min-height: 26px;
+  border-radius: 3px; font-size: 10px; color: var(--fg); font-variant-numeric: tabular-nums;
+}
+.cleanup-heat-cell.clickable { cursor: pointer; }
+.cleanup-heat-cell.clickable:hover { outline: 2px solid var(--fg); outline-offset: -2px; }
+.cleanup-heat-cell.hot { font-weight: 700; color: #fff; }
 
 /* ── Voice Library panel ──────────────────────────────────────────────────── */
 .fingerprint-panel-dialog {

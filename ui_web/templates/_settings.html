@@ -231,6 +231,27 @@
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">
+                <div class="settings-row-label">Microphone is you</div>
+                <div class="settings-row-desc">Always attribute your microphone audio to a single "you" speaker and never run it through diarization. Only desktop audio is split into speakers. (Takes effect on the next recording.)</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="mic-is-me-enabled" onchange="saveMicIsMeSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Your speaker</div>
+                <div class="settings-row-desc" id="me-speaker-current">Not set yet</div>
+              </div>
+              <button type="button" class="ap-reset-all-btn" style="margin:0" onclick="showMeSpeakerPopup()">
+                <i class="fa-solid fa-circle-user"></i> Set / change
+              </button>
+            </div>
+          </div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
                 <div class="settings-row-label">Preset</div>
                 <div class="settings-row-desc" id="diarization-preset-desc">Balanced preset for typical meetings</div>
               </div>

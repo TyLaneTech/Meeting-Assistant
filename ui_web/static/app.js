@@ -113,17 +113,26 @@ function _morphChatBody(el, mdText) {
   // Linkify timestamps in the raw markdown before marked parses it
   let newHtml = renderMd(_linkifyTimestampsInMd(mdText));
 
+  // Fast path for the common image-free reply: skip all three img scans. marked
+  // escapes literal <img inside code blocks to &lt;img, so this only short-
+  // circuits when the rendered output genuinely has no images to preserve.
+  const hasImg = newHtml.indexOf('<img') !== -1;
+
   // Preserve existing loaded images - detach them before morphdom runs,
   // then restore them after. This prevents flashing when morphdom
   // recreates parent <p> elements around unchanged images.
   const existingImgs = new Map();
-  el.querySelectorAll('img[src]').forEach(img => {
-    existingImgs.set(img.getAttribute('src'), img);
-  });
+  if (hasImg) {
+    el.querySelectorAll('img[src]').forEach(img => {
+      existingImgs.set(img.getAttribute('src'), img);
+    });
+  }
 
   const tmp = document.createElement('div');
   tmp.innerHTML = newHtml;
   morphdom(el, tmp, { childrenOnly: true });
+
+  if (!hasImg) return;
 
   // Restore preserved images by replacing their fresh (unloaded) clones
   if (existingImgs.size > 0) {
@@ -141,6 +150,18 @@ function _morphChatBody(el, mdText) {
     img.dataset.scrollWired = '1';
     img.addEventListener('load', () => scrollChatToBottom(), { once: true });
   });
+}
+
+// Live summary tokens arrive one at a time; coalesce rendering to one markdown
+// parse + morph per animation frame instead of rebuilding the whole summary DOM
+// per token (which was O(N^2) parsing + a full teardown + a forced reflow each).
+let _summaryRenderRAF = null;
+let _pendingChatRaf = 0;   // same coalescing for the chat stream
+function _flushSummaryRender() {
+  _summaryRenderRAF = null;
+  if (!state.summaryCursor) return;
+  _morphChatBody(state.summaryCursor, state.summaryBuffer);
+  if (_summaryAtBottom) state.summaryCursor.scrollTop = state.summaryCursor.scrollHeight;
 }
 
 /**
@@ -498,7 +519,17 @@ function recalcColWidths() {
     });
   });
 
-  window.addEventListener('resize', recalcColWidths);
+  // Coalesce resize bursts to one layout recompute per frame. recalcColWidths
+  // reads workspace.offsetWidth and rewrites gridTemplateColumns, so running it
+  // per raw resize event thrashes layout during a window drag.
+  let _colResizeRaf = 0;
+  window.addEventListener('resize', () => {
+    if (_colResizeRaf) return;
+    _colResizeRaf = requestAnimationFrame(() => {
+      _colResizeRaf = 0;
+      recalcColWidths();
+    });
+  });
 })();
 
 /* ── Column drag-to-reorder ──────────────────────────────────────────────── */
@@ -2549,7 +2580,7 @@ function _makeSessionEl(s) {
   metaEl.innerHTML = formatSessionMeta(s);
   // Speaker initial icons after duration
   if (s.speakers?.length) {
-    const filtered = s.speakers.filter(sp => sp.name && !/^Speaker \d+$/i.test(sp.name));
+    const filtered = s.speakers.filter(sp => sp.name && !/^Speaker \d+$/i.test(sp.name) && sp.name.toLowerCase() !== _NOISE_LABEL.toLowerCase());
     if (filtered.length) {
       const sep = document.createElement('span');
       sep.className = 'session-meta-sep';
@@ -3575,6 +3606,8 @@ function connectSSE(afterSegId = 0) {
     const sid = d.session_id || state.sessionId;
     _summaryStreams[sid] = { buffer: '', streaming: true, mode: 'generating' };
     if (sid !== state.sessionId) return;
+    // Drop any leftover render frame so it can't morph into the cleared element.
+    if (_summaryRenderRAF !== null) { cancelAnimationFrame(_summaryRenderRAF); _summaryRenderRAF = null; }
     state.summaryStreaming = true;
     state.summaryBuffer = '';
     const el = document.getElementById('summary');
@@ -3590,10 +3623,8 @@ function connectSSE(afterSegId = 0) {
     // Only update DOM if this is the active session
     if (sid !== state.sessionId) return;
     state.summaryBuffer += d.text;
-    if (state.summaryCursor) {
-      const html = renderMd(_linkifyTimestampsInMd(state.summaryBuffer));
-      state.summaryCursor.innerHTML = html;
-      if (_summaryAtBottom) state.summaryCursor.scrollTop = state.summaryCursor.scrollHeight;
+    if (state.summaryCursor && _summaryRenderRAF === null) {
+      _summaryRenderRAF = requestAnimationFrame(_flushSummaryRender);
     }
   });
 
@@ -3605,6 +3636,9 @@ function connectSSE(afterSegId = 0) {
       _summaryStreams[sid].mode = '';
     }
     if (sid !== state.sessionId) return;
+    // Flush the last buffered tokens synchronously before the final passes.
+    if (_summaryRenderRAF !== null) { cancelAnimationFrame(_summaryRenderRAF); _summaryRenderRAF = null; }
+    if (state.summaryCursor) _morphChatBody(state.summaryCursor, state.summaryBuffer);
     state.summaryStreaming = false;
     state.summaryCursor = null;
     highlightCode('#summary');
@@ -3672,16 +3706,30 @@ function connectSSE(afterSegId = 0) {
         const actions = wrap.querySelector('.chat-msg-actions');
         if (actions) actions.style.display = '';
       }
-      // Use morphdom to diff-update instead of innerHTML to avoid image flashing
-      _morphChatBody(state.chatCursor, state.chatBuffer);
-      _ensureTypingCursor(state.chatCursor);
       _chunkArrived();
-      scrollChatToBottom();
+      // Coalesce the markdown re-parse + morphdom diff + scroll into one frame
+      // regardless of token rate (was running the full O(n) parse per token).
+      if (!_pendingChatRaf) {
+        _pendingChatRaf = requestAnimationFrame(() => {
+          _pendingChatRaf = 0;
+          if (state.chatCursor) {
+            _morphChatBody(state.chatCursor, state.chatBuffer);
+            _ensureTypingCursor(state.chatCursor);
+            scrollChatToBottom();
+          }
+        });
+      }
     }
   });
 
   src.addEventListener('chat_done', () => {
     if (state.chatCursor) {
+      // Flush any pending coalesced render so the final tokens are never dropped.
+      if (_pendingChatRaf) {
+        cancelAnimationFrame(_pendingChatRaf);
+        _pendingChatRaf = 0;
+        _morphChatBody(state.chatCursor, state.chatBuffer);
+      }
       const wrap = state.chatCursor.closest('.chat-msg');
       if (wrap) _setAssistantProcessing(wrap, false);
       linkifyTimestamps(state.chatCursor);
@@ -3702,6 +3750,9 @@ function connectSSE(afterSegId = 0) {
     vizHasMic    = !!d.has_mic;
     if (d.lb_spectrum)  vizLbSpec  = d.lb_spectrum;
     if (d.mic_spectrum) vizMicSpec = d.mic_spectrum;
+    // Fresh levels arrived — wake the (possibly parked) visualizer loops.
+    _startVizLoop();
+    if (!_isHomePage) _startBrandVizLoop();
     // Sync gain sliders if server reports different values (e.g. after reconnect)
     if (d.lb_gain  != null) _syncGainSlider('lb',  d.lb_gain);
     if (d.mic_gain != null) _syncGainSlider('mic', d.mic_gain);
@@ -3944,6 +3995,16 @@ function onStatus(d) {
     state.recordingReadyReason = d.recording_ready_reason || 'Loading transcription model...';
   }
 
+  // "Me" speaker (microphone = app user). Cache the global id locally so the
+  // transcript can show a "(You)" badge ONLY for this instance's own mic
+  // segments (keyed on global id, never on the reserved "me" key, so imported
+  // foreign mic segments are never mislabeled as the local user).
+  if (d.me_speaker !== undefined) {
+    window._meSpeakerGlobalId = d.me_speaker ? d.me_speaker.global_id : null;
+    window._meSpeakerName     = d.me_speaker ? d.me_speaker.name : null;
+  }
+  if (d.me_prompt_pending) _maybeShowMeSpeakerPopup();
+
   if (d.recording !== undefined) {
     state.isRecording = d.recording;
     updateRecordBtn();
@@ -3987,6 +4048,13 @@ function onStatus(d) {
       _updateBrandIcons(true);
       if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
       if (_pendingSpeakerProfiles.length) _flushPendingSpeakers(d.session_id);
+      // During a live recording the reserved "me" key is THIS instance's own
+      // mic audio, so link it locally for the "(You)" badge. (When viewing a
+      // past/imported session, links come from the server instead, so foreign
+      // mic segments stay unbadged.)
+      if (d.me_speaker) {
+        _sessionLinks['me'] = { global_id: d.me_speaker.global_id, name: d.me_speaker.name };
+      }
       refreshSidebar();
       if (_quietPromptLanding === d.session_id) {
         setTimeout(() => showQuietStopConfirm(d.session_id), 150);
@@ -4277,6 +4345,193 @@ function _speakerNameKey(name, excludeKey = '') {
   ) || '';
 }
 
+/* ── "Me" speaker (microphone = app user) ─────────────────────────────────── */
+
+/** True only for THIS instance's own mic segments. Keyed on the linked global
+ *  id matching the local Me id (never on the reserved "me" key) so imported
+ *  foreign mic segments are never badged as the local user. */
+function _isMeSpeaker(speakerKey) {
+  const meId = window._meSpeakerGlobalId;
+  if (!meId) return false;
+  const link = _sessionLinks[speakerKey];
+  return !!(link && link.global_id === meId);
+}
+
+let _meSpeakerPopupShown = false;
+function _maybeShowMeSpeakerPopup() {
+  if (_meSpeakerPopupShown) return;
+  if (document.querySelector('.me-speaker-overlay')) return;
+  _meSpeakerPopupShown = true;
+  _showMeSpeakerPopup();
+}
+
+/** First-run / change-identity dialog for the microphone "Me" speaker.
+ *  Non-blocking overlay modelled on _showWhatsNewPopup. */
+async function _showMeSpeakerPopup() {
+  document.querySelectorAll('.me-speaker-overlay').forEach(el => el.remove());
+
+  let speakers = [];
+  try {
+    speakers = await fetch('/api/fingerprint/speakers').then(r => r.json());
+  } catch (_) { speakers = []; }
+  const meId = window._meSpeakerGlobalId || null;
+  const current = meId ? speakers.find(s => s.id === meId) : null;
+  const others = speakers.filter(s => s.id !== meId);
+
+  const overlay = document.createElement('div');
+  overlay.className = 'me-speaker-overlay';
+  overlay.setAttribute('role', 'presentation');
+  overlay.innerHTML = `
+    <div class="me-speaker-dialog" role="dialog" aria-modal="true" aria-labelledby="me-speaker-title">
+      <button class="me-speaker-x" type="button" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+      <div class="me-speaker-head">
+        <i class="fa-solid fa-circle-user"></i>
+        <div>
+          <div class="me-speaker-eyebrow">Who's on the microphone?</div>
+          <div class="me-speaker-title" id="me-speaker-title">Set your speaker</div>
+        </div>
+      </div>
+      <p class="me-speaker-sub">Microphone audio is always attributed to you and is never mixed in
+        with the diarized desktop speakers. Pick the speaker that's you, or enter a name.</p>
+
+      <label class="me-speaker-label">Your name</label>
+      <div class="me-speaker-row">
+        <input id="me-speaker-name" type="text" class="me-speaker-input"
+               placeholder="e.g. ${escapeHtml((window._meSpeakerName) || 'Ty')}"
+               value="${escapeHtml(current ? current.name : (window._meSpeakerName || ''))}">
+        <button id="me-speaker-save-name" class="me-speaker-primary" type="button">Use this name</button>
+      </div>
+
+      ${others.length ? `
+      <div class="me-speaker-or">or pick an existing speaker</div>
+      <div class="me-speaker-row">
+        <select id="me-speaker-select" class="me-speaker-input">
+          <option value="">Select a saved speaker…</option>
+          ${others.map(s => `<option value="${escapeHtml(s.id)}" data-emb="${s.emb_count || 0}">${escapeHtml(s.name)}${s.emb_count ? ` (${s.emb_count} voice samples)` : ''}</option>`).join('')}
+        </select>
+        <button id="me-speaker-use-existing" class="me-speaker-secondary" type="button">That's me</button>
+      </div>
+      <p class="me-speaker-warn" id="me-speaker-warn" hidden></p>` : ''}
+
+      <div class="me-speaker-actions">
+        <button id="me-speaker-skip" class="me-speaker-skip" type="button">Not now</button>
+      </div>
+    </div>`;
+
+  // Minimal scoped styles (kept inline so no stylesheet change is required).
+  if (!document.getElementById('me-speaker-style')) {
+    const st = document.createElement('style');
+    st.id = 'me-speaker-style';
+    st.textContent = `
+      .me-speaker-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;
+        justify-content:center;background:rgba(0,0,0,.5);opacity:0;transition:opacity .18s ease;}
+      .me-speaker-overlay.visible{opacity:1;}
+      .me-speaker-dialog{position:relative;width:min(480px,92vw);background:var(--bg-elevated,#1c2128);
+        color:var(--text,#e6edf3);border:1px solid var(--border,#30363d);border-radius:14px;
+        padding:22px 22px 18px;box-shadow:0 18px 60px rgba(0,0,0,.5);
+        transform:scale(.97);transition:transform .18s ease;}
+      .me-speaker-overlay.visible .me-speaker-dialog{transform:scale(1);}
+      .me-speaker-x{position:absolute;top:12px;right:12px;background:none;border:none;color:var(--text-muted,#8b949e);
+        font-size:18px;cursor:pointer;padding:4px;border-radius:6px;}
+      .me-speaker-x:hover{background:var(--bg-subtle,#262c36);color:var(--text,#e6edf3);}
+      .me-speaker-head{display:flex;gap:12px;align-items:center;margin-bottom:10px;}
+      .me-speaker-head i{font-size:30px;color:var(--accent,#58a6ff);}
+      .me-speaker-eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-muted,#8b949e);}
+      .me-speaker-title{font-size:19px;font-weight:650;}
+      .me-speaker-sub{font-size:13px;line-height:1.5;color:var(--text-muted,#8b949e);margin:4px 0 16px;}
+      .me-speaker-label{font-size:12px;font-weight:600;color:var(--text-muted,#8b949e);display:block;margin-bottom:6px;}
+      .me-speaker-row{display:flex;gap:8px;margin-bottom:10px;}
+      .me-speaker-input{flex:1;min-width:0;background:var(--bg-subtle,#0d1117);color:var(--text,#e6edf3);
+        border:1px solid var(--border,#30363d);border-radius:8px;padding:9px 11px;font-size:14px;}
+      .me-speaker-primary,.me-speaker-secondary{border:none;border-radius:8px;padding:9px 14px;font-size:13px;
+        font-weight:600;cursor:pointer;white-space:nowrap;}
+      .me-speaker-primary{background:var(--accent,#2f81f7);color:#fff;}
+      .me-speaker-secondary{background:var(--bg-subtle,#262c36);color:var(--text,#e6edf3);border:1px solid var(--border,#30363d);}
+      .me-speaker-or{text-align:center;font-size:12px;color:var(--text-muted,#8b949e);margin:6px 0 10px;}
+      .me-speaker-warn{font-size:12px;color:var(--warn,#d29922);margin:0 0 8px;}
+      .me-speaker-actions{display:flex;justify-content:flex-end;margin-top:6px;}
+      .me-speaker-skip{background:none;border:none;color:var(--text-muted,#8b949e);font-size:13px;cursor:pointer;padding:6px 8px;}
+      .me-speaker-skip:hover{color:var(--text,#e6edf3);text-decoration:underline;}`;
+    document.head.appendChild(st);
+  }
+
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    overlay.classList.remove('visible');
+    setTimeout(() => overlay.remove(), 180);
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); doSkip(); } };
+
+  const post = (body) => fetch('/api/onboarding/me-speaker', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(r => r.json());
+
+  const applied = (resp) => {
+    if (resp && resp.me_speaker) {
+      window._meSpeakerGlobalId = resp.me_speaker.global_id;
+      window._meSpeakerName = resp.me_speaker.name;
+      if (typeof flashStatus === 'function') flashStatus(`You: ${resp.me_speaker.name}`);
+    }
+    close();
+  };
+
+  const doSkip = () => {
+    fetch('/api/onboarding/skip', { method: 'POST' }).catch(() => {});
+    close();
+  };
+
+  overlay.querySelector('.me-speaker-x').addEventListener('click', doSkip);
+  overlay.querySelector('#me-speaker-skip').addEventListener('click', doSkip);
+  overlay.addEventListener('click', e => { if (e.target === overlay) doSkip(); });
+  document.addEventListener('keydown', onKey);
+
+  overlay.querySelector('#me-speaker-save-name').addEventListener('click', async () => {
+    const name = overlay.querySelector('#me-speaker-name').value.trim();
+    if (!name) return;
+    // Rename the existing Me profile in place (retroactive everywhere) when one
+    // exists; otherwise create/select by name.
+    if (meId) {
+      try {
+        await fetch(`/api/fingerprint/speakers/${meId}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        window._meSpeakerName = name;
+        if (typeof flashStatus === 'function') flashStatus(`You: ${name}`);
+        close();
+      } catch (_) { close(); }
+    } else {
+      applied(await post({ mode: 'name', name }));
+    }
+  });
+
+  const selEl = overlay.querySelector('#me-speaker-select');
+  const warnEl = overlay.querySelector('#me-speaker-warn');
+  if (selEl) {
+    selEl.addEventListener('change', () => {
+      const opt = selEl.selectedOptions[0];
+      const emb = opt ? parseInt(opt.dataset.emb || '0', 10) : 0;
+      if (emb > 0) {
+        warnEl.hidden = false;
+        warnEl.textContent = `Heads up: this clears ${opt.textContent.replace(/\s*\(\d+ voice samples\)$/, '')}'s saved voice samples so the profile is only used for your mic.`;
+      } else {
+        warnEl.hidden = true;
+      }
+    });
+    overlay.querySelector('#me-speaker-use-existing').addEventListener('click', async () => {
+      const gid = selEl.value;
+      if (!gid) return;
+      applied(await post({ mode: 'existing', global_id: gid }));
+    });
+  }
+
+  requestAnimationFrame(() => overlay.classList.add('visible'));
+}
+window.showMeSpeakerPopup = _showMeSpeakerPopup;
+
 function _upsertSpeakerProfile(data) {
   const speakerKey = data.speaker_key || data.speakerKey;
   if (!speakerKey) return null;
@@ -4561,10 +4816,15 @@ function closeSpeakerManagerOnOverlay(event) {
 let _cleanupState = null;
 // { sessionId, clusters: [...], noiseKeys: Set, library: [...], thresholds, originalSnapshot, dirty }
 let _cleanupActiveTab = 'manage';
-let _cleanupDragKey = null;
+let _cleanupDragKeys = [];            // speaker_keys currently being dragged (multi-select aware)
 let _cleanupExpandedKeys = new Set();
 let _cleanupNoiseExpanded = false;
-let _cleanupPreviewStop = null;  // { btn, timer }
+let _cleanupSelectedKeys = new Set(); // multi-select: speaker_keys highlighted for bulk ops
+let _cleanupSelAnchor = null;         // anchor key for Shift-range selection
+let _cleanupKeyOrder = [];            // visual order of member keys, rebuilt each render
+let _cleanupShowHeatmap = false;      // similarity heatmap view toggle
+let _cleanupPlayQueueState = null;    // sequential audio/video player: { btn, segs, idx, key, timer }
+let _cleanupPicker = null;            // open assignment popover element, or null
 
 function switchSpeakerManagerTab(tab) {
   _cleanupActiveTab = tab;
@@ -4574,8 +4834,16 @@ function switchSpeakerManagerTab(tab) {
   document.querySelectorAll('[data-tab-view]').forEach(el => {
     el.hidden = el.dataset.tabView !== tab;
   });
-  if (tab === 'cleanup' && !_cleanupState) {
-    loadSpeakerClusters();
+  // The cleanup tab needs far more room than the compact manage list — widen
+  // the dialog (and let it grow taller) only while cleanup is the active tab.
+  const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
+  if (dialog) dialog.classList.toggle('cleanup-active', tab === 'cleanup');
+  if (tab === 'cleanup') {
+    // Load (or reload) whenever there's no state or it's stale for another session.
+    if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();
+    _cleanupVideoSyncToggleBtn();
+  } else {
+    _cleanupClosePicker();
   }
 }
 
@@ -4623,6 +4891,10 @@ function reloadSpeakerClusters() {
 }
 
 function _cleanupBuildState(payload) {
+  // Fresh load — drop any stale multi-selection / open popover.
+  _cleanupSelectedKeys = new Set();
+  _cleanupSelAnchor = null;
+  _cleanupClosePicker();
   // Decode all centroids once. We keep both labeled + unlabeled clusters in
   // one homogenous list, plus a separate noise bucket.
   const decode = b64 => {
@@ -4778,69 +5050,56 @@ function _cleanupUpdateSuggestion(cluster) {
 function renderSpeakerClusters() {
   const grid = document.getElementById('cleanup-grid');
   const statsEl = document.getElementById('cleanup-stats');
+  const heatWrap = document.getElementById('cleanup-heatmap-wrap');
   if (!grid || !_cleanupState) return;
-  grid.innerHTML = '';
 
-  // Recompute centroids + suggestions for everything before render so any
-  // in-flight DnD reorderings are reflected.
+  // Recompute centroids + suggestions before render so drag reorderings are
+  // reflected in similarity suggestions.
   _cleanupState.clusters.forEach(_cleanupUpdateSuggestion);
 
-  // Sort: labeled first (by segment count desc), then unlabeled (segment count desc).
-  const sorted = [..._cleanupState.clusters].sort((a, b) => {
-    if (a.kind !== b.kind) return a.kind === 'labeled' ? -1 : 1;
-    const segCount = c => c.members.reduce((s, m) => s + m.segment_count, 0);
-    return segCount(b) - segCount(a);
-  });
+  // ── Heatmap vs cluster-grid view ──
+  const heatBtn = document.getElementById('cleanup-heatmap-toggle');
+  if (heatBtn) heatBtn.classList.toggle('active', _cleanupShowHeatmap);
+  // Use explicit display values (not '') — the heatmap wrap still carries the
+  // [hidden] attribute, so '' would fall back to the UA display:none rule.
+  grid.style.display = _cleanupShowHeatmap ? 'none' : 'grid';
+  if (heatWrap) heatWrap.style.display = _cleanupShowHeatmap ? 'flex' : 'none';
 
-  for (const cluster of sorted) {
-    grid.appendChild(_cleanupRenderCluster(cluster));
+  if (_cleanupShowHeatmap) {
+    _cleanupRenderHeatmap(heatWrap);
+  } else {
+    grid.innerHTML = '';
+    _cleanupKeyOrder = [];
+
+    // Sort: labeled first (by segment count desc), then unlabeled (seg count desc).
+    const sorted = [..._cleanupState.clusters].sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind === 'labeled' ? -1 : 1;
+      const segCount = c => c.members.reduce((s, m) => s + m.segment_count, 0);
+      return segCount(b) - segCount(a);
+    });
+    for (const cluster of sorted) grid.appendChild(_cleanupRenderCluster(cluster));
+
+    // "+ New group" drop zone (always last in the grid).
+    const newZone = document.createElement('div');
+    newZone.className = 'cleanup-new-cluster';
+    newZone.innerHTML = '<i class="fa-solid fa-plus"></i> Drop here to start a new group';
+    _cleanupWireDropZone(newZone, () => _cleanupMoveKeysToNewCluster(_cleanupDragKeys));
+    grid.appendChild(newZone);
   }
 
-  // "+ New cluster" drop zone always present.
-  const newZone = document.createElement('div');
-  newZone.className = 'cleanup-new-cluster';
-  newZone.innerHTML = '<i class="fa-solid fa-plus"></i> Drop here to start a new cluster';
-  newZone.addEventListener('dragover', e => {
-    if (_cleanupDragKey) { e.preventDefault(); newZone.classList.add('drop-target'); }
-  });
-  newZone.addEventListener('dragleave', () => newZone.classList.remove('drop-target'));
-  newZone.addEventListener('drop', e => {
-    e.preventDefault();
-    newZone.classList.remove('drop-target');
-    if (_cleanupDragKey) _cleanupMoveMemberToNewCluster(_cleanupDragKey);
-  });
-  grid.appendChild(newZone);
+  // ── Noise drop zone (shown beneath either view) ──
+  _cleanupRenderNoiseSection();
 
-  // Noise section
-  const noiseSection = document.getElementById('cleanup-noise-section');
-  const noiseCountEl = document.getElementById('cleanup-noise-count');
-  const noiseMembersEl = document.getElementById('cleanup-noise-members');
-  if (noiseSection) {
-    const noiseList = Array.from(_cleanupState.noiseKeys)
-      .map(k => _cleanupGetMember(k))
-      .filter(Boolean);
-    if (noiseList.length === 0) {
-      noiseSection.hidden = true;
-      _cleanupNoiseExpanded = false;
-    } else {
-      noiseSection.hidden = false;
-      noiseSection.classList.toggle('expanded', _cleanupNoiseExpanded);
-      noiseCountEl.textContent = String(noiseList.length);
-      noiseMembersEl.hidden = !_cleanupNoiseExpanded;
-      noiseMembersEl.innerHTML = '';
-      noiseList.forEach(m => noiseMembersEl.appendChild(_cleanupRenderMember(m, null, /*inNoise*/ true)));
-    }
-  }
-
+  // ── Stats ──
   if (statsEl) {
-    const total  = _cleanupState.stats.speakers_total || 0;
-    const labeledCount = sorted.filter(c => c.kind === 'labeled').length;
-    const unlabeledCount = sorted.filter(c => c.kind === 'unlabeled' && c.members.length).length;
-    const noiseCount2 = _cleanupState.noiseKeys.size;
-    statsEl.innerHTML = `<strong>${labeledCount}</strong> labeled · <strong>${unlabeledCount}</strong> unlabeled · <strong>${total}</strong> speakers${noiseCount2 ? ` · <strong>${noiseCount2}</strong> noise` : ''}`;
+    const labeledCount = _cleanupState.clusters.filter(c => c.kind === 'labeled' && c.members.length).length;
+    const unlabeledCount = _cleanupState.clusters.filter(c => c.kind === 'unlabeled' && c.members.length).length;
+    const total = _cleanupState.stats.speakers_total || 0;
+    const noiseCount = _cleanupState.noiseKeys.size;
+    statsEl.innerHTML = `<strong>${labeledCount}</strong> named · <strong>${unlabeledCount}</strong> unnamed · <strong>${total}</strong> voices${noiseCount ? ` · <strong>${noiseCount}</strong> noise` : ''}`;
   }
 
-  // Enable confident button if any suggestion is ≥ auto threshold.
+  // Enable Auto-assign when any unlabeled cluster has a high-confidence match.
   const confidentBtn = document.getElementById('cleanup-confident-btn');
   if (confidentBtn) {
     const hasConfident = _cleanupState.clusters.some(
@@ -4848,7 +5107,115 @@ function renderSpeakerClusters() {
     );
     confidentBtn.disabled = !hasConfident;
   }
+
+  _cleanupRenderSelectionBar();
   _cleanupUpdateBadge();
+  _cleanupWireGridAutoscroll();
+}
+
+function _cleanupRenderNoiseSection() {
+  const noiseSection = document.getElementById('cleanup-noise-section');
+  const noiseCountEl = document.getElementById('cleanup-noise-count');
+  const noiseMembersEl = document.getElementById('cleanup-noise-members');
+  if (!noiseSection) return;
+  const noiseList = Array.from(_cleanupState.noiseKeys)
+    .map(k => _cleanupGetMember(k))
+    .filter(Boolean);
+  // Always a drop target so users can drag speakers here to silence them.
+  // Wire once — this element is persistent (lives in the template), so re-wiring
+  // each render would stack duplicate listeners.
+  if (!noiseSection._dropWired) {
+    noiseSection._dropWired = true;
+    _cleanupWireDropZone(noiseSection, () => _cleanupMarkKeysNoise(_cleanupDragKeys));
+  }
+  if (noiseList.length === 0) {
+    noiseSection.hidden = false;
+    noiseSection.classList.add('empty');
+    noiseSection.classList.remove('expanded');
+    if (noiseCountEl) noiseCountEl.textContent = '0';
+    if (noiseMembersEl) { noiseMembersEl.hidden = true; noiseMembersEl.innerHTML = ''; }
+    return;
+  }
+  noiseSection.hidden = false;
+  noiseSection.classList.remove('empty');
+  noiseSection.classList.toggle('expanded', _cleanupNoiseExpanded);
+  if (noiseCountEl) noiseCountEl.textContent = String(noiseList.length);
+  if (noiseMembersEl) {
+    noiseMembersEl.hidden = !_cleanupNoiseExpanded;
+    noiseMembersEl.innerHTML = '';
+    noiseList.forEach(m => noiseMembersEl.appendChild(_cleanupRenderMember(m, null, /*inNoise*/ true)));
+  }
+}
+
+/* ── Multi-select model ───────────────────────────────────────────────────
+ * Members can be selected (click / Ctrl-click / Shift-range) and then dragged
+ * or bulk-acted on via the floating selection bar. This removes the need to
+ * drag pills one-at-a-time across a tall widget. */
+
+function _cleanupSelectPill(key, opts) {
+  opts = opts || {};
+  if (opts.range && _cleanupSelAnchor) {
+    const order = _cleanupKeyOrder;
+    const a = order.indexOf(_cleanupSelAnchor);
+    const b = order.indexOf(key);
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      if (!opts.toggle) _cleanupSelectedKeys = new Set();
+      for (let i = lo; i <= hi; i++) _cleanupSelectedKeys.add(order[i]);
+    } else {
+      _cleanupSelectedKeys.add(key);
+    }
+  } else if (opts.toggle) {
+    if (_cleanupSelectedKeys.has(key)) _cleanupSelectedKeys.delete(key);
+    else _cleanupSelectedKeys.add(key);
+    _cleanupSelAnchor = key;
+  } else {
+    // Plain click: toggle a singleton selection (click again to deselect).
+    if (_cleanupSelectedKeys.size === 1 && _cleanupSelectedKeys.has(key)) {
+      _cleanupSelectedKeys = new Set();
+      _cleanupSelAnchor = null;
+    } else {
+      _cleanupSelectedKeys = new Set([key]);
+      _cleanupSelAnchor = key;
+    }
+  }
+  _cleanupRefreshSelectionUI();
+}
+
+// Cheap UI refresh that doesn't rebuild the whole grid — just toggles the
+// `selected` class on pills and re-renders the selection bar.
+function _cleanupRefreshSelectionUI() {
+  document.querySelectorAll('#cleanup-grid .cleanup-member, #cleanup-noise-members .cleanup-member')
+    .forEach(pill => {
+      pill.classList.toggle('selected', _cleanupSelectedKeys.has(pill.dataset.speakerKey));
+    });
+  _cleanupRenderSelectionBar();
+}
+
+function _cleanupClearSelection() {
+  _cleanupSelectedKeys = new Set();
+  _cleanupSelAnchor = null;
+  _cleanupRefreshSelectionUI();
+}
+
+function _cleanupRenderSelectionBar() {
+  const bar = document.getElementById('cleanup-selbar');
+  const countEl = document.getElementById('cleanup-selbar-count');
+  if (!bar) return;
+  const n = _cleanupSelectedKeys.size;
+  const body = document.querySelector('#speaker-manager-overlay .speaker-cleanup-body');
+  if (body) body.classList.toggle('has-selection', n > 0);
+  if (n === 0) { bar.hidden = true; return; }
+  bar.hidden = false;
+  if (countEl) countEl.textContent = `${n} selected`;
+  // The Noise button doubles as Restore when every selected pill is noise.
+  const allNoise = Array.from(_cleanupSelectedKeys).every(k => _cleanupState.noiseKeys.has(k));
+  const noiseBtn = document.getElementById('cleanup-selbar-noise');
+  if (noiseBtn) {
+    noiseBtn.innerHTML = allNoise
+      ? '<i class="fa-solid fa-rotate-left"></i> Restore'
+      : '<i class="fa-solid fa-volume-xmark"></i> Noise';
+  }
 }
 
 function _cleanupAllMembers() {
@@ -4867,6 +5234,21 @@ function _cleanupGetMember(speakerKey) {
   return _cleanupState.noiseMembers.get(speakerKey) || null;
 }
 
+// Wire an element as a drag drop-target for the current multi-selection.
+function _cleanupWireDropZone(el, onDrop) {
+  el.addEventListener('dragover', e => {
+    if (_cleanupDragKeys.length) { e.preventDefault(); el.classList.add('drop-target'); }
+  });
+  el.addEventListener('dragleave', e => {
+    if (e.target === el || !el.contains(e.relatedTarget)) el.classList.remove('drop-target');
+  });
+  el.addEventListener('drop', e => {
+    e.preventDefault();
+    el.classList.remove('drop-target');
+    if (_cleanupDragKeys.length) onDrop();
+  });
+}
+
 function _cleanupRenderCluster(cluster) {
   const card = document.createElement('div');
   card.className = `cleanup-cluster kind-${cluster.kind}`;
@@ -4874,89 +5256,171 @@ function _cleanupRenderCluster(cluster) {
   const visibleMembers = cluster.members.filter(m => !_cleanupState.noiseKeys.has(m.speaker_key));
   if (!visibleMembers.length) card.classList.add('cluster-empty');
 
+  const accent = cluster.color || (visibleMembers[0] && visibleMembers[0].color) || '#6e7681';
+  card.style.setProperty('--cluster-accent', accent);
+
+  // ── Header ──
   const header = document.createElement('div');
   header.className = 'cleanup-cluster-header';
+
   const swatch = document.createElement('span');
   swatch.className = 'cleanup-cluster-swatch';
-  swatch.style.background = cluster.color || (visibleMembers[0]?.color) || '#6e7681';
+  swatch.style.background = accent;
   header.appendChild(swatch);
 
   const nameWrap = document.createElement('div');
   nameWrap.className = 'cleanup-cluster-name';
+  const label = document.createElement('span');
+  label.className = 'cleanup-cluster-label';
   if (cluster.kind === 'labeled') {
-    const span = document.createElement('span');
-    span.textContent = cluster.name || '(unnamed)';
-    nameWrap.appendChild(span);
+    label.textContent = cluster.name || '(unnamed)';
+    nameWrap.appendChild(label);
+    const linked = document.createElement('span');
+    linked.className = 'cleanup-cluster-linked';
+    linked.innerHTML = '<i class="fa-solid fa-link"></i>';
+    linked.title = 'Linked to a voice-library profile';
+    nameWrap.appendChild(linked);
   } else {
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.placeholder = cluster.suggestion ? `e.g. ${cluster.suggestion.name}` : 'Name this cluster…';
-    input.value = cluster.new_name || '';
-    input.addEventListener('input', e => { cluster.new_name = e.target.value; _cleanupMarkDirty(); });
-    nameWrap.appendChild(input);
+    label.classList.add('placeholder');
+    label.textContent = cluster.new_name ? cluster.new_name : 'Unnamed group';
+    nameWrap.appendChild(label);
   }
   header.appendChild(nameWrap);
 
   const count = document.createElement('span');
   count.className = 'cleanup-cluster-count';
   const segTotal = visibleMembers.reduce((s, m) => s + m.segment_count, 0);
-  count.textContent = `${visibleMembers.length} · ${segTotal} seg`;
+  count.textContent = `${segTotal} seg`;
   header.appendChild(count);
+
+  // Assign / change button — opens the voice-library picker popover.
+  const assignBtn = document.createElement('button');
+  assignBtn.className = 'cleanup-assign-btn' + (cluster.kind === 'labeled' ? ' is-set' : '');
+  assignBtn.innerHTML = cluster.kind === 'labeled'
+    ? '<i class="fa-solid fa-pen"></i>'
+    : '<i class="fa-solid fa-user-tag"></i> Assign';
+  assignBtn.title = cluster.kind === 'labeled' ? 'Change assignment' : 'Assign to a voice profile';
+  assignBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    _cleanupOpenPicker(assignBtn, { cluster });
+  });
+  header.appendChild(assignBtn);
   card.appendChild(header);
 
-  // Library suggestion banner — only for unlabeled clusters with no chosen name yet.
-  if (cluster.suggestion && !cluster.global_id && cluster.kind === 'unlabeled' && !cluster.new_name) {
-    const sugg = document.createElement('div');
+  // ── One-click suggestion chip (unlabeled clusters only) ──
+  if (cluster.suggestion && !cluster.global_id && cluster.kind === 'unlabeled') {
+    const row = document.createElement('div');
+    row.className = 'cleanup-suggestion-row';
+    const sugg = document.createElement('button');
     sugg.className = 'cleanup-suggestion';
-    const dot = document.createElement('span');
-    dot.className = 'cleanup-cluster-swatch';
-    dot.style.background = cluster.suggestion.color || '#58a6ff';
-    sugg.appendChild(dot);
-    const txt = document.createElement('span');
-    txt.innerHTML = `Sounds like <strong>${escapeHtml(cluster.suggestion.name)}</strong> <span class="sim">(${cluster.suggestion.similarity})</span>`;
-    sugg.appendChild(txt);
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-    const applyBtn = document.createElement('button');
-    applyBtn.className = 'apply-btn';
-    applyBtn.textContent = 'Assign';
-    applyBtn.onclick = () => {
-      cluster.global_id = cluster.suggestion.global_id;
-      cluster.name = cluster.suggestion.name;
-      cluster.color = cluster.suggestion.color;
-      cluster.kind = 'labeled';
-      _cleanupMarkDirty();
-      renderSpeakerClusters();
-    };
-    const rejectBtn = document.createElement('button');
-    rejectBtn.textContent = 'Not this';
-    rejectBtn.onclick = () => {
+    sugg.title = `Assign ${cluster.suggestion.name}`;
+    const conf = cluster.suggestion.similarity >= _cleanupState.thresholds.auto ? ' high' : '';
+    sugg.innerHTML =
+      `<span class="cleanup-cluster-swatch sm" style="background:${cluster.suggestion.color || '#58a6ff'}"></span>` +
+      `<span class="txt">Sounds like <strong>${escapeHtml(cluster.suggestion.name)}</strong></span>` +
+      `<span class="sim${conf}">${Math.round(cluster.suggestion.similarity * 100)}%</span>` +
+      `<span class="cleanup-suggestion-go"><i class="fa-solid fa-check"></i> Assign</span>`;
+    sugg.addEventListener('click', e => {
+      e.stopPropagation();
+      _cleanupAssignClusterToProfile(cluster, cluster.suggestion);
+    });
+    const reject = document.createElement('button');
+    reject.className = 'cleanup-suggestion-reject';
+    reject.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+    reject.title = 'Not this person';
+    reject.addEventListener('click', e => {
+      e.stopPropagation();
       cluster._dropped_suggestions.add(cluster.suggestion.global_id);
       cluster.suggestion = null;
       renderSpeakerClusters();
-    };
-    actions.appendChild(applyBtn);
-    actions.appendChild(rejectBtn);
-    sugg.appendChild(actions);
-    card.appendChild(sugg);
+    });
+    row.appendChild(sugg);
+    row.appendChild(reject);
+    card.appendChild(row);
   }
 
+  // ── Members ──
   const memberRow = document.createElement('div');
   memberRow.className = 'cleanup-members';
   memberRow.dataset.clusterId = cluster.cluster_id;
-  memberRow.addEventListener('dragover', e => {
-    if (_cleanupDragKey) { e.preventDefault(); card.classList.add('drop-target'); }
+  // Whole card is the drop target so short drags near the header still land.
+  _cleanupWireDropZone(card, () => _cleanupMoveKeysToCluster(_cleanupDragKeys, cluster.cluster_id));
+  visibleMembers.forEach(m => {
+    _cleanupKeyOrder.push(m.speaker_key);
+    memberRow.appendChild(_cleanupRenderMember(m, cluster, false));
   });
-  memberRow.addEventListener('dragleave', () => card.classList.remove('drop-target'));
-  memberRow.addEventListener('drop', e => {
-    e.preventDefault();
-    card.classList.remove('drop-target');
-    if (_cleanupDragKey) _cleanupMoveMemberToCluster(_cleanupDragKey, cluster.cluster_id);
-  });
-  visibleMembers.forEach(m => memberRow.appendChild(_cleanupRenderMember(m, cluster, false)));
   card.appendChild(memberRow);
 
   return card;
+}
+
+function _cleanupTalkTime(member) {
+  return (member.segments || []).reduce((s, seg) => s + Math.max(0, seg.end - seg.start), 0);
+}
+
+// Furthest segment end across the whole session — used to scale mini-timelines.
+function _cleanupSessionSpan() {
+  if (_cleanupState._span) return _cleanupState._span;
+  let max = 0;
+  const scan = m => { for (const s of m.segments) if (s.end > max) max = s.end; };
+  _cleanupState.clusters.forEach(c => c.members.forEach(scan));
+  if (_cleanupState.noiseMembers) _cleanupState.noiseMembers.forEach(scan);
+  _cleanupState._span = max || 1;
+  return _cleanupState._span;
+}
+
+function _cleanupBuildTimeline(member) {
+  const span = _cleanupSessionSpan();
+  const tl = document.createElement('div');
+  tl.className = 'cleanup-timeline';
+  tl.title = 'When this speaker talks across the meeting (click a tick to play)';
+  member.segments.forEach(seg => {
+    const tick = document.createElement('span');
+    tick.className = 'cleanup-tl-tick';
+    tick.style.left = `${(seg.start / span) * 100}%`;
+    tick.style.width = `${Math.max(0.5, ((seg.end - seg.start) / span) * 100)}%`;
+    tick.style.background = member.color || 'var(--accent, #58a6ff)';
+    tick.title = `${_fmtTime(seg.start)} · ${(seg.end - seg.start).toFixed(1)}s`;
+    tick.addEventListener('click', e => {
+      e.stopPropagation();
+      _cleanupPlayQueue([seg], null, { key: `seg:${seg.id}` });
+    });
+    tl.appendChild(tick);
+  });
+  return tl;
+}
+
+function _cleanupBuildSegRow(seg, member) {
+  const r = document.createElement('div');
+  r.className = 'cleanup-seg-row';
+  const play = document.createElement('button');
+  play.className = 'cleanup-seg-play';
+  play.dataset.segKey = `seg:${seg.id}`;
+  play.innerHTML = '<i class="fa-solid fa-play"></i>';
+  play.title = 'Play segment';
+  play.addEventListener('click', e => { e.stopPropagation(); _cleanupPlayQueue([seg], play, { key: `seg:${seg.id}` }); });
+  r.appendChild(play);
+  const t = document.createElement('span');
+  t.className = 'cleanup-seg-time';
+  t.textContent = _fmtTime(seg.start);
+  r.appendChild(t);
+  const txt = document.createElement('span');
+  txt.className = 'cleanup-seg-text';
+  if (seg.text) { txt.textContent = seg.text; }
+  else { txt.textContent = '(no transcript)'; txt.classList.add('empty'); }
+  r.appendChild(txt);
+  return r;
+}
+
+// Custom drag image when moving multiple speakers at once.
+function _cleanupSetDragImage(e, n) {
+  if (n <= 1 || !e.dataTransfer || !e.dataTransfer.setDragImage) return;
+  const ghost = document.createElement('div');
+  ghost.className = 'cleanup-drag-ghost';
+  ghost.textContent = `${n} speakers`;
+  document.body.appendChild(ghost);
+  try { e.dataTransfer.setDragImage(ghost, 12, 12); } catch (_) {}
+  setTimeout(() => ghost.remove(), 0);
 }
 
 function _cleanupRenderMember(member, cluster, inNoise) {
@@ -4964,87 +5428,121 @@ function _cleanupRenderMember(member, cluster, inNoise) {
   pill.className = 'cleanup-member';
   pill.dataset.speakerKey = member.speaker_key;
   if (inNoise) pill.classList.add('is-noise');
-  if (_cleanupExpandedKeys.has(member.speaker_key)) pill.classList.add('expanded');
+  if (_cleanupSelectedKeys.has(member.speaker_key)) pill.classList.add('selected');
+  const expanded = _cleanupExpandedKeys.has(member.speaker_key);
+  if (expanded) pill.classList.add('expanded');
   pill.draggable = true;
+
   pill.addEventListener('dragstart', e => {
-    _cleanupDragKey = member.speaker_key;
-    pill.classList.add('dragging');
+    // Drag the whole selection if this pill is part of it; otherwise drag just
+    // this one (and make it the selection so what moves matches what's lit up).
+    if (!_cleanupSelectedKeys.has(member.speaker_key)) {
+      _cleanupSelectedKeys = new Set([member.speaker_key]);
+      _cleanupSelAnchor = member.speaker_key;
+      _cleanupRefreshSelectionUI();
+    }
+    _cleanupDragKeys = Array.from(_cleanupSelectedKeys);
+    document.querySelectorAll('.cleanup-member').forEach(p => {
+      if (_cleanupDragKeys.includes(p.dataset.speakerKey)) p.classList.add('dragging');
+    });
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', member.speaker_key); } catch (_) {}
+    _cleanupSetDragImage(e, _cleanupDragKeys.length);
   });
   pill.addEventListener('dragend', () => {
-    _cleanupDragKey = null;
-    pill.classList.remove('dragging');
-    document.querySelectorAll('.cleanup-cluster.drop-target, .cleanup-new-cluster.drop-target')
-      .forEach(el => el.classList.remove('drop-target'));
+    _cleanupDragKeys = [];
+    _cleanupStopAutoscroll();
+    document.querySelectorAll('.cleanup-member.dragging').forEach(p => p.classList.remove('dragging'));
+    document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
   });
 
+  // ── Always-visible row ──
   const row = document.createElement('div');
   row.className = 'cleanup-member-row';
+  row.addEventListener('click', e => {
+    if (e.target.closest('button')) return;  // buttons handle their own clicks
+    _cleanupSelectPill(member.speaker_key, { toggle: e.ctrlKey || e.metaKey, range: e.shiftKey });
+  });
+
+  const grip = document.createElement('span');
+  grip.className = 'cleanup-member-grip';
+  grip.innerHTML = '<i class="fa-solid fa-grip-vertical"></i>';
+  row.appendChild(grip);
 
   const dot = document.createElement('span');
   dot.className = 'cleanup-member-dot';
   dot.style.background = member.color || (cluster && cluster.color) || '#6e7681';
   row.appendChild(dot);
 
+  const main = document.createElement('span');
+  main.className = 'cleanup-member-main';
   const key = document.createElement('span');
   key.className = 'cleanup-member-key';
-  key.textContent = member.speaker_key;
-  row.appendChild(key);
+  key.textContent = (member.name && member.name !== member.speaker_key) ? member.name : member.speaker_key;
+  main.appendChild(key);
+  const meta = document.createElement('span');
+  meta.className = 'cleanup-member-meta';
+  meta.textContent = `${member.segment_count} seg · ${_fmtTime(_cleanupTalkTime(member))}`;
+  main.appendChild(meta);
+  row.appendChild(main);
 
-  const seg = document.createElement('span');
-  seg.className = 'cleanup-member-segcount';
-  seg.textContent = `${member.segment_count}`;
-  row.appendChild(seg);
-
-  const noiseBtn = document.createElement('button');
-  noiseBtn.className = 'cleanup-member-noise-btn';
-  noiseBtn.title = inNoise ? 'Restore from noise' : 'Mark as noise';
-  noiseBtn.innerHTML = inNoise ? '<i class="fa-solid fa-rotate-left"></i>' : '<i class="fa-solid fa-volume-xmark"></i>';
-  noiseBtn.addEventListener('click', e => {
-    e.stopPropagation();
-    _cleanupToggleNoise(member.speaker_key);
-  });
-  row.appendChild(noiseBtn);
+  // Play-all button (this is the button that replaced "mark as noise").
+  const playBtn = document.createElement('button');
+  playBtn.className = 'cleanup-play-btn';
+  playBtn.dataset.segKey = `member:${member.speaker_key}`;
+  playBtn.title = 'Play this speaker’s segments';
+  playBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
+  playBtn.addEventListener('click', e => { e.stopPropagation(); _cleanupPlayMember(member, playBtn); });
+  row.appendChild(playBtn);
 
   if (member.segments.length > 0) {
     const expandBtn = document.createElement('button');
     expandBtn.className = 'cleanup-member-expand-btn';
-    expandBtn.title = 'Preview audio';
-    expandBtn.innerHTML = '<i class="fa-regular fa-circle-play"></i>';
+    expandBtn.title = expanded ? 'Hide segments' : 'Show segments';
+    expandBtn.innerHTML = '<i class="fa-solid fa-chevron-down"></i>';
     expandBtn.addEventListener('click', e => {
       e.stopPropagation();
-      if (_cleanupExpandedKeys.has(member.speaker_key)) {
-        _cleanupExpandedKeys.delete(member.speaker_key);
-      } else {
-        _cleanupExpandedKeys.add(member.speaker_key);
-      }
-      pill.classList.toggle('expanded');
+      if (_cleanupExpandedKeys.has(member.speaker_key)) _cleanupExpandedKeys.delete(member.speaker_key);
+      else _cleanupExpandedKeys.add(member.speaker_key);
+      const nowExp = _cleanupExpandedKeys.has(member.speaker_key);
+      pill.classList.toggle('expanded', nowExp);
+      expandBtn.title = nowExp ? 'Hide segments' : 'Show segments';
     });
     row.appendChild(expandBtn);
   }
 
   pill.appendChild(row);
 
+  // ── Expandable detail: mini-timeline + transcript-backed segment list ──
   if (member.segments.length > 0) {
-    const previews = document.createElement('div');
-    previews.className = 'cleanup-member-previews';
-    // Top 5 longest segments.
+    const detail = document.createElement('div');
+    detail.className = 'cleanup-member-detail';
+    const inner = document.createElement('div');
+    inner.className = 'cleanup-member-detail-inner';
+    inner.appendChild(_cleanupBuildTimeline(member));
+    const list = document.createElement('div');
+    list.className = 'cleanup-seg-list';
     const ranked = [...member.segments]
       .sort((a, b) => (b.end - b.start) - (a.end - a.start))
-      .slice(0, 5);
-    ranked.forEach(seg => {
-      const btn = document.createElement('button');
-      btn.className = 'cleanup-preview-btn';
-      const dur = seg.end - seg.start;
-      btn.innerHTML = `<i class="fa-solid fa-play"></i> ${_fmtTime(seg.start)} <span style="color:var(--fg-subtle)">${dur.toFixed(1)}s</span>`;
-      btn.addEventListener('click', e => { e.stopPropagation(); _cleanupPlaySegment(seg, btn); });
-      previews.appendChild(btn);
-    });
-    pill.appendChild(previews);
+      .slice(0, 8);
+    ranked.forEach(seg => list.appendChild(_cleanupBuildSegRow(seg, member)));
+    if (member.segments.length > ranked.length) {
+      const more = document.createElement('div');
+      more.className = 'cleanup-seg-more';
+      more.textContent = `+${member.segments.length - ranked.length} more`;
+      list.appendChild(more);
+    }
+    inner.appendChild(list);
+    detail.appendChild(inner);
+    pill.appendChild(detail);
   }
 
   return pill;
+}
+
+function _cleanupPlayMember(member, btn) {
+  if (!member.segments || !member.segments.length) return;
+  _cleanupPlayQueue(member.segments, btn, { key: `member:${member.speaker_key}` });
 }
 
 function _fmtTime(sec) {
@@ -5054,74 +5552,99 @@ function _fmtTime(sec) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-function _cleanupPlaySegment(seg, btn) {
+/* ── Sequential segment player ─────────────────────────────────────────────
+ * Plays one or more segments back-to-back on the shared playback-audio and
+ * mirrors each onto the floating video popup when it's open. Re-invoking with
+ * the same `key` toggles off; starting a new queue stops the previous one. */
+
+function _cleanupClearPlayingButtons() {
+  document.querySelectorAll('.cleanup-play-btn.playing, .cleanup-seg-play.playing, .cleanup-selbar-btn.playing')
+    .forEach(b => b.classList.remove('playing'));
+}
+
+function _cleanupStopPlayback() {
   const audio = document.getElementById('playback-audio');
-  if (!audio || !_cleanupState) return;
-
-  // Stop anything currently previewing.
-  if (_cleanupPreviewStop) {
-    try { _cleanupPreviewStop.btn.classList.remove('playing'); } catch (_) {}
-    if (_cleanupPreviewStop.timer) clearTimeout(_cleanupPreviewStop.timer);
-    _cleanupPreviewStop = null;
-  }
-  // Detach any leftover segment-end handler. This element is the SHARED main
-  // playback-audio, so a stale handler bound to a previous segment's end would
-  // otherwise pause normal playback when the playhead crossed that old end.
-  if (audio._cleanupStopAt) {
-    audio.removeEventListener('timeupdate', audio._cleanupStopAt);
-    audio._cleanupStopAt = null;
-  }
-
-  // Toggle off if same button clicked while playing.
-  if (audio.dataset.cleanupActive === String(seg.start)) {
-    audio.pause();
+  if (_cleanupPlayQueueState && _cleanupPlayQueueState.timer) clearTimeout(_cleanupPlayQueueState.timer);
+  _cleanupPlayQueueState = null;
+  if (audio) {
+    if (audio._cleanupStopAt) { audio.removeEventListener('timeupdate', audio._cleanupStopAt); audio._cleanupStopAt = null; }
+    try { audio.pause(); } catch (_) {}
     audio.dataset.cleanupActive = '';
+  }
+  _cleanupClearPlayingButtons();
+  _cvStopPreview();   // park the floating video popup
+}
+
+// Light every button mapped to the active queue key (segment + member buttons
+// share data-seg-key values so the right control glows).
+function _cleanupSyncPlayButtons(key) {
+  _cleanupClearPlayingButtons();
+  if (!key) return;
+  document.querySelectorAll('[data-seg-key]').forEach(b => {
+    if (b.dataset.segKey === key) b.classList.add('playing');
+  });
+}
+
+function _cleanupPlayQueue(segs, btn, opts) {
+  opts = opts || {};
+  const audio = document.getElementById('playback-audio');
+  if (!audio || !_cleanupState || !segs || !segs.length) return;
+  const key = opts.key || segs.map(s => s.id).join(',');
+  // Toggle off if this exact queue is already playing.
+  if (_cleanupPlayQueueState && _cleanupPlayQueueState.key === key) {
+    _cleanupStopPlayback();
     return;
   }
-
+  _cleanupStopPlayback();
+  const ordered = [...segs].sort((a, b) => a.start - b.start);
+  _cleanupPlayQueueState = { btn: btn || null, segs: ordered, idx: 0, key, timer: 0 };
+  // Light matching data-seg-key controls first, then the explicit button (which
+  // may have no data-seg-key, e.g. the selection-bar Play button).
+  _cleanupSyncPlayButtons(key);
+  if (btn) btn.classList.add('playing');
   const src = `/api/sessions/${_cleanupState.sessionId}/audio`;
   if (audio.src.indexOf(src) === -1) audio.src = src;
-
-  const start = seg.start;
-  const end = seg.end;
-  audio.dataset.cleanupActive = String(start);
-  btn.classList.add('playing');
-
-  const onMeta = () => {
-    audio.currentTime = start;
-    audio.play().catch(() => { btn.classList.remove('playing'); });
-  };
-  if (isFinite(audio.duration) && audio.duration > 0) {
-    onMeta();
-  } else {
-    audio.addEventListener('loadedmetadata', onMeta, { once: true });
+  const onErr = () => _cleanupStopPlayback();   // don't leave the button stuck on a 404/decode error
+  const begin = () => { audio.removeEventListener('error', onErr); _cleanupPlayCurrent(); };
+  if (isFinite(audio.duration) && audio.duration > 0) begin();
+  else {
+    audio.addEventListener('loadedmetadata', begin, { once: true });
+    audio.addEventListener('error', onErr, { once: true });
     audio.load();
   }
+}
 
-  const clearStop = () => {
-    audio.removeEventListener('timeupdate', stopAt);
-    if (audio._cleanupStopAt === stopAt) audio._cleanupStopAt = null;
+function _cleanupPlayCurrent() {
+  const st = _cleanupPlayQueueState;
+  const audio = document.getElementById('playback-audio');
+  if (!st || !audio) return;
+  const seg = st.segs[st.idx];
+  if (!seg) { _cleanupStopPlayback(); return; }
+  if (audio._cleanupStopAt) { audio.removeEventListener('timeupdate', audio._cleanupStopAt); audio._cleanupStopAt = null; }
+  if (st.timer) { clearTimeout(st.timer); st.timer = 0; }
+  const start = seg.start, end = seg.end;
+  // Set the active flag BEFORE driving the video so its sync loop matches.
+  audio.dataset.cleanupActive = String(start);
+  try { audio.currentTime = start; } catch (_) {}
+  audio.play().catch(() => { _cleanupStopPlayback(); });
+
+  const advance = () => {
+    if (_cleanupPlayQueueState !== st) return;   // superseded by a newer queue
+    if (audio._cleanupStopAt) { audio.removeEventListener('timeupdate', audio._cleanupStopAt); audio._cleanupStopAt = null; }
+    if (st.timer) { clearTimeout(st.timer); st.timer = 0; }
+    st.idx += 1;
+    if (st.idx >= st.segs.length) _cleanupStopPlayback();
+    else _cleanupPlayCurrent();
   };
-  const stopAt = () => {
-    if (audio.currentTime >= end) {
-      audio.pause();
-      btn.classList.remove('playing');
-      audio.dataset.cleanupActive = '';
-      clearStop();
-    }
-  };
+  const stopAt = () => { if (audio.currentTime >= end) advance(); };
   audio._cleanupStopAt = stopAt;
   audio.addEventListener('timeupdate', stopAt);
+  // Safety net in case 'timeupdate' stops firing (tab blur, decode stall).
+  st.timer = setTimeout(advance, (end - start + 0.7) * 1000);
 
-  // Safety: hard stop after expected duration + 0.5s buffer.
-  const timer = setTimeout(() => {
-    audio.pause();
-    btn.classList.remove('playing');
-    audio.dataset.cleanupActive = '';
-    clearStop();
-  }, (end - start + 0.5) * 1000);
-
-  _cleanupPreviewStop = { btn, timer };
+  // Mirror onto the video popup when it's open.
+  const popup = _cleanupVideoPopupEl();
+  if (popup && !popup.hidden && _cleanupVideoAvailable()) _cleanupVideoPlaySegment(seg);
 }
 
 function _cleanupFindMember(speakerKey) {
@@ -5130,44 +5653,6 @@ function _cleanupFindMember(speakerKey) {
     if (idx >= 0) return { cluster: c, idx, member: c.members[idx] };
   }
   return null;
-}
-
-function _cleanupMoveMemberToCluster(speakerKey, destClusterId) {
-  const found = _cleanupFindMember(speakerKey);
-  if (!found) return;
-  if (found.cluster.cluster_id === destClusterId) return;
-  const dest = _cleanupState.clusters.find(c => c.cluster_id === destClusterId);
-  if (!dest) return;
-  const [member] = found.cluster.members.splice(found.idx, 1);
-  dest.members.push(member);
-  _cleanupState.noiseKeys.delete(speakerKey);  // moving out of noise
-  _cleanupGarbageCollectClusters();
-  _cleanupMarkDirty();
-  renderSpeakerClusters();
-}
-
-function _cleanupMoveMemberToNewCluster(speakerKey) {
-  const found = _cleanupFindMember(speakerKey);
-  if (!found) return;
-  // Don't create a new cluster if the speaker is already alone.
-  if (found.cluster.members.length === 1 && found.cluster.kind === 'unlabeled' && !found.cluster.global_id) return;
-  const [member] = found.cluster.members.splice(found.idx, 1);
-  const newId = `unlabeled:new:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
-  _cleanupState.clusters.push({
-    cluster_id: newId,
-    kind: 'unlabeled',
-    global_id: null,
-    new_name: '',
-    name: '',
-    color: null,
-    members: [member],
-    suggestion: null,
-    _dropped_suggestions: new Set(),
-  });
-  _cleanupState.noiseKeys.delete(speakerKey);
-  _cleanupGarbageCollectClusters();
-  _cleanupMarkDirty();
-  renderSpeakerClusters();
 }
 
 function _cleanupGarbageCollectClusters() {
@@ -5181,39 +5666,508 @@ function _cleanupGarbageCollectClusters() {
   });
 }
 
-function _cleanupToggleNoise(speakerKey) {
-  if (!_cleanupState) return;
-  if (_cleanupState.noiseKeys.has(speakerKey)) {
-    // Restore: move back into a fresh singleton cluster.
-    _cleanupState.noiseKeys.delete(speakerKey);
-    const member = _cleanupState.noiseMembers.get(speakerKey);
-    if (member) {
-      const newId = `unlabeled:restored:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
-      _cleanupState.clusters.push({
-        cluster_id: newId,
-        kind: 'unlabeled',
-        global_id: null,
-        new_name: '',
-        name: '',
-        color: null,
-        members: [member],
-        suggestion: null,
-        _dropped_suggestions: new Set(),
-      });
-      _cleanupState.noiseMembers.delete(speakerKey);
-    }
-  } else {
-    // Mark noise: lift member out of its cluster, cache for possible restore.
-    const found = _cleanupFindMember(speakerKey);
-    if (found) {
-      const [member] = found.cluster.members.splice(found.idx, 1);
-      _cleanupState.noiseMembers.set(speakerKey, member);
-    }
-    _cleanupState.noiseKeys.add(speakerKey);
-    _cleanupGarbageCollectClusters();
+function _cleanupBlankCluster(members, tag) {
+  return {
+    cluster_id: `unlabeled:${tag}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
+    kind: 'unlabeled', global_id: null, new_name: '', name: '', color: null,
+    members: members || [], suggestion: null, _dropped_suggestions: new Set(),
+  };
+}
+
+// Pull a member out of wherever it lives (cluster or noise bucket) and return
+// it, clearing the noise flag. Returns null if the key is unknown.
+function _cleanupDetachMember(key) {
+  const found = _cleanupFindMember(key);
+  let member = null;
+  if (found) { [member] = found.cluster.members.splice(found.idx, 1); }
+  else if (_cleanupState.noiseMembers.has(key)) {
+    member = _cleanupState.noiseMembers.get(key);
+    _cleanupState.noiseMembers.delete(key);
   }
+  _cleanupState.noiseKeys.delete(key);
+  return member;
+}
+
+function _cleanupNextColor() {
+  const used = new Set(_cleanupState.clusters.map(c => c.color).filter(Boolean));
+  for (const col of _SPEAKER_PALETTE) if (!used.has(col)) return col;
+  return _SPEAKER_PALETTE[Math.floor(Math.random() * _SPEAKER_PALETTE.length)];
+}
+
+// ── Bulk moves (multi-select aware) ────────────────────────────────────────
+
+function _cleanupMoveKeysToCluster(keys, destClusterId) {
+  const dest = _cleanupState.clusters.find(c => c.cluster_id === destClusterId);
+  if (!dest) return;
+  let moved = 0;
+  keys.forEach(k => {
+    const found = _cleanupFindMember(k);
+    if (found && found.cluster.cluster_id === destClusterId) return;  // already here
+    const member = _cleanupDetachMember(k);
+    if (member) { dest.members.push(member); moved++; }
+  });
+  if (!moved) return;
+  _cleanupGarbageCollectClusters();
+  _cleanupClearSelection();
   _cleanupMarkDirty();
   renderSpeakerClusters();
+}
+
+function _cleanupMoveKeysToNewCluster(keys) {
+  const members = keys.map(k => _cleanupDetachMember(k)).filter(Boolean);
+  if (!members.length) return;
+  _cleanupState.clusters.push(_cleanupBlankCluster(members, 'new'));
+  _cleanupGarbageCollectClusters();
+  _cleanupClearSelection();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupMarkKeysNoise(keys) {
+  let changed = 0;
+  keys.forEach(k => {
+    if (_cleanupState.noiseKeys.has(k)) return;
+    const found = _cleanupFindMember(k);
+    if (found) {
+      const [member] = found.cluster.members.splice(found.idx, 1);
+      _cleanupState.noiseMembers.set(k, member);
+    }
+    _cleanupState.noiseKeys.add(k);
+    changed++;
+  });
+  if (!changed) return;
+  _cleanupGarbageCollectClusters();
+  _cleanupClearSelection();
+  _cleanupNoiseExpanded = true;
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupRestoreKeys(keys) {
+  const restored = [];
+  keys.forEach(k => {
+    if (!_cleanupState.noiseKeys.has(k)) return;
+    const m = _cleanupDetachMember(k);
+    if (m) restored.push(m);
+  });
+  if (!restored.length) return;
+  // Each restored speaker starts in its own group (preserves prior behaviour).
+  restored.forEach(m => _cleanupState.clusters.push(_cleanupBlankCluster([m], 'restored')));
+  _cleanupClearSelection();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+// ── Selection-bar actions ───────────────────────────────────────────────────
+
+function _cleanupSelectionNewCluster() {
+  if (_cleanupSelectedKeys.size) _cleanupMoveKeysToNewCluster(Array.from(_cleanupSelectedKeys));
+}
+
+function _cleanupSelectionToggleNoise() {
+  const keys = Array.from(_cleanupSelectedKeys);
+  if (!keys.length) return;
+  if (keys.every(k => _cleanupState.noiseKeys.has(k))) _cleanupRestoreKeys(keys);
+  else _cleanupMarkKeysNoise(keys);
+}
+
+function _cleanupSelectionPlay() {
+  const keys = Array.from(_cleanupSelectedKeys);
+  if (!keys.length) return;
+  const segs = [];
+  keys.forEach(k => { const m = _cleanupGetMember(k); if (m) segs.push(...m.segments); });
+  if (!segs.length) return;
+  const btn = document.getElementById('cleanup-selbar-play');
+  _cleanupPlayQueue(segs, btn, { key: `sel:${keys.slice().sort().join(',')}` });
+}
+
+function _cleanupSelectionAssign(e) {
+  if (e) e.stopPropagation();
+  if (!_cleanupSelectedKeys.size) return;
+  _cleanupOpenPicker(document.getElementById('cleanup-selbar-assign'), { keys: Array.from(_cleanupSelectedKeys) });
+}
+
+// ── Assignment (cluster + key-set targets) ──────────────────────────────────
+
+function _cleanupAssignClusterToProfile(cluster, profile) {
+  const existing = _cleanupState.clusters.find(c => c !== cluster && c.global_id === profile.global_id);
+  if (existing) {
+    existing.members.push(...cluster.members);
+    cluster.members = [];
+    _cleanupGarbageCollectClusters();
+  } else {
+    cluster.global_id = profile.global_id;
+    cluster.name = profile.name;
+    cluster.color = profile.color;
+    cluster.kind = 'labeled';
+    cluster.new_name = '';
+    cluster._dropped_suggestions = new Set();
+  }
+  _cleanupClosePicker();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupAssignClusterToNewName(cluster, name, color) {
+  cluster.global_id = null;
+  cluster.kind = 'unlabeled';
+  cluster.new_name = name;
+  cluster.name = name;
+  cluster.color = color || cluster.color || _cleanupNextColor();
+  _cleanupClosePicker();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupUnassignCluster(cluster) {
+  cluster.global_id = null;
+  cluster.kind = 'unlabeled';
+  cluster.name = '';
+  cluster.new_name = '';
+  cluster.color = null;
+  cluster._dropped_suggestions = new Set();
+  _cleanupClosePicker();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupAssignKeysToProfile(keys, profile) {
+  const members = keys.map(k => _cleanupDetachMember(k)).filter(Boolean);
+  if (!members.length) { _cleanupClosePicker(); return; }
+  let target = _cleanupState.clusters.find(c => c.global_id === profile.global_id);
+  if (!target) {
+    target = _cleanupBlankCluster([], 'profile');
+    target.global_id = profile.global_id;
+    target.name = profile.name;
+    target.color = profile.color;
+    target.kind = 'labeled';
+    _cleanupState.clusters.push(target);
+  }
+  target.members.push(...members);
+  _cleanupGarbageCollectClusters();
+  _cleanupClosePicker();
+  _cleanupClearSelection();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+function _cleanupAssignKeysToNewName(keys, name, color) {
+  const members = keys.map(k => _cleanupDetachMember(k)).filter(Boolean);
+  if (!members.length) { _cleanupClosePicker(); return; }
+  const cl = _cleanupBlankCluster(members, 'new');
+  cl.new_name = name;
+  cl.name = name;
+  cl.color = color || _cleanupNextColor();
+  _cleanupState.clusters.push(cl);
+  _cleanupGarbageCollectClusters();
+  _cleanupClosePicker();
+  _cleanupClearSelection();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+// ── Voice-library picker popover ────────────────────────────────────────────
+
+function _cleanupCombinedCentroid(keys) {
+  let sum = null, totalW = 0;
+  keys.forEach(k => {
+    const m = _cleanupGetMember(k);
+    if (!m || !m.centroid) return;
+    const w = Math.max(m.emb_count, 1);
+    if (!sum) sum = new Float32Array(m.centroid.length);
+    for (let i = 0; i < sum.length; i++) sum[i] += m.centroid[i] * w;
+    totalW += w;
+  });
+  if (!sum || !totalW) return null;
+  let norm = 0;
+  for (let i = 0; i < sum.length; i++) norm += sum[i] * sum[i];
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < sum.length; i++) sum[i] /= norm;
+  return sum;
+}
+
+function _cleanupRankLibrary(centroid) {
+  const out = _cleanupState.library.map(g => {
+    let sim = null;
+    if (centroid && g.centroid) {
+      sim = 0;
+      for (let i = 0; i < centroid.length; i++) sim += centroid[i] * g.centroid[i];
+    }
+    return { global_id: g.global_id, name: g.name, color: g.color, emb_count: g.emb_count, similarity: sim };
+  });
+  out.sort((a, b) => {
+    if (a.similarity == null && b.similarity == null) return a.name.localeCompare(b.name);
+    if (a.similarity == null) return 1;
+    if (b.similarity == null) return -1;
+    return b.similarity - a.similarity;
+  });
+  return out;
+}
+
+function _cleanupClosePicker() {
+  if (_cleanupPicker) { _cleanupPicker.remove(); _cleanupPicker = null; }
+  document.removeEventListener('mousedown', _cleanupPickerOutside, true);
+  document.removeEventListener('keydown', _cleanupPickerKey, true);
+}
+function _cleanupPickerOutside(e) {
+  if (_cleanupPicker && !_cleanupPicker.contains(e.target)) _cleanupClosePicker();
+}
+function _cleanupPickerKey(e) {
+  if (e.key === 'Escape') { e.preventDefault(); _cleanupClosePicker(); }
+}
+
+function _cleanupOpenPicker(anchorEl, target) {
+  _cleanupClosePicker();
+  const cluster = target.cluster || null;
+  const keys = target.keys || (cluster ? cluster.members.map(m => m.speaker_key) : []);
+  let centroid;
+  if (cluster) { _cleanupRecomputeClusterCentroid(cluster); centroid = cluster._centroid; }
+  else centroid = _cleanupCombinedCentroid(keys);
+  const currentGid = cluster ? cluster.global_id : null;
+
+  const pop = document.createElement('div');
+  pop.className = 'cleanup-picker';
+
+  const search = document.createElement('input');
+  search.className = 'cleanup-picker-search';
+  search.type = 'text';
+  search.placeholder = 'Search profiles or type a new name…';
+  pop.appendChild(search);
+
+  // No embeddings → no similarity ranking. Say so rather than silently dropping
+  // the percentages, so the user knows why matches aren't ranked.
+  if (!centroid) {
+    const sub = document.createElement('div');
+    sub.className = 'cleanup-picker-subtitle';
+    sub.innerHTML = '<i class="fa-solid fa-circle-info"></i> No voice samples here — profiles aren’t ranked by similarity.';
+    pop.appendChild(sub);
+  }
+
+  const listWrap = document.createElement('div');
+  listWrap.className = 'cleanup-picker-list';
+  pop.appendChild(listWrap);
+
+  const choose = (chooser) => chooser();
+  const render = () => {
+    const q = search.value.trim();
+    const ql = q.toLowerCase();
+    listWrap.innerHTML = '';
+    const ranked = _cleanupRankLibrary(centroid).filter(p => !ql || p.name.toLowerCase().includes(ql));
+    const exact = ranked.find(p => p.name.toLowerCase() === ql);
+    if (q && !exact) {
+      const create = document.createElement('button');
+      create.className = 'cleanup-picker-item create';
+      create.innerHTML =
+        `<span class="cleanup-picker-dot" style="background:${_cleanupNextColor()}"></span>` +
+        `<span class="nm">Create “${escapeHtml(q)}”</span>` +
+        `<span class="cleanup-picker-go"><i class="fa-solid fa-plus"></i> New</span>`;
+      create.addEventListener('click', () => choose(() => _cleanupPickerChooseNew(target, q)));
+      listWrap.appendChild(create);
+    }
+    if (!ranked.length && !q) {
+      const empty = document.createElement('div');
+      empty.className = 'cleanup-picker-empty';
+      empty.textContent = 'No saved voice profiles yet — type a name to create one.';
+      listWrap.appendChild(empty);
+    }
+    ranked.forEach(p => {
+      const item = document.createElement('button');
+      item.className = 'cleanup-picker-item' + (p.global_id === currentGid ? ' current' : '');
+      const simHtml = p.similarity != null
+        ? `<span class="cleanup-picker-sim${p.similarity >= _cleanupState.thresholds.auto ? ' high' : (p.similarity >= _cleanupState.thresholds.suggest ? ' mid' : '')}">${Math.round(p.similarity * 100)}%</span>`
+        : '';
+      item.innerHTML =
+        `<span class="cleanup-picker-dot" style="background:${p.color || '#6e7681'}"></span>` +
+        `<span class="nm">${escapeHtml(p.name)}</span>` +
+        `<span class="cleanup-picker-embs" title="voice samples on file">${p.emb_count || 0}</span>` +
+        simHtml;
+      item.addEventListener('click', () => choose(() => _cleanupPickerChooseProfile(target, p)));
+      listWrap.appendChild(item);
+    });
+  };
+
+  if (cluster && cluster.global_id) {
+    const foot = document.createElement('div');
+    foot.className = 'cleanup-picker-foot';
+    const un = document.createElement('button');
+    un.className = 'cleanup-picker-unassign';
+    un.innerHTML = '<i class="fa-solid fa-link-slash"></i> Unassign (make unnamed)';
+    un.addEventListener('click', () => _cleanupUnassignCluster(cluster));
+    foot.appendChild(un);
+    pop.appendChild(foot);
+  }
+
+  search.addEventListener('input', render);
+  search.addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const first = listWrap.querySelector('.cleanup-picker-item');
+      if (first) first.click();
+    }
+  });
+
+  document.body.appendChild(pop);
+  _cleanupPicker = pop;
+  _cleanupPositionPicker(pop, anchorEl);
+  render();
+  setTimeout(() => search.focus(), 0);
+  document.addEventListener('mousedown', _cleanupPickerOutside, true);
+  document.addEventListener('keydown', _cleanupPickerKey, true);
+}
+
+function _cleanupPickerChooseProfile(target, profile) {
+  if (target.cluster) _cleanupAssignClusterToProfile(target.cluster, profile);
+  else _cleanupAssignKeysToProfile(target.keys, profile);
+}
+function _cleanupPickerChooseNew(target, name) {
+  const color = _cleanupNextColor();
+  if (target.cluster) _cleanupAssignClusterToNewName(target.cluster, name, color);
+  else _cleanupAssignKeysToNewName(target.keys, name, color);
+}
+
+function _cleanupPositionPicker(pop, anchorEl) {
+  const r = anchorEl ? anchorEl.getBoundingClientRect()
+                     : { left: window.innerWidth / 2 - 140, right: 0, top: 120, bottom: 120 };
+  const pw = pop.offsetWidth || 300;
+  const ph = pop.offsetHeight || 340;
+  let left = r.left;
+  let top = r.bottom + 6;
+  if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+  if (left < 8) left = 8;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 6);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+// ── Similarity heatmap ──────────────────────────────────────────────────────
+
+function _cleanupTrunc(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+function _cleanupHeatColor(s) {
+  // Map similarity 0.4..1.0 onto a dim→hot ramp; below 0.4 stays cool.
+  const t = Math.max(0, Math.min(1, (s - 0.4) / 0.6));
+  const r = Math.round(40 + t * 200);
+  const g = Math.round(55 + t * 70);
+  const b = Math.round(85 + (1 - t) * 95);
+  const a = 0.16 + t * 0.72;
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function _cleanupHeatCell(cls) {
+  const d = document.createElement('div');
+  d.className = `cleanup-heat-${cls}`;
+  return d;
+}
+
+function _cleanupRenderHeatmap(wrap) {
+  wrap.innerHTML = '';
+  const entities = _cleanupState.clusters
+    .filter(c => c.members.length)
+    .map(c => {
+      _cleanupRecomputeClusterCentroid(c);
+      const label = c.kind === 'labeled' ? (c.name || '(unnamed)')
+                                         : (c.new_name || c.members[0].speaker_key);
+      const color = c.color || (c.members[0] && c.members[0].color) || '#6e7681';
+      return { cluster: c, label, color, centroid: c._centroid };
+    })
+    .filter(e => e.centroid);
+
+  const head = document.createElement('div');
+  head.className = 'cleanup-heatmap-head';
+  head.innerHTML = '<i class="fa-solid fa-circle-info"></i> Voice similarity between groups. Hot off-diagonal cells are likely the same person — click one to select both groups and merge them.';
+  wrap.appendChild(head);
+
+  if (entities.length < 2) {
+    const note = document.createElement('div');
+    note.className = 'cleanup-help';
+    note.textContent = 'Need at least two groups with voice embeddings to compare.';
+    wrap.appendChild(note);
+    return;
+  }
+
+  const n = entities.length;
+  const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+
+  const table = document.createElement('div');
+  table.className = 'cleanup-heatmap';
+  table.style.setProperty('--n', n);
+
+  table.appendChild(_cleanupHeatCell('corner'));
+  entities.forEach(e => {
+    const c = _cleanupHeatCell('colhead');
+    c.innerHTML = `<span class="cleanup-heat-collabel" title="${escapeHtml(e.label)}">${escapeHtml(_cleanupTrunc(e.label, 12))}</span>`;
+    c.style.setProperty('--c', e.color);
+    table.appendChild(c);
+  });
+
+  entities.forEach((er, i) => {
+    const rh = _cleanupHeatCell('rowhead');
+    rh.innerHTML = `<span class="cleanup-heat-dot" style="background:${er.color}"></span><span class="cleanup-heat-rowlabel" title="${escapeHtml(er.label)}">${escapeHtml(_cleanupTrunc(er.label, 16))}</span>`;
+    table.appendChild(rh);
+    entities.forEach((ec, j) => {
+      const s = i === j ? 1 : dot(er.centroid, ec.centroid);
+      const cell = _cleanupHeatCell('cell');
+      cell.style.background = i === j ? 'var(--surface3)' : _cleanupHeatColor(s);
+      cell.textContent = i === j ? '·' : String(Math.round(s * 100));
+      cell.title = `${er.label} ↔ ${ec.label}: ${(s * 100).toFixed(0)}%`;
+      if (i !== j) {
+        cell.classList.add('clickable');
+        if (s >= _cleanupState.thresholds.cluster) cell.classList.add('hot');
+        cell.addEventListener('click', () => {
+          _cleanupShowHeatmap = false;
+          _cleanupSelectedKeys = new Set([
+            ...er.cluster.members.map(m => m.speaker_key),
+            ...ec.cluster.members.map(m => m.speaker_key),
+          ]);
+          _cleanupSelAnchor = null;
+          renderSpeakerClusters();
+          const first = document.querySelector('#cleanup-grid .cleanup-member.selected');
+          if (first) first.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        });
+      }
+      table.appendChild(cell);
+    });
+  });
+  wrap.appendChild(table);
+}
+
+function toggleCleanupHeatmap() {
+  _cleanupShowHeatmap = !_cleanupShowHeatmap;
+  _cleanupClosePicker();
+  renderSpeakerClusters();
+}
+
+// ── Drag-autoscroll (so you can drag across a tall widget) ───────────────────
+
+let _cleanupAutoscrollRAF = 0;
+let _cleanupAutoscrollDir = 0;
+
+function _cleanupWireGridAutoscroll() {
+  const scroll = document.getElementById('cleanup-scroll');
+  if (!scroll || scroll._autoscrollWired) return;
+  scroll._autoscrollWired = true;
+  scroll.addEventListener('dragover', e => {
+    if (!_cleanupDragKeys.length) { _cleanupStopAutoscroll(); return; }
+    const r = scroll.getBoundingClientRect();
+    const edge = 56;
+    if (e.clientY < r.top + edge) _cleanupAutoscrollDir = -1;
+    else if (e.clientY > r.bottom - edge) _cleanupAutoscrollDir = 1;
+    else _cleanupAutoscrollDir = 0;
+    if (_cleanupAutoscrollDir && !_cleanupAutoscrollRAF) _cleanupAutoscrollStep();
+  });
+  scroll.addEventListener('drop', _cleanupStopAutoscroll);
+}
+
+function _cleanupAutoscrollStep() {
+  const scroll = document.getElementById('cleanup-scroll');
+  if (!scroll || !_cleanupDragKeys.length || !_cleanupAutoscrollDir) { _cleanupAutoscrollRAF = 0; return; }
+  scroll.scrollTop += _cleanupAutoscrollDir * 16;
+  _cleanupAutoscrollRAF = requestAnimationFrame(_cleanupAutoscrollStep);
+}
+
+function _cleanupStopAutoscroll() {
+  _cleanupAutoscrollDir = 0;
+  if (_cleanupAutoscrollRAF) { cancelAnimationFrame(_cleanupAutoscrollRAF); _cleanupAutoscrollRAF = 0; }
 }
 
 function toggleCleanupNoiseExpanded() {
@@ -5225,15 +6179,30 @@ function applyConfidentCleanupMatches() {
   if (!_cleanupState) return;
   const auto = _cleanupState.thresholds.auto;
   let applied = 0;
-  for (const c of _cleanupState.clusters) {
-    if (c.kind !== 'unlabeled' || c.global_id) continue;
-    if (c.suggestion && c.suggestion.similarity >= auto) {
-      c.global_id = c.suggestion.global_id;
-      c.name = c.suggestion.name;
-      c.color = c.suggestion.color;
+  let guard = 0;
+  // Re-evaluate suggestions between assignments so a profile that just got
+  // claimed is excluded from the next cluster's candidates (no duplicates).
+  while (guard++ < 200) {
+    _cleanupState.clusters.forEach(_cleanupUpdateSuggestion);
+    const c = _cleanupState.clusters.find(
+      x => x.kind === 'unlabeled' && !x.global_id && x.members.length &&
+           x.suggestion && x.suggestion.similarity >= auto,
+    );
+    if (!c) break;
+    const profile = c.suggestion;
+    const existing = _cleanupState.clusters.find(x => x !== c && x.global_id === profile.global_id);
+    if (existing) {
+      existing.members.push(...c.members);
+      c.members = [];
+      _cleanupGarbageCollectClusters();
+    } else {
+      c.global_id = profile.global_id;
+      c.name = profile.name;
+      c.color = profile.color;
       c.kind = 'labeled';
-      applied++;
+      c.new_name = '';
     }
+    applied++;
   }
   if (applied) {
     _cleanupMarkDirty();
@@ -5249,22 +6218,57 @@ function resetSpeakerCleanup() {
 async function applySpeakerCleanup() {
   if (!_cleanupState || !_cleanupState.dirty) return;
   const sid = _cleanupState.sessionId;
+  const snap = _cleanupState.originalSnapshot || {};
+  const visibleKeys = c => c.members
+    .filter(m => !_cleanupState.noiseKeys.has(m.speaker_key))
+    .map(m => m.speaker_key);
+
+  // Guard: a multi-speaker group with no name (and no library profile) can't be
+  // persisted as a merge — the backend keys identity on a profile, so an unnamed
+  // group would be silently split back into individual speakers. Make the user
+  // name it (or assign a profile) instead of dropping their grouping.
+  const unnamedMerges = _cleanupState.clusters.filter(
+    c => !c.global_id && !(c.new_name || '').trim() && visibleKeys(c).length > 1,
+  );
+  if (unnamedMerges.length) {
+    alert(
+      'Name these grouped speakers before applying — a merged group needs a name ' +
+      '(or an existing voice profile) to be saved:\n\n' +
+      unnamedMerges.map(c => '•  ' + visibleKeys(c).join('  +  ')).join('\n') +
+      '\n\nClick “Assign” on each group to name it.',
+    );
+    return;
+  }
+
   const applyBtn = document.getElementById('cleanup-apply-btn');
   if (applyBtn) { applyBtn.disabled = true; applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Applying…'; }
 
+  // Only unlabeled/unnamed members that were ORIGINALLY linked to a profile or
+  // marked noise need to be sent (so the backend unlinks / un-noises them).
+  // Members that were already plain "Speaker N" are left untouched — sending
+  // them would reset a manual label and churn the DB for no reason.
+  const wasProfileLinked = k => {
+    const o = snap[k];
+    return !!(o && typeof o.cluster_id === 'string' && o.cluster_id.indexOf('profile:') === 0);
+  };
+  const wasNoise = k => { const o = snap[k]; return !!(o && o.is_noise); };
+
   const proposed = [];
   for (const c of _cleanupState.clusters) {
-    // Skip empty clusters that aren't doing anything.
-    if (!c.members.length && c.kind !== 'labeled') continue;
-    const visible = c.members
-      .filter(m => !_cleanupState.noiseKeys.has(m.speaker_key))
-      .map(m => m.speaker_key);
-    proposed.push({
-      global_id: c.global_id || null,
-      new_name:  c.global_id ? null : (c.new_name || '').trim() || null,
-      color:     c.color || null,
-      member_keys: visible,
-    });
+    const visible = visibleKeys(c);
+    if (c.global_id) {
+      // Existing profile → relink every member to it.
+      proposed.push({ global_id: c.global_id, new_name: null, color: c.color || null, member_keys: visible });
+    } else if ((c.new_name || '').trim()) {
+      // New profile from a typed name.
+      proposed.push({ global_id: null, new_name: c.new_name.trim(), color: c.color || null, member_keys: visible });
+    } else {
+      // Unlabeled + unnamed → send only the members that need a DB change.
+      const toReset = visible.filter(k => wasProfileLinked(k) || wasNoise(k));
+      if (toReset.length) {
+        proposed.push({ global_id: null, new_name: null, color: null, member_keys: toReset });
+      }
+    }
   }
   const noise_keys = Array.from(_cleanupState.noiseKeys);
 
@@ -5277,13 +6281,13 @@ async function applySpeakerCleanup() {
     const data = await resp.json();
     if (!resp.ok) {
       alert(`Apply failed: ${data.error || resp.status}`);
-      if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply changes'; }
+      if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply'; }
       return;
     }
     // Refresh from server to pick up canonical names/links + show the new state.
     _cleanupState = null;
     await loadSpeakerClusters(true);
-    if (applyBtn) { applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply changes'; applyBtn.disabled = true; }
+    if (applyBtn) { applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply'; applyBtn.disabled = true; }
     const reset = document.getElementById('cleanup-reset-btn');
     if (reset) reset.disabled = true;
     // Refresh transcript / sidebar speaker pills so they reflect new labels.
@@ -5295,7 +6299,7 @@ async function applySpeakerCleanup() {
     } catch (_) {}
   } catch (e) {
     alert(`Apply failed: ${e.message}`);
-    if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply changes'; }
+    if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply'; }
   }
 }
 
@@ -5359,22 +6363,30 @@ function _cleanupVideoUpdateTime() {
 function _cleanupVideoApplySavedPosition() {
   const popup = _cleanupVideoPopupEl();
   if (!popup) return;
+  const popupW = popup.offsetWidth  || 360;
+  const popupH = popup.offsetHeight || 240;
   const pos = (typeof _prefs !== 'undefined' && _prefs.cleanup_video_pos) || null;
   if (pos && typeof pos === 'object'
       && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
-    popup.style.left   = `${pos.left}px`;
-    popup.style.top    = `${pos.top}px`;
+    // Clamp the restored geometry into the *current* viewport. A position
+    // saved on a larger monitor (or before the window shrank) used to land
+    // off-screen, so the popup "opened" but was never visible — the reported
+    // bug. Clamp size first, then the top-left, so it's always reachable.
+    let w = Math.min(Number.isFinite(pos.width)  ? pos.width  : popupW, window.innerWidth  - 16);
+    let h = Math.min(Number.isFinite(pos.height) ? pos.height : popupH, window.innerHeight - 16);
+    const left = Math.max(8, Math.min(pos.left, window.innerWidth  - w - 8));
+    const top  = Math.max(8, Math.min(pos.top,  window.innerHeight - h - 8));
+    popup.style.width  = `${w}px`;
+    popup.style.height = `${h}px`;
+    popup.style.left   = `${left}px`;
+    popup.style.top    = `${top}px`;
     popup.style.right  = 'auto';
-    if (Number.isFinite(pos.width))  popup.style.width  = `${pos.width}px`;
-    if (Number.isFinite(pos.height)) popup.style.height = `${pos.height}px`;
     return;
   }
   // No saved position — anchor to the LEFT of the speaker manager dialog so
-  // the user can see both panes at once. Fall back to top-right if there
-  // isn't enough room on the left.
+  // the user can see both panes at once. Fall back to the right side, then to
+  // an explicit top-right corner.
   const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
-  const popupW = popup.offsetWidth  || 360;
-  const popupH = popup.offsetHeight || 240;
   if (dialog) {
     const dr = dialog.getBoundingClientRect();
     const gap = 16;
@@ -5385,7 +6397,6 @@ function _cleanupVideoApplySavedPosition() {
       popup.style.right = 'auto';
       return;
     }
-    // Not enough room on the left — try the right side of the dialog.
     const rightLeft = dr.right + gap;
     if (rightLeft + popupW <= window.innerWidth - 8) {
       popup.style.left  = `${rightLeft}px`;
@@ -5394,7 +6405,11 @@ function _cleanupVideoApplySavedPosition() {
       return;
     }
   }
-  // Default: stay top-right via the CSS rule (right: 24px, top: 80px).
+  // Default: explicit top-right (don't rely on the CSS rule alone — a prior
+  // inline left/top could otherwise leave it parked off-screen).
+  popup.style.left  = 'auto';
+  popup.style.right = '24px';
+  popup.style.top   = '80px';
 }
 
 function _cleanupVideoSavePosition() {
@@ -5423,7 +6438,10 @@ function _cleanupVideoSyncToggleBtn() {
 }
 
 function showCleanupVideoPopup() {
-  if (!_cleanupVideoAvailable()) return;
+  if (!_cleanupVideoAvailable()) {
+    if (typeof flashStatus === 'function') flashStatus('No screen recording for this session');
+    return;
+  }
   const popup = _cleanupVideoPopupEl();
   if (!popup) return;
   if (!_cleanupVideoEnsureLoaded()) return;
@@ -5527,6 +6545,9 @@ function _cvStopPreview() {
     try { v.pause(); } catch (_) {}
     if (Math.abs(v.playbackRate - 1) > 1e-3) v.playbackRate = 1;
   }
+  // Restore the idle prompt so the popup never looks like a dead black box.
+  const idle = document.getElementById('cleanup-video-idle');
+  if (idle) idle.hidden = false;
 }
 
 // Per-frame sync: track the master audio clock. The audio's cleanupActive flag
@@ -5554,7 +6575,7 @@ function _cvSyncLoop() {
       const signed = v.currentTime - expected;     // + ahead of audio, - behind
       const adrift = Math.abs(signed);
       if (adrift >= _VS.HARD_DRIFT) {
-        if (_cvHardSeek(expected, false)) { _cvRAF = requestAnimationFrame(_cvSyncLoop); return; }
+        if (_cvHardSeek(expected, false)) { if (_cvRAF === 0) _cvRAF = requestAnimationFrame(_cvSyncLoop); return; }
       }
       if (v.paused) v.play().catch(() => {});
       let corr = 0;
@@ -5566,7 +6587,8 @@ function _cvSyncLoop() {
       if (Math.abs(v.playbackRate - want) > 1e-3) v.playbackRate = want;
     }
   }
-  _cvRAF = requestAnimationFrame(_cvSyncLoop);
+  // Guard against a concurrent restart having already scheduled a frame.
+  if (_cvRAF === 0) _cvRAF = requestAnimationFrame(_cvSyncLoop);
 }
 
 function _cleanupVideoPlaySegment(seg) {
@@ -5575,15 +6597,18 @@ function _cleanupVideoPlaySegment(seg) {
   if (popup.hidden) showCleanupVideoPopup();
   const video = _cleanupVideoEl();
   const noseek = document.getElementById('cleanup-video-noseek');
+  const idle = document.getElementById('cleanup-video-idle');
   const offset = typeof _videoOffset === 'number' ? _videoOffset : 0;
   const vStart = seg.start - offset;
   const vEnd = seg.end - offset;
   if (vEnd <= 0 || (isFinite(video.duration) && vStart >= video.duration)) {
+    _cvStopPreview();              // parks video + re-shows idle prompt
+    if (idle) idle.hidden = true;  // ...but the no-video notice takes over here
     if (noseek) noseek.hidden = false;
-    _cvStopPreview();
     return true;  // we handled it (even if we couldn't seek)
   }
   if (noseek) noseek.hidden = true;
+  if (idle) idle.hidden = true;
 
   // Retire any legacy per-video stop handler still attached from older builds;
   // the audio clock bounds the segment now, so a video-time stop would fight it.
@@ -5752,42 +6777,12 @@ function _cleanupVideoEnsureDragWired() {
   });
 }
 
-// Hook into existing _cleanupPlaySegment so when the video popup is open we
-// play the WAV (authoritative audio) AND seek the muted video alongside it.
-// Screen recordings frequently have no audio track, so we never rely on the
-// video for sound.
-const _origCleanupPlaySegment = _cleanupPlaySegment;
-_cleanupPlaySegment = function (seg, btn) {
-  _cleanupVideoEnsureDragWired();
-  const popup = _cleanupVideoPopupEl();
-  const videoOpen = popup && !popup.hidden && _cleanupVideoAvailable();
-  // Always run the WAV-based preview — it handles button toggling, stop-at-end
-  // logic, and works whether or not the video popup is open.
-  _origCleanupPlaySegment(seg, btn);
-  if (!videoOpen) return;
-  // Mirror the WAV's play/pause state on the muted video. The original
-  // function toggles audio.dataset.cleanupActive based on whether playback
-  // started or stopped — read it back to know which path we took.
-  const audio = document.getElementById('playback-audio');
-  const v = _cleanupVideoEl();
-  if (!v) return;
-  if (audio && audio.dataset.cleanupActive === String(seg.start)) {
-    _cleanupVideoPlaySegment(seg);
-  } else {
-    _cvStopPreview();
-  }
-};
-
-// Reset auto-open flag when session changes (so a new session can opt-in again).
-const _cleanupSwitchTabOrig = switchSpeakerManagerTab;
-switchSpeakerManagerTab = function (tab) {
-  _cleanupSwitchTabOrig(tab);
-  if (tab === 'cleanup') {
-    _cleanupVideoSyncToggleBtn();
-  } else {
-    // Don't kill the popup when leaving the tab — let user keep it parked.
-  }
-};
+// NOTE: video mirroring is now driven directly inside the sequential player
+// (`_cleanupPlayCurrent`), which seeks the muted popup video alongside the WAV
+// whenever the popup is open. Screen recordings frequently have no audio track,
+// so the WAV is always the authoritative clock. (The old _cleanupPlaySegment
+// monkey-patch and the switchSpeakerManagerTab wrapper were folded in there and
+// into switchSpeakerManagerTab respectively.)
 
 // Dirty guard — both for page unload and for the modal close handler.
 window.addEventListener('beforeunload', e => {
@@ -5806,8 +6801,10 @@ closeSpeakerManager = function () {
     if (!confirm('You have unsaved cleanup changes. Close anyway?')) return;
     _cleanupState.dirty = false;
   }
-  // Close the floating video popup too — it's part of the same workspace.
+  // Tear down the floating workspace bits — popup, picker, any preview audio.
   try {
+    _cleanupClosePicker();
+    _cleanupStopPlayback();
     const popup = document.getElementById('cleanup-video-popup');
     if (popup && !popup.hidden) closeCleanupVideoPopup();
   } catch (_) {}
@@ -7418,6 +8415,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
       ? `Saved voice profile: ${_sessionLinks[source].name || source}`
       : 'Click to rename';
     // Show original key (with alias) when toggle is active, unless per-segment override
+    const isMe = _isMeSpeaker(source);
     if (_showOriginalKeys && !labelOverride) {
       _setBadgeLabel(badge, source);
     } else {
@@ -7427,17 +8425,31 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
     badge.style.color = color;
     badge.style.borderColor = color + '60';
 
-    // Inline identify icon for unlinked speakers
-    const idIcon = document.createElement('i');
-    idIcon.className = 'fa-solid fa-fingerprint speaker-identify-icon';
-    const suggestion = _fpGetSuggestion(source);
-    if (suggestion) {
-      idIcon.classList.add('has-suggestion');
-      idIcon.title = `Sounds like ${suggestion.matches[0].name} (${Math.round(suggestion.matches[0].similarity * 100)}%)`;
+    if (isMe) {
+      // Local-only "(You)" indicator. Never baked into the stored/exported name
+      // — keyed on the local Me id so imported foreign mic segments aren't badged.
+      badge.classList.add('src-me');
+      const you = document.createElement('span');
+      you.className = 'badge-you';
+      you.textContent = ' (You)';
+      you.style.opacity = '.7';
+      you.style.fontWeight = '500';
+      badge.appendChild(you);
+      badge.title = 'Your microphone audio. Click to change your speaker name.';
     } else {
-      idIcon.title = 'Identify speaker';
+      // Inline identify icon for unlinked speakers (never for the Me speaker —
+      // mic audio is always you and is never fingerprinted/identified).
+      const idIcon = document.createElement('i');
+      idIcon.className = 'fa-solid fa-fingerprint speaker-identify-icon';
+      const suggestion = _fpGetSuggestion(source);
+      if (suggestion) {
+        idIcon.classList.add('has-suggestion');
+        idIcon.title = `Sounds like ${suggestion.matches[0].name} (${Math.round(suggestion.matches[0].similarity * 100)}%)`;
+      } else {
+        idIcon.title = 'Identify speaker';
+      }
+      badge.appendChild(idIcon);
     }
-    badge.appendChild(idIcon);
 
     badge.addEventListener('click', e => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) {
@@ -7446,6 +8458,8 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
         _toggleTranscriptSegSelection(seg, { range: e.shiftKey });
         return;
       }
+      // The Me speaker opens the identity dialog (rename is retroactive).
+      if (isMe) { e.stopPropagation(); _showMeSpeakerPopup(); return; }
       // If clicking the identify icon and there's a suggestion, open the panel
       if (e.target.closest('.speaker-identify-icon') && _fpGetSuggestion(source)) {
         const panel = document.getElementById('fp-notif-panel');
@@ -7575,6 +8589,9 @@ function editSpeakerLabel(badge, speakerKey) {
       const name = (sp.name || '').trim();
       if (!name || meetingNameSet.has(name.toLowerCase())) return;
       if (name.toLowerCase() === currentName.toLowerCase()) return;
+      // Never offer the "You" (Me) profile as a label for a desktop speaker —
+      // mic audio is the only thing that is ever you.
+      if (window._meSpeakerGlobalId && sp.id === window._meSpeakerGlobalId) return;
       const opt = document.createElement('button');
       opt.className = 'speaker-picker-opt speaker-picker-vl-opt';
       opt.dataset.optName = name.toLowerCase();
@@ -8145,6 +9162,21 @@ function applyTranscriptFilter() {
   _visibleRangesCache = null;  // filter changed - invalidate cached ranges
   _tnHighlightMatches();
   _refreshMinimap(true);
+}
+
+// The time-range slider fires dozens-to-hundreds of 'input' events per drag, and
+// each applyTranscriptFilter() does three O(N) passes over the transcript. Coalesce
+// the heavy work behind one trailing animation frame so a whole drag costs one
+// filter pass, not 3N per pixel. Module-scoped (not inside _tnRefreshTimeRange,
+// which clones+rebinds the sliders) so a rebind can't leave competing timers.
+let _tnFilterRaf = 0;
+function _tnScheduleFilter() {
+  if (_tnFilterRaf) return;
+  _tnFilterRaf = requestAnimationFrame(() => {
+    _tnFilterRaf = 0;
+    applyTranscriptFilter();
+    _updateFilterBtnState();
+  });
 }
 
 function _updateFilterBtnState() {
@@ -8741,10 +9773,11 @@ function _tnRefreshTimeRange() {
   newMin.addEventListener('input', () => {
     if (parseFloat(newMin.value) > parseFloat(newMax.value)) newMin.value = newMax.value;
     _transcriptFilter.timeMin = parseFloat(newMin.value);
+    // Cheap visuals stay synchronous so the thumb/fill/labels track at 60fps…
     _tnUpdateRangeFill();
     _tnUpdateTimeLabels();
-    applyTranscriptFilter();
-    _updateFilterBtnState();
+    // …only the heavy O(N) filter is coalesced to one frame.
+    _tnScheduleFilter();
   });
   newMax.addEventListener('input', () => {
     if (parseFloat(newMax.value) < parseFloat(newMin.value)) newMax.value = newMin.value;
@@ -8754,9 +9787,12 @@ function _tnRefreshTimeRange() {
     _transcriptFilter.timeMax = atEnd ? Infinity : parseFloat(newMax.value);
     _tnUpdateRangeFill();
     _tnUpdateTimeLabels();
-    applyTranscriptFilter();
-    _updateFilterBtnState();
+    _tnScheduleFilter();
   });
+  // Pointer-up flush so the final position always applies even if the last
+  // 'input' frame was already in flight.
+  newMin.addEventListener('change', _tnScheduleFilter);
+  newMax.addEventListener('change', _tnScheduleFilter);
 }
 
 // Called when new segments arrive during live recording to extend the slider
@@ -12871,12 +13907,28 @@ async function loadSession(sessionId) {
   // Load pending speaker suggestions
   _fpLoadSuggestions();
 
-  // Render segments in chunks to keep the UI responsive on large transcripts.
+  // Render the transcript WITHOUT blocking the lighter Summary/Chat panes below.
+  // On a long session the chunked render spans many frames; awaiting it here used
+  // to leave Summary and Chat empty until the whole transcript finished. Instead
+  // we kick it off and let the cheap panes paint in this same synchronous tick,
+  // so all three come alive together and the transcript fills in progressively.
+  // (No `await` runs between the generation check above and the pane renders, so
+  // the cancellation guard still holds — a newer load can't interleave here.)
   const segments = data.segments || [];
   const CHUNK = 150;  // segments per animation frame
 
+  // The pending search highlight needs the transcript DOM, so it runs once the
+  // transcript is actually rendered (covers both the async and sync branches).
+  const _afterTranscriptRender = () => {
+    if (_pendingSearchHighlight) {
+      const hl = _pendingSearchHighlight;
+      _pendingSearchHighlight = null;
+      requestAnimationFrame(() => _executeSearchHighlight(hl));
+    }
+  };
+
   if (segments.length > CHUNK) {
-    // Show loading hint and render in async chunks
+    // Show loading hint and render in async chunks (does NOT block the panes below)
     const transcriptEl = document.getElementById('transcript');
     transcriptEl.innerHTML = '';
     const loadingHint = document.createElement('p');
@@ -12885,29 +13937,26 @@ async function loadSession(sessionId) {
     transcriptEl.appendChild(loadingHint);
 
     _bulkLoading = true;
-    const completed = await _renderSegmentsChunked(segments, CHUNK, loadingHint, gen);
-    _bulkLoading = false;
-    if (!completed) return;  // load was cancelled by a newer loadSession call
-    _finishBulkLoad();
+    _renderSegmentsChunked(segments, CHUNK, loadingHint, gen).then(completed => {
+      _bulkLoading = false;
+      if (!completed) return;  // load was cancelled by a newer loadSession call
+      _finishBulkLoad();
+      _afterTranscriptRender();
+    });
   } else {
     // Small transcript - render synchronously (fast enough)
     segments.forEach(s =>
       appendTranscript(s.text, s.source_override || s.source || 'loopback', s.start_time, s.end_time,
                        s.id, s.label_override, s.source_override ? s.source : null)
     );
+    _afterTranscriptRender();
   }
 
-  // Handle pending search highlight - scroll to and flash the matching segment
-  if (_pendingSearchHighlight) {
-    const hl = _pendingSearchHighlight;
-    _pendingSearchHighlight = null;
-    requestAnimationFrame(() => _executeSearchHighlight(hl));
-  }
-
-  // Restore summary prompt for this session
+  // Restore summary prompt for this session (fire-and-forget so it can't wedge a
+  // network round-trip in front of the Summary/Chat render).
   const storedPrompt = localStorage.getItem('summary-prompt:' + sessionId) || '';
   _applyPromptText(storedPrompt);
-  await fetch('/api/custom-prompt', {
+  fetch('/api/custom-prompt', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ custom_prompt: storedPrompt }),
@@ -12916,6 +13965,24 @@ async function loadSession(sessionId) {
   // Show playback bar if audio is available
   if (data.has_audio) initPlayback(sessionId);
   if (data.has_video) initVideo(sessionId, data.video_offset);
+  // Keep the cleanup video toggle in sync with the freshly-loaded session's
+  // video availability (e.g. switching to a no-video session with the speaker
+  // manager left open).
+  if (typeof _cleanupVideoSyncToggleBtn === 'function') _cleanupVideoSyncToggleBtn();
+  // Invalidate any cached cleanup clusters from the previous session — otherwise
+  // reopening the Cleanup tab would show the old session's speakers.
+  if (_cleanupState && _cleanupState.sessionId !== sessionId) {
+    _cleanupState = null;
+    try { _cleanupStopPlayback(); _cleanupClosePicker(); } catch (_) {}
+    _cleanupSelectedKeys = new Set();
+    _cleanupSelAnchor = null;
+    _cleanupExpandedKeys = new Set();
+    _cleanupShowHeatmap = false;
+    const overlay = document.getElementById('speaker-manager-overlay');
+    if (_cleanupActiveTab === 'cleanup' && overlay && !overlay.classList.contains('hidden')) {
+      loadSpeakerClusters();  // manager is open on Cleanup — refetch for the new session now
+    }
+  }
 
   if (data.summary) {
     const sumEl = document.getElementById('summary');
@@ -13020,7 +14087,12 @@ function _renderSegmentsChunked(segments, chunkSize, loadingHint, gen) {
 function _finishBulkLoad() {
   _tnExtendTimeRange();
   applyTranscriptFilter();
-  _highlightSelectedSpeakerBadges();
+  // On a fresh load nothing is selected (clearAll cleared it), so this whole
+  // O(N) per-segment querySelector pass would just toggle a class off on every
+  // badge that never had it. Skip it when the selection is empty. (Keep the
+  // unconditional calls on the real select/deselect paths — they must run with
+  // an empty set to clear stale highlights.)
+  if (_selectedSpeakerKeys.length) _highlightSelectedSpeakerBadges();
   if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
     renderSpeakerManager();
   }
@@ -13124,7 +14196,13 @@ async function doUpdateRestart() {
       return;
     }
   } catch {}
+  let attempts = 0;
   const poll = setInterval(async () => {
+    if (++attempts > 60) {   // give up after ~2 min so we don't poll forever
+      clearInterval(poll);
+      screen.subtitleEl.textContent = 'Still waiting. Refresh the page once the server is back.';
+      return;
+    }
     try {
       const r = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
       if (r.ok) { clearInterval(poll); location.reload(); }
@@ -13234,8 +14312,14 @@ function _showTransitionScreen(title, subtitle) {
 async function doRestart() {
   document.querySelector('.overlay')?.remove();
   await fetch('/api/restart', { method: 'POST' }).catch(() => {});
-  _showTransitionScreen('Restarting\u2026', 'The page will reload when the server is back.');
+  const screen = _showTransitionScreen('Restarting\u2026', 'The page will reload when the server is back.');
+  let attempts = 0;
   const poll = setInterval(async () => {
+    if (++attempts > 60) {   // give up after ~2 min so we don't poll forever
+      clearInterval(poll);
+      screen.subtitleEl.textContent = 'Still waiting. Refresh the page once the server is back.';
+      return;
+    }
     try {
       const r = await fetch('/api/status', { signal: AbortSignal.timeout(2000) });
       if (r.ok) { clearInterval(poll); location.reload(); }
@@ -14510,6 +15594,14 @@ let vizMicSpec = [];
 const vizLbBars  = new Float32Array(N_BARS);
 const vizMicBars = new Float32Array(N_BARS);
 
+// Each visualizer loop self-suspends once levels have fully settled to zero so
+// it isn't burning a canvas redraw every frame while idle. The rAF id is 0 when
+// parked; the kick helpers re-arm it idempotently when fresh audio arrives.
+let _vizRAF = 0, _bvRAF = 0;
+let _vizFrame = null, _bvFrame = null;
+function _startVizLoop()      { if (!_vizRAF && _vizFrame) _vizRAF = requestAnimationFrame(_vizFrame); }
+function _startBrandVizLoop() { if (!_bvRAF && _bvFrame) _bvRAF = requestAnimationFrame(_bvFrame); }
+
 function updateLevelMeters(lb, mic, hasMic) {
   const toH = v => Math.round(Math.min(100, Math.log1p(v * 60) / Math.log1p(60) * 100));
   const lbEl  = document.getElementById('viz-meter-lb');
@@ -14529,17 +15621,18 @@ function startVizLoop() {
   if (!canvas) return;
 
   const dpr = window.devicePixelRatio || 1;
+  const ctx = canvas.getContext('2d');
   const resize = () => {
     canvas.width  = canvas.offsetWidth  * dpr;
     canvas.height = canvas.offsetHeight * dpr;
   };
   resize();
-  new ResizeObserver(resize).observe(canvas);
+  // Re-kick after a resize so a parked (idle) loop repaints into the new bitmap.
+  new ResizeObserver(() => { resize(); _startVizLoop(); }).observe(canvas);
 
-  requestAnimationFrame(function loop() {
-    requestAnimationFrame(loop);
+  _vizFrame = function vizFrame() {
+    _vizRAF = 0;
 
-    const ctx = canvas.getContext('2d');
     const w   = canvas.width  / dpr;
     const h   = canvas.height / dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -14605,7 +15698,20 @@ function startVizLoop() {
     ctx.moveTo(0, midY);
     ctx.lineTo(w, midY);
     ctx.stroke();
-  });
+
+    // Re-arm only while something is still moving: levels, their targets, or the
+    // smoothed bars mid-decay. Checking the targets too keeps a freshly-arrived
+    // signal alive until the bars visibly fall to zero (never freeze mid-decay).
+    let settled = vizLbTarget < 0.002 && vizMicTarget < 0.002 &&
+                  vizLb < 0.002 && vizMic < 0.002;
+    if (settled) {
+      for (let i = 0; i < N_BARS; i++) {
+        if (vizLbBars[i] > 0.004 || vizMicBars[i] > 0.004) { settled = false; break; }
+      }
+    }
+    if (!settled && !document.hidden) _vizRAF = requestAnimationFrame(_vizFrame);
+  };
+  _startVizLoop();   // kick once so any initial decay settles, then it parks
 }
 
 /* ── Brand horizontal visualizer (bars extend left/right from logo) ──────── */
@@ -14614,21 +15720,22 @@ function startBrandVizLoop() {
   if (!canvas) return;
 
   const dpr = window.devicePixelRatio || 1;
+  const ctx = canvas.getContext('2d');
   const resize = () => {
     canvas.width  = canvas.offsetWidth  * dpr;
     canvas.height = canvas.offsetHeight * dpr;
   };
   resize();
-  new ResizeObserver(resize).observe(canvas);
+  // Re-kick after a resize so a parked (idle) loop repaints into the new bitmap.
+  new ResizeObserver(() => { resize(); _startBrandVizLoop(); }).observe(canvas);
 
   // Separate smoothed bars so brand viz can animate independently
   const bvLbBars  = new Float32Array(N_BARS);
   const bvMicBars = new Float32Array(N_BARS);
 
-  requestAnimationFrame(function loop() {
-    requestAnimationFrame(loop);
+  _bvFrame = function bvFrame() {
+    _bvRAF = 0;
 
-    const ctx = canvas.getContext('2d');
     const w   = canvas.width  / dpr;
     const h   = canvas.height / dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -14690,7 +15797,18 @@ function startBrandVizLoop() {
         ctx.fillRect(cx + logoHalfW, y, bw, bh);
       }
     }
-  });
+
+    // Park once levels, targets, and the smoothed bars have all settled to zero.
+    let settled = vizLbTarget < 0.002 && vizMicTarget < 0.002 &&
+                  vizLb < 0.002 && vizMic < 0.002;
+    if (settled) {
+      for (let i = 0; i < N_BARS; i++) {
+        if (bvLbBars[i] > 0.004 || bvMicBars[i] > 0.004) { settled = false; break; }
+      }
+    }
+    if (!settled && !document.hidden) _bvRAF = requestAnimationFrame(_bvFrame);
+  };
+  _startBrandVizLoop();   // kick once so any initial decay settles, then it parks
 }
 
 /* ── Gain controls ───────────────────────────────────────────────────────── */
@@ -14995,6 +16113,7 @@ async function openSettings() {
     _renderQuietReminderSettings();
     _renderMeetingDetectSettings();
     _renderWarpSettings();
+    _renderMicIsMeSettings();
   } catch (_) {}
 
   // Startup toggle (Windows only - hidden on unsupported platforms)
@@ -15076,6 +16195,29 @@ function _renderWarpSettings() {
 function saveWarpSettings() {
   const updates = {
     warp_toggle_enabled: document.getElementById('warp-toggle-enabled')?.checked === true,
+  };
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
+}
+
+function _renderMicIsMeSettings() {
+  const enabled = document.getElementById('mic-is-me-enabled');
+  if (enabled) enabled.checked = _prefs.mic_is_me_enabled !== false;  // default on
+  const cur = document.getElementById('me-speaker-current');
+  if (cur) {
+    cur.textContent = window._meSpeakerName
+      ? `You: ${window._meSpeakerName}`
+      : 'Not set yet — your mic uses a default "You" label until you choose.';
+  }
+}
+
+function saveMicIsMeSettings() {
+  const updates = {
+    mic_is_me_enabled: document.getElementById('mic-is-me-enabled')?.checked === true,
   };
   Object.assign(_prefs, updates);
   fetch('/api/preferences', {
@@ -17198,7 +18340,8 @@ if (!_isHomePage) {
   // Auto-scroll behavior:
   // - Live recording: disable when user scrolls up, re-enable at bottom
   // - Playback: disable on user-initiated scroll only, re-enable via button click
-  document.getElementById('transcript').addEventListener('scroll', () => {
+  const _transcriptEl = document.getElementById('transcript');
+  if (_transcriptEl) _transcriptEl.addEventListener('scroll', () => {
     // Ignore programmatic scrolls (from playback tracking, seek, button clicks, etc.)
     if (_programmaticScrollCount > 0) return;
 
@@ -17209,15 +18352,14 @@ if (!_isHomePage) {
         updateAutoScrollBtn();
       }
     } else {
-      // Live mode: re-enable at bottom
-      const el = document.getElementById('transcript');
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      // Live mode: re-enable at bottom (reuse the captured element, no re-query)
+      const atBottom = _transcriptEl.scrollHeight - _transcriptEl.scrollTop - _transcriptEl.clientHeight < 40;
       if (_autoScroll !== atBottom) {
         _autoScroll = atBottom;
         updateAutoScrollBtn();
       }
     }
-  });
+  }, { passive: true });
 }
 
 // Import drag-and-drop init
@@ -17260,6 +18402,14 @@ fetch('/api/ai_settings')
 
 startVizLoop();
 if (!_isHomePage) startBrandVizLoop();
+// Returning to a foreground tab re-kicks the parked loops; they re-evaluate the
+// settled state on the first frame and immediately re-park if levels are zero.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    _startVizLoop();
+    if (!_isHomePage) _startBrandVizLoop();
+  }
+});
 initGainSliders();
 _restoreSidebarPanes();
 

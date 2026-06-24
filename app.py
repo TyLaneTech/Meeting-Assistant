@@ -55,7 +55,7 @@ from capture_audio.params import (
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
 from capture_video import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, kill_stale_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
-from ml.speaker_db import SpeakerFingerprintDB
+from ml.speaker_db import SpeakerFingerprintDB, ME_SPEAKER_KEY
 from ml import text_embeddings as text_embeddings
 from ml.transcriber import (
     DIARIZER_OPTIONS,
@@ -83,6 +83,7 @@ fingerprint_db = SpeakerFingerprintDB.__new__(SpeakerFingerprintDB)
 fingerprint_db._db_path   = storage.DB_PATH
 fingerprint_db._ready     = False
 fingerprint_db._inference = None
+fingerprint_db._me_id     = None   # set via _sync_me_id() once __init__ runs
 
 # ── Global singletons ─────────────────────────────────────────────────────────
 
@@ -170,6 +171,13 @@ _startup_init_started = False
 AUTO_SUMMARY_EVERY = 6  # trigger summary after this many new segments
 _CUSTOM_SPEAKER_PREFIX = "custom:"
 
+# Reserved speaker key for microphone audio. When the "mic is me" feature is on,
+# every microphone segment is tagged with this key (never a diarized "Speaker N")
+# and linked to the user's chosen "Me" global profile. See ml/speaker_db.py
+# (purge_global_speaker_embeddings) and the mic-stream path in ml/transcriber.py.
+# Canonical definition lives in ml/speaker_db.py; aliased here for readability.
+ME_KEY = ME_SPEAKER_KEY
+
 
 def _refresh_tray() -> None:
     """Update tray icon/menu if a tray is running. Safe to call from any thread."""
@@ -253,6 +261,17 @@ def _status_payload(extra: dict | None = None) -> dict:
         recording_ready, recording_ready_reason = _recording_prereqs_locked()
     payload["recording_ready"] = recording_ready
     payload["recording_ready_reason"] = recording_ready_reason
+
+    # "Me" speaker (microphone = app user). me_speaker is null until chosen; the
+    # client uses me_prompt_pending to decide whether to show the first-run popup.
+    me_speaker = _resolve_me_speaker()
+    payload["me_speaker"] = me_speaker
+    payload["me_prompt_pending"] = bool(
+        _me_feature_enabled()
+        and me_speaker is None
+        and not settings.get("me_speaker_prompt_dismissed", False)
+    )
+
     if extra:
         payload.update(extra)
     return payload
@@ -268,6 +287,10 @@ _SOURCE_LABELS = {
     "loopback": "Desktop",
     "mic":      "Mic",
     "both":     "Desktop+Mic",
+    # Fallback display for the reserved mic ("me") key when no speaker_labels
+    # row resolves it (e.g. a brief window before the row is written). Normally
+    # the linked "Me" profile name wins via the speaker_labels lookup above.
+    ME_KEY:     "Me",
 }
 
 def _fmt_time(seconds: float) -> str:
@@ -797,6 +820,9 @@ def _load_diarizer() -> None:
 def _load_fingerprint_db() -> None:
     """Load the speaker embedding model. Called after all module globals are set."""
     fingerprint_db.__init__(storage.DB_PATH, os.getenv("HUGGING_FACE_KEY", ""))
+    # Register the "Me" speaker guard so its profile stays embedding-free even
+    # before the first recording (e.g. an import that arrives at startup).
+    _sync_me_id()
     # Wire callback if diarizer already finished loading before we did
     with _state_lock:
         diarizer_ready = _state.get("diarizer_ready", False)
@@ -1012,6 +1038,76 @@ def _meeting_detect_loop() -> None:
 threading.Thread(target=_meeting_detect_loop, daemon=True).start()
 
 
+# ── "Me" speaker (microphone = app user) ──────────────────────────────────────
+
+def _me_feature_enabled() -> bool:
+    """True when mic audio should be attributed to the Me speaker."""
+    return bool(settings.get("mic_is_me_enabled", True)) and fingerprint_db.ready
+
+
+def _sync_me_id() -> str | None:
+    """Push the configured Me global_id into the fingerprint DB guard so its
+    profile is kept embedding-free. Clears a dangling id (deleted profile).
+    Returns the resolved id (or None)."""
+    me_id = settings.get("me_speaker_global_id")
+    if me_id and fingerprint_db.ready and fingerprint_db.get_global_speaker(me_id) is None:
+        settings.put("me_speaker_global_id", None)
+        me_id = None
+    try:
+        fingerprint_db.set_me_id(me_id)
+    except Exception:
+        pass
+    return me_id
+
+
+def _resolve_me_speaker() -> dict | None:
+    """Return {global_id, name, color} for the current Me speaker, or None if
+    unset/missing. Read-only — does not create anything."""
+    me_id = settings.get("me_speaker_global_id")
+    if not me_id or not fingerprint_db.ready:
+        return None
+    prof = fingerprint_db.get_global_speaker(me_id)
+    if prof is None:
+        return None
+    return {"global_id": prof["id"], "name": prof["name"], "color": prof.get("color")}
+
+
+def _ensure_me_profile() -> dict | None:
+    """Ensure a Me global profile exists, is registered as the embedding-free
+    Me speaker, and is persisted. Reuses the chosen profile, else an existing
+    "You" profile, else creates one. Idempotent. Returns {global_id, name, color}
+    or None when the feature/DB is unavailable."""
+    if not fingerprint_db.ready:
+        return None
+    me_id = settings.get("me_speaker_global_id")
+    prof = fingerprint_db.get_global_speaker(me_id) if me_id else None
+    if prof is None:
+        prof = fingerprint_db.find_by_name("You")
+        if prof is None:
+            gid = fingerprint_db.create_global_speaker("You")
+            prof = fingerprint_db.get_global_speaker(gid)
+        settings.put("me_speaker_global_id", prof["id"])
+    fingerprint_db.set_me_id(prof["id"])
+    # Backstop: keep the Me profile embedding-free so it never matches desktop
+    # speakers. Only writes when something actually accrued.
+    if prof.get("emb_count"):
+        fingerprint_db.purge_global_speaker_embeddings(prof["id"])
+    return {"global_id": prof["id"], "name": prof["name"], "color": prof.get("color")}
+
+
+def _set_me_speaker(global_id: str) -> dict | None:
+    """Designate an existing profile as Me: persist, register the guard, and
+    purge its voice embeddings so it can never be matched against desktop
+    speakers. Returns {global_id, name, color} or None."""
+    prof = fingerprint_db.get_global_speaker(global_id)
+    if prof is None:
+        return None
+    settings.put("me_speaker_global_id", global_id)
+    fingerprint_db.set_me_id(global_id)
+    fingerprint_db.purge_global_speaker_embeddings(global_id)
+    return {"global_id": prof["id"], "name": prof["name"], "color": prof.get("color")}
+
+
 # ── Speaker fingerprint helpers ───────────────────────────────────────────────
 
 def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, session_id: str) -> None:
@@ -1019,6 +1115,9 @@ def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, sess
     global_id = match["global_id"]
     name  = match["name"]
     color = match.get("color")
+    # The Me speaker must never auto-link or accumulate embeddings.
+    if speaker_key == ME_KEY or (fingerprint_db._me_id and global_id == fingerprint_db._me_id):
+        return
     fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0)
     fingerprint_db.link_session_speaker(session_id, speaker_key, global_id)
     storage.save_speaker_label(session_id, speaker_key, name=name, color=color)
@@ -1040,6 +1139,11 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
     Accumulates audio per speaker_key; extracts embeddings once MIN_DURATION_SEC reached.
     """
     if not fingerprint_db.ready:
+        return
+    # The microphone ("Me") speaker is never fingerprinted: its audio is always
+    # the app user, and its profile must stay embedding-free so it can't be
+    # matched against desktop speakers.
+    if speaker_key == ME_KEY:
         return
     duration = abs_end - abs_start
     if duration <= 0 or audio is None or len(audio) == 0:
@@ -1103,6 +1207,11 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
             log.warn("fingerprint", f"add_unlabeled_embedding failed: {e}")
 
         excluded = dismissals.get(speaker_key, set()) | other_links
+        # Never suggest the "You" (Me) profile for a desktop speaker. The purge
+        # already drops it from find_matches (NULL centroid); this is an explicit
+        # backstop in case it ever holds a centroid.
+        if fingerprint_db._me_id:
+            excluded = excluded | {fingerprint_db._me_id}
 
         # Diagnostic: pull top candidates regardless of threshold so we can see
         # *why* a speaker isn't getting matched (closest profile sim too low,
@@ -1564,6 +1673,11 @@ def start_recording():
     capture.agc_max_gain = float(_ec_params.get("agc_max_gain", 4.0))
     capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
 
+    # "Mic = Me": when on and a mic is present, the capture writes per-source
+    # tracks so mic audio is always the app user and only desktop is diarized.
+    _mic_present = mic_device is not None and int(mic_device) != -1
+    capture.mic_is_me_enabled = bool(_me_feature_enabled() and _mic_present)
+
     # Set up WAV recording - append to existing file on resume
     wav_dir = paths.audio_dir()
     wav_path = str(wav_dir / f"{session_id}.wav")
@@ -1579,6 +1693,24 @@ def start_recording():
         if not resume_session_id:
             storage.end_session(session_id)
         return jsonify({"error": str(e)}), 500
+
+    # Activate the "Me" mic stream only when the capture actually produced
+    # per-source tracks (Windows + mic present). On platforms/paths without
+    # per-source capture, me_label stays None and the transcriber runs the
+    # legacy single mixed-stream path.
+    _me_profile = None
+    if getattr(capture, "_per_source_active", False):
+        _me_profile = _ensure_me_profile()
+    if _me_profile:
+        _transcriber.me_label = ME_KEY
+        # Seed the session label row so "me" segments resolve to the Me name and
+        # so a later rename propagates retroactively via rename_global_speaker.
+        storage.save_speaker_label(session_id, ME_KEY,
+                                   name=_me_profile["name"], color=_me_profile["color"])
+        fingerprint_db.link_session_speaker(session_id, ME_KEY, _me_profile["global_id"])
+        existing_labels[ME_KEY] = _me_profile["name"]
+    else:
+        _transcriber.me_label = None
 
     _transcriber.start(capture.sample_rate, capture.channels,
                        next_speaker_label=next_speaker_label)
@@ -4714,6 +4846,23 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 raw = live.get("delta_new", 0.5) * 0.75
                 params["reanalysis_clustering_threshold"] = max(0.35, min(0.75, raw))
 
+            # Source-aware ("mic = Me") reanalysis. When per-source tracks exist
+            # for this recording, the batch pipeline diarizes only the desktop
+            # track and attributes the mic track to the Me speaker. Re-seed the
+            # "me" label row (it was cleared by reset_session_transcript) so the
+            # segments resolve to the Me name and a later rename stays retroactive.
+            me_profile = _ensure_me_profile() if _me_feature_enabled() else None
+            if me_profile:
+                params["me_label"] = ME_KEY
+                params.setdefault("silence_threshold",
+                                  resolve_audio_params().get("silence_threshold", 0.008))
+                storage.save_speaker_label(session_id, ME_KEY,
+                                           name=me_profile["name"], color=me_profile["color"])
+                fingerprint_db.link_session_speaker(session_id, ME_KEY, me_profile["global_id"])
+                with _state_lock:
+                    if _state["session_id"] == session_id:
+                        _state["speaker_labels"][ME_KEY] = me_profile["name"]
+
             batch = BatchTranscriber(
                 on_text_callback=_on_segment,
                 fingerprint_callback=_on_fingerprint_audio if fingerprint_db.ready else None,
@@ -5393,6 +5542,14 @@ def _import_speaker_embeddings(session_id: str, pkg: dict) -> None:
             if not global_name:
                 continue
 
+            # Never import/link the reserved microphone ("me") key. A foreign
+            # recording's mic audio is the *exporter's* voice; it must keep its
+            # baked-in name and stay unlinked so it never adopts this importer's
+            # "Me" identity or "(You)" badge. (Me profiles are purged on export,
+            # so this is normally a no-op, but guard defensively.)
+            if speaker_key == ME_KEY:
+                continue
+
             # Find or create a matching global speaker profile
             existing = fingerprint_db.find_by_name(global_name)
             if existing:
@@ -5476,6 +5633,72 @@ def fp_delete_speaker(global_id: str):
     if not fingerprint_db.ready:
         return _fp_unavailable()
     fingerprint_db.delete_global_speaker(global_id)
+    # If the deleted profile was the Me speaker, clear the setting + guard and
+    # re-arm the first-run prompt.
+    if settings.get("me_speaker_global_id") == global_id:
+        settings.put("me_speaker_global_id", None)
+        settings.put("me_speaker_prompt_dismissed", False)
+        fingerprint_db.set_me_id(None)
+        _push_status()
+    return jsonify({"ok": True})
+
+
+# ── "Me" speaker onboarding ───────────────────────────────────────────────────
+
+@app.route("/api/onboarding/me-speaker", methods=["POST"])
+def set_me_speaker():
+    """Designate the Me speaker (microphone = app user). Body:
+      {"mode": "existing", "global_id": "<id>"}  -> use + purge that profile
+      {"mode": "name", "name": "Ty"}              -> reuse-by-name or create
+    Purges the chosen profile's voice embeddings so it never matches desktop
+    speakers."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "").strip()
+    profile = None
+    if mode == "existing":
+        gid = (data.get("global_id") or "").strip()
+        if not gid:
+            return jsonify({"error": "global_id is required"}), 400
+        profile = _set_me_speaker(gid)
+        if profile is None:
+            return jsonify({"error": "speaker not found"}), 404
+    elif mode == "name":
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        existing = fingerprint_db.find_by_name(name)
+        if existing is not None:
+            profile = _set_me_speaker(existing["id"])
+        else:
+            gid = fingerprint_db.create_global_speaker(name)
+            profile = _set_me_speaker(gid)
+    else:
+        return jsonify({"error": "mode must be 'existing' or 'name'"}), 400
+
+    settings.put("me_speaker_prompt_dismissed", True)
+    # If a recording is live, retro-link the mic key to the chosen profile and
+    # push the label so existing "me" segments resolve to the new name.
+    with _state_lock:
+        sid = _state.get("session_id") if _state.get("is_recording") else None
+    if sid and profile:
+        storage.save_speaker_label(sid, ME_KEY, name=profile["name"], color=profile["color"])
+        fingerprint_db.link_session_speaker(sid, ME_KEY, profile["global_id"])
+        with _state_lock:
+            if _state.get("session_id") == sid:
+                _state["speaker_labels"][ME_KEY] = profile["name"]
+        _push("speaker_label", {"session_id": sid, "speaker_key": ME_KEY,
+                                "name": profile["name"], "color": profile["color"]})
+    _push_status()
+    return jsonify({"ok": True, "me_speaker": profile})
+
+
+@app.route("/api/onboarding/skip", methods=["POST"])
+def skip_me_speaker():
+    """Dismiss the first-run Me-speaker popup (non-blocking)."""
+    settings.put("me_speaker_prompt_dismissed", True)
+    _push_status()
     return jsonify({"ok": True})
 
 

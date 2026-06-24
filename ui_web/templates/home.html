@@ -8,9 +8,12 @@
   <link rel="stylesheet" href="/static/fontAwesome/css/all.min.css">
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" id="hljs-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <!-- highlight.js and morphdom are only used at runtime (code-block highlight,
+       chat morph), so defer them off the first-paint critical path. marked must
+       stay synchronous: app.js and home.js call marked.use() at parse time. -->
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/morphdom@2/dist/morphdom-umd.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/morphdom@2/dist/morphdom-umd.min.js"></script>
   <script>
     // Apply saved theme synchronously (pre-paint) to avoid flash-of-wrong-theme.
     (function () {

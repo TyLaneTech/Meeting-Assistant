@@ -108,6 +108,29 @@ class BatchTranscriber:
 
         log.info("batch", f"Device: {device}")
 
+        # ── Source-aware path ("mic = Me") ────────────────────────────────────
+        # When per-source tracks exist (recorded with the feature on), diarize
+        # ONLY the desktop track and attribute the whole mic track to the Me
+        # speaker. Falls back to the mixed path for old recordings.
+        me_label = params.get("me_label")
+        if me_label:
+            ps = self._per_source_inputs(wav_path)
+            if ps is not None:
+                desktop_audio, mic_audio = ps
+                total_duration = max(len(desktop_audio), len(mic_audio)) / TARGET_RATE
+                log.info("batch", f"Per-source reanalysis: desktop "
+                         f"{len(desktop_audio)/TARGET_RATE:.1f}s + mic "
+                         f"{len(mic_audio)/TARGET_RATE:.1f}s")
+                self._report_progress(0.05)
+                self._process_per_source(
+                    desktop_audio, mic_audio, params, me_label,
+                    torch_device, device, total_duration)
+                self._report_progress(1.0)
+                log.info("batch", "Reanalysis complete (source-aware).")
+                return
+            log.info("batch", "No per-source tracks found - using mixed audio "
+                     "(this recording predates source-aware capture).")
+
         # ── Load audio ────────────────────────────────────────────────────────
         log.info("batch", f"Loading audio: {wav_path}")
         audio, original_rate = _load_audio(wav_path)
@@ -146,6 +169,159 @@ class BatchTranscriber:
         self._report_progress(1.0)
 
         log.info("batch", "Reanalysis complete.")
+
+    # ── Source-aware ("mic = Me") reanalysis ──────────────────────────────────
+
+    @staticmethod
+    def _per_source_opus_paths(wav_path: str) -> tuple[str, str]:
+        root = wav_path[:-4] if wav_path.lower().endswith(".wav") else wav_path
+        return root + "_desktop.opus", root + "_mic.opus"
+
+    def _per_source_inputs(self, wav_path: str):
+        """If both per-source Opus tracks exist beside ``wav_path``, decode them
+        to 16 kHz mono numpy and return (desktop_audio, mic_audio); else None.
+        Also accepts leftover temp WAVs (e.g. an interrupted encode)."""
+        desktop_opus, mic_opus = self._per_source_opus_paths(wav_path)
+        root = wav_path[:-4] if wav_path.lower().endswith(".wav") else wav_path
+        desktop_src = desktop_opus if os.path.isfile(desktop_opus) else (
+            root + "_desktop.wav" if os.path.isfile(root + "_desktop.wav") else None)
+        mic_src = mic_opus if os.path.isfile(mic_opus) else (
+            root + "_mic.wav" if os.path.isfile(root + "_mic.wav") else None)
+        if not desktop_src or not mic_src:
+            return None
+        desktop_audio = self._decode_to_array(desktop_src)
+        mic_audio = self._decode_to_array(mic_src)
+        if desktop_audio is None or mic_audio is None:
+            return None
+        return desktop_audio, mic_audio
+
+    @staticmethod
+    def _decode_to_array(path: str):
+        """Decode any ffmpeg-readable audio file to a 16 kHz mono float32 array."""
+        if path.lower().endswith(".wav"):
+            try:
+                audio, _ = _load_audio(path)
+                return audio
+            except Exception:
+                return None
+        from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+        import subprocess
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            log.warn("batch", "ffmpeg not found - cannot decode per-source Opus")
+            return None
+        tmp = path + ".dec16k.wav"
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-i", path, "-acodec", "pcm_s16le",
+                 "-ar", str(TARGET_RATE), "-ac", "1", tmp],
+                capture_output=True, timeout=600,
+                creationflags=subprocess_no_window_flag(),
+            )
+            if r.returncode != 0 or not os.path.isfile(tmp):
+                return None
+            audio, _ = _load_audio(tmp)
+            return audio
+        except Exception:
+            traceback.print_exc()
+            return None
+        finally:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _energy_segments(audio: np.ndarray, rms_thresh: float,
+                         frame_sec: float = 0.03, merge_gap_sec: float = 0.6,
+                         min_seg_sec: float = 0.3, pad_sec: float = 0.15
+                         ) -> list[tuple[float, float]]:
+        """Split mono audio into voiced (start, end) spans by frame energy. Used
+        to give the microphone "Me" track real per-utterance timestamps without
+        diarizing it."""
+        n = len(audio)
+        fr = max(1, int(frame_sec * TARGET_RATE))
+        if n == 0:
+            return []
+        spans: list[tuple[float, float]] = []
+        cur_start = None
+        idx = 0
+        for i in range(0, n, fr):
+            chunk = audio[i:i + fr]
+            rms = float(np.sqrt(np.mean(chunk ** 2))) if len(chunk) else 0.0
+            t = idx * frame_sec
+            if rms >= rms_thresh and cur_start is None:
+                cur_start = t
+            elif rms < rms_thresh and cur_start is not None:
+                spans.append((cur_start, t))
+                cur_start = None
+            idx += 1
+        if cur_start is not None:
+            spans.append((cur_start, idx * frame_sec))
+        # Merge small gaps
+        merged: list[tuple[float, float]] = []
+        for s, e in spans:
+            if merged and s - merged[-1][1] <= merge_gap_sec:
+                merged[-1] = (merged[-1][0], e)
+            else:
+                merged.append((s, e))
+        # Pad + drop too-short + clamp
+        dur = n / TARGET_RATE
+        out = []
+        for s, e in merged:
+            if e - s < min_seg_sec:
+                continue
+            out.append((max(0.0, s - pad_sec), min(dur, e + pad_sec)))
+        return out
+
+    def _process_per_source(
+        self,
+        desktop_audio: np.ndarray,
+        mic_audio: np.ndarray,
+        params: dict,
+        me_label: str,
+        torch_device,
+        device: str,
+        total_duration: float,
+    ) -> None:
+        """Diarize the desktop track, attribute the mic track to the Me speaker,
+        merge by time, and transcribe."""
+        # Desktop: full diarization.
+        desktop_segs = self._run_diarization(
+            desktop_audio, params, torch_device, total_duration)
+        self._report_progress(0.40)
+
+        # Fingerprint only desktop speakers (Me is never fingerprinted).
+        if self.fingerprint_callback:
+            for speaker, start, end in desktop_segs:
+                seg = desktop_audio[int(start * TARGET_RATE):int(end * TARGET_RATE)]
+                if len(seg) > 0:
+                    try:
+                        self.fingerprint_callback(speaker, seg, start, end)
+                    except Exception as e:
+                        log.warn("batch", f"Fingerprint callback failed for {speaker}: {e}")
+        self._report_progress(0.45)
+
+        # Mic: energy-segment into Me utterances (never diarized).
+        rms_thresh = float(params.get("silence_threshold", 0.008) or 0.008)
+        me_spans = self._energy_segments(mic_audio, rms_thresh)
+        log.info("batch", f"Mic (Me) utterances: {len(me_spans)}")
+
+        # Build the combined, time-sorted segment list with per-source audio.
+        seg_list: list[tuple[str, float, float, np.ndarray]] = []
+        for speaker, start, end in desktop_segs:
+            seg_list.append((speaker, start, end,
+                             desktop_audio[int(start * TARGET_RATE):int(end * TARGET_RATE)]))
+        for start, end in me_spans:
+            seg_list.append((me_label, start, end,
+                             mic_audio[int(start * TARGET_RATE):int(end * TARGET_RATE)]))
+        seg_list.sort(key=lambda x: x[1])
+
+        if not seg_list:
+            log.warn("batch", "No segments after source-aware split")
+            return
+        self._run_transcription_multi(seg_list, params, device, total_duration)
 
     def _run_diarization(
         self,
@@ -286,7 +462,28 @@ class BatchTranscriber:
         device: str,
         total_duration: float,
     ) -> None:
-        """Batch-transcribe diarized segments using HuggingFace transformers pipeline."""
+        """Batch-transcribe diarized segments (sliced from a single ``audio``
+        array) using HuggingFace transformers pipeline."""
+        seg_list = []
+        for speaker, start, end in segments:
+            start_i = int(start * TARGET_RATE)
+            end_i = int(end * TARGET_RATE)
+            seg_list.append((speaker, start, end, audio[start_i:end_i]))
+        self._run_transcription_multi(seg_list, params, device, total_duration)
+
+    def _run_transcription_multi(
+        self,
+        seg_list: list[tuple[str, float, float, np.ndarray]],
+        params: dict,
+        device: str,
+        total_duration: float,
+    ) -> None:
+        """Batch-transcribe segments where each carries its own audio slice.
+
+        ``seg_list`` is [(speaker, start, end, seg_audio), ...] and should be
+        sorted by start so callbacks fire chronologically. This lets the
+        source-aware path mix desktop-diarized segments (sliced from the desktop
+        track) with microphone "Me" segments (sliced from the mic track)."""
         import torch
         from transformers import pipeline as hf_pipeline
         from transformers.utils import is_flash_attn_2_available
@@ -314,13 +511,10 @@ class BatchTranscriber:
             model_kwargs={"attn_implementation": attn_impl},
         )
 
-        # Prepare audio chunks for each diarized segment
+        # Prepare audio chunks for each segment (audio already sliced per source)
         chunks = []
         chunk_meta = []  # (speaker, start, end) parallel to chunks
-        for speaker, start, end in segments:
-            start_i = int(start * TARGET_RATE)
-            end_i = int(end * TARGET_RATE)
-            seg_audio = audio[start_i:end_i]
+        for speaker, start, end, seg_audio in seg_list:
             if len(seg_audio) < int(0.1 * TARGET_RATE):
                 continue  # skip tiny segments
             seg_duration = len(seg_audio) / TARGET_RATE

@@ -42,6 +42,16 @@ DEFAULTS: dict = {
     "diarization_enabled": True,
     "auto_summary": True,
 
+    # "Me" speaker / source-aware diarization. Microphone audio is always
+    # attributed to a single "Me" speaker (the person running the app) and is
+    # never diarized; only desktop/loopback audio is diarized. me_speaker_global_id
+    # points at the chosen global_speakers profile (its voice embeddings are
+    # purged so it can never be matched against desktop speakers). The first-run
+    # popup is non-blocking; me_speaker_prompt_dismissed remembers a dismissal.
+    "mic_is_me_enabled": True,
+    "me_speaker_global_id": None,
+    "me_speaker_prompt_dismissed": False,
+
     # AI provider and model (primary / fallback)
     "ai_provider": "openai",
     "ai_model": "gpt-5.4",

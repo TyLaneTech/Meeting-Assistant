@@ -809,14 +809,20 @@ function _initSearch() {
 
 async function _checkHomeSemanticReady() {
   const badge = document.getElementById('home-search-ai');
+  let loading = false;
   try {
     const res = await fetch('/api/search/semantic/status');
     const data = await res.json();
     _homeSemanticReady = !!data.ready;
+    loading = !!data.loading;
     if (badge) badge.classList.toggle('ready', _homeSemanticReady);
   } catch {}
-  // Re-check periodically until ready
-  if (!_homeSemanticReady) setTimeout(_checkHomeSemanticReady, 10000);
+  // Re-check only while the model is actively loading (matches app.js). This
+  // terminates in every non-loading state — ready or unavailable — instead of
+  // polling /api/search/semantic/status forever, and pauses while backgrounded.
+  if (!_homeSemanticReady && loading && !document.hidden) {
+    setTimeout(_checkHomeSemanticReady, 10000);
+  }
 }
 
 function _onHomeSearch(value) {

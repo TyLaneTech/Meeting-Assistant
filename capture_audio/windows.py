@@ -108,6 +108,18 @@ class AudioCapture:
         self._wav_path: str | None = None
         self._wav_append: bool = False
 
+        # Per-source recording ("mic = Me" feature). When enabled and a mic is
+        # present, the mixer also writes a mic-only and a desktop-only track to
+        # temp WAVs sample-aligned with the mix; on stop() they are encoded to
+        # Opus ({sid}_mic.opus / {sid}_desktop.opus) and the temp WAVs deleted.
+        # Reanalysis re-separates from these so mic audio is always the app user.
+        self.mic_is_me_enabled: bool = False
+        self._mic_wav_writer: WavWriter | None = None
+        self._desktop_wav_writer: WavWriter | None = None
+        self._mic_wav_path: str | None = None
+        self._desktop_wav_path: str | None = None
+        self._per_source_active: bool = False
+
         # Live RMS levels - read by app.py to push to the visualizer
         self.loopback_level: float = 0.0
         self.mic_level: float = 0.0
@@ -293,6 +305,106 @@ class AudioCapture:
             self.wav_writer.close()
             self.wav_writer = None
 
+    # ── Per-source ("mic = Me") tracks ─────────────────────────────────────
+
+    @staticmethod
+    def _per_source_paths(base_wav_path: str) -> dict:
+        """Derive the per-source temp WAV + final Opus paths from the mixed WAV
+        path ``{dir}/{sid}.wav``."""
+        root = base_wav_path[:-4] if base_wav_path.lower().endswith(".wav") else base_wav_path
+        return {
+            "mic_wav":     root + "_mic.wav",
+            "desktop_wav": root + "_desktop.wav",
+            "mic_opus":    root + "_mic.opus",
+            "desktop_opus": root + "_desktop.opus",
+        }
+
+    def _open_per_source_writers(self, base_wav_path: str, append: bool) -> None:
+        """Open the mic-only and desktop-only temp WAV writers. On resume
+        (append) with an existing Opus part, decode it back to the temp WAV first
+        so the final encode covers the whole session."""
+        p = self._per_source_paths(base_wav_path)
+        self._mic_wav_path     = p["mic_wav"]
+        self._desktop_wav_path = p["desktop_wav"]
+        for wav_path, opus_path in ((p["mic_wav"], p["mic_opus"]),
+                                    (p["desktop_wav"], p["desktop_opus"])):
+            if append and not os.path.isfile(wav_path) and os.path.isfile(opus_path):
+                # Resume: rebuild the temp WAV from the previously encoded part
+                # so WavWriter(append=True) continues the full track.
+                self._decode_opus_to_wav(opus_path, wav_path)
+        self._mic_wav_writer = WavWriter(p["mic_wav"], self.sample_rate, append=append)
+        self._desktop_wav_writer = WavWriter(p["desktop_wav"], self.sample_rate, append=append)
+
+    def _close_per_source_writers(self) -> None:
+        for attr in ("_mic_wav_writer", "_desktop_wav_writer"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def _decode_opus_to_wav(self, opus_path: str, wav_path: str) -> bool:
+        """Decode an Opus part back to a temp WAV at the capture sample rate."""
+        from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return False
+        try:
+            subprocess.run(
+                [ffmpeg, "-y", "-i", opus_path,
+                 "-acodec", "pcm_s16le", "-ar", str(self.sample_rate or 48000),
+                 "-ac", "1", wav_path],
+                capture_output=True, timeout=300,
+                creationflags=subprocess_no_window_flag(),
+            )
+            return os.path.isfile(wav_path)
+        except Exception:
+            log.warn("audio", f"Could not decode {os.path.basename(opus_path)} for resume")
+            return False
+
+    def _encode_per_source_opus(self) -> None:
+        """Encode the per-source temp WAVs to Opus and delete the temps. Called
+        from stop() after writers are closed. Failures are non-fatal: the temp
+        WAV is kept so reanalysis can still fall back to it."""
+        from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+        ffmpeg = find_ffmpeg()
+        pairs = []
+        if self._mic_wav_path:
+            pairs.append((self._mic_wav_path, self._per_source_paths_opus(self._mic_wav_path)))
+        if self._desktop_wav_path:
+            pairs.append((self._desktop_wav_path, self._per_source_paths_opus(self._desktop_wav_path)))
+        for wav_path, opus_path in pairs:
+            if not os.path.isfile(wav_path):
+                continue
+            if not ffmpeg:
+                log.warn("audio", "ffmpeg not found - keeping per-source WAV (no Opus encode)")
+                continue
+            try:
+                r = subprocess.run(
+                    [ffmpeg, "-y", "-i", wav_path,
+                     "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                     "-application", "voip", opus_path],
+                    capture_output=True, timeout=600,
+                    creationflags=subprocess_no_window_flag(),
+                )
+                if r.returncode == 0 and os.path.isfile(opus_path):
+                    os.remove(wav_path)
+                else:
+                    log.warn("audio", f"Opus encode failed for {os.path.basename(wav_path)} "
+                                      f"(rc={r.returncode}); keeping WAV")
+            except Exception:
+                log.warn("audio", f"Opus encode error for {os.path.basename(wav_path)}; keeping WAV")
+                traceback.print_exc()
+        self._mic_wav_path = None
+        self._desktop_wav_path = None
+
+    @staticmethod
+    def _per_source_paths_opus(wav_path: str) -> str:
+        """Map a per-source temp WAV path to its Opus sibling."""
+        return wav_path[:-4] + ".opus" if wav_path.lower().endswith(".wav") else wav_path + ".opus"
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self, loopback_index: int | None = None, mic_index: int | None = None,
@@ -475,10 +587,28 @@ class AudioCapture:
                 log.info("audio", "No microphone device found - capturing loopback only.")
 
         # Open WAV writer now that sample_rate is known
+        base_wav_path = self._wav_path
         if self._wav_path:
             self.wav_writer = WavWriter(self._wav_path, self.sample_rate,
                                         append=self._wav_append)
             self._wav_path = None
+
+        # Per-source tracks for the "mic = Me" feature. Only meaningful when a
+        # mic is actually present (otherwise mixed == desktop) and we're writing
+        # to a file (not the live audio-test path).
+        self._per_source_active = False
+        if self.mic_is_me_enabled and self._has_mic and base_wav_path:
+            try:
+                self._open_per_source_writers(base_wav_path, self._wav_append)
+                self._per_source_active = True
+                log.info("audio", "Per-source capture on: writing mic-only + "
+                                  "desktop-only tracks for source-aware diarization.")
+            except Exception:
+                log.warn("audio", "Could not open per-source writers; "
+                                  "continuing with mixed audio only.")
+                traceback.print_exc()
+                self._close_per_source_writers()
+                self._per_source_active = False
 
         self.is_running = True
 
@@ -534,6 +664,18 @@ class AudioCapture:
         # while the mixer is still running is a race condition that can corrupt
         # the file or crash on a write to a closed handle.
         self.stop_wav()
+        # Close + encode the per-source tracks (mic-only / desktop-only) to Opus.
+        # Done after the mixer thread joins so no writes race the close. Encode
+        # failures are non-fatal (the temp WAV is kept as a reanalysis fallback).
+        if self._per_source_active:
+            self._close_per_source_writers()
+            try:
+                self._encode_per_source_opus()
+            except Exception:
+                log.warn("audio", "Per-source Opus encode raised; per-source temp "
+                                  "WAVs left in place.")
+                traceback.print_exc()
+            self._per_source_active = False
         # Park streams + PyAudio instance in the graveyard instead of closing them.
         # Pa_StopStream / Pa_CloseStream on a WASAPI loopback stream calls
         # ExitProcess() at the C level on Windows, killing the whole process.
@@ -1122,8 +1264,26 @@ class AudioCapture:
                     if self.wav_writer is not None:
                         sample_offset = self.wav_writer.write(int16_bytes)
 
+                    # Per-source ("mic = Me") tracks: write the desktop-only and
+                    # mic-only chunks every tick (zeros included) so they stay
+                    # sample-aligned with the mix, and hand the transcriber the
+                    # separated PCM. The mixed writer remains the single source of
+                    # truth for sample_offset / video sync.
+                    mic_int16 = lb_int16 = None
+                    if self._per_source_active:
+                        mic_int16 = (mic_chunk * 32767).astype(np.int16).tobytes()
+                        lb_int16  = (lb_chunk * 32767).astype(np.int16).tobytes()
+                        if self._desktop_wav_writer is not None:
+                            self._desktop_wav_writer.write(lb_int16)
+                        if self._mic_wav_writer is not None:
+                            self._mic_wav_writer.write(mic_int16)
+
                     try:
-                        self.audio_queue.put_nowait((src, int16_bytes, sample_offset))
+                        if self._per_source_active:
+                            self.audio_queue.put_nowait(
+                                (src, int16_bytes, sample_offset, mic_int16, lb_int16))
+                        else:
+                            self.audio_queue.put_nowait((src, int16_bytes, sample_offset))
                     except queue.Full:
                         if INPUT_DEBUG:
                             self._idbg_audio_q_full_drops += 1

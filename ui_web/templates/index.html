@@ -632,6 +632,10 @@
   </div>
   <div class="cleanup-video-body">
     <video id="cleanup-video" playsinline preload="metadata" muted></video>
+    <div class="cleanup-video-idle" id="cleanup-video-idle">
+      <i class="fa-regular fa-circle-play"></i>
+      <span>Play a speaker segment to preview it here</span>
+    </div>
     <div class="cleanup-video-noseek" id="cleanup-video-noseek" hidden>
       <i class="fa-solid fa-video-slash"></i>
       <span>Segment falls outside recorded video</span>
@@ -684,20 +688,23 @@
       <div class="cleanup-toolbar">
         <div class="cleanup-stats" id="cleanup-stats">Loading clusters…</div>
         <div class="cleanup-actions">
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-heatmap-toggle" onclick="toggleCleanupHeatmap()" title="Show voice similarity heatmap">
+            <i class="fa-solid fa-table-cells"></i>
+          </button>
           <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-video-toggle" onclick="toggleCleanupVideoPopup()" title="Show recording preview">
             <i class="fa-solid fa-video"></i>
           </button>
           <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-reload-btn" onclick="reloadSpeakerClusters()" title="Reload from disk">
             <i class="fa-solid fa-arrows-rotate"></i>
           </button>
-          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-confident-btn" onclick="applyConfidentCleanupMatches()" disabled>
-            <i class="fa-solid fa-wand-magic-sparkles"></i> Apply confident
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-confident-btn" onclick="applyConfidentCleanupMatches()" disabled title="Auto-assign every cluster whose top library match is highly confident">
+            <i class="fa-solid fa-wand-magic-sparkles"></i> Auto-assign
           </button>
           <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-reset-btn" onclick="resetSpeakerCleanup()" disabled>
             Reset
           </button>
           <button type="button" class="speaker-manager-btn speaker-manager-btn-primary" id="cleanup-apply-btn" onclick="applySpeakerCleanup()" disabled>
-            <i class="fa-solid fa-check"></i> Apply changes
+            <i class="fa-solid fa-check"></i> Apply
           </button>
         </div>
       </div>
@@ -707,20 +714,37 @@
         <div class="cleanup-loading-text" id="cleanup-loading-text">Analyzing speakers…</div>
       </div>
 
-      <div class="cleanup-grid" id="cleanup-grid"></div>
+      <!-- Scroll viewport holds the cluster grid; drag-autoscroll targets this. -->
+      <div class="cleanup-scroll" id="cleanup-scroll">
+        <div class="cleanup-grid" id="cleanup-grid"></div>
 
-      <div class="cleanup-noise-section" id="cleanup-noise-section" hidden>
-        <button type="button" class="cleanup-noise-toggle" onclick="toggleCleanupNoiseExpanded()">
-          <i class="fa-solid fa-volume-xmark"></i>
-          <span id="cleanup-noise-count">0</span> marked as noise
-          <i class="fa-solid fa-chevron-down cleanup-noise-chevron" id="cleanup-noise-chevron"></i>
-        </button>
-        <div class="cleanup-noise-members" id="cleanup-noise-members" hidden></div>
+        <div class="cleanup-heatmap-wrap" id="cleanup-heatmap-wrap" hidden></div>
+
+        <div class="cleanup-noise-section" id="cleanup-noise-section" hidden>
+          <button type="button" class="cleanup-noise-toggle" onclick="toggleCleanupNoiseExpanded()">
+            <i class="fa-solid fa-volume-xmark"></i>
+            <span id="cleanup-noise-count">0</span> marked as noise
+            <i class="fa-solid fa-chevron-down cleanup-noise-chevron" id="cleanup-noise-chevron"></i>
+          </button>
+          <div class="cleanup-noise-members" id="cleanup-noise-members" hidden></div>
+        </div>
+      </div>
+
+      <!-- Floating selection action bar — appears when speakers are selected. -->
+      <div class="cleanup-selbar" id="cleanup-selbar" hidden>
+        <span class="cleanup-selbar-count" id="cleanup-selbar-count">0 selected</span>
+        <div class="cleanup-selbar-actions">
+          <button type="button" class="cleanup-selbar-btn primary" id="cleanup-selbar-assign" onclick="_cleanupSelectionAssign(event)"><i class="fa-solid fa-user-tag"></i> Assign…</button>
+          <button type="button" class="cleanup-selbar-btn" onclick="_cleanupSelectionNewCluster()"><i class="fa-solid fa-layer-group"></i> New group</button>
+          <button type="button" class="cleanup-selbar-btn" id="cleanup-selbar-play" onclick="_cleanupSelectionPlay()"><i class="fa-solid fa-play"></i> Play</button>
+          <button type="button" class="cleanup-selbar-btn" id="cleanup-selbar-noise" onclick="_cleanupSelectionToggleNoise()"><i class="fa-solid fa-volume-xmark"></i> Noise</button>
+          <button type="button" class="cleanup-selbar-btn ghost" onclick="_cleanupClearSelection()">Clear</button>
+        </div>
       </div>
 
       <div class="cleanup-help">
         <i class="fa-regular fa-circle-info"></i>
-        Drag speakers between cards to fix mislabeled segments. Drop on <em>+ New cluster</em> to split off. Click a speaker to preview audio.
+        <span><strong>Click</strong> to select speakers (<em>Ctrl</em> multi · <em>Shift</em> range), then drag them as a group or use the bar below. <strong>Assign</strong> links a group to a voice-library profile. The <i class="fa-regular fa-circle-play"></i> button plays a speaker's audio.</span>
       </div>
     </div>
   </div>
