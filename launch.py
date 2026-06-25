@@ -496,47 +496,125 @@ def _torch_build() -> str:
 # The download functions are defined inside _predownload_models to avoid
 # importing heavy libraries at module level.
 
-def _is_model_cached(hf_model_id: str) -> bool:
-    """Search common cache roots for a HuggingFace model directory.
+def _hf_hub_cache_root() -> Path:
+    """The HF hub cache the offline runtime reads non-pyannote models from.
 
-    The target directory name is models--<org>--<name>.  We search
-    recursively (up to depth 4) under ~/.cache/ and the project-local
-    models/ dir so that models cached by any library (huggingface_hub,
-    pyannote, torch, etc.) are found regardless of the exact path.
+    Mirrors huggingface_hub's own resolution (HF_HUB_CACHE > HF_HOME/hub) and
+    core.config's HF_HOME default of the project-local storage/models.  Used for
+    faster-whisper, transformers and sentence-transformers.
+    """
+    explicit = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if explicit:
+        return Path(explicit)
+    hf_home = os.environ.get("HF_HOME") or str(Path(__file__).parent / "storage" / "models")
+    return Path(hf_home) / "hub"
+
+
+def _pyannote_cache_roots() -> list:
+    """Where pyannote/diart read their models — a SEPARATE cache from HF_HOME.
+
+    pyannote.audio caches under PYANNOTE_CACHE (default ~/.cache/torch/pyannote),
+    not HF_HOME, so that is where the offline runtime resolves pyannote models.
+    Same models--org--name/refs/snapshots layout as the HF hub cache, just a
+    different root. We return every plausible location.
+    """
+    roots = []
+    env = os.environ.get("PYANNOTE_CACHE")
+    if env:
+        roots.append(Path(env))
+    roots.append(Path.home() / ".cache" / "torch" / "pyannote")
+    return roots
+
+
+def _cache_roots_for(hf_model_id: str) -> list:
+    """The cache root(s) the offline runtime actually reads this model from.
+
+    pyannote models live in the pyannote/torch cache; everything else lives in
+    HF_HOME/hub. We deliberately do NOT consult the user's global
+    ~/.cache/huggingface: the app runs HF_HUB_OFFLINE=1 pinned to HF_HOME and
+    will never load a non-pyannote model from there, so a copy sitting in the
+    global cache must not count as 'present'.
+    """
+    if hf_model_id.startswith("pyannote/"):
+        return _pyannote_cache_roots()
+    return [_hf_hub_cache_root()]
+
+
+def _is_model_cached(hf_model_id: str) -> bool:
+    """True only if a snapshot the offline runtime can load is fully present.
+
+    The runtime sets HF_HUB_OFFLINE=1 / local_files_only=True, so it reads only
+    its cache and cannot repair a gap.  A loose "the folder has some file in it"
+    check therefore lies: an interrupted download, an AV-quarantined blob, or a
+    OneDrive Files-On-Demand placeholder all leave a directory that exists but
+    has no loadable snapshot.  We verify what the loader actually needs:
+    refs/<branch> resolving to a snapshots/<commit>/ whose files are materialised
+    on disk, in the exact cache root the runtime reads this model from.
     """
     target = "models--" + hf_model_id.replace("/", "--")
-    roots = [
-        Path(__file__).parent / "storage" / "models",   # project-local HF_HOME
-        Path.home() / ".cache",             # covers huggingface/, torch/, etc.
-    ]
-    for root in roots:
-        if not root.is_dir():
-            continue
-        if _find_model_dir(root, target, max_depth=4):
+    for root in _cache_roots_for(hf_model_id):
+        model_dir = root / target
+        if model_dir.is_dir() and _snapshot_complete(model_dir):
             return True
     return False
 
 
-def _find_model_dir(base: Path, target: str, max_depth: int) -> bool:
-    """Recursively search for a directory named `target` under `base`."""
-    if max_depth <= 0:
+def _snapshot_complete(model_dir: Path) -> bool:
+    """Verify model_dir has at least one fully-materialised snapshot.
+
+    huggingface_hub resolves a model name to a commit via refs/<branch>, then
+    loads snapshots/<commit>/.  Offline, a missing ref or an empty/partial
+    snapshot is exactly the "cannot find an appropriate cached snapshot folder
+    for the specified revision" failure, so we require a ref that points at a
+    snapshot whose every file resolves to real, non-zero, on-disk content.
+    """
+    refs_dir = model_dir / "refs"
+    snapshots_dir = model_dir / "snapshots"
+    if not refs_dir.is_dir() or not snapshots_dir.is_dir():
         return False
+    revisions = set()
     try:
-        for entry in base.iterdir():
-            if not entry.is_dir():
+        for ref in refs_dir.rglob("*"):
+            if not ref.is_file():
                 continue
-            if entry.name == target:
-                # Confirm it has actual content (snapshots or model files)
-                try:
-                    if any(entry.rglob("*")):
-                        return True
-                except (PermissionError, OSError):
-                    pass
-            if _find_model_dir(entry, target, max_depth - 1):
-                return True
+            try:
+                rev = ref.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if rev:
+                revisions.add(rev)
     except (PermissionError, OSError):
-        pass
+        return False
+    for rev in revisions:
+        snap = snapshots_dir / rev
+        if not snap.is_dir():
+            continue
+        files = [f for f in snap.rglob("*") if f.is_file() or f.is_symlink()]
+        if files and all(_file_materialised(f) for f in files):
+            return True
     return False
+
+
+def _file_materialised(path: Path) -> bool:
+    """True if path resolves to real on-disk content, not a stub or placeholder.
+
+    Snapshot entries are symlinks into ../../blobs where the OS allows them and
+    plain copies on Windows without Developer Mode; either way we resolve and
+    stat.  A dangling link or 0-byte file fails.  On Windows we also reject cloud
+    "online-only" placeholders (OneDrive Files-On-Demand): they report a logical
+    size but aren't on disk, so the offline loader can't read them.
+    """
+    try:
+        st = path.resolve(strict=True).stat()
+    except (OSError, RuntimeError):
+        return False
+    if st.st_size <= 0:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    # RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE — set on cloud placeholders
+    if attrs & (0x00400000 | 0x00040000 | 0x00001000):
+        return False
+    return True
 
 
 # Map task IDs → HuggingFace model IDs for cache checking.
@@ -637,21 +715,27 @@ elif task == "sentence-transformers":
     max_attempts = 3
     all_ok = True
     for task_id, display_name in need_download:
+        hf_id = _MODEL_IDS.get(task_id)
         success = False
         for attempt in range(1, max_attempts + 1):
             r = subprocess.run(
                 [sys.executable, str(script_path), task_id],
                 capture_output=True, text=True, timeout=600,
             )
-            if r.returncode == 0:
+            # Trust the cache, not the exit code. The runtime loads offline from
+            # HF_HOME, so "downloaded" means a complete snapshot is actually
+            # present there: a clean exit over a half-written cache is still a
+            # failure, and a noisy non-zero exit over a good cache is still fine.
+            if hf_id and _is_model_cached(hf_id):
                 success = True
                 break
-            stderr = r.stderr.strip()
-            if "already" in stderr.lower() or not stderr:
+            if r.returncode == 0 and not hf_id:
                 success = True
                 break
             if attempt < max_attempts:
-                _info(f"{display_name} - retrying ({attempt}/{max_attempts})...")
+                last = (r.stderr.strip().splitlines() or [""])[-1][:160]
+                suffix = f"  {GRY}{last}{R}" if last else ""
+                _info(f"{display_name} - retrying ({attempt}/{max_attempts})...{suffix}")
         if success:
             _ok(f"{display_name}")
         else:

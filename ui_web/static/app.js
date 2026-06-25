@@ -10492,6 +10492,25 @@ async function loadSummaryPrompt() {
 const _playbackAudio = document.getElementById('playback-audio');
 let _playbackActive = false;
 
+// Playback output level (0..1), persisted to localStorage. Recordings are
+// mastered hot (AGC normalises each source, then both are summed), so default
+// to half volume rather than blasting at full scale.
+const _VOLUME_KEY = 'ma-playback-volume';
+let _preMuteVolume = 0.5;   // restored when un-muting from the speaker icon
+function _getSavedVolume() {
+  const raw = parseFloat(localStorage.getItem(_VOLUME_KEY));
+  if (!isFinite(raw)) return 0.5;
+  return Math.min(1, Math.max(0, raw));
+}
+function _updateVolumeIcon(v) {
+  const icon = document.getElementById('playback-volume-icon');
+  if (!icon) return;
+  let glyph = 'fa-volume-high';
+  if (v <= 0.001)   glyph = 'fa-volume-xmark';
+  else if (v < 0.5) glyph = 'fa-volume-low';
+  icon.className = `fa-solid ${glyph}`;
+}
+
 function fmtTime(s) {
   if (!isFinite(s)) return '0:00';
   return fmtDuration(s);
@@ -10512,6 +10531,14 @@ function initPlayback(sessionId) {
   const speedSel = document.getElementById('playback-speed');
   if (speedSel) speedSel.value = savedSpeed;
   _playbackAudio.playbackRate = parseFloat(savedSpeed);
+
+  // Restore saved output level (defaults to 0.5 so playback isn't blasting)
+  const savedVol = _getSavedVolume();
+  if (savedVol > 0.001) _preMuteVolume = savedVol;
+  _playbackAudio.volume = savedVol;
+  const volSlider = document.getElementById('playback-volume-slider');
+  if (volSlider) volSlider.value = savedVol;
+  _updateVolumeIcon(savedVol);
 
   _playbackAudio.onloadedmetadata = () => {
     document.getElementById('playback-duration').textContent = fmtTime(_playbackAudio.duration);
@@ -10595,6 +10622,21 @@ function seekToTime(t) {
 function setPlaybackSpeed(val) {
   _playbackAudio.playbackRate = parseFloat(val);
   savePref('playback_speed', val);
+}
+
+function setPlaybackVolume(val) {
+  const v = Math.min(1, Math.max(0, parseFloat(val) || 0));
+  _playbackAudio.volume = v;
+  if (v > 0.001) _preMuteVolume = v;
+  const slider = document.getElementById('playback-volume-slider');
+  if (slider && parseFloat(slider.value) !== v) slider.value = v;
+  _updateVolumeIcon(v);
+  try { localStorage.setItem(_VOLUME_KEY, String(v)); } catch (_) {}
+}
+
+// Clicking the speaker icon toggles mute, restoring the prior level.
+function togglePlaybackMute() {
+  setPlaybackVolume(_playbackAudio.volume > 0.001 ? 0 : (_preMuteVolume || 0.5));
 }
 
 // Build a sorted list of visible time ranges from transcript segments
