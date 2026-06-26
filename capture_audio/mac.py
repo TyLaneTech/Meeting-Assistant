@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import os
 import queue
 import re
 import subprocess
@@ -587,6 +588,19 @@ class AudioCapture:
         self._wav_path: str | None = None
         self._wav_append: bool = False
 
+        # Per-source recording ("mic = Me" feature). When enabled and a mic is
+        # present, the mixer also writes a mic-only and a desktop-only track to
+        # temp WAVs sample-aligned with the mix; on stop() they are encoded to
+        # Opus ({sid}_mic.opus / {sid}_desktop.opus) and the temp WAVs deleted.
+        # Reanalysis re-separates from these so mic audio is always the app user.
+        # Mirrors capture_audio/windows.py so macOS behaves identically.
+        self.mic_is_me_enabled: bool = False
+        self._mic_wav_writer: WavWriter | None = None
+        self._desktop_wav_writer: WavWriter | None = None
+        self._mic_wav_path: str | None = None
+        self._desktop_wav_path: str | None = None
+        self._per_source_active: bool = False
+
         self.loopback_level: float = 0.0
         self.mic_level: float = 0.0
 
@@ -662,6 +676,108 @@ class AudioCapture:
         if self.wav_writer is not None:
             self.wav_writer.close()
             self.wav_writer = None
+
+    # ── Per-source ("mic = Me") tracks ─────────────────────────────────────
+    # Lifted verbatim from capture_audio/windows.py so the macOS source-aware
+    # diarization path is byte-for-byte the same shape downstream.
+
+    @staticmethod
+    def _per_source_paths(base_wav_path: str) -> dict:
+        """Derive the per-source temp WAV + final Opus paths from the mixed WAV
+        path ``{dir}/{sid}.wav``."""
+        root = base_wav_path[:-4] if base_wav_path.lower().endswith(".wav") else base_wav_path
+        return {
+            "mic_wav":     root + "_mic.wav",
+            "desktop_wav": root + "_desktop.wav",
+            "mic_opus":    root + "_mic.opus",
+            "desktop_opus": root + "_desktop.opus",
+        }
+
+    def _open_per_source_writers(self, base_wav_path: str, append: bool) -> None:
+        """Open the mic-only and desktop-only temp WAV writers. On resume
+        (append) with an existing Opus part, decode it back to the temp WAV first
+        so the final encode covers the whole session."""
+        p = self._per_source_paths(base_wav_path)
+        self._mic_wav_path     = p["mic_wav"]
+        self._desktop_wav_path = p["desktop_wav"]
+        for wav_path, opus_path in ((p["mic_wav"], p["mic_opus"]),
+                                    (p["desktop_wav"], p["desktop_opus"])):
+            if append and not os.path.isfile(wav_path) and os.path.isfile(opus_path):
+                # Resume: rebuild the temp WAV from the previously encoded part
+                # so WavWriter(append=True) continues the full track.
+                self._decode_opus_to_wav(opus_path, wav_path)
+        self._mic_wav_writer = WavWriter(p["mic_wav"], self.sample_rate, append=append)
+        self._desktop_wav_writer = WavWriter(p["desktop_wav"], self.sample_rate, append=append)
+
+    def _close_per_source_writers(self) -> None:
+        for attr in ("_mic_wav_writer", "_desktop_wav_writer"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
+    def _decode_opus_to_wav(self, opus_path: str, wav_path: str) -> bool:
+        """Decode an Opus part back to a temp WAV at the capture sample rate."""
+        from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return False
+        try:
+            subprocess.run(
+                [ffmpeg, "-y", "-i", opus_path,
+                 "-acodec", "pcm_s16le", "-ar", str(self.sample_rate or 48000),
+                 "-ac", "1", wav_path],
+                capture_output=True, timeout=300,
+                creationflags=subprocess_no_window_flag(),
+            )
+            return os.path.isfile(wav_path)
+        except Exception:
+            log.warn("audio", f"Could not decode {os.path.basename(opus_path)} for resume")
+            return False
+
+    def _encode_per_source_opus(self) -> None:
+        """Encode the per-source temp WAVs to Opus and delete the temps. Called
+        from stop() after writers are closed. Failures are non-fatal: the temp
+        WAV is kept so reanalysis can still fall back to it."""
+        from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+        ffmpeg = find_ffmpeg()
+        pairs = []
+        if self._mic_wav_path:
+            pairs.append((self._mic_wav_path, self._per_source_paths_opus(self._mic_wav_path)))
+        if self._desktop_wav_path:
+            pairs.append((self._desktop_wav_path, self._per_source_paths_opus(self._desktop_wav_path)))
+        for wav_path, opus_path in pairs:
+            if not os.path.isfile(wav_path):
+                continue
+            if not ffmpeg:
+                log.warn("audio", "ffmpeg not found - keeping per-source WAV (no Opus encode)")
+                continue
+            try:
+                r = subprocess.run(
+                    [ffmpeg, "-y", "-i", wav_path,
+                     "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                     "-application", "voip", opus_path],
+                    capture_output=True, timeout=600,
+                    creationflags=subprocess_no_window_flag(),
+                )
+                if r.returncode == 0 and os.path.isfile(opus_path):
+                    os.remove(wav_path)
+                else:
+                    log.warn("audio", f"Opus encode failed for {os.path.basename(wav_path)} "
+                                      f"(rc={r.returncode}); keeping WAV")
+            except Exception:
+                log.warn("audio", f"Opus encode error for {os.path.basename(wav_path)}; keeping WAV")
+                traceback.print_exc()
+        self._mic_wav_path = None
+        self._desktop_wav_path = None
+
+    @staticmethod
+    def _per_source_paths_opus(wav_path: str) -> str:
+        """Map a per-source temp WAV path to its Opus sibling."""
+        return wav_path[:-4] + ".opus" if wav_path.lower().endswith(".wav") else wav_path + ".opus"
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -778,9 +894,27 @@ class AudioCapture:
             else:
                 log.info("audio", "No microphone device found - capturing loopback only.")
 
+        base_wav_path = self._wav_path
         if self._wav_path:
             self.wav_writer = WavWriter(self._wav_path, self.sample_rate, append=self._wav_append)
             self._wav_path = None
+
+        # Per-source tracks for the "mic = Me" feature. Only meaningful when a
+        # mic is actually present (otherwise mixed == desktop) and we're writing
+        # to a file (not the live audio-test path). Mirrors capture_audio/windows.py.
+        self._per_source_active = False
+        if self.mic_is_me_enabled and self._has_mic and base_wav_path:
+            try:
+                self._open_per_source_writers(base_wav_path, self._wav_append)
+                self._per_source_active = True
+                log.info("audio", "Per-source capture on: writing mic-only + "
+                                  "desktop-only tracks for source-aware diarization.")
+            except Exception:
+                log.warn("audio", "Could not open per-source writers; "
+                                  "continuing with mixed audio only.")
+                traceback.print_exc()
+                self._close_per_source_writers()
+                self._per_source_active = False
 
         self.is_running = True
 
@@ -823,6 +957,19 @@ class AudioCapture:
         self._sck_watchdog_thread = None
 
         self.stop_wav()
+
+        # Close + encode the per-source tracks (mic-only / desktop-only) to Opus.
+        # Done after the mixer thread joins so no writes race the close. Encode
+        # failures are non-fatal (the temp WAV is kept as a reanalysis fallback).
+        if self._per_source_active:
+            self._close_per_source_writers()
+            try:
+                self._encode_per_source_opus()
+            except Exception:
+                log.warn("audio", "Per-source Opus encode raised; per-source temp "
+                                  "WAVs left in place.")
+                traceback.print_exc()
+            self._per_source_active = False
 
         if self._sck_loopback is not None:
             try:
@@ -1018,11 +1165,17 @@ class AudioCapture:
         return samples
 
     def _mixer_loop(self) -> None:
-        # Identical to audio_capture_win.py — pure DSP, no platform calls.
+        # Pure DSP, no platform calls. Matches capture_audio/windows.py so the
+        # macOS pipeline behaves identically: wall-clock-paced emission, always
+        # sum (never "louder side wins"), zero-fill the absent side, and the
+        # "mic = Me" per-source 5-tuple. (The Windows-only INPUT_DEBUG tracing
+        # is omitted here; it is a dev aid and does not affect output.)
         lb_parts: list[np.ndarray] = []
         lb_len = 0
         mic_parts: list[np.ndarray] = []
         mic_len = 0
+        # Cap internal buffers at 3 seconds to prevent unbounded growth if the
+        # downstream audio_queue backs up.
         max_buf_samples = int((self.sample_rate or 48000) * 3.0)
 
         _agc_lb_env  = 0.0
@@ -1034,10 +1187,21 @@ class AudioCapture:
         _aec_lb_buf  = np.array([], dtype=np.float32)
         _aec_out_buf = np.array([], dtype=np.float32)
 
+        # ── Wall-clock pacing ────────────────────────────────────────────────
+        # Emit exactly one CHUNK_SIZE-sized mixed chunk per wall-clock period
+        # (CHUNK_SIZE / sample_rate seconds). Without this, mic and loopback
+        # arrive in independent bursts and the mixer emits a fresh chunk for
+        # whichever stream's data lands first, producing 2x real-time output
+        # when both are active. With wall-clock pacing, one tick = one chunk =
+        # one slice of real time, regardless of which queue has data right then.
+        chunk_dur = self.CHUNK_SIZE / float(self.sample_rate or 48000)
+        next_emit_time = 0.0   # set on first available data
+
         while self.is_running:
             try:
                 got_data = False
 
+                # Drain loopback queue
                 try:
                     while True:
                         data = self._loopback_q.get_nowait()
@@ -1048,6 +1212,7 @@ class AudioCapture:
                 except queue.Empty:
                     pass
 
+                # Drain mic queue (resample to loopback rate if necessary)
                 if self._has_mic:
                     try:
                         while True:
@@ -1063,6 +1228,30 @@ class AudioCapture:
                     except queue.Empty:
                         pass
 
+                # Bootstrap the emit clock the first time data appears, so we
+                # don't fire a stretch of silence before either stream has
+                # produced anything.
+                now = time.monotonic()
+                if next_emit_time == 0.0:
+                    if lb_len > 0 or mic_len > 0:
+                        next_emit_time = now
+                    else:
+                        time.sleep(0.005)
+                        continue
+
+                # If we're behind by more than 0.5s (e.g. system was paused),
+                # reset the clock instead of dumping a wall of catch-up audio.
+                if now - next_emit_time > 0.5:
+                    next_emit_time = now
+
+                # If it's not yet time to emit, sleep and loop. We do NOT touch
+                # the parts lists here.
+                if now < next_emit_time:
+                    time.sleep(min(0.002, next_emit_time - now))
+                    continue
+
+                # Flatten the part lists into contiguous arrays for this
+                # single-chunk consumption.
                 if lb_parts and lb_len >= self.CHUNK_SIZE:
                     lb_buf = np.concatenate(lb_parts)
                     lb_parts.clear()
@@ -1077,39 +1266,55 @@ class AudioCapture:
                 else:
                     mic_buf = np.array([], dtype=np.float32)
 
+                # Emit exactly ONE chunk per wall-clock tick, taking whatever is
+                # in the buffers right now. Each side that has >=CHUNK_SIZE
+                # contributes its real samples; the side that doesn't is
+                # zero-filled. This decouples emission rate from the burstiness
+                # of either source.
                 lb_pos = 0
                 mic_pos = 0
-                while lb_pos + self.CHUNK_SIZE <= len(lb_buf):
-                    lb_chunk = np.clip(
-                        lb_buf[lb_pos:lb_pos + self.CHUNK_SIZE] * self.loopback_gain,
-                        -1.0, 1.0,
-                    )
-                    lb_pos += self.CHUNK_SIZE
+                _zero_chunk = np.zeros(self.CHUNK_SIZE, dtype=np.float32)
+                next_emit_time += chunk_dur
+                if True:
+                    have_lb  = lb_pos + self.CHUNK_SIZE <= len(lb_buf)
+                    have_mic = self._has_mic and mic_pos + self.CHUNK_SIZE <= len(mic_buf)
 
-                    if self.agc_loopback_enabled:
-                        lb_chunk, _agc_lb_env, _g, _gated = self._agc_apply(
-                            lb_chunk, _agc_lb_env, self.agc_target_rms,
-                            self.agc_max_gain, self.agc_gate_threshold,
-                            self.sample_rate or 48000,
+                    # ── Loopback chunk ──────────────────────────────────────
+                    if have_lb:
+                        lb_chunk = np.clip(
+                            lb_buf[lb_pos:lb_pos + self.CHUNK_SIZE] * self.loopback_gain,
+                            -1.0, 1.0,
                         )
-                        self.agc_lb_gain = _g
-                        self.agc_lb_envelope = _agc_lb_env
-                        self.agc_lb_gated = _gated
+                        lb_pos += self.CHUNK_SIZE
+                        if self.agc_loopback_enabled:
+                            lb_chunk, _agc_lb_env, _g, _gated = self._agc_apply(
+                                lb_chunk, _agc_lb_env, self.agc_target_rms,
+                                self.agc_max_gain, self.agc_gate_threshold,
+                                self.sample_rate or 48000,
+                            )
+                            self.agc_lb_gain = _g
+                            self.agc_lb_envelope = _agc_lb_env
+                            self.agc_lb_gated = _gated
+                        else:
+                            self.agc_lb_gain = 1.0
+                            self.agc_lb_gated = True
+                        lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
+                        self.loopback_level = lb_rms
+                        self._lb_fft_buf.extend(lb_chunk.tolist())
                     else:
+                        lb_chunk = _zero_chunk
+                        lb_rms = 0.0
+                        self.loopback_level = 0.0
                         self.agc_lb_gain = 1.0
                         self.agc_lb_gated = True
 
-                    lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
-                    self.loopback_level = lb_rms
-                    self._lb_fft_buf.extend(lb_chunk.tolist())
-
-                    if self._has_mic and mic_pos + self.CHUNK_SIZE <= len(mic_buf):
+                    # ── Mic chunk ───────────────────────────────────────────
+                    if have_mic:
                         mic_chunk = np.clip(
                             mic_buf[mic_pos:mic_pos + self.CHUNK_SIZE] * self.mic_gain,
                             -1.0, 1.0,
                         )
                         mic_pos += self.CHUNK_SIZE
-
                         if self.agc_mic_enabled:
                             mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(
                                 mic_chunk, _agc_mic_env, self.agc_target_rms,
@@ -1122,90 +1327,113 @@ class AudioCapture:
                         else:
                             self.agc_mic_gain = 1.0
                             self.agc_mic_gated = True
-
                         mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
-
-                        if self.echo_cancel_enabled:
-                            if _aec_processor is None or _aec_frame_size == 0:
-                                try:
-                                    from aec_audio_processing import AudioProcessor
-                                    _aec_processor = AudioProcessor(
-                                        enable_aec=True, enable_ns=False, enable_agc=False,
-                                    )
-                                    sr = self.sample_rate or 16000
-                                    _aec_processor.set_stream_format(sr, 1)
-                                    _aec_processor.set_reverse_stream_format(sr, 1)
-                                    _aec_frame_size = _aec_processor.get_frame_size()
-                                    log.info("audio", f"WebRTC AEC initialised @ {sr} Hz, "
-                                                      f"frame={_aec_frame_size} samples")
-                                except Exception:
-                                    traceback.print_exc()
-                                    _aec_processor = None
-
-                            if _aec_processor is not None:
-                                _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
-                                _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
-
-                                cleaned_parts: list[np.ndarray] = []
-                                while (len(_aec_mic_buf) >= _aec_frame_size
-                                       and len(_aec_lb_buf) >= _aec_frame_size):
-                                    mf = _aec_mic_buf[:_aec_frame_size]
-                                    lf = _aec_lb_buf[:_aec_frame_size]
-                                    _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
-                                    _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
-
-                                    lb_i16 = (lf * 32767).astype(np.int16).tobytes()
-                                    mic_i16 = (mf * 32767).astype(np.int16).tobytes()
-                                    _aec_processor.process_reverse_stream(lb_i16)
-                                    result = _aec_processor.process_stream(mic_i16)
-                                    cleaned_parts.append(
-                                        np.frombuffer(result, dtype=np.int16)
-                                          .astype(np.float32) / 32768.0
-                                    )
-
-                                if cleaned_parts:
-                                    _aec_out_buf = np.concatenate(
-                                        (_aec_out_buf, *cleaned_parts)
-                                    )
-
-                                if len(_aec_out_buf) >= self.CHUNK_SIZE:
-                                    mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
-                                    _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
-                                    mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
-                        elif _aec_processor is not None:
-                            _aec_processor = None
-                            _aec_frame_size = 0
-                            _aec_mic_buf = np.array([], dtype=np.float32)
-                            _aec_lb_buf  = np.array([], dtype=np.float32)
-                            _aec_out_buf = np.array([], dtype=np.float32)
-
-                        if mic_rms < 0.005 or lb_rms > mic_rms * 2.0:
-                            src = "loopback"
-                            mixed = lb_chunk
-                        elif lb_rms < 0.005 or mic_rms > lb_rms * 2.0:
-                            src = "mic"
-                            mixed = mic_chunk
-                        else:
-                            src = "both"
-                            mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
                     else:
+                        mic_chunk = _zero_chunk
+                        mic_rms = 0.0
                         self.mic_level = 0.0
-                        mixed = lb_chunk
+                        self.agc_mic_gain = 1.0
+                        self.agc_mic_gated = True
+
+                    # ── WebRTC AEC: only meaningful when BOTH sides are real
+                    # this iteration. The reference signal (loopback) must be in
+                    # lock-step with the mic; feeding either side alone
+                    # desynchronises the buffers. When loopback is absent there
+                    # is no echo to cancel anyway.
+                    if self.echo_cancel_enabled and have_lb and have_mic:
+                        if _aec_processor is None or _aec_frame_size == 0:
+                            try:
+                                from aec_audio_processing import AudioProcessor
+                                _aec_processor = AudioProcessor(
+                                    enable_aec=True, enable_ns=False, enable_agc=False,
+                                )
+                                sr = self.sample_rate or 16000
+                                _aec_processor.set_stream_format(sr, 1)
+                                _aec_processor.set_reverse_stream_format(sr, 1)
+                                _aec_frame_size = _aec_processor.get_frame_size()
+                                log.info("audio", f"WebRTC AEC initialised @ {sr} Hz, "
+                                                  f"frame={_aec_frame_size} samples")
+                            except Exception:
+                                traceback.print_exc()
+                                _aec_processor = None
+
+                        if _aec_processor is not None:
+                            _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
+                            _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
+                            cleaned_parts: list[np.ndarray] = []
+                            while (len(_aec_mic_buf) >= _aec_frame_size
+                                   and len(_aec_lb_buf) >= _aec_frame_size):
+                                mf = _aec_mic_buf[:_aec_frame_size]
+                                lf = _aec_lb_buf[:_aec_frame_size]
+                                _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
+                                _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
+                                lb_i16  = (lf * 32767).astype(np.int16).tobytes()
+                                mic_i16 = (mf * 32767).astype(np.int16).tobytes()
+                                _aec_processor.process_reverse_stream(lb_i16)
+                                result = _aec_processor.process_stream(mic_i16)
+                                cleaned_parts.append(
+                                    np.frombuffer(result, dtype=np.int16)
+                                      .astype(np.float32) / 32768.0
+                                )
+                            if cleaned_parts:
+                                _aec_out_buf = np.concatenate(
+                                    (_aec_out_buf, *cleaned_parts)
+                                )
+                            if len(_aec_out_buf) >= self.CHUNK_SIZE:
+                                mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
+                                _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
+                                mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
+                    elif (not self.echo_cancel_enabled) and _aec_processor is not None:
+                        # Echo cancellation was just disabled - tear down
+                        _aec_processor = None
+                        _aec_frame_size = 0
+                        _aec_mic_buf = np.array([], dtype=np.float32)
+                        _aec_lb_buf  = np.array([], dtype=np.float32)
+                        _aec_out_buf = np.array([], dtype=np.float32)
+
+                    # ── Mix: always sum. Both sources are clipped before
+                    # summing and the sum itself is clipped, so headroom is fine.
+                    if have_lb and have_mic:
+                        src = "both"
+                    elif have_mic:
+                        src = "mic"
+                    else:
                         src = "loopback"
+                    mixed = np.clip(lb_chunk + mic_chunk, -1.0, 1.0)
 
                     int16_bytes = (mixed * 32767).astype(np.int16).tobytes()
 
+                    # Write to WAV (before queue - never lose audio even if queue is full)
                     sample_offset = -1
                     if self.wav_writer is not None:
                         sample_offset = self.wav_writer.write(int16_bytes)
 
+                    # Per-source ("mic = Me") tracks: write the desktop-only and
+                    # mic-only chunks every tick (zeros included) so they stay
+                    # sample-aligned with the mix, and hand the transcriber the
+                    # separated PCM. The mixed writer remains the single source
+                    # of truth for sample_offset / video sync.
+                    mic_int16 = lb_int16 = None
+                    if self._per_source_active:
+                        mic_int16 = (mic_chunk * 32767).astype(np.int16).tobytes()
+                        lb_int16  = (lb_chunk * 32767).astype(np.int16).tobytes()
+                        if self._desktop_wav_writer is not None:
+                            self._desktop_wav_writer.write(lb_int16)
+                        if self._mic_wav_writer is not None:
+                            self._mic_wav_writer.write(mic_int16)
+
                     try:
-                        self.audio_queue.put_nowait((src, int16_bytes, sample_offset))
+                        if self._per_source_active:
+                            self.audio_queue.put_nowait(
+                                (src, int16_bytes, sample_offset, mic_int16, lb_int16))
+                        else:
+                            self.audio_queue.put_nowait((src, int16_bytes, sample_offset))
                     except queue.Full:
                         pass
 
+                # Keep leftover samples (less than CHUNK_SIZE) for next iteration
                 if lb_pos < len(lb_buf):
                     lb_parts.append(lb_buf[lb_pos:])
                     lb_len = len(lb_buf) - lb_pos
@@ -1213,6 +1441,7 @@ class AudioCapture:
                     mic_parts.append(mic_buf[mic_pos:])
                     mic_len = len(mic_buf) - mic_pos
 
+                # Backpressure: discard oldest data if buffers exceed the cap.
                 if lb_len > max_buf_samples:
                     lb_parts.clear()
                     lb_len = 0
@@ -1220,8 +1449,8 @@ class AudioCapture:
                     mic_parts.clear()
                     mic_len = 0
 
-                if not got_data:
-                    time.sleep(0.005)
+                # Pacing handled at top via next_emit_time; no sleep here so a
+                # catch-up emit can happen immediately.
 
             except Exception:
                 traceback.print_exc()
