@@ -47,7 +47,7 @@ Postponed ideas and feature plans. Not yet scheduled for implementation.
 1. Add the same `mic_is_me_enabled` / `_per_source_active` attributes + `_open_per_source_writers` / `_encode_per_source_opus` / resume-decode helpers to `capture_audio/mac.py` (they can largely be lifted from `windows.py`).
 2. At mac's mix point, write the loopback-only and mic-only chunks (sample-aligned, zeros included) to the two temp WavWriters and enqueue the 5-tuple.
 3. Reuse `capture_video/ffmpeg_util.find_ffmpeg()` for the Opus encode (the bundled macOS ffmpeg already supports libopus).
-4. Verify end-to-end on macOS hardware (BlackHole loopback + a real mic).
+4. Verify end-to-end on macOS hardware (ScreenCaptureKit loopback + a real mic).
 
 ---
 

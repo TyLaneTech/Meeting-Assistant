@@ -191,6 +191,29 @@ def _ensure_venv():
 _SHORTCUT_NAME = "Meeting Assistant.lnk"
 
 
+def _warn_if_cloud_storage_path():
+    """Warn when the project lives on a macOS File Provider volume
+    (OneDrive, iCloud Drive, etc. under ~/Library/CloudStorage).
+
+    Dataless-evicted files make Python imports and SQLite writes
+    pathologically slow (observed: a single .pyc read blocking for minutes),
+    and sync can corrupt the live database or recordings mid-write. This is a
+    warning only and never blocks the launch. It is a no-op on Windows, whose
+    paths never contain "/Library/CloudStorage/".
+    """
+    try:
+        root = str(Path(__file__).resolve().parent)
+    except Exception:
+        return
+    if "/Library/CloudStorage/" not in root:
+        return
+    _warn("Project folder is inside a cloud-synced volume (OneDrive/File Provider):")
+    _info(root)
+    _warn("Imports and database writes can be pathologically slow, and recordings")
+    _warn("or the meetings database can corrupt when files sync mid-write.")
+    _warn("Recommended: move this folder to a local path, e.g. ~/meeting-assistant")
+
+
 def _create_start_menu_shortcut():
     """
     Ensures a Start Menu shortcut exists and points to the current launch.bat
@@ -482,10 +505,16 @@ def _torch_build() -> str:
         )
         if r.returncode != 0:
             return ""
-        ver = r.stdout.strip()          # e.g. "2.10.0+cu126" or "2.10.0+cpu"
+        ver = r.stdout.strip()          # e.g. "2.10.0+cu126", "2.10.0+cpu", "2.10.0"
         if "+" in ver:
             return ver.split("+", 1)[1] # "cu126" or "cpu"
-        return ""                       # plain version string - treat as unknown
+        if ver:
+            # Plain PyPI wheel with no local-version suffix (the macOS arm64
+            # Metal build). Treat as installed so macOS doesn't reinstall torch
+            # on every launch. "pypi" never equals a CUDA tag or "cpu", so the
+            # Windows comparisons below (== whl, == "cpu") behave as before.
+            return "pypi"
+        return ""                       # torch not installed
     except Exception:
         return ""
 
@@ -793,6 +822,10 @@ def main():
         _fatal("Python version too old")
     _ok(f"Python {vi.major}.{vi.minor}.{vi.micro}")
 
+    # Non-blocking warning if the project sits on a cloud-synced volume
+    # (macOS OneDrive/iCloud File Provider). No-op on Windows.
+    _warn_if_cloud_storage_path()
+
     # Start Menu shortcut (first run only)
     _create_start_menu_shortcut()
 
@@ -915,22 +948,16 @@ def main():
             _warn(f"Could not download ffmpeg: {e}")
             _warn("Screen recording will be unavailable. Install ffmpeg manually to enable it.")
 
-    # ── macOS audio bootstrap (BlackHole + aggregate device) ──────────────
+    # ── macOS audio: ScreenCaptureKit needs no install-time setup ─────────
+    # System audio is captured via Apple's ScreenCaptureKit (macOS 13+), so
+    # there is no BlackHole driver to install and no aggregate device to wire.
+    # The only requirement is the Screen & System Audio Recording permission,
+    # granted on first capture.
     if sys.platform == "darwin":
         _section("macOS AUDIO")
-        from capture_audio.mac_bootstrap import bootstrap_first_launch
-        try:
-            mac_status = bootstrap_first_launch()
-            if mac_status["installed"]:
-                _ok(f"BlackHole 2ch installed")
-            else:
-                _warn("BlackHole 2ch not installed automatically")
-            if mac_status["aggregate_ready"]:
-                _ok(f"Aggregate output device ready")
-            for msg in mac_status.get("messages", []):
-                _warn(msg)
-        except Exception as e:
-            _warn(f"macOS audio bootstrap failed: {e}")
+        _info("System audio uses ScreenCaptureKit (macOS 13+); no virtual audio driver is needed.")
+        _info("On first Record/Test, grant Screen & System Audio Recording, then")
+        _info("restart Meeting Assistant once (macOS caches the permission per process).")
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print()

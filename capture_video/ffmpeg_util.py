@@ -41,8 +41,22 @@ def download_ffmpeg(progress_cb=None) -> str:
     """Download a static ffmpeg build into tools/. Returns the binary path.
 
     progress_cb(message: str) is called for status updates.
+
+    On macOS Apple Silicon we refuse to auto-download because the bundled
+    URL (evermeet.cx) serves an x86_64 binary that runs through Rosetta, a
+    silent perf footgun. We raise with a `brew install ffmpeg` instruction;
+    the brew binary is native arm64 and is picked up by find_ffmpeg() via
+    PATH on the next launch.
     """
     import urllib.request
+    import platform as _platform
+
+    if sys.platform == "darwin" and _platform.machine() == "arm64":
+        raise RuntimeError(
+            "Auto-downloading ffmpeg on Apple Silicon would install an x86_64 "
+            "binary (evermeet.cx default). Run `brew install ffmpeg` once for "
+            "a native arm64 build; the launcher will pick it up automatically."
+        )
 
     _LOCAL_FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = _LOCAL_FFMPEG_DIR / "ffmpeg-download.zip"
@@ -101,8 +115,11 @@ def kill_stale_ffmpeg() -> int:
                 if "SUCCESS" in line:
                     killed += 1
         else:
+            # -x matches the exact process name (like taskkill /IM above);
+            # -f would match the full command line and could kill innocent
+            # bystanders such as `tail -f ffmpeg.log` or `vim ffmpeg_util.py`.
             r = subprocess.run(
-                ["pkill", "-f", "ffmpeg"],
+                ["pkill", "-x", "ffmpeg"],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:

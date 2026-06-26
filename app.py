@@ -6233,9 +6233,55 @@ def shutdown():
     return jsonify({"ok": True})
 
 
+def _relaunch_app() -> None:
+    """Relaunch the app in a detached process so it survives this process's
+    os._exit(0). Cross-platform; never raises (callers exit immediately after).
+
+    Windows: prefer the Start Menu shortcut (matches a normal start), else run
+    launch.bat in a new detached console.
+    macOS/Linux: run launch.command via bash (or `python launch.py` as a
+    fallback) in a new session so the child outlives the parent.
+    """
+    try:
+        root = Path(__file__).parent
+        if sys.platform == "win32":
+            lnk_path = (
+                Path(os.environ.get("APPDATA", ""))
+                / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+                / "Meeting Assistant.lnk"
+            )
+            if lnk_path.exists():
+                os.startfile(str(lnk_path))
+            else:
+                bat = root / "launch.bat"
+                if bat.exists():
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", str(bat)],
+                        cwd=str(root),
+                        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
+                    )
+        else:
+            # macOS / Linux: relaunch via launch.command (preferred) or
+            # `python launch.py`, detached so it outlives os._exit(0).
+            launcher = root / "launch.command"
+            if launcher.exists():
+                cmd = ["/bin/bash", str(launcher)]
+            else:
+                cmd = [sys.executable, str(root / "launch.py")]
+            subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception as e:
+        log.warn("app", f"relaunch failed: {e}")
+
+
 @app.route("/api/restart", methods=["POST"])
 def restart():
-    """Gracefully stop everything, then relaunch via Start Menu shortcut."""
+    """Gracefully stop everything, then relaunch (cross-platform)."""
     def _do_restart() -> None:
         global _tray
         with _state_lock:
@@ -6255,22 +6301,7 @@ def restart():
             storage.end_session(sid)
         time.sleep(0.5)
 
-        root = Path(__file__).parent
-        lnk_path = (
-            Path(os.environ.get("APPDATA", ""))
-            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-            / "Meeting Assistant.lnk"
-        )
-        if lnk_path.exists():
-            os.startfile(str(lnk_path))
-        else:
-            bat = root / "launch.bat"
-            if bat.exists():
-                subprocess.Popen(
-                    ["cmd.exe", "/c", str(bat)],
-                    cwd=str(root),
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
-                )
+        _relaunch_app()
 
         if _tray is not None:
             _tray.stop()
@@ -6540,23 +6571,8 @@ def update_apply():
             storage.end_session(sid)
         time.sleep(0.5)  # let the HTTP response reach the browser
 
-        # Launch via Start Menu shortcut so the experience matches a normal start
-        lnk_path = (
-            Path(os.environ.get("APPDATA", ""))
-            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-            / "Meeting Assistant.lnk"
-        )
-        if lnk_path.exists():
-            os.startfile(str(lnk_path))
-        else:
-            # Fallback: run launch.bat directly
-            bat = root / "launch.bat"
-            if bat.exists():
-                subprocess.Popen(
-                    ["cmd.exe", "/c", str(bat)],
-                    cwd=str(root),
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
-                )
+        # Relaunch so the experience matches a normal start (cross-platform).
+        _relaunch_app()
 
         if _tray is not None:
             _tray.stop()
@@ -6616,6 +6632,18 @@ def _handshake_existing_instance(url: str) -> bool:
     return False
 
 
+def _keepalive_loop() -> None:
+    """Keep the main thread alive in a Python-level loop so signal handlers
+    (Ctrl+C) can fire.  threading.Event.wait() with a timeout releases the GIL
+    and lets the interpreter check for pending signals each iteration."""
+    try:
+        _shutdown_event = threading.Event()
+        while not _shutdown_event.wait(timeout=1):
+            pass
+    except KeyboardInterrupt:
+        _force_quit()
+
+
 def main() -> None:
     global _tray, _server_url
 
@@ -6643,8 +6671,11 @@ def main() -> None:
     )
     flask_thread.start()
 
-    # Try to start system tray immediately so it becomes available during the
-    # same startup window as the webserver, rather than after the bind wait.
+    # Build the tray now; *when* it runs depends on the platform. On
+    # Windows/Linux it runs on a daemon thread (just below) so the main thread
+    # can receive Ctrl+C. On macOS the NSStatusItem MUST be created on the main
+    # thread (AppKit aborts otherwise), so the darwin tray runs on the main
+    # thread at the very end of main().
     try:
         from ui_desktop.tray import TRAY_AVAILABLE, MeetingTray
         if not TRAY_AVAILABLE:
@@ -6666,15 +6697,17 @@ def main() -> None:
             _force_quit()
 
         _tray = MeetingTray(url, _state_snapshot, _on_tray_quit)
-        log.info("tray", "System tray active - right-click for menu.")
-        # Run tray in a daemon thread so the main thread stays in Python code
-        # where it can receive signals (Ctrl+C).  pystray's Win32 message loop
-        # blocks in native C, which prevents Python signal handlers from firing.
-        threading.Thread(target=_tray.run, daemon=True).start()
-
     except ImportError:
         log.warn("tray", "pystray/Pillow not installed - running without system tray.")
         log.warn("tray", "Install with: pip install pystray Pillow")
+
+    if _tray is not None and sys.platform != "darwin":
+        # Windows/Linux: run the tray in a daemon thread so the main thread
+        # stays in Python code where it can receive signals (Ctrl+C).  pystray's
+        # Win32 message loop blocks in native C, which would otherwise prevent
+        # Python signal handlers from firing.
+        threading.Thread(target=_tray.run, daemon=True).start()
+        log.info("tray", "System tray active - right-click for menu.")
 
     # Wait for Flask to bind
     import urllib.request
@@ -6698,15 +6731,25 @@ def main() -> None:
     # This ensures Ctrl+C in the console immediately stops recording and exits.
     signal.signal(signal.SIGINT, lambda *_: _force_quit())
 
-    # Keep the main thread alive in a Python-level loop so signal handlers
-    # (Ctrl+C) can fire.  threading.Event.wait() with a timeout releases the
-    # GIL and lets the interpreter check for pending signals each iteration.
-    try:
-        _shutdown_event = threading.Event()
-        while not _shutdown_event.wait(timeout=1):
-            pass
-    except KeyboardInterrupt:
-        _force_quit()
+    if _tray is not None and sys.platform == "darwin":
+        # macOS: the NSStatusItem and its run loop MUST live on the main thread
+        # (AppKit raises NSInternalInconsistencyException otherwise, and the
+        # menu-bar icon silently dies). run() blocks here until the user quits
+        # from the menu; pystray installs its own SIGINT handling while the
+        # NSApplication loop runs.
+        log.info("tray", "Menu bar icon active - click for menu.")
+        try:
+            _tray.run()
+        except Exception as e:
+            log.warn("tray", f"System tray unavailable in this launch context: {e}")
+            _tray = None
+            webbrowser.open(url)  # no tray means no UI entry point; give one
+            _keepalive_loop()
+        else:
+            # run() returned: the user quit from the menu, or the loop ended.
+            _force_quit()
+    else:
+        _keepalive_loop()
 
 
 if __name__ == "__main__":

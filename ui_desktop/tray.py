@@ -9,6 +9,7 @@ Requires: pystray, Pillow.  If not installed the app runs without a tray.
 from __future__ import annotations
 
 import sys
+import threading
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -157,32 +158,68 @@ class MeetingTray:
         """Update the icon image and tooltip to reflect current state. Thread-safe."""
         if self._icon is None:
             return
+        # AppKit objects (NSImage, NSStatusItem, NSMenu) may only be touched
+        # from the main thread; refresh() is called from Flask request threads
+        # and the state-push loop, so on macOS hop onto the main run loop. On
+        # Windows/Linux this runs inline (identical to a direct call).
+        self._call_on_ui_thread(self._refresh_ui)
+
+    def _refresh_ui(self) -> None:
         try:
             self._icon.icon = self._pick_icon()
             self._icon.title = self._pick_tooltip()
             self._icon.update_menu()
-            # Re-apply template-image flag — pystray rebuilds the NSImage
+            # Re-apply template-image flag: pystray rebuilds the NSImage
             # whenever .icon is reassigned, so the flag is lost on each refresh.
             if _IS_MACOS:
                 self._mark_template_image(self._icon)
         except Exception:
             pass
 
+    @staticmethod
+    def _call_on_ui_thread(fn: Callable[[], None]) -> None:
+        """Run *fn* on the AppKit main thread (macOS) or inline elsewhere.
+
+        Best-effort: if the Foundation bridge is unavailable the call runs
+        inline, which matches the pre-macOS behavior. On Windows/Linux
+        _IS_MACOS is False, so this is always a plain inline call.
+        """
+        if _IS_MACOS and threading.current_thread() is not threading.main_thread():
+            try:
+                from Foundation import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+                return
+            except Exception:
+                pass
+        try:
+            fn()
+        except Exception:
+            pass
+
     def stop(self) -> None:
         """Remove the tray icon and unblock run()."""
         if self._icon:
-            try:
-                self._icon.stop()
-            except Exception:
-                pass
+            self._call_on_ui_thread(self._stop_ui)
+
+    def _stop_ui(self) -> None:
+        try:
+            self._icon.stop()
+        except Exception:
+            pass
 
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _on_setup(self, icon: "pystray.Icon") -> None:
-        """Called once after the icon enters its event loop."""
-        icon.visible = True
-        if _IS_MACOS:
-            self._mark_template_image(icon)
+        """Called once after the icon enters its event loop.
+
+        pystray invokes setup on a helper thread, so the AppKit touches are
+        marshaled to the main thread like every other mutation.
+        """
+        def _apply() -> None:
+            icon.visible = True
+            if _IS_MACOS:
+                self._mark_template_image(icon)
+        self._call_on_ui_thread(_apply)
 
     @staticmethod
     def _mark_template_image(icon: "pystray.Icon") -> None:
