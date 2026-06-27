@@ -9,6 +9,7 @@ Requires: pystray, Pillow.  If not installed the app runs without a tray.
 from __future__ import annotations
 
 import sys
+import threading
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -24,13 +25,12 @@ except ImportError:
 
 from core import config as config
 
-# macOS menu-bar icons should be rendered as "template images" — black
-# silhouettes with alpha — so AppKit can invert them automatically for
-# dark menu bars. We achieve this two ways:
-#   1. Provide a monochrome (black) variant of each state icon.
-#   2. After pystray creates the NSStatusItem, mark the NSImage as a
-#      template image via setTemplate_(True). Wrapped in try/except so
-#      it degrades cleanly if pystray's internals shift.
+# The menu-bar icon is shown in colour on every platform so macOS matches the
+# Windows tray: the brand green mic when ready, a red mic while recording, a grey
+# mic while models load, and amber when setup (an API key) is required. On macOS
+# we deliberately do NOT mark the NSImage as a template (that would force a
+# monochrome silhouette); we only size it to the menu-bar point size after
+# pystray creates the NSStatusItem (see _size_status_image).
 _IS_MACOS = sys.platform == "darwin"
 
 # ── Icon loading ───────────────────────────────────────────────────────────────
@@ -48,19 +48,6 @@ def _tint(img: "Image.Image", color: tuple[int, int, int]) -> "Image.Image":
     return colored
 
 
-def _to_template(img: "Image.Image") -> "Image.Image":
-    """Convert an icon to a black silhouette suitable for a macOS template image.
-
-    Preserves alpha but flattens all RGB to black. AppKit then renders it
-    correctly on both dark and light menu bars when setTemplate_(True) is
-    set on the NSImage.
-    """
-    alpha = img.split()[3]
-    black = Image.new("RGBA", img.size, (0, 0, 0, 255))
-    black.putalpha(alpha)
-    return black
-
-
 def _ensure_icons() -> None:
     """Load PNG assets and derive tray variants on first call."""
     if _icons:
@@ -76,21 +63,13 @@ def _ensure_icons() -> None:
         idle      = _load("logo.png")
         recording = _load("logo_recording.png")
 
-        if _IS_MACOS:
-            # Menu bar template images: monochrome silhouette, no fill colour.
-            # AppKit inverts them automatically for dark menu bars when the
-            # underlying NSImage is marked template (handled in run()).
-            idle_template      = _to_template(idle)
-            recording_template = _to_template(recording)
-            _icons["ready"]     = idle_template
-            _icons["recording"] = recording_template
-            _icons["loading"]   = idle_template
-            _icons["setup"]     = idle_template
-        else:
-            _icons["ready"]     = idle
-            _icons["recording"] = recording
-            _icons["loading"]   = _tint(idle, (110, 118, 129))   # gray
-            _icons["setup"]     = _tint(idle, (210, 153, 34))    # amber
+        # Same colour scheme on every platform (macOS included, per the note
+        # above): green when ready, red while recording, grey while loading,
+        # amber when setup is required.
+        _icons["ready"]     = idle                               # brand green
+        _icons["recording"] = recording                          # red
+        _icons["loading"]   = _tint(idle, (110, 118, 129))       # gray
+        _icons["setup"]     = _tint(idle, (210, 153, 34))        # amber
     except Exception as e:
         print(f"[tray] Could not load PNG icons, falling back to drawn icons: {e}")
 
@@ -145,6 +124,8 @@ class MeetingTray:
 
     def run(self) -> None:
         """Start the tray icon.  Blocks the calling thread (must be main)."""
+        if _IS_MACOS:
+            self._make_accessory_app()
         self._icon = pystray.Icon(
             name="Meeting Assistant",
             icon=self._pick_icon(),
@@ -153,52 +134,121 @@ class MeetingTray:
         )
         self._icon.run(setup=self._on_setup)
 
+    @staticmethod
+    def _make_accessory_app() -> None:
+        """Run as a menu-bar-only (accessory) app on macOS: no Dock icon and no
+        Cmd-Tab entry, with the status-bar icon as the app's entry point. Must
+        run on the main thread before the NSApplication loop starts. Best-effort:
+        if AppKit is unavailable the app simply keeps its default Dock icon.
+        """
+        try:
+            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory
+            )
+        except Exception:
+            pass
+
     def refresh(self) -> None:
         """Update the icon image and tooltip to reflect current state. Thread-safe."""
         if self._icon is None:
             return
+        # AppKit objects (NSImage, NSStatusItem, NSMenu) may only be touched
+        # from the main thread; refresh() is called from Flask request threads
+        # and the state-push loop, so on macOS hop onto the main run loop. On
+        # Windows/Linux this runs inline (identical to a direct call).
+        self._call_on_ui_thread(self._refresh_ui)
+
+    def _refresh_ui(self) -> None:
         try:
             self._icon.icon = self._pick_icon()
             self._icon.title = self._pick_tooltip()
             self._icon.update_menu()
-            # Re-apply template-image flag — pystray rebuilds the NSImage
-            # whenever .icon is reassigned, so the flag is lost on each refresh.
+            # Re-apply icon sizing: pystray rebuilds the NSImage whenever .icon
+            # is reassigned, so the menu-bar size is lost on each refresh.
             if _IS_MACOS:
-                self._mark_template_image(self._icon)
+                self._size_status_image(self._icon)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _call_on_ui_thread(fn: Callable[[], None]) -> None:
+        """Run *fn* on the AppKit main thread (macOS) or inline elsewhere.
+
+        Best-effort: if the Foundation bridge is unavailable the call runs
+        inline, which matches the pre-macOS behavior. On Windows/Linux
+        _IS_MACOS is False, so this is always a plain inline call.
+        """
+        if _IS_MACOS and threading.current_thread() is not threading.main_thread():
+            try:
+                from Foundation import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+                return
+            except Exception:
+                pass
+        try:
+            fn()
         except Exception:
             pass
 
     def stop(self) -> None:
         """Remove the tray icon and unblock run()."""
         if self._icon:
-            try:
-                self._icon.stop()
-            except Exception:
-                pass
+            self._call_on_ui_thread(self._stop_ui)
+
+    def _stop_ui(self) -> None:
+        try:
+            self._icon.stop()
+        except Exception:
+            pass
 
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _on_setup(self, icon: "pystray.Icon") -> None:
-        """Called once after the icon enters its event loop."""
-        icon.visible = True
-        if _IS_MACOS:
-            self._mark_template_image(icon)
+        """Called once after the icon enters its event loop.
+
+        pystray invokes setup on a helper thread, so the AppKit touches are
+        marshaled to the main thread like every other mutation.
+        """
+        def _apply() -> None:
+            icon.visible = True
+            if _IS_MACOS:
+                self._size_status_image(icon)
+        self._call_on_ui_thread(_apply)
 
     @staticmethod
-    def _mark_template_image(icon: "pystray.Icon") -> None:
-        """Mark the menu-bar NSImage as a template so AppKit inverts it
-        automatically for dark menu bars. pystray exposes the underlying
-        NSStatusItem via internal attrs; we walk it defensively."""
+    def _size_status_image(icon: "pystray.Icon") -> None:
+        """Size the menu-bar NSImage to match the system icons (macOS only).
+
+        pystray hands AppKit the full 64px bitmap, which it renders at the full
+        bar height with no padding, so the glyph reads noticeably larger than its
+        neighbours; we pin it to the bar thickness minus a little padding. We also
+        clear the template flag so the icon keeps its colour (green / red / grey /
+        amber) instead of being flattened to a monochrome silhouette.
+
+        pystray exposes the underlying NSStatusItem via internal attrs; we walk
+        it defensively and re-apply on every refresh (pystray rebuilds the
+        NSImage whenever .icon is reassigned, which drops these touches)."""
         try:
             status_item = getattr(icon, "_status_item", None) or getattr(icon, "_status_bar_item", None)
             if status_item is None:
                 return
             ns_button = status_item.button() if callable(getattr(status_item, "button", None)) else None
             ns_image = ns_button.image() if ns_button is not None else None
-            if ns_image is not None and hasattr(ns_image, "setTemplate_"):
-                ns_image.setTemplate_(True)
+            if ns_image is None:
+                return
+            if hasattr(ns_image, "setTemplate_"):
+                ns_image.setTemplate_(False)  # keep colour; do not flatten to a silhouette
+            try:
+                from AppKit import NSStatusBar
+                thickness = float(NSStatusBar.systemStatusBar().thickness()) or 24.0
+            except Exception:
+                thickness = 24.0
+            side = max(15.0, min(19.0, round(thickness - 6.0)))
+            if hasattr(ns_image, "setSize_"):
+                ns_image.setSize_((side, side))
         except Exception:
-            pass  # styling polish only — not worth crashing the tray over
+            pass  # styling polish only, not worth crashing the tray over
 
     def _get_tray_state(self) -> str:
         """Return the current tray state key."""
@@ -266,7 +316,7 @@ class MeetingTray:
 
     def _status_text(self) -> str:
         st = self._get_state()
-        if config.needs_setup():
+        if config.needs_setup(st.get("ai_provider", "anthropic")):
             return "Setup required"
         if st.get("is_recording"):
             return "Recording..."
@@ -303,33 +353,44 @@ class MeetingTray:
         webbrowser.open(f"{self._url}/session?settings=1&section=system")
 
     def _restart_server(self, icon=None, item=None) -> None:
-        """Restart the server via the API."""
-        try:
-            req = urllib.request.Request(
-                f"{self._url}/api/restart",
-                data=b"{}",
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass  # server is restarting, connection will drop
+        """Restart the server via the API.
 
-    def _toggle_recording(self, icon=None, item=None) -> None:
-        """Start or stop recording via the local Flask API."""
-        st = self._get_state()
-        if st.get("is_recording"):
-            # Stop: direct API call is fine
+        Dispatched on a daemon thread: on macOS this menu callback fires on the
+        AppKit main run loop, and the POST targets a server that is tearing
+        itself down, so the socket can hang until the timeout and freeze the
+        whole menu bar. Returning immediately keeps the run loop pumping.
+        """
+        def _do() -> None:
             try:
                 req = urllib.request.Request(
-                    f"{self._url}/api/recording/stop",
+                    f"{self._url}/api/restart",
                     data=b"{}",
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
                 urllib.request.urlopen(req, timeout=5)
-            except Exception as e:
-                print(f"[tray] stop recording failed: {e}")
+            except Exception:
+                pass  # server is restarting, connection will drop
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _toggle_recording(self, icon=None, item=None) -> None:
+        """Start or stop recording via the local Flask API."""
+        st = self._get_state()
+        if st.get("is_recording"):
+            # Stop: POST on a daemon thread so the AppKit main run loop (which
+            # invokes this callback on macOS) is never blocked on the socket.
+            def _do_stop() -> None:
+                try:
+                    req = urllib.request.Request(
+                        f"{self._url}/api/recording/stop",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=5)
+                except Exception as e:
+                    print(f"[tray] stop recording failed: {e}")
+            threading.Thread(target=_do_stop, daemon=True).start()
         else:
             # Start: open the session page with ?autostart so the recording
             # goes through the same audio-initialisation path as a normal
@@ -337,14 +398,21 @@ class MeetingTray:
             webbrowser.open(f"{self._url}/session?autostart=1")
 
     def _test_toast(self, icon=None, item=None) -> None:
-        """Fire a diagnostic system toast — verifies callbacks + visibility."""
-        try:
-            from ui_desktop import notifications
-            ok = notifications.send_test_toast()
-            if not ok:
-                print("[tray] Test toast failed to dispatch — see [notify] log lines above.")
-        except Exception as e:
-            print(f"[tray] Test toast error: {e}")
+        """Fire a diagnostic system toast — verifies callbacks + visibility.
+
+        Runs on a daemon thread: send_test_toast() shells out to osascript
+        (subprocess.run with a 5 s timeout) on macOS, and this callback fires on
+        the AppKit main run loop, so doing it inline would stall the menu bar.
+        """
+        def _do() -> None:
+            try:
+                from ui_desktop import notifications
+                ok = notifications.send_test_toast()
+                if not ok:
+                    print("[tray] Test toast failed to dispatch — see [notify] log lines above.")
+            except Exception as e:
+                print(f"[tray] Test toast error: {e}")
+        threading.Thread(target=_do, daemon=True).start()
 
     def _quit(self, icon=None, item=None) -> None:
         self._on_quit(self._icon)

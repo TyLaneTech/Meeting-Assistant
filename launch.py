@@ -73,9 +73,26 @@ def _find_uv() -> str:
     return ""
 
 
+def _uv_target() -> list[str]:
+    """The interpreter uv should install into: the project venv, named explicitly.
+
+    Passing ``--python <venv python>`` instead of relying on the active
+    ``VIRTUAL_ENV`` matters on macOS: the stock python.org interpreter is a
+    universal2 framework build whose sysconfig platform is
+    ``macosx-10.9-universal2``. When uv discovers that interpreter via the
+    environment (no ``--python``), it derives an *x86_64* wheel-tag set from
+    that universal2 platform and then can't satisfy arm64-only wheels such as
+    ``mlx`` (Apple-silicon-only), failing the whole install. An explicit
+    ``--python`` makes uv probe the interpreter directly and resolve arm64
+    wheels correctly. We keep the universal2 framework build (not a single-arch
+    managed python) because the menu-bar tray needs a framework interpreter.
+    """
+    return ["--python", str(_venv_python())]
+
+
 def _uv(*args, show_output=False):
     """Run uv pip install with the given args. Returns True on success."""
-    cmd = [UV, "pip", "install"]
+    cmd = [UV, "pip", "install"] + _uv_target()
     if not show_output:
         cmd.append("--quiet")
     cmd.extend(args)
@@ -86,7 +103,7 @@ def _uv_streaming(*args):
     """
     Run uv pip install and print filtered progress lines in real time.
     """
-    cmd = [UV, "pip", "install"] + list(args)
+    cmd = [UV, "pip", "install"] + _uv_target() + list(args)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -189,6 +206,29 @@ def _ensure_venv():
 # ── Start Menu shortcut ───────────────────────────────────────────────────────
 
 _SHORTCUT_NAME = "Meeting Assistant.lnk"
+
+
+def _warn_if_cloud_storage_path():
+    """Warn when the project lives on a macOS File Provider volume
+    (OneDrive, iCloud Drive, etc. under ~/Library/CloudStorage).
+
+    Dataless-evicted files make Python imports and SQLite writes
+    pathologically slow (observed: a single .pyc read blocking for minutes),
+    and sync can corrupt the live database or recordings mid-write. This is a
+    warning only and never blocks the launch. It is a no-op on Windows, whose
+    paths never contain "/Library/CloudStorage/".
+    """
+    try:
+        root = str(Path(__file__).resolve().parent)
+    except Exception:
+        return
+    if "/Library/CloudStorage/" not in root:
+        return
+    _warn("Project folder is inside a cloud-synced volume (OneDrive/File Provider):")
+    _info(root)
+    _warn("Imports and database writes can be pathologically slow, and recordings")
+    _warn("or the meetings database can corrupt when files sync mid-write.")
+    _warn("Recommended: move this folder to a local path, e.g. ~/meeting-assistant")
 
 
 def _create_start_menu_shortcut():
@@ -482,10 +522,16 @@ def _torch_build() -> str:
         )
         if r.returncode != 0:
             return ""
-        ver = r.stdout.strip()          # e.g. "2.10.0+cu126" or "2.10.0+cpu"
+        ver = r.stdout.strip()          # e.g. "2.10.0+cu126", "2.10.0+cpu", "2.10.0"
         if "+" in ver:
             return ver.split("+", 1)[1] # "cu126" or "cpu"
-        return ""                       # plain version string - treat as unknown
+        if ver:
+            # Plain PyPI wheel with no local-version suffix (the macOS arm64
+            # Metal build). Treat as installed so macOS doesn't reinstall torch
+            # on every launch. "pypi" never equals a CUDA tag or "cpu", so the
+            # Windows comparisons below (== whl, == "cpu") behave as before.
+            return "pypi"
+        return ""                       # torch not installed
     except Exception:
         return ""
 
@@ -793,6 +839,10 @@ def main():
         _fatal("Python version too old")
     _ok(f"Python {vi.major}.{vi.minor}.{vi.micro}")
 
+    # Non-blocking warning if the project sits on a cloud-synced volume
+    # (macOS OneDrive/iCloud File Provider). No-op on Windows.
+    _warn_if_cloud_storage_path()
+
     # Start Menu shortcut (first run only)
     _create_start_menu_shortcut()
 
@@ -819,6 +869,24 @@ def main():
     # Disconnect before package installs, reconnect after (git/HF need it).
     from core.network import warp_disconnect
     warp_disconnect()
+
+    if sys.platform == "darwin":
+        # Apple Silicon source-build hygiene. The stock python.org interpreter
+        # is a universal2 framework build, so setuptools otherwise attempts a
+        # fat x86_64+arm64 compile that can't link arm64-only artefacts. Pin
+        # builds to arm64.
+        os.environ["ARCHFLAGS"] = "-arch arm64"
+        # aec-audio-processing compiles webrtc-audio-processing from source via
+        # meson and finds abseil through pkg-config. On an Apple Silicon machine
+        # that also carries an Intel (x86_64) Homebrew under /usr/local, meson
+        # links the host's x86_64 abseil and the arm64 build fails. Point
+        # pkg-config at an empty dir so meson falls back to abseil's bundled
+        # arm64 subproject. Harmless on clean machines (subproject either way);
+        # only source builds consult pkg-config, and the wheels above ignore it.
+        _empty_pc = Path(__file__).parent / "storage" / "tools" / "empty-pkgconfig"
+        _empty_pc.mkdir(parents=True, exist_ok=True)
+        os.environ["PKG_CONFIG_LIBDIR"] = str(_empty_pc)
+        os.environ["PKG_CONFIG_PATH"] = ""
 
     # PyTorch - only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
@@ -915,22 +983,16 @@ def main():
             _warn(f"Could not download ffmpeg: {e}")
             _warn("Screen recording will be unavailable. Install ffmpeg manually to enable it.")
 
-    # ── macOS audio bootstrap (BlackHole + aggregate device) ──────────────
+    # ── macOS audio: ScreenCaptureKit needs no install-time setup ─────────
+    # System audio is captured via Apple's ScreenCaptureKit (macOS 13+), so
+    # there is no BlackHole driver to install and no aggregate device to wire.
+    # The only requirement is the Screen & System Audio Recording permission,
+    # granted on first capture.
     if sys.platform == "darwin":
         _section("macOS AUDIO")
-        from capture_audio.mac_bootstrap import bootstrap_first_launch
-        try:
-            mac_status = bootstrap_first_launch()
-            if mac_status["installed"]:
-                _ok(f"BlackHole 2ch installed")
-            else:
-                _warn("BlackHole 2ch not installed automatically")
-            if mac_status["aggregate_ready"]:
-                _ok(f"Aggregate output device ready")
-            for msg in mac_status.get("messages", []):
-                _warn(msg)
-        except Exception as e:
-            _warn(f"macOS audio bootstrap failed: {e}")
+        _info("System audio uses ScreenCaptureKit (macOS 13+); no virtual audio driver is needed.")
+        _info("On first Record/Test, grant Screen & System Audio Recording, then")
+        _info("restart Meeting Assistant once (macOS caches the permission per process).")
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print()

@@ -18,6 +18,7 @@ import pyaudiowpatch as pyaudio
 from scipy.signal import resample_poly
 
 from core import log as log
+from capture_audio._webrtc import WebRTCMicProcessor
 from capture_audio.wav_writer import WavWriter
 
 # ── INPUT_DEBUG ──────────────────────────────────────────────────────────
@@ -139,6 +140,10 @@ class AudioCapture:
 
         # Echo cancellation (disabled by default - enable for speaker+mic setups)
         self.echo_cancel_enabled: bool = False
+        # Noise suppression, independent of echo cancellation. Echo cancellation
+        # always includes it; this flag enables it on its own (e.g. to stop the
+        # custom AGC boosting quiet background noise when echo cancellation is off).
+        self.noise_suppress_enabled: bool = False
 
         # Automatic gain control (soft compressor / normaliser)
         self.agc_loopback_enabled: bool = True
@@ -1004,12 +1009,8 @@ class AudioCapture:
         _agc_lb_env  = 0.0
         _agc_mic_env = 0.0
 
-        # WebRTC AEC state - lazily initialised when echo cancellation is enabled
-        _aec_processor = None
-        _aec_frame_size = 0
-        _aec_mic_buf = np.array([], dtype=np.float32)
-        _aec_lb_buf  = np.array([], dtype=np.float32)
-        _aec_out_buf = np.array([], dtype=np.float32)
+        # Shared WebRTC echo-cancel / noise-suppression processor (raw mic, pre-AGC).
+        _mic_proc = WebRTCMicProcessor(self.CHUNK_SIZE)
 
         # ── Wall-clock pacing ────────────────────────────────────────────────
         # Emit exactly one CHUNK_SIZE-sized mixed chunk per wall-clock period
@@ -1113,13 +1114,42 @@ class AudioCapture:
                     have_lb  = lb_pos + self.CHUNK_SIZE <= len(lb_buf)
                     have_mic = self._has_mic and mic_pos + self.CHUNK_SIZE <= len(mic_buf)
 
-                    # ── Loopback chunk ──────────────────────────────────────
+                    # ── Loopback chunk (raw; AGC applied after AEC below) ───
                     if have_lb:
                         lb_chunk = np.clip(
                             lb_buf[lb_pos:lb_pos + self.CHUNK_SIZE] * self.loopback_gain,
                             -1.0, 1.0,
                         )
                         lb_pos += self.CHUNK_SIZE
+                    else:
+                        lb_chunk = _zero_chunk
+
+                    # ── Mic chunk (raw) ─────────────────────────────────────
+                    if have_mic:
+                        mic_chunk = np.clip(
+                            mic_buf[mic_pos:mic_pos + self.CHUNK_SIZE] * self.mic_gain,
+                            -1.0, 1.0,
+                        )
+                        mic_pos += self.CHUNK_SIZE
+                    else:
+                        mic_chunk = _zero_chunk
+
+                    # ── WebRTC echo cancel / noise suppression on the raw mic ──
+                    # Runs before AGC and against the raw loopback reference: AGC's
+                    # time-varying gain would otherwise break the echo relationship
+                    # the canceller relies on. Echo cancellation and noise
+                    # suppression are independent; noise suppression runs on the mic
+                    # alone, so it works even with echo cancellation off.
+                    if have_mic:
+                        mic_chunk = _mic_proc.process(
+                            mic_chunk, lb_chunk, self.sample_rate or 16000,
+                            enable_aec=self.echo_cancel_enabled,
+                            enable_ns=(self.echo_cancel_enabled
+                                       or self.noise_suppress_enabled),
+                        )
+
+                    # ── Loopback auto-gain (for the mix; AEC used the raw ref) ──
+                    if have_lb:
                         if self.agc_loopback_enabled:
                             lb_chunk, _agc_lb_env, _g, _gated = self._agc_apply(
                                 lb_chunk, _agc_lb_env, self.agc_target_rms,
@@ -1136,20 +1166,18 @@ class AudioCapture:
                         self.loopback_level = lb_rms
                         self._lb_fft_buf.extend(lb_chunk.tolist())
                     else:
-                        lb_chunk = _zero_chunk
                         lb_rms = 0.0
                         self.loopback_level = 0.0
                         self.agc_lb_gain = 1.0
                         self.agc_lb_gated = True
 
-                    # ── Mic chunk ───────────────────────────────────────────
+                    # ── Mic auto-gain. Bypassed whenever the mic is being cleaned
+                    # (echo cancellation or noise suppression on) so the suppressed
+                    # echo residual / background noise is not re-boosted straight
+                    # back up by the gain stage. ────────────────────────────────
                     if have_mic:
-                        mic_chunk = np.clip(
-                            mic_buf[mic_pos:mic_pos + self.CHUNK_SIZE] * self.mic_gain,
-                            -1.0, 1.0,
-                        )
-                        mic_pos += self.CHUNK_SIZE
-                        if self.agc_mic_enabled:
+                        if (self.agc_mic_enabled and not self.echo_cancel_enabled
+                                and not self.noise_suppress_enabled):
                             mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(
                                 mic_chunk, _agc_mic_env, self.agc_target_rms,
                                 self.agc_max_gain, self.agc_gate_threshold,
@@ -1165,67 +1193,10 @@ class AudioCapture:
                         self.mic_level = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
                     else:
-                        mic_chunk = _zero_chunk
                         mic_rms = 0.0
                         self.mic_level = 0.0
                         self.agc_mic_gain = 1.0
                         self.agc_mic_gated = True
-
-                    # ── WebRTC AEC: only meaningful when BOTH sides are real
-                    # this iteration. The reference signal (loopback) must be
-                    # in lock-step with the mic; feeding either side alone
-                    # desynchronises the buffers. When loopback is absent,
-                    # there's no echo to cancel anyway.
-                    if self.echo_cancel_enabled and have_lb and have_mic:
-                        if _aec_processor is None or _aec_frame_size == 0:
-                            try:
-                                from aec_audio_processing import AudioProcessor
-                                _aec_processor = AudioProcessor(
-                                    enable_aec=True, enable_ns=False, enable_agc=False,
-                                )
-                                sr = self.sample_rate or 16000
-                                _aec_processor.set_stream_format(sr, 1)
-                                _aec_processor.set_reverse_stream_format(sr, 1)
-                                _aec_frame_size = _aec_processor.get_frame_size()
-                                log.info("audio", f"WebRTC AEC initialised @ {sr} Hz, "
-                                                  f"frame={_aec_frame_size} samples")
-                            except Exception:
-                                traceback.print_exc()
-                                _aec_processor = None
-
-                        if _aec_processor is not None:
-                            _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
-                            _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
-                            cleaned_parts: list[np.ndarray] = []
-                            while (len(_aec_mic_buf) >= _aec_frame_size
-                                   and len(_aec_lb_buf) >= _aec_frame_size):
-                                mf = _aec_mic_buf[:_aec_frame_size]
-                                lf = _aec_lb_buf[:_aec_frame_size]
-                                _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
-                                _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
-                                lb_i16  = (lf * 32767).astype(np.int16).tobytes()
-                                mic_i16 = (mf * 32767).astype(np.int16).tobytes()
-                                _aec_processor.process_reverse_stream(lb_i16)
-                                result = _aec_processor.process_stream(mic_i16)
-                                cleaned_parts.append(
-                                    np.frombuffer(result, dtype=np.int16)
-                                      .astype(np.float32) / 32768.0
-                                )
-                            if cleaned_parts:
-                                _aec_out_buf = np.concatenate(
-                                    (_aec_out_buf, *cleaned_parts)
-                                )
-                            if len(_aec_out_buf) >= self.CHUNK_SIZE:
-                                mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
-                                _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
-                                mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
-                    elif (not self.echo_cancel_enabled) and _aec_processor is not None:
-                        # Echo cancellation was just disabled - tear down
-                        _aec_processor = None
-                        _aec_frame_size = 0
-                        _aec_mic_buf = np.array([], dtype=np.float32)
-                        _aec_lb_buf  = np.array([], dtype=np.float32)
-                        _aec_out_buf = np.array([], dtype=np.float32)
 
                     # ── Mix: always sum. The previous "louder side wins"
                     # gate was muting the mic the moment desktop audio got

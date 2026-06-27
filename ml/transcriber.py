@@ -136,6 +136,15 @@ def get_cuda_available() -> bool:
 
 def get_default_model_config() -> tuple[str, str, str]:
     """Return the preferred default Whisper config, probing once lazily."""
+    if sys.platform == "darwin":
+        # Apple Silicon: mlx-whisper drives Metal directly. Mirror
+        # detect_device() so the streaming engine defaults to large-v3, the
+        # model the launcher pre-caches — without this darwin branch the
+        # function falls through to the CPU default ("small"), which on macOS
+        # maps to whisper-small-mlx (never pre-downloaded) and fails to load
+        # under HF_HUB_OFFLINE, so live transcription produces no segments.
+        log.info("whisper", "Using mlx-whisper on Metal - large-v3.")
+        return "mlx", "fp16", "large-v3"
     if get_cuda_available():
         log.info("whisper", "CUDA OK - using large-v3 (float16).")
         return "cuda", "float16", "large-v3"
@@ -185,6 +194,9 @@ _HALLUCINATION_PHRASES = [
     "transcription by",
     "translated by",
     "captioned by",
+    "closed captioning",
+    "captioning by",
+    "captioning sponsored by",
 ]
 
 # Pre-compile a single regex for efficiency
@@ -256,6 +268,16 @@ def _clean_ellipses(text: str) -> str:
     cleaned = _re.sub(r'\s{2,}', ' ', cleaned).strip()
     if trailing and cleaned and not cleaned.endswith("..."):
         cleaned += "..."
+    return cleaned
+
+
+def _strip_repeated_char_runs(text: str) -> str:
+    """Strip 'stuck character' Whisper hallucinations: long runs of a single
+    repeated letter (e.g. 'ŠŠŠŠŠ…'), which Whisper emits over near-silent or
+    noisy audio. Digit runs (large numbers) and punctuation runs ('...', '!!!')
+    are deliberately left alone."""
+    cleaned = _re.sub(r"([^\W\d_])\1{4,}", " ", text)   # 5+ of the same letter
+    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned
 
 
@@ -503,6 +525,23 @@ class Transcriber:
         self.vad_speech_pad_ms   = int(p["vad_speech_pad_ms"])
         self.compression_ratio_threshold = float(p["compression_ratio_threshold"])
         self.segment_break_silence = float(p.get("segment_break_silence", 1.5))
+        # "Mic = Me" desktop-bleed rejection by VOICEPRINT (secondary, opt-in). A
+        # microphone segment whose speaker embedding matches the concurrent desktop
+        # (loopback) audio at least this closely (cosine similarity) is treated as
+        # bleed and dropped. Disabled by default (0.0): with the built-in mic and
+        # speakers the mic and loopback clocks drift, so the two never line up well
+        # enough for the embedding to match reliably; the level gate below carries
+        # the load instead. Set > 0 to re-enable as an extra check.
+        self.mic_bleed_threshold = float(p.get("mic_bleed_threshold", 0.0))
+        # "Mic = Me" desktop-bleed LEVEL gate (the primary, reliable mechanism on
+        # macOS, where the mic and loopback clocks drift and an echo canceller
+        # cannot lock on). When the desktop is playing, a microphone segment is
+        # kept as the user only if its RAW level rises at least this far above the
+        # learned bleed floor (coupling x desktop level); otherwise the whole
+        # segment is dropped as desktop bleed. Higher = stricter (drops more,
+        # needs you clearly louder than the desktop); lower = keeps more mic.
+        self.mic_bleed_slack = float(p.get("mic_bleed_slack",
+                                           p.get("bleed_duck_slack", 2.0)))
 
     @property
     def device_info(self) -> str:
@@ -693,6 +732,113 @@ class Transcriber:
             audio = scipy_signal.resample_poly(audio, self.TARGET_RATE, self.sample_rate)
         return audio
 
+    def _mic_is_desktop_bleed(
+        self, mic_buffer: list[bytes], start_t: float, end_t: float, desktop_ring,
+    ) -> bool:
+        """True if a "mic = Me" segment is actually desktop audio bleeding into
+        the microphone (same voice as what was playing) rather than the app user.
+
+        Compares the microphone segment's speaker embedding against the embedding
+        of the desktop (loopback) audio from the SAME time window. When the mic is
+        just picking up the speakers, both carry the same voiceprint, so a high
+        cosine similarity means bleed. Deliberately conservative: returns False
+        (keep the segment) whenever it cannot decide, so genuine user speech is
+        never dropped on a hunch."""
+        thr = self.mic_bleed_threshold
+        diar = self.diarizer
+        if thr <= 0.0 or diar is None or getattr(diar, "_emb_model", None) is None:
+            return False
+        try:
+            mic_audio = self._convert(mic_buffer)
+        except Exception:
+            return False
+        min_samples = int(0.6 * self.TARGET_RATE)
+        if len(mic_audio) < min_samples or float(np.sqrt(np.mean(mic_audio ** 2))) < 0.005:
+            return False
+        # Concurrent desktop audio for [start_t, end_t], widened by 1 s on each
+        # side. mic and desktop chunks share the mixer's sample offset, but the
+        # two capture clocks drift, so the desktop that bled into the mic can sit
+        # slightly earlier or later; the margin gives the comparison a stable,
+        # same-speaker reference window.
+        sr = self.sample_rate or 48000
+        lo, hi = int((start_t - 1.0) * sr), int((end_t + 1.0) * sr)
+        parts = [b for (off, b) in list(desktop_ring) if off >= 0 and lo <= off <= hi]
+        if not parts:
+            return False
+        try:
+            dsk_audio = self._convert(parts)
+        except Exception:
+            return False
+        if len(dsk_audio) < min_samples or float(np.sqrt(np.mean(dsk_audio ** 2))) < 0.005:
+            return False
+        try:
+            e_mic = diar._extract_embedding(mic_audio)
+            e_dsk = diar._extract_embedding(dsk_audio)
+        except Exception:
+            return False
+        if e_mic is None or e_dsk is None:
+            return False
+        sim = float(np.dot(e_mic, e_dsk))
+        bleed = sim >= thr
+        log.info(
+            "transcriber",
+            f"[me] bleed check sim={sim:.2f} thr={thr:.2f} -> "
+            f"{'DROP (desktop bleed)' if bleed else 'keep'}",
+        )
+        return bleed
+
+    def _mic_segment_is_bleed(self, start_t: float, end_t: float) -> bool:
+        """True when a "mic = Me" segment is just the desktop bleeding into the
+        microphone, judged on RAW levels over the WHOLE segment.
+
+        This is the primary bleed gate on macOS, where the mic and loopback clocks
+        drift and an echo canceller cannot stay locked. While the desktop plays,
+        pure bleed sits at a roughly fixed coupling below the desktop's own level.
+        We estimate that coupling live as a low percentile of the raw mic/desktop
+        ratio across a trailing window (the quiet-mic moments are pure bleed), then
+        keep the segment only if its mic level, averaged over [start_t, end_t], rose
+        clearly above that bleed floor (i.e. there was genuine near-end speech).
+
+        Deciding once per segment, rather than muting per chunk, means word onsets
+        are never sliced into fragments that Whisper transcribes as spurious "You"
+        lines (the failure mode of the earlier per-chunk gate). Conservative:
+        returns False (keep) when the desktop is silent or there is too little
+        history to judge, so the user's own speech is never dropped on a hunch."""
+        ring = getattr(self, "_level_ring", None)
+        if not ring:
+            return False
+        sr = self.sample_rate or 48000
+        lo, hi = int(start_t * sr), int(end_t * sr)
+        seg_mic: list[float] = []
+        seg_dsk: list[float] = []
+        ratios:  list[float] = []
+        for off, m, l in list(ring):
+            if l > 0.003:                      # desktop audible -> a coupling sample
+                ratios.append(m / l)
+            if off >= 0 and lo <= off <= hi:
+                seg_mic.append(m)
+                seg_dsk.append(l)
+        if not seg_dsk or len(ratios) < 8:
+            return False
+        mean_dsk = sum(seg_dsk) / len(seg_dsk)
+        if mean_dsk < 0.003:                   # desktop effectively silent this segment
+            return False
+        mean_mic = sum(seg_mic) / len(seg_mic)
+        # Bleed floor = how loud pure desktop bleed is in the mic, self-calibrated to
+        # this machine's speaker volume and mic. The 20th percentile tracks the quiet
+        # (pure-bleed) moments while ignoring the user's own speech spikes.
+        coupling = float(np.percentile(np.asarray(ratios, dtype=np.float64), 20.0))
+        coupling = min(max(coupling, 0.02), 1.0)
+        keep_above = coupling * mean_dsk * self.mic_bleed_slack
+        is_bleed = mean_mic < keep_above
+        log.info(
+            "transcriber",
+            f"[me] level gate mic={mean_mic:.4f} dsk={mean_dsk:.4f} "
+            f"coupling={coupling:.2f} need>{keep_above:.4f} -> "
+            f"{'DROP (desktop bleed)' if is_bleed else 'keep'}",
+        )
+        return is_bleed
+
     def _transcribe(
         self,
         buffer: list[bytes],
@@ -850,6 +996,14 @@ class Transcriber:
             if parts:
                 text = _strip_fragment_period(" ".join(parts))
                 text = _clean_ellipses(text)
+                # Strip 'stuck character' runs (e.g. 'ŠŠŠŠ…') that Whisper emits
+                # over near-silent audio; if nothing meaningful remains, drop it.
+                stripped = _strip_repeated_char_runs(text)
+                if stripped != text:
+                    log.warn("transcriber", f"[{label}] Repeated-character hallucination cleaned")
+                    text = stripped
+                if len(_re.sub(r"[^\w]", "", text, flags=_re.UNICODE)) < 3:
+                    return
                 # Collapse per-word periods (e.g. "And. Uh. It. Would.") into
                 # normal text. Done after _strip_fragment_period so the latter
                 # still handles the simple single-fragment case.
@@ -959,22 +1113,49 @@ class Transcriber:
         min_buffer_chunks    = int(self.min_buffer_seconds * chunks_per_second)
         max_buffer_chunks    = int(self.max_buffer_seconds * chunks_per_second)
 
+        import collections
+        sr = self.sample_rate or 48000
+        # Rolling buffer of recent desktop (loopback) audio keyed by the mixer's
+        # sample offset, used by the optional voiceprint bleed check (~20 s window).
+        desktop_ring = collections.deque(maxlen=int(20 * sr / self.CHUNK_SIZE) + 8)
+        # Rolling RAW (pre-gain) mic/loopback levels keyed by sample offset, used by
+        # the primary level-based bleed gate to judge whole mic segments (~30 s).
+        self._level_ring = collections.deque(maxlen=int(30 * sr / self.CHUNK_SIZE) + 8)
+
         def _mk(on_flush):
             return _StreamAccumulator(
                 self.sample_rate, self.CHUNK_SIZE, self.silence_threshold,
                 silence_chunk_thresh, min_buffer_chunks, max_buffer_chunks, on_flush)
 
-        mic = _mk(lambda buf, s, e: self._transcribe(
-            buf, self.me_label, start_time=s, end_time=e, force_no_diarize=True))
+        def _mic_flush(buf, s, e):
+            # Drop a mic segment that is really just the desktop bleeding in. The
+            # level gate is the primary, reliable check (it survives the mic/loopback
+            # clock drift); the voiceprint check is an optional secondary, off unless
+            # mic_bleed_threshold > 0.
+            if self._mic_segment_is_bleed(s, e):
+                return
+            if self.mic_bleed_threshold > 0.0 and \
+                    self._mic_is_desktop_bleed(buf, s, e, desktop_ring):
+                return
+            self._transcribe(buf, self.me_label, start_time=s, end_time=e,
+                             force_no_diarize=True)
+
+        mic = _mk(_mic_flush)
         desktop = _mk(lambda buf, s, e: self._transcribe(
             buf, "loopback", start_time=s, end_time=e))
 
         while self.is_running:
             try:
                 item = self.audio_queue.get(timeout=0.5)
-                if isinstance(item, tuple) and len(item) == 5:
-                    _src, _mixed, sample_off, mic_bytes, lb_bytes = item
+                if isinstance(item, tuple) and len(item) >= 5:
+                    _src, _mixed, sample_off, mic_bytes, lb_bytes = item[:5]
+                    # 6th element (macOS): (raw_mic_rms, raw_lb_rms) pre-gain levels
+                    # for the bleed gate. Absent on Windows, where the gate no-ops.
+                    levels = item[5] if len(item) >= 6 else None
+                    if levels is not None and sample_off >= 0:
+                        self._level_ring.append((sample_off, levels[0], levels[1]))
                     if lb_bytes is not None:
+                        desktop_ring.append((sample_off, lb_bytes))
                         desktop.feed(lb_bytes, sample_off)
                     if mic_bytes is not None:
                         mic.feed(mic_bytes, sample_off)

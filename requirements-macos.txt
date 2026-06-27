@@ -43,15 +43,20 @@ speechbrain==1.0.3
 pyaudiowpatch>=0.2.12.7; sys_platform == "win32"
 
 # ── Audio capture (macOS) ────────────────────────────────────────────────────
-# sounddevice talks to CoreAudio. System-audio loopback comes from BlackHole
-# (auto-installed by mac_audio_bootstrap.py on first launch).
+# sounddevice talks to CoreAudio for microphone input. System audio is
+# captured directly via Apple's ScreenCaptureKit (macOS 13+): no virtual
+# audio driver, no aggregate device, no system-output reroute.
 sounddevice>=0.4.6; sys_platform == "darwin"
 
 # ── macOS native APIs (PyObjC) ───────────────────────────────────────────────
-# CoreAudio  - aggregate device creation for BlackHole + speakers
-# Quartz     - display enumeration for screen recorder
-# AVFoundation - misc media APIs (probing, device strings)
-pyobjc-framework-CoreAudio; sys_platform == "darwin"
+# ScreenCaptureKit - system-audio loopback (macOS 13+); the SCStream capture
+# CoreMedia        - CMSampleBuffer audio extraction from SCK sample buffers
+# Quartz           - display enumeration for the screen recorder
+# AVFoundation     - misc media APIs (probing, device strings)
+# NOTE: the umbrella `pyobjc` package does NOT pull ScreenCaptureKit/CoreMedia
+# in; they must be listed individually.
+pyobjc-framework-ScreenCaptureKit; sys_platform == "darwin"
+pyobjc-framework-CoreMedia; sys_platform == "darwin"
 pyobjc-framework-Quartz; sys_platform == "darwin"
 pyobjc-framework-AVFoundation; sys_platform == "darwin"
 

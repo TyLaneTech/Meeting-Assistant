@@ -39,12 +39,12 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 
 | Requirement | Details |
 |---|---|
-| **Operating System** | Windows 10/11 (WASAPI loopback) **or** macOS 12+ on Apple Silicon (BlackHole loopback) |
+| **Operating System** | Windows 10/11 (WASAPI loopback) **or** macOS 13+ on Apple Silicon (ScreenCaptureKit loopback) |
 | **Python** | 3.10 or higher - [python.org/downloads](https://www.python.org/downloads/) (check "Add to PATH") |
 | **AI API Key** | [Anthropic](https://console.anthropic.com/settings/keys) or [OpenAI](https://platform.openai.com/api-keys) - for summaries and chat |
 | **HuggingFace Token** | *(Optional)* - enables speaker diarization ([get one here](https://huggingface.co/settings/tokens)) |
 | **GPU acceleration** | *(Optional)* - NVIDIA GPU with CUDA on Windows, or Apple Silicon Metal on macOS. Falls back to CPU otherwise. |
-| **macOS audio loopback** | [BlackHole 2ch](https://existential.audio/blackhole/) - auto-installed via Homebrew on first launch |
+| **macOS audio loopback** | Apple [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) (built into macOS 13+) - no driver to install; grant Screen & System Audio Recording on first capture |
 
 ---
 
@@ -58,17 +58,17 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 4. Hit Record
 ```
 
-**macOS (Apple Silicon):**
+**macOS (Apple Silicon, macOS 13+):**
 ```
 1. Install Homebrew if you don't have it: https://brew.sh
-2. brew install ffmpeg blackhole-2ch    # may prompt for sudo on the BlackHole pkg step
-3. sudo killall coreaudiod              # register the BlackHole driver without rebooting
-4. ./launch.command                     # or: python launch.py
-5. Enter your API key in Settings
+2. brew install ffmpeg                   # native arm64 build (no BlackHole needed)
+3. ./launch.command                     # or: python launch.py
+4. Enter your API key in Settings
+5. Grant Screen & System Audio Recording when prompted, then restart once
 6. Hit Record
 ```
 
-The launcher handles everything on first run — virtual environment creation, accelerator detection (CUDA on Windows, Metal/MPS on macOS), PyTorch + Whisper backend installation (`faster-whisper` on Windows/Linux, `mlx-whisper` on macOS), model downloads, BlackHole aggregate device setup (macOS), and browser launch. Subsequent starts are fast.
+The launcher handles everything on first run — virtual environment creation, accelerator detection (CUDA on Windows, Metal/MPS on macOS), PyTorch + Whisper backend installation (`faster-whisper` on Windows/Linux, `mlx-whisper` on macOS), model downloads, and browser launch. Subsequent starts are fast.
 
 ### Updating
 
@@ -122,7 +122,7 @@ Audio Input (WASAPI)
 ### Audio Capture
 
 - **Windows backend:** `pyaudiowpatch` (PyAudio fork) for native WASAPI loopback. System audio is captured directly without any virtual driver.
-- **macOS backend:** `sounddevice` + `BlackHole 2ch` virtual audio device. The launcher creates a multi-output aggregate device that fans system audio to both your speakers (so you still hear it) and BlackHole's input (which we capture). System default output is auto-switched to the aggregate during recording and restored on stop.
+- **macOS backend:** Apple `ScreenCaptureKit` (macOS 13+) captures the system audio mix directly via an `SCStream`, with mic input through `sounddevice`/CoreAudio. No virtual audio driver, no aggregate device, and no system-output reroute: the only requirement is the Screen & System Audio Recording permission (granted on first capture; macOS caches it per process, so restart once after granting).
 - **Microphone:** WASAPI input device on Windows, AVFoundation on macOS, or browser `getUserMedia` injection.
 - **Source-gated mixing:** Prevents echo duplication by analyzing RMS levels — when one source dominates, the other is suppressed.
 - **Sample rate:** Device native (typically 48 kHz), resampled to 16 kHz for Whisper via `scipy.signal.resample_poly`.
@@ -432,8 +432,8 @@ Meeting Assistant/
 ├── capture_audio/         ← Audio input pipeline
 │   ├── __init__.py         — Platform dispatcher (selects backend at import)
 │   ├── windows.py          — WASAPI loopback + mic capture (DSP, mixer, AGC)
-│   ├── mac.py              — BlackHole loopback + AVFoundation mic capture
-│   ├── mac_bootstrap.py    — BlackHole install + aggregate device routing
+│   ├── mac.py              — ScreenCaptureKit system-audio loopback + AVFoundation mic capture
+│   ├── mac_bootstrap.py    — retired no-op shim (BlackHole logic removed; SCK needs no setup)
 │   ├── wav_writer.py       — WAV recording with sample-accurate timestamps
 │   ├── params.py           — Default audio parameters and presets
 │   └── audio/              — Bundled MP3s used by input-device auto-detection

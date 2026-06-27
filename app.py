@@ -50,7 +50,7 @@ from capture_audio import (
 )
 from capture_audio.params import (
     TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, AUTO_GAIN_DEFAULTS,
-    SCREEN_RECORDING_DEFAULTS,
+    ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
     TRANSCRIPTION_PRESETS, TRANSCRIPTION_DEFAULT_PRESET,
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
@@ -919,6 +919,10 @@ def _level_push_loop() -> None:
                     "mic_env":     round(float(capture.agc_mic_envelope), 5),
                     "mic_gated":   bool(capture.agc_mic_gated),
                     "mic_enabled": bool(capture.agc_mic_enabled),
+                    # Mic AGC is bypassed (mic left clean) while echo cancellation or
+                    # noise suppression is on, so the suppressed signal is not re-gained.
+                    "mic_bypassed": bool(getattr(capture, "echo_cancel_enabled", False)
+                                         or getattr(capture, "noise_suppress_enabled", False)),
                     "target":      float(capture.agc_target_rms),
                     "gate":        float(capture.agc_gate_threshold),
                     "max_gain":    float(capture.agc_max_gain),
@@ -1544,6 +1548,7 @@ def start_audio_test():
     from capture_audio.params import resolve_audio_params
     _params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
+    capture.noise_suppress_enabled = bool(int(_params.get("noise_suppress_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
     capture.agc_mic_enabled = bool(int(_params.get("agc_mic_enabled", 0)))
     capture.agc_target_rms = float(_params.get("agc_target_rms", 0.15))
@@ -1697,11 +1702,23 @@ def start_recording():
     from capture_audio.params import resolve_audio_params
     _ec_params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
+    capture.noise_suppress_enabled = bool(int(_ec_params.get("noise_suppress_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
     capture.agc_mic_enabled = bool(int(_ec_params.get("agc_mic_enabled", 0)))
     capture.agc_target_rms = float(_ec_params.get("agc_target_rms", 0.15))
     capture.agc_max_gain = float(_ec_params.get("agc_max_gain", 4.0))
     capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
+    # macOS desktop-bleed gate aggressiveness (ignored on Windows). The gate lives
+    # in the transcriber now (a per-segment decision). Higher ducks more of the
+    # desktop out of the "mic = Me" track; lower keeps more mic. Accept the legacy
+    # bleed_duck_slack key as an alias so existing settings keep working.
+    _transcriber.mic_bleed_slack = float(
+        _ec_params.get("mic_bleed_slack",
+                       _ec_params.get("bleed_duck_slack",
+                                      getattr(_transcriber, "mic_bleed_slack", 2.0))))
+    _transcriber.mic_bleed_threshold = float(
+        _ec_params.get("mic_bleed_threshold",
+                       getattr(_transcriber, "mic_bleed_threshold", 0.0)))
 
     # "Mic = Me": when on and a mic is present, the capture writes per-source
     # tracks so mic audio is always the app user and only desktop is diarized.
@@ -2821,6 +2838,7 @@ def reset_audio_section():
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
         "auto_gain": AUTO_GAIN_DEFAULTS,
+        "echo_cancellation": ECHO_CANCELLATION_DEFAULTS,
         "screen_recording": SCREEN_RECORDING_DEFAULTS,
     }
     data = request.get_json(silent=True) or {}
@@ -2987,14 +3005,22 @@ def _apply_audio_params(params: dict) -> None:
     _transcriber.compression_ratio_threshold = float(
         params.get("compression_ratio_threshold", 2.0)
     )
+    # "Mic = Me" desktop-bleed gate (the level gate is the primary mechanism; the
+    # voiceprint check is opt-in). Accept the legacy bleed_duck_slack alias.
+    _transcriber.mic_bleed_slack = float(
+        params.get("mic_bleed_slack", params.get("bleed_duck_slack", 2.0)))
+    _transcriber.mic_bleed_threshold = float(params.get("mic_bleed_threshold", 0.0))
     if _transcriber.diarizer is not None:
         _transcriber.diarizer.apply_params(params)
 
     # Push echo cancellation and AGC toggles to the active AudioCapture instance
+    # (the live recording capture, or the input-test capture when testing) so
+    # changes apply immediately without restarting the recording or the test.
     with _state_lock:
-        capture = _state.get("audio_capture")
+        capture = _state.get("audio_capture") or _state.get("test_capture")
     if capture is not None:
         capture.echo_cancel_enabled = bool(int(params.get("echo_cancel_enabled", 0)))
+        capture.noise_suppress_enabled = bool(int(params.get("noise_suppress_enabled", 0)))
         capture.agc_loopback_enabled = bool(int(params.get("agc_loopback_enabled", 0)))
         capture.agc_mic_enabled = bool(int(params.get("agc_mic_enabled", 0)))
         capture.agc_target_rms = float(params.get("agc_target_rms", 0.15))
@@ -6233,9 +6259,55 @@ def shutdown():
     return jsonify({"ok": True})
 
 
+def _relaunch_app() -> None:
+    """Relaunch the app in a detached process so it survives this process's
+    os._exit(0). Cross-platform; never raises (callers exit immediately after).
+
+    Windows: prefer the Start Menu shortcut (matches a normal start), else run
+    launch.bat in a new detached console.
+    macOS/Linux: run launch.command via bash (or `python launch.py` as a
+    fallback) in a new session so the child outlives the parent.
+    """
+    try:
+        root = Path(__file__).parent
+        if sys.platform == "win32":
+            lnk_path = (
+                Path(os.environ.get("APPDATA", ""))
+                / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+                / "Meeting Assistant.lnk"
+            )
+            if lnk_path.exists():
+                os.startfile(str(lnk_path))
+            else:
+                bat = root / "launch.bat"
+                if bat.exists():
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", str(bat)],
+                        cwd=str(root),
+                        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
+                    )
+        else:
+            # macOS / Linux: relaunch via launch.command (preferred) or
+            # `python launch.py`, detached so it outlives os._exit(0).
+            launcher = root / "launch.command"
+            if launcher.exists():
+                cmd = ["/bin/bash", str(launcher)]
+            else:
+                cmd = [sys.executable, str(root / "launch.py")]
+            subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception as e:
+        log.warn("app", f"relaunch failed: {e}")
+
+
 @app.route("/api/restart", methods=["POST"])
 def restart():
-    """Gracefully stop everything, then relaunch via Start Menu shortcut."""
+    """Gracefully stop everything, then relaunch (cross-platform)."""
     def _do_restart() -> None:
         global _tray
         with _state_lock:
@@ -6255,22 +6327,7 @@ def restart():
             storage.end_session(sid)
         time.sleep(0.5)
 
-        root = Path(__file__).parent
-        lnk_path = (
-            Path(os.environ.get("APPDATA", ""))
-            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-            / "Meeting Assistant.lnk"
-        )
-        if lnk_path.exists():
-            os.startfile(str(lnk_path))
-        else:
-            bat = root / "launch.bat"
-            if bat.exists():
-                subprocess.Popen(
-                    ["cmd.exe", "/c", str(bat)],
-                    cwd=str(root),
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
-                )
+        _relaunch_app()
 
         if _tray is not None:
             _tray.stop()
@@ -6540,23 +6597,8 @@ def update_apply():
             storage.end_session(sid)
         time.sleep(0.5)  # let the HTTP response reach the browser
 
-        # Launch via Start Menu shortcut so the experience matches a normal start
-        lnk_path = (
-            Path(os.environ.get("APPDATA", ""))
-            / "Microsoft" / "Windows" / "Start Menu" / "Programs"
-            / "Meeting Assistant.lnk"
-        )
-        if lnk_path.exists():
-            os.startfile(str(lnk_path))
-        else:
-            # Fallback: run launch.bat directly
-            bat = root / "launch.bat"
-            if bat.exists():
-                subprocess.Popen(
-                    ["cmd.exe", "/c", str(bat)],
-                    cwd=str(root),
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_CONSOLE,
-                )
+        # Relaunch so the experience matches a normal start (cross-platform).
+        _relaunch_app()
 
         if _tray is not None:
             _tray.stop()
@@ -6616,6 +6658,18 @@ def _handshake_existing_instance(url: str) -> bool:
     return False
 
 
+def _keepalive_loop() -> None:
+    """Keep the main thread alive in a Python-level loop so signal handlers
+    (Ctrl+C) can fire.  threading.Event.wait() with a timeout releases the GIL
+    and lets the interpreter check for pending signals each iteration."""
+    try:
+        _shutdown_event = threading.Event()
+        while not _shutdown_event.wait(timeout=1):
+            pass
+    except KeyboardInterrupt:
+        _force_quit()
+
+
 def main() -> None:
     global _tray, _server_url
 
@@ -6643,8 +6697,11 @@ def main() -> None:
     )
     flask_thread.start()
 
-    # Try to start system tray immediately so it becomes available during the
-    # same startup window as the webserver, rather than after the bind wait.
+    # Build the tray now; *when* it runs depends on the platform. On
+    # Windows/Linux it runs on a daemon thread (just below) so the main thread
+    # can receive Ctrl+C. On macOS the NSStatusItem MUST be created on the main
+    # thread (AppKit aborts otherwise), so the darwin tray runs on the main
+    # thread at the very end of main().
     try:
         from ui_desktop.tray import TRAY_AVAILABLE, MeetingTray
         if not TRAY_AVAILABLE:
@@ -6666,15 +6723,17 @@ def main() -> None:
             _force_quit()
 
         _tray = MeetingTray(url, _state_snapshot, _on_tray_quit)
-        log.info("tray", "System tray active - right-click for menu.")
-        # Run tray in a daemon thread so the main thread stays in Python code
-        # where it can receive signals (Ctrl+C).  pystray's Win32 message loop
-        # blocks in native C, which prevents Python signal handlers from firing.
-        threading.Thread(target=_tray.run, daemon=True).start()
-
     except ImportError:
         log.warn("tray", "pystray/Pillow not installed - running without system tray.")
         log.warn("tray", "Install with: pip install pystray Pillow")
+
+    if _tray is not None and sys.platform != "darwin":
+        # Windows/Linux: run the tray in a daemon thread so the main thread
+        # stays in Python code where it can receive signals (Ctrl+C).  pystray's
+        # Win32 message loop blocks in native C, which would otherwise prevent
+        # Python signal handlers from firing.
+        threading.Thread(target=_tray.run, daemon=True).start()
+        log.info("tray", "System tray active - right-click for menu.")
 
     # Wait for Flask to bind
     import urllib.request
@@ -6698,15 +6757,25 @@ def main() -> None:
     # This ensures Ctrl+C in the console immediately stops recording and exits.
     signal.signal(signal.SIGINT, lambda *_: _force_quit())
 
-    # Keep the main thread alive in a Python-level loop so signal handlers
-    # (Ctrl+C) can fire.  threading.Event.wait() with a timeout releases the
-    # GIL and lets the interpreter check for pending signals each iteration.
-    try:
-        _shutdown_event = threading.Event()
-        while not _shutdown_event.wait(timeout=1):
-            pass
-    except KeyboardInterrupt:
-        _force_quit()
+    if _tray is not None and sys.platform == "darwin":
+        # macOS: the NSStatusItem and its run loop MUST live on the main thread
+        # (AppKit raises NSInternalInconsistencyException otherwise, and the
+        # menu-bar icon silently dies). run() blocks here until the user quits
+        # from the menu; pystray installs its own SIGINT handling while the
+        # NSApplication loop runs.
+        log.info("tray", "Menu bar icon active - click for menu.")
+        try:
+            _tray.run()
+        except Exception as e:
+            log.warn("tray", f"System tray unavailable in this launch context: {e}")
+            _tray = None
+            webbrowser.open(url)  # no tray means no UI entry point; give one
+            _keepalive_loop()
+        else:
+            # run() returned: the user quit from the menu, or the loop ended.
+            _force_quit()
+    else:
+        _keepalive_loop()
 
 
 if __name__ == "__main__":

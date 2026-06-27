@@ -34,20 +34,9 @@ Postponed ideas and feature plans. Not yet scheduled for implementation.
 
 ---
 
-## macOS: per-source ("mic = Me") capture
+## ~~macOS: per-source ("mic = Me") capture~~ — done
 
-**Goal:** Mirror the Windows "microphone is you" source-aware diarization on macOS so mic audio is always the app user and only desktop audio is diarized there too.
-
-### Context
-- The feature shipped Windows-first. The cross-cutting parts (the `me_speaker_global_id` setting + purge, the two-stream `Transcriber._loop_two_stream`, the `BatchTranscriber` per-source reanalysis path, the onboarding popup + "(You)" badge, export/import safety) are platform-agnostic and already done.
-- Only the capture side is Windows-only: `capture_audio/windows.py` writes the per-source `{sid}_mic.wav` / `{sid}_desktop.wav` temp tracks in `_mixer_loop`, encodes them to Opus on `stop()`, and enqueues 5-tuples `(src, mixed, offset, mic_bytes, lb_bytes)`.
-- `capture_audio/mac.py` still enqueues the legacy mixed tuples, so on macOS `start_recording` sees `getattr(capture, "_per_source_active", False) == False` and leaves `me_label` unset — the app cleanly falls back to the legacy single-stream behavior (no regression, just no feature).
-
-### Proposed implementation
-1. Add the same `mic_is_me_enabled` / `_per_source_active` attributes + `_open_per_source_writers` / `_encode_per_source_opus` / resume-decode helpers to `capture_audio/mac.py` (they can largely be lifted from `windows.py`).
-2. At mac's mix point, write the loopback-only and mic-only chunks (sample-aligned, zeros included) to the two temp WavWriters and enqueue the 5-tuple.
-3. Reuse `capture_video/ffmpeg_util.find_ffmpeg()` for the Opus encode (the bundled macOS ffmpeg already supports libopus).
-4. Verify end-to-end on macOS hardware (BlackHole loopback + a real mic).
+`capture_audio/mac.py` now mirrors `capture_audio/windows.py`: the per-source helpers (`_open_per_source_writers` / `_close_per_source_writers` / `_encode_per_source_opus` / resume-decode) are byte-identical, and the mixer is the same dual-clocked, always-sum loop that writes the sample-aligned mic-only / desktop-only temp WAVs (encoded to Opus on `stop()`) and enqueues the 5-tuple `(src, mixed, offset, mic_bytes, lb_bytes)`. `mic_is_me_enabled` / `_per_source_active` are wired exactly as on Windows (app.py drives both backends through the same attributes), so source-aware diarization now works on macOS. The only Windows-side code not ported is the `INPUT_DEBUG` verbose tracing, a dev aid that does not affect output. Still wants one end-to-end check on Apple Silicon hardware (SCK loopback + a real mic).
 
 ---
 

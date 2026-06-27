@@ -4061,6 +4061,17 @@ function onStatus(d) {
         _quietPromptLanding = null;
       }
     } else if (!d.recording) {
+      // Smoothly fade the audio visualizers out rather than freezing on the last
+      // frame: no more audio_level events will arrive to drive them down, so zero
+      // the targets and re-kick the loops, which decay the bars/meters to zero and
+      // then park.
+      vizLbTarget = 0;
+      vizMicTarget = 0;
+      vizLbSpec    = [];
+      vizMicSpec   = [];
+      updateLevelMeters(0, 0, false);
+      _startVizLoop();
+      if (!_isHomePage) _startBrandVizLoop();
       stopDurationCounter();
       _updateBrandIcons(false);
       _updateScreenRecordingStatus(false);
@@ -4175,6 +4186,10 @@ function updateTestBtn() {
 
 /* ── Recording ───────────────────────────────────────────────────────────── */
 async function toggleRecording() {
+  // Drop keyboard focus from the record button. Browsers activate the focused
+  // <button> when Space is pressed, so without this a spacebar tap after a
+  // recording starts would "click" the still-focused button and stop it.
+  document.getElementById('record-btn')?.blur();
   if (state.isRecording) {
     // Immediate visual feedback while the server tears down streams
     const btn = document.getElementById('record-btn');
@@ -15695,14 +15710,15 @@ function _updateAgcDebug(agc) {
   el.style.display = '';
 
   const fmt = (v) => v < 0.001 ? v.toExponential(1) : v.toFixed(4);
-  const renderCol = (id, label, cssClass, enabled, gain, env, gated, target) => {
+  const renderCol = (id, label, cssClass, enabled, gain, env, gated, target, bypassed) => {
     const col = document.getElementById(id);
     if (!col) return;
     if (!enabled) {
       col.innerHTML = `<div class="agc-src ${cssClass}">${label}</div><div class="agc-idle">disabled</div>`;
       return;
     }
-    const status = gated ? '<span class="agc-gated">GATED</span>'
+    const status = bypassed ? '<span class="agc-idle">bypassed (cleaning)</span>'
+                  : gated ? '<span class="agc-gated">GATED</span>'
                   : gain > 1.01 ? `<span class="agc-boosting">BOOST ${gain.toFixed(1)}\u00d7</span>`
                   : '<span class="agc-idle">1.0\u00d7</span>';
     col.innerHTML = `<div class="agc-src ${cssClass}">${label}</div>`
@@ -15711,8 +15727,8 @@ function _updateAgcDebug(agc) {
       + `<div class="agc-val"><span class="agc-lbl">Env</span> ${fmt(env)}</div>`
       + `<div class="agc-val"><span class="agc-lbl">Target</span> ${fmt(target)}</div>`;
   };
-  renderCol('agc-debug-lb',  'Desktop', 'lb',  agc.lb_enabled,  agc.lb_gain,  agc.lb_env,  agc.lb_gated,  agc.target);
-  renderCol('agc-debug-mic', 'Mic',     'mic', agc.mic_enabled, agc.mic_gain, agc.mic_env, agc.mic_gated, agc.target);
+  renderCol('agc-debug-lb',  'Desktop', 'lb',  agc.lb_enabled,  agc.lb_gain,  agc.lb_env,  agc.lb_gated,  agc.target, false);
+  renderCol('agc-debug-mic', 'Mic',     'mic', agc.mic_enabled, agc.mic_gain, agc.mic_env, agc.mic_gated, agc.target, agc.mic_bypassed);
 }
 
 /** Parse the mic selector value into {mic_device, ffmpeg_mic_name} for the API. */
@@ -17479,6 +17495,7 @@ function _apRenderSection(containerId, paramDefs, current) {
     const param = document.createElement('div');
     param.className = 'ap-param';
     param.dataset.apKey = key;
+    if (spec.independent) param.dataset.apIndependent = '1';
 
     if (spec.type === 'toggle') {
       // Render as a toggle switch
@@ -17574,7 +17591,9 @@ function _apRenderSection(containerId, paramDefs, current) {
     const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
     const anyToggleOn = toggleKeys.some(tk => !!parseInt(current[tk] ?? 0));
     const isToggle = toggleKeys.includes(key);
-    const isDisabled = (toggleKeys.length > 0 && !isToggle && (toggleInverted ? anyToggleOn : !anyToggleOn));
+    // Params flagged "independent" are never gated by the section's toggle (e.g.
+    // the desktop-bleed gate works whether or not echo cancellation is enabled).
+    const isDisabled = (toggleKeys.length > 0 && !isToggle && !spec.independent && (toggleInverted ? anyToggleOn : !anyToggleOn));
 
     param.innerHTML = `
       <div class="ap-header">
@@ -17641,6 +17660,7 @@ function _apSetSectionEnabled(containerId, skipKeys, enabled) {
   const skip = new Set(Array.isArray(skipKeys) ? skipKeys : [skipKeys]);
   for (const param of container.querySelectorAll('.ap-param')) {
     if (skip.has(param.dataset.apKey)) continue;
+    if (param.dataset.apIndependent === '1') continue;   // never toggle-gated
     param.classList.toggle('ap-disabled', !enabled);
     for (const el of param.querySelectorAll('input, button')) {
       el.disabled = !enabled;

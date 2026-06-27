@@ -124,6 +124,7 @@ def notify(
     image: Optional[Path | str] = None,
     duration: str = "short",
     scenario: str = "",
+    mac_url: Optional[str] = None,
 ) -> bool:
     """Show a system toast.
 
@@ -165,7 +166,7 @@ def notify(
     if sys.platform == "win32":
         return _send_windows_toast(title, body, on_click=on_click, actions=actions or [], image=image, duration=duration, scenario=scenario)
     if sys.platform == "darwin":
-        return _send_macos_notification(title, body)
+        return _send_macos_notification(title, body, url=mac_url)
     log.warn("notify", f"Toast skipped: unsupported platform {sys.platform}")
     return False
 
@@ -210,6 +211,7 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
             {"label": "Keep recording", "arg": "keep", "on_click": _noop_dismiss},
         ],
         duration="long",
+        mac_url=session_url,
     )
 
 
@@ -238,6 +240,7 @@ def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
         ],
         duration="long",
         scenario="reminder",
+        mac_url=start_url,
     )
 
 
@@ -369,7 +372,12 @@ def _osascript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _send_macos_notification(title: str, body: str) -> bool:
+def _send_macos_notification(title: str, body: str, url: Optional[str] = None) -> bool:
+    # osascript notifications cannot carry a click action, so when a caller has
+    # a destination URL we surface it in the body: on macOS it is the only way
+    # for the user to reach the session/page from the notification.
+    if url:
+        body = f"{body}\n{url}" if body else url
     script = (
         f'display notification "{_osascript_escape(body)}" '
         f'with title "{_osascript_escape(title)}" sound name "Pop"'
