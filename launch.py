@@ -344,6 +344,113 @@ def _create_start_menu_shortcut():
         _warn("Could not update Start Menu shortcut (non-fatal)")
 
 
+def _create_macos_app_shortcut():
+    """Create (or refresh) a launcher app bundle in ~/Applications on macOS,
+    mirroring the Windows Start Menu shortcut.
+
+    The bundle makes Meeting Assistant appear in Launchpad / Spotlight / Finder
+    and, importantly, gives macOS a stable app identity to attach the Screen
+    Recording and Microphone (TCC) permissions to, instead of attributing them
+    to Terminal or the python binary. It re-writes only when missing or when its
+    launcher points at a different checkout (e.g. the folder was moved), so it
+    does not churn on every launch. No-ops silently on non-macOS.
+    """
+    if sys.platform != "darwin":
+        return
+
+    root = Path(__file__).parent
+    launcher = root / "launch.command"
+    if not launcher.exists():
+        return
+
+    app_dir    = Path.home() / "Applications" / "Meeting Assistant.app"
+    macos_dir  = app_dir / "Contents" / "MacOS"
+    res_dir    = app_dir / "Contents" / "Resources"
+    exe_path   = macos_dir / "MeetingAssistant"
+    plist_path = app_dir / "Contents" / "Info.plist"
+
+    # The bundle's executable just cd's into THIS checkout and hands off to
+    # launch.command (uv + venv + app). We widen PATH first so a Finder/Launchpad
+    # launch (which gets a minimal PATH) still finds Homebrew's ffmpeg and uv.
+    exe_script = (
+        "#!/bin/bash\n"
+        'export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"\n'
+        f'cd "{root}" || exit 1\n'
+        'exec "./launch.command"\n'
+    )
+
+    # Self-heal: only rewrite when missing or when the embedded checkout path
+    # has changed (the script content carries the root path).
+    if exe_path.exists() and plist_path.exists():
+        try:
+            if exe_path.read_text() == exe_script:
+                return
+        except Exception:
+            pass
+
+    try:
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        res_dir.mkdir(parents=True, exist_ok=True)
+
+        exe_path.write_text(exe_script)
+        exe_path.chmod(0o755)
+
+        # Best-effort app icon: convert the logo PNG to .icns via sips.
+        icon_src  = root / "ui_web" / "static" / "images" / "logo.png"
+        icon_name = ""
+        if icon_src.exists():
+            try:
+                subprocess.run(
+                    ["sips", "-s", "format", "icns", str(icon_src),
+                     "--out", str(res_dir / "AppIcon.icns")],
+                    capture_output=True, timeout=20,
+                )
+                if (res_dir / "AppIcon.icns").exists():
+                    icon_name = "AppIcon"
+            except Exception:
+                pass
+
+        icon_plist = (
+            f"    <key>CFBundleIconFile</key>\n    <string>{icon_name}</string>\n"
+            if icon_name else ""
+        )
+        plist_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n'
+            "<dict>\n"
+            "    <key>CFBundleName</key>\n    <string>Meeting Assistant</string>\n"
+            "    <key>CFBundleDisplayName</key>\n    <string>Meeting Assistant</string>\n"
+            "    <key>CFBundleIdentifier</key>\n"
+            "    <string>com.higg.meetingassistant.launcher</string>\n"
+            "    <key>CFBundleVersion</key>\n    <string>1.0</string>\n"
+            "    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n"
+            "    <key>CFBundleExecutable</key>\n    <string>MeetingAssistant</string>\n"
+            + icon_plist +
+            "    <key>NSHighResolutionCapable</key>\n    <true/>\n"
+            "    <key>LSMinimumSystemVersion</key>\n    <string>13.0</string>\n"
+            "    <key>NSMicrophoneUsageDescription</key>\n"
+            "    <string>Meeting Assistant records your microphone to transcribe meetings.</string>\n"
+            "</dict>\n"
+            "</plist>\n"
+        )
+
+        # Ad-hoc codesign so the bundle has a stable identity; macOS then keeps
+        # its TCC grants across launches instead of re-prompting. Best-effort.
+        try:
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-", str(app_dir)],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            pass
+
+        _ok(f"Applications shortcut ready  {GRY}(~/Applications/Meeting Assistant.app){R}")
+    except Exception:
+        _warn("Could not create the macOS Applications shortcut (non-fatal)")
+
+
 # ── Storage layout migration ──────────────────────────────────────────────────
 
 def _migrate_legacy_layout():
@@ -847,8 +954,10 @@ def main():
     # (macOS OneDrive/iCloud File Provider). No-op on Windows.
     _warn_if_cloud_storage_path()
 
-    # Start Menu shortcut (first run only)
+    # Launcher shortcut (first run / self-heal): Start Menu on Windows, an
+    # Applications app bundle on macOS. Each no-ops on the other platform.
     _create_start_menu_shortcut()
+    _create_macos_app_shortcut()
 
     # GPU
     whl, gpu_name, cuda_ver = _detect_gpu()
