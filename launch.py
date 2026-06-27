@@ -73,9 +73,26 @@ def _find_uv() -> str:
     return ""
 
 
+def _uv_target() -> list[str]:
+    """The interpreter uv should install into: the project venv, named explicitly.
+
+    Passing ``--python <venv python>`` instead of relying on the active
+    ``VIRTUAL_ENV`` matters on macOS: the stock python.org interpreter is a
+    universal2 framework build whose sysconfig platform is
+    ``macosx-10.9-universal2``. When uv discovers that interpreter via the
+    environment (no ``--python``), it derives an *x86_64* wheel-tag set from
+    that universal2 platform and then can't satisfy arm64-only wheels such as
+    ``mlx`` (Apple-silicon-only), failing the whole install. An explicit
+    ``--python`` makes uv probe the interpreter directly and resolve arm64
+    wheels correctly. We keep the universal2 framework build (not a single-arch
+    managed python) because the menu-bar tray needs a framework interpreter.
+    """
+    return ["--python", str(_venv_python())]
+
+
 def _uv(*args, show_output=False):
     """Run uv pip install with the given args. Returns True on success."""
-    cmd = [UV, "pip", "install"]
+    cmd = [UV, "pip", "install"] + _uv_target()
     if not show_output:
         cmd.append("--quiet")
     cmd.extend(args)
@@ -86,7 +103,7 @@ def _uv_streaming(*args):
     """
     Run uv pip install and print filtered progress lines in real time.
     """
-    cmd = [UV, "pip", "install"] + list(args)
+    cmd = [UV, "pip", "install"] + _uv_target() + list(args)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -852,6 +869,24 @@ def main():
     # Disconnect before package installs, reconnect after (git/HF need it).
     from core.network import warp_disconnect
     warp_disconnect()
+
+    if sys.platform == "darwin":
+        # Apple Silicon source-build hygiene. The stock python.org interpreter
+        # is a universal2 framework build, so setuptools otherwise attempts a
+        # fat x86_64+arm64 compile that can't link arm64-only artefacts. Pin
+        # builds to arm64.
+        os.environ["ARCHFLAGS"] = "-arch arm64"
+        # aec-audio-processing compiles webrtc-audio-processing from source via
+        # meson and finds abseil through pkg-config. On an Apple Silicon machine
+        # that also carries an Intel (x86_64) Homebrew under /usr/local, meson
+        # links the host's x86_64 abseil and the arm64 build fails. Point
+        # pkg-config at an empty dir so meson falls back to abseil's bundled
+        # arm64 subproject. Harmless on clean machines (subproject either way);
+        # only source builds consult pkg-config, and the wheels above ignore it.
+        _empty_pc = Path(__file__).parent / "storage" / "tools" / "empty-pkgconfig"
+        _empty_pc.mkdir(parents=True, exist_ok=True)
+        os.environ["PKG_CONFIG_LIBDIR"] = str(_empty_pc)
+        os.environ["PKG_CONFIG_PATH"] = ""
 
     # PyTorch - only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
