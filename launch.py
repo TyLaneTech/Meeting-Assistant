@@ -403,7 +403,11 @@ def _create_macos_app_shortcut():
         # App icon: build a proper multi-resolution .icns from the logo PNG via an
         # iconset + iconutil (a plain `sips -s format icns` often yields nothing on
         # a non-square / wrong-DPI source, which is why the icon was blank before).
-        icon_src  = root / "ui_web" / "static" / "images" / "logo.png"
+        # Prefer the macOS-styled tile (squircle, margins, depth) over the bare
+        # web logo, which looks unfinished full-bleed in Launchpad / the Dock.
+        _img_dir = root / "ui_web" / "static" / "images"
+        _macos_icon = _img_dir / "app_icon_macos.png"
+        icon_src  = _macos_icon if _macos_icon.exists() else (_img_dir / "logo.png")
         icon_name = ""
         if icon_src.exists():
             try:
