@@ -5,6 +5,20 @@
 
 set -e
 
+# ── Force native arm64 on Apple Silicon ───────────────────────────────────────
+# If launched under Rosetta (x86_64) on Apple Silicon - e.g. the Terminal is set
+# to "Open using Rosetta" - re-exec natively as arm64. The python.org interpreter
+# is a universal2 build, so under Rosetta it runs its x86_64 slice; uv then
+# resolves x86_64 wheel tags and mlx (which ships arm64-only wheels) becomes
+# unsatisfiable, while torch is pinned to its last x86_64 macOS wheel. The env
+# var guards against a re-exec loop; a genuine Intel Mac is left untouched.
+if [ "$(uname -m)" = "x86_64" ] \
+   && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ] \
+   && [ -z "$_MA_NATIVE_ARM64" ]; then
+    export _MA_NATIVE_ARM64=1
+    exec arch -arm64 /bin/bash "${BASH_SOURCE[0]}" "$@"
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$ROOT/.venv"
 

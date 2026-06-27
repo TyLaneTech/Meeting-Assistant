@@ -911,9 +911,44 @@ elif task == "sentence-transformers":
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _reexec_native_arm64():
+    """On Apple Silicon, re-exec natively as arm64 if running x86_64 under Rosetta.
+
+    The python.org interpreter is a universal2 build, so inside a Rosetta-translated
+    process (e.g. the Terminal is set to "Open using Rosetta") it runs its x86_64
+    slice. uv then resolves an x86_64 wheel-tag set: mlx ships arm64-only wheels and
+    becomes unsatisfiable, and torch falls back to its last x86_64 macOS wheel.
+    Forcing arm64 makes uv resolve arm64 and the app run native. An env var guards
+    against a re-exec loop; a genuine Intel Mac (not translated) is left alone.
+
+    launch.command applies the same guard before this script runs; this covers the
+    direct ``python launch.py`` path and the in-app relaunch as a safety net.
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("_MA_NATIVE_ARM64") == "1":
+        return
+    if os.uname().machine != "x86_64":
+        return                       # already running arm64
+    try:
+        translated = subprocess.run(
+            ["sysctl", "-n", "sysctl.proc_translated"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        translated = ""
+    if translated != "1":
+        return                       # genuine Intel Mac: an arm64 slice cannot run
+    os.environ["_MA_NATIVE_ARM64"] = "1"
+    try:
+        os.execvp("arch", ["arch", "-arm64", sys.executable, *sys.argv])
+    except Exception:
+        pass                         # best effort: fall through if arch is missing
+
+
 def main():
     global UV
 
+    _reexec_native_arm64()   # ensure native arm64 before any venv / uv work
     os.chdir(Path(__file__).parent)
     _ensure_venv()   # re-execs into .venv if not already running inside it
 
