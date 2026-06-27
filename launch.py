@@ -974,15 +974,28 @@ def main():
                 [ffmpeg_path, "-version"],
                 capture_output=True, text=True, timeout=5,
             )
-            ver_line = fv.stdout.split("\n")[0].strip() if fv.returncode == 0 else "ffmpeg"
-            _ok(f"{ver_line}  {GRY}({ffmpeg_path}){R}")
+            # Keep this line short: take just the version token (drop the
+            # "Copyright ... the FFmpeg developers" tail) and show the path
+            # relative to the project root for the bundled binary.
+            first = fv.stdout.split("\n")[0].strip() if fv.returncode == 0 else ""
+            vm = re.search(r"ffmpeg version (\S+)", first)
+            ver = f"ffmpeg {vm.group(1)}" if vm else "ffmpeg"
+            try:
+                disp = str(Path(ffmpeg_path).relative_to(Path(__file__).parent))
+            except ValueError:
+                disp = ffmpeg_path
+            _ok(f"{ver}  {GRY}({disp}){R}")
         except Exception:
             _ok(f"ffmpeg  {GRY}({ffmpeg_path}){R}")
     else:
         _info(f"ffmpeg not found - downloading...  {GRY}(needed for screen recording){R}")
         try:
             download_ffmpeg(progress_cb=lambda msg: _info(msg))
-            _ok(f"ffmpeg  {GRY}({_LOCAL_FFMPEG}){R}")
+            try:
+                disp = str(Path(_LOCAL_FFMPEG).relative_to(Path(__file__).parent))
+            except ValueError:
+                disp = str(_LOCAL_FFMPEG)
+            _ok(f"ffmpeg  {GRY}({disp}){R}")
         except Exception as e:
             _warn(f"Could not download ffmpeg: {e}")
             _warn("Screen recording will be unavailable. Install ffmpeg manually to enable it.")
