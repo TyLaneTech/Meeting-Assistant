@@ -303,7 +303,7 @@ class MeetingTray:
 
     def _status_text(self) -> str:
         st = self._get_state()
-        if config.needs_setup():
+        if config.needs_setup(st.get("ai_provider", "anthropic")):
             return "Setup required"
         if st.get("is_recording"):
             return "Recording..."
@@ -340,33 +340,44 @@ class MeetingTray:
         webbrowser.open(f"{self._url}/session?settings=1&section=system")
 
     def _restart_server(self, icon=None, item=None) -> None:
-        """Restart the server via the API."""
-        try:
-            req = urllib.request.Request(
-                f"{self._url}/api/restart",
-                data=b"{}",
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-        except Exception:
-            pass  # server is restarting, connection will drop
+        """Restart the server via the API.
 
-    def _toggle_recording(self, icon=None, item=None) -> None:
-        """Start or stop recording via the local Flask API."""
-        st = self._get_state()
-        if st.get("is_recording"):
-            # Stop: direct API call is fine
+        Dispatched on a daemon thread: on macOS this menu callback fires on the
+        AppKit main run loop, and the POST targets a server that is tearing
+        itself down, so the socket can hang until the timeout and freeze the
+        whole menu bar. Returning immediately keeps the run loop pumping.
+        """
+        def _do() -> None:
             try:
                 req = urllib.request.Request(
-                    f"{self._url}/api/recording/stop",
+                    f"{self._url}/api/restart",
                     data=b"{}",
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
                 urllib.request.urlopen(req, timeout=5)
-            except Exception as e:
-                print(f"[tray] stop recording failed: {e}")
+            except Exception:
+                pass  # server is restarting, connection will drop
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _toggle_recording(self, icon=None, item=None) -> None:
+        """Start or stop recording via the local Flask API."""
+        st = self._get_state()
+        if st.get("is_recording"):
+            # Stop: POST on a daemon thread so the AppKit main run loop (which
+            # invokes this callback on macOS) is never blocked on the socket.
+            def _do_stop() -> None:
+                try:
+                    req = urllib.request.Request(
+                        f"{self._url}/api/recording/stop",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=5)
+                except Exception as e:
+                    print(f"[tray] stop recording failed: {e}")
+            threading.Thread(target=_do_stop, daemon=True).start()
         else:
             # Start: open the session page with ?autostart so the recording
             # goes through the same audio-initialisation path as a normal
@@ -374,14 +385,21 @@ class MeetingTray:
             webbrowser.open(f"{self._url}/session?autostart=1")
 
     def _test_toast(self, icon=None, item=None) -> None:
-        """Fire a diagnostic system toast — verifies callbacks + visibility."""
-        try:
-            from ui_desktop import notifications
-            ok = notifications.send_test_toast()
-            if not ok:
-                print("[tray] Test toast failed to dispatch — see [notify] log lines above.")
-        except Exception as e:
-            print(f"[tray] Test toast error: {e}")
+        """Fire a diagnostic system toast — verifies callbacks + visibility.
+
+        Runs on a daemon thread: send_test_toast() shells out to osascript
+        (subprocess.run with a 5 s timeout) on macOS, and this callback fires on
+        the AppKit main run loop, so doing it inline would stall the menu bar.
+        """
+        def _do() -> None:
+            try:
+                from ui_desktop import notifications
+                ok = notifications.send_test_toast()
+                if not ok:
+                    print("[tray] Test toast failed to dispatch — see [notify] log lines above.")
+            except Exception as e:
+                print(f"[tray] Test toast error: {e}")
+        threading.Thread(target=_do, daemon=True).start()
 
     def _quit(self, icon=None, item=None) -> None:
         self._on_quit(self._icon)
