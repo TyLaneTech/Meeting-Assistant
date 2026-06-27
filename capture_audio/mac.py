@@ -1370,14 +1370,15 @@ class AudioCapture:
                         self.agc_lb_gated = True
 
                     # ── Mic auto-gain ───────────────────────────────────────────
-                    # Bypassed while echo cancellation is on: the cleaned mic still
-                    # carries a speech-like echo residual, and any gain stage would
-                    # re-boost it (and the noise floor) straight back up, which is
-                    # the "desktop still bleeds through" / "noise boosted 4x"
-                    # behaviour. With echo off the custom AGC runs exactly as before
-                    # (noise suppression, when enabled, lowers the floor first).
+                    # Bypassed whenever the mic is being cleaned (echo cancellation
+                    # or noise suppression on): any gain stage would just re-boost
+                    # what was suppressed straight back up. That is the "desktop
+                    # still bleeds through" / "background noise boosted 4x" you get
+                    # otherwise, since the AGC's gate cannot tell loud room noise from
+                    # speech. With both off the custom AGC runs exactly as before.
                     if have_mic:
-                        if self.agc_mic_enabled and not self.echo_cancel_enabled:
+                        if (self.agc_mic_enabled and not self.echo_cancel_enabled
+                                and not self.noise_suppress_enabled):
                             mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(
                                 mic_chunk, _agc_mic_env, self.agc_target_rms,
                                 self.agc_max_gain, self.agc_gate_threshold,

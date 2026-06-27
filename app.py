@@ -919,6 +919,10 @@ def _level_push_loop() -> None:
                     "mic_env":     round(float(capture.agc_mic_envelope), 5),
                     "mic_gated":   bool(capture.agc_mic_gated),
                     "mic_enabled": bool(capture.agc_mic_enabled),
+                    # Mic AGC is bypassed (mic left clean) while echo cancellation or
+                    # noise suppression is on, so the suppressed signal is not re-gained.
+                    "mic_bypassed": bool(getattr(capture, "echo_cancel_enabled", False)
+                                         or getattr(capture, "noise_suppress_enabled", False)),
                     "target":      float(capture.agc_target_rms),
                     "gate":        float(capture.agc_gate_threshold),
                     "max_gain":    float(capture.agc_max_gain),
@@ -1544,6 +1548,7 @@ def start_audio_test():
     from capture_audio.params import resolve_audio_params
     _params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
+    capture.noise_suppress_enabled = bool(int(_params.get("noise_suppress_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
     capture.agc_mic_enabled = bool(int(_params.get("agc_mic_enabled", 0)))
     capture.agc_target_rms = float(_params.get("agc_target_rms", 0.15))
@@ -3009,8 +3014,10 @@ def _apply_audio_params(params: dict) -> None:
         _transcriber.diarizer.apply_params(params)
 
     # Push echo cancellation and AGC toggles to the active AudioCapture instance
+    # (the live recording capture, or the input-test capture when testing) so
+    # changes apply immediately without restarting the recording or the test.
     with _state_lock:
-        capture = _state.get("audio_capture")
+        capture = _state.get("audio_capture") or _state.get("test_capture")
     if capture is not None:
         capture.echo_cancel_enabled = bool(int(params.get("echo_cancel_enabled", 0)))
         capture.noise_suppress_enabled = bool(int(params.get("noise_suppress_enabled", 0)))

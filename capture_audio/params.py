@@ -435,7 +435,10 @@ ECHO_CANCELLATION_DEFAULTS = {
             "(fans, air conditioning, hum) on the microphone. It runs on the mic "
             "alone, so it works independently of echo cancellation; echo "
             "cancellation already includes it.<br><br>"
-            "<b>Enable</b> if quiet background noise is being boosted when echo "
+            "While on, the microphone auto-gain is bypassed (like echo "
+            "cancellation), so loud room noise is not boosted back up; use the Mic "
+            "gain slider if you need to raise your level.<br><br>"
+            "<b>Enable</b> if background noise is being boosted when echo "
             "cancellation is off.<br>"
             "<b>Leave disabled</b> to capture the microphone untouched."
         ),

@@ -15710,14 +15710,15 @@ function _updateAgcDebug(agc) {
   el.style.display = '';
 
   const fmt = (v) => v < 0.001 ? v.toExponential(1) : v.toFixed(4);
-  const renderCol = (id, label, cssClass, enabled, gain, env, gated, target) => {
+  const renderCol = (id, label, cssClass, enabled, gain, env, gated, target, bypassed) => {
     const col = document.getElementById(id);
     if (!col) return;
     if (!enabled) {
       col.innerHTML = `<div class="agc-src ${cssClass}">${label}</div><div class="agc-idle">disabled</div>`;
       return;
     }
-    const status = gated ? '<span class="agc-gated">GATED</span>'
+    const status = bypassed ? '<span class="agc-idle">bypassed (cleaning)</span>'
+                  : gated ? '<span class="agc-gated">GATED</span>'
                   : gain > 1.01 ? `<span class="agc-boosting">BOOST ${gain.toFixed(1)}\u00d7</span>`
                   : '<span class="agc-idle">1.0\u00d7</span>';
     col.innerHTML = `<div class="agc-src ${cssClass}">${label}</div>`
@@ -15726,8 +15727,8 @@ function _updateAgcDebug(agc) {
       + `<div class="agc-val"><span class="agc-lbl">Env</span> ${fmt(env)}</div>`
       + `<div class="agc-val"><span class="agc-lbl">Target</span> ${fmt(target)}</div>`;
   };
-  renderCol('agc-debug-lb',  'Desktop', 'lb',  agc.lb_enabled,  agc.lb_gain,  agc.lb_env,  agc.lb_gated,  agc.target);
-  renderCol('agc-debug-mic', 'Mic',     'mic', agc.mic_enabled, agc.mic_gain, agc.mic_env, agc.mic_gated, agc.target);
+  renderCol('agc-debug-lb',  'Desktop', 'lb',  agc.lb_enabled,  agc.lb_gain,  agc.lb_env,  agc.lb_gated,  agc.target, false);
+  renderCol('agc-debug-mic', 'Mic',     'mic', agc.mic_enabled, agc.mic_gain, agc.mic_env, agc.mic_gated, agc.target, agc.mic_bypassed);
 }
 
 /** Parse the mic selector value into {mic_device, ffmpeg_mic_name} for the API. */

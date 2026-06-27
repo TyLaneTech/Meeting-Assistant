@@ -1171,11 +1171,13 @@ class AudioCapture:
                         self.agc_lb_gain = 1.0
                         self.agc_lb_gated = True
 
-                    # ── Mic auto-gain. Bypassed while echo cancellation is on so
-                    # the cleaned echo residual is not re-boosted (which would
-                    # bring the desktop bleed straight back). ───────────────────
+                    # ── Mic auto-gain. Bypassed whenever the mic is being cleaned
+                    # (echo cancellation or noise suppression on) so the suppressed
+                    # echo residual / background noise is not re-boosted straight
+                    # back up by the gain stage. ────────────────────────────────
                     if have_mic:
-                        if self.agc_mic_enabled and not self.echo_cancel_enabled:
+                        if (self.agc_mic_enabled and not self.echo_cancel_enabled
+                                and not self.noise_suppress_enabled):
                             mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(
                                 mic_chunk, _agc_mic_env, self.agc_target_rms,
                                 self.agc_max_gain, self.agc_gate_threshold,
