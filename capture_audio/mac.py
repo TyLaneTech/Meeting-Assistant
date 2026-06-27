@@ -653,6 +653,13 @@ class AudioCapture:
         # avfoundation subprocess mic capture (mic_index=-3 on Mac)
         self._ffmpeg_proc: subprocess.Popen | None = None
         self._ffmpeg_mic_name: str | None = None
+        self._ffmpeg_stderr_thread: threading.Thread | None = None
+        # Bounded ring buffer of recent ffmpeg mic stderr lines. Drained
+        # continuously by _ffmpeg_stderr_drain so a sustained burst of
+        # error-level stderr cannot fill the 64KB pipe and deadlock ffmpeg's
+        # writes while the device keeps streaming; the capture loop's finally
+        # reports this tail on a non-zero exit.
+        self._ffmpeg_stderr_tail: collections.deque = collections.deque(maxlen=50)
 
     # ── Device discovery ──────────────────────────────────────────────────────
 
@@ -838,37 +845,65 @@ class AudioCapture:
                 log.warn("audio", f"Ignoring hidden virtual mic '{ffmpeg_mic_name}'")
                 mic_info = self._find_mic_device()
             else:
-                self._mic_rate = 48000
-                self._mic_channels = 1
-                self._has_mic = True
-                self._ffmpeg_mic_name = ffmpeg_mic_name
-                if self._mic_rate != self.sample_rate:
-                    g = gcd(self.sample_rate, self._mic_rate)
-                    self._resample_up   = self.sample_rate // g
-                    self._resample_down = self._mic_rate    // g
-                cmd = [
-                    ffmpeg_path,
-                    "-f", "avfoundation",
-                    # NB: do NOT pass -audio_buffer_size here. That is a
-                    # DirectShow (Windows) input option; avfoundation rejects it
-                    # with "Unrecognized option 'audio_buffer_size'" and ffmpeg
-                    # exits immediately, so the mic captures nothing. Low latency
-                    # is handled by -fflags +nobuffer / -flags +low_delay below.
-                    "-i", f":{ffmpeg_mic_name}",
-                    "-f", "s16le",
-                    "-acodec", "pcm_s16le",
-                    "-ar", str(self._mic_rate),
-                    "-ac", "1",
-                    "-fflags", "+nobuffer",
-                    "-flags", "+low_delay",
-                    "-loglevel", "error",
-                    "pipe:1",
-                ]
-                log.info("audio", f"Mic: ffmpeg avfoundation '{ffmpeg_mic_name}' "
-                                  f"@ {self._mic_rate} Hz, 1 ch")
-                self._ffmpeg_proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
+                # Re-resolve the persisted name against the live avfoundation
+                # device list before spawning. The friendly name we saved may
+                # have shifted (OS update, device re-enumeration) or the device
+                # may be gone; trusting the stale string spawns an ffmpeg that
+                # records nothing. Re-resolving recovers the same physical mic
+                # after a benign rename, or fails cleanly without claiming a mic
+                # that will not open. Mirrors the Windows backend
+                # (resolve_dshow_mic_name).
+                resolved, reason = resolve_dshow_mic_name(ffmpeg_mic_name)
+                if resolved is None:
+                    log.warn("audio", f"Mic '{ffmpeg_mic_name}' not found in "
+                                      f"avfoundation device list ({reason}) - "
+                                      f"capturing loopback only")
+                else:
+                    if resolved != ffmpeg_mic_name:
+                        log.info("audio", f"Mic name re-resolved: '{ffmpeg_mic_name}' "
+                                          f"-> '{resolved}' ({reason})")
+                    ffmpeg_mic_name = resolved
+                    self._mic_rate = 48000
+                    self._mic_channels = 1
+                    self._has_mic = True
+                    self._ffmpeg_mic_name = ffmpeg_mic_name
+                    if self._mic_rate != self.sample_rate:
+                        g = gcd(self.sample_rate, self._mic_rate)
+                        self._resample_up   = self.sample_rate // g
+                        self._resample_down = self._mic_rate    // g
+                    cmd = [
+                        ffmpeg_path,
+                        "-f", "avfoundation",
+                        # NB: do NOT pass -audio_buffer_size here. That is a
+                        # DirectShow (Windows) input option; avfoundation rejects it
+                        # with "Unrecognized option 'audio_buffer_size'" and ffmpeg
+                        # exits immediately, so the mic captures nothing. Low latency
+                        # is handled by -fflags +nobuffer / -flags +low_delay below.
+                        "-i", f":{ffmpeg_mic_name}",
+                        "-f", "s16le",
+                        "-acodec", "pcm_s16le",
+                        "-ar", str(self._mic_rate),
+                        "-ac", "1",
+                        "-fflags", "+nobuffer",
+                        "-flags", "+low_delay",
+                        "-loglevel", "error",
+                        "pipe:1",
+                    ]
+                    log.info("audio", f"Mic: ffmpeg avfoundation '{ffmpeg_mic_name}' "
+                                      f"@ {self._mic_rate} Hz, 1 ch")
+                    self._ffmpeg_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    # Drain stderr in real time so the pipe never fills and
+                    # stalls capture. Started right after Popen, mirroring
+                    # capture_video/mac.py's _monitor.
+                    self._ffmpeg_stderr_tail = collections.deque(maxlen=50)
+                    self._ffmpeg_stderr_thread = threading.Thread(
+                        target=self._ffmpeg_stderr_drain,
+                        args=(self._ffmpeg_proc, self._ffmpeg_stderr_tail),
+                        daemon=True,
+                    )
+                    self._ffmpeg_stderr_thread.start()
         elif mic_index == -2:
             # Browser mic: data arrives via inject_mic_data().
             self._mic_rate = 48000
@@ -981,6 +1016,7 @@ class AudioCapture:
         self._mic_thread = None
         self._mixer_thread = None
         self._sck_watchdog_thread = None
+        self._ffmpeg_stderr_thread = None
 
         self.stop_wav()
 
@@ -1131,6 +1167,43 @@ class AudioCapture:
                     break
                 time.sleep(0.01)
 
+    def _ffmpeg_stderr_drain(self, proc: subprocess.Popen,
+                             tail: collections.deque) -> None:
+        """Drain the mic ffmpeg's stderr into a bounded ring buffer.
+
+        The stderr pipe is opened with subprocess.PIPE; if it is only read once
+        (in _ffmpeg_capture_loop's finally), a sustained burst of error-level
+        stderr while the device keeps streaming fills the pipe and blocks
+        ffmpeg's writes, stalling capture. Draining it here in real time keeps
+        the pipe clear and preserves the most recent lines for the exit-error
+        report. read1 returns as soon as bytes arrive rather than blocking for a
+        full 4096. Mirrors capture_video/mac.py's _monitor.
+        """
+        if not proc.stderr:
+            return
+        buf = b""
+        try:
+            while True:
+                chunk = proc.stderr.read1(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                # ffmpeg separates progress updates with \r, messages with \n.
+                *lines, buf = re.split(rb"[\r\n]", buf)
+                for raw in lines:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if line:
+                        tail.append(line)
+        except Exception:
+            pass
+        if buf.strip():
+            tail.append(buf.decode("utf-8", "replace").strip())
+
+    def _ffmpeg_stderr_tail_text(self, limit: int = 8) -> str:
+        """Last few captured ffmpeg mic stderr lines, for the exit-error report."""
+        lines = list(self._ffmpeg_stderr_tail)[-limit:]
+        return " | ".join(lines)
+
     def _ffmpeg_capture_loop(self) -> None:
         """Read raw PCM from an ffmpeg avfoundation subprocess."""
         read_size = self.CHUNK_SIZE * 2
@@ -1152,10 +1225,17 @@ class AudioCapture:
                 proc.terminate()
             if proc:
                 try:
-                    stderr_out = proc.stderr.read() if proc.stderr else b""
-                    if proc.wait(timeout=3) != 0 and stderr_out:
+                    rc = proc.wait(timeout=3)
+                    # Report from the tail the drain thread captured, never
+                    # proc.stderr.read() (the drain owns that pipe and a blocking
+                    # read could deadlock against it). Join the drain briefly so
+                    # ffmpeg's final lines land in the tail first.
+                    if self._ffmpeg_stderr_thread is not None:
+                        self._ffmpeg_stderr_thread.join(timeout=2)
+                    tail = self._ffmpeg_stderr_tail_text()
+                    if rc != 0 and tail:
                         log.warn("audio", f"ffmpeg mic exited with code {proc.returncode}: "
-                                          f"{stderr_out.decode(errors='replace')[:500]}")
+                                          f"{tail[:500]}")
                 except Exception:
                     pass
 
@@ -1536,6 +1616,60 @@ def enumerate_dshow_audio_devices() -> list[dict]:
             if name and not _is_hidden_input_device(name):
                 devices.append({"name": name})
     return devices
+
+
+def resolve_dshow_mic_name(requested: str) -> tuple[str | None, str]:
+    """Re-resolve a saved avfoundation mic name against the current device list.
+
+    Named to match the Windows API (resolve_dshow_mic_name) so the capture
+    backends stay swappable, but it queries the avfoundation list. A device's
+    friendly name can change between sessions (OS update, USB re-enumeration)
+    or the device can be unplugged, so the name we persisted may no longer
+    match anything ffmpeg can open. Re-querying the live list and picking the
+    best surviving match recovers the same physical mic after a benign rename
+    instead of spawning an ffmpeg that records nothing.
+
+    Resolution order (avfoundation devices carry no alternative/GUID name, so
+    the Windows alt-name step is omitted):
+      1. Exact friendly-name match.
+      2. Case-insensitive friendly-name match.
+      3. Substring match (requested in candidate or candidate in requested).
+
+    Returns (resolved_name, reason). resolved_name is None if nothing matched.
+    The reason string is suitable for logging ("exact", "case-insensitive",
+    "substring", "no-match").
+    """
+    if not requested:
+        return None, "empty-request"
+    devices = enumerate_dshow_audio_devices()
+    if not devices:
+        return None, "enumeration-failed"
+
+    # 1. Exact friendly-name match
+    for d in devices:
+        if d.get("name") == requested:
+            return requested, "exact"
+
+    # 2. Case-insensitive
+    req_lower = requested.lower()
+    for d in devices:
+        if d.get("name", "").lower() == req_lower:
+            return d["name"], "case-insensitive"
+
+    # 3. Substring (prefer longest candidate name)
+    cand: list[tuple[int, str]] = []
+    for d in devices:
+        name = d.get("name", "")
+        if not name:
+            continue
+        nl = name.lower()
+        if req_lower in nl or nl in req_lower:
+            cand.append((len(name), name))
+    if cand:
+        cand.sort(reverse=True)
+        return cand[0][1], "substring"
+
+    return None, "no-match"
 
 
 def _play_audio_file(p: Path, device: int | str | None = None) -> None:
