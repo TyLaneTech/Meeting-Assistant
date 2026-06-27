@@ -136,6 +136,15 @@ def get_cuda_available() -> bool:
 
 def get_default_model_config() -> tuple[str, str, str]:
     """Return the preferred default Whisper config, probing once lazily."""
+    if sys.platform == "darwin":
+        # Apple Silicon: mlx-whisper drives Metal directly. Mirror
+        # detect_device() so the streaming engine defaults to large-v3, the
+        # model the launcher pre-caches — without this darwin branch the
+        # function falls through to the CPU default ("small"), which on macOS
+        # maps to whisper-small-mlx (never pre-downloaded) and fails to load
+        # under HF_HUB_OFFLINE, so live transcription produces no segments.
+        log.info("whisper", "Using mlx-whisper on Metal - large-v3.")
+        return "mlx", "fp16", "large-v3"
     if get_cuda_available():
         log.info("whisper", "CUDA OK - using large-v3 (float16).")
         return "cuda", "float16", "large-v3"
