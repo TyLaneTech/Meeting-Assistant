@@ -283,6 +283,15 @@ class _SCKLoopbackStream:
             log.warn("audio", "SCStream startCapture completion never fired but "
                               "audio is flowing - treating stream as live")
 
+        # Reseed the watchdog baseline to "now". On the confirmed branch the
+        # completion handler can fire before the first audio sample buffer is
+        # delivered, so last_audio_monotonic is still the pre-startCapture
+        # timestamp. If the handler took more than the watchdog timeout to land
+        # (plausible inside the 20 s warm-up budget), the very first watchdog
+        # tick would see a stale clock and tear down a healthy, still-warming-up
+        # stream. Anchoring to the moment we treat the stream as live closes that
+        # window without masking a genuinely stalled stream thereafter.
+        self.last_audio_monotonic = time.monotonic()
         self._started = True
         log.info("audio", f"ScreenCaptureKit loopback started @ {_SCK_SAMPLE_RATE} Hz, "
                           f"{self._channels} ch")
@@ -825,9 +834,11 @@ class AudioCapture:
                 cmd = [
                     ffmpeg_path,
                     "-f", "avfoundation",
-                    # Latency tuning the app added: cap the avfoundation input
-                    # buffer so mic chunks arrive promptly.
-                    "-audio_buffer_size", "40",
+                    # NB: do NOT pass -audio_buffer_size here. That is a
+                    # DirectShow (Windows) input option; avfoundation rejects it
+                    # with "Unrecognized option 'audio_buffer_size'" and ffmpeg
+                    # exits immediately, so the mic captures nothing. Low latency
+                    # is handled by -fflags +nobuffer / -flags +low_delay below.
                     "-i", f":{ffmpeg_mic_name}",
                     "-f", "s16le",
                     "-acodec", "pcm_s16le",
