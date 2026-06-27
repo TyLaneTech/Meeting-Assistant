@@ -146,6 +146,8 @@ class MeetingTray:
 
     def run(self) -> None:
         """Start the tray icon.  Blocks the calling thread (must be main)."""
+        if _IS_MACOS:
+            self._make_accessory_app()
         self._icon = pystray.Icon(
             name="Meeting Assistant",
             icon=self._pick_icon(),
@@ -153,6 +155,21 @@ class MeetingTray:
             menu=self._build_menu(),
         )
         self._icon.run(setup=self._on_setup)
+
+    @staticmethod
+    def _make_accessory_app() -> None:
+        """Run as a menu-bar-only (accessory) app on macOS: no Dock icon and no
+        Cmd-Tab entry, with the status-bar icon as the app's entry point. Must
+        run on the main thread before the NSApplication loop starts. Best-effort:
+        if AppKit is unavailable the app simply keeps its default Dock icon.
+        """
+        try:
+            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory
+            )
+        except Exception:
+            pass
 
     def refresh(self) -> None:
         """Update the icon image and tooltip to reflect current state. Thread-safe."""
@@ -223,19 +240,38 @@ class MeetingTray:
 
     @staticmethod
     def _mark_template_image(icon: "pystray.Icon") -> None:
-        """Mark the menu-bar NSImage as a template so AppKit inverts it
-        automatically for dark menu bars. pystray exposes the underlying
-        NSStatusItem via internal attrs; we walk it defensively."""
+        """Style the menu-bar NSImage to match the system icons.
+
+        Two touches, both macOS-only:
+        1. Mark it a template image so AppKit inverts it for dark menu bars.
+        2. Pin its point size. pystray hands AppKit the full 64px bitmap, which
+           it renders at the full bar height with no padding, so the glyph reads
+           noticeably larger than its neighbours. Sizing it to the bar thickness
+           minus a little padding brings it in line with the system icons.
+
+        pystray exposes the underlying NSStatusItem via internal attrs; we walk
+        it defensively and re-apply on every refresh (pystray rebuilds the
+        NSImage whenever .icon is reassigned, which drops both touches)."""
         try:
             status_item = getattr(icon, "_status_item", None) or getattr(icon, "_status_bar_item", None)
             if status_item is None:
                 return
             ns_button = status_item.button() if callable(getattr(status_item, "button", None)) else None
             ns_image = ns_button.image() if ns_button is not None else None
-            if ns_image is not None and hasattr(ns_image, "setTemplate_"):
+            if ns_image is None:
+                return
+            if hasattr(ns_image, "setTemplate_"):
                 ns_image.setTemplate_(True)
+            try:
+                from AppKit import NSStatusBar
+                thickness = float(NSStatusBar.systemStatusBar().thickness()) or 24.0
+            except Exception:
+                thickness = 24.0
+            side = max(15.0, min(19.0, round(thickness - 6.0)))
+            if hasattr(ns_image, "setSize_"):
+                ns_image.setSize_((side, side))
         except Exception:
-            pass  # styling polish only — not worth crashing the tray over
+            pass  # styling polish only, not worth crashing the tray over
 
     def _get_tray_state(self) -> str:
         """Return the current tray state key."""
