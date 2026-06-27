@@ -4175,6 +4175,10 @@ function updateTestBtn() {
 
 /* ── Recording ───────────────────────────────────────────────────────────── */
 async function toggleRecording() {
+  // Drop keyboard focus from the record button. Browsers activate the focused
+  // <button> when Space is pressed, so without this a spacebar tap after a
+  // recording starts would "click" the still-focused button and stop it.
+  document.getElementById('record-btn')?.blur();
   if (state.isRecording) {
     // Immediate visual feedback while the server tears down streams
     const btn = document.getElementById('record-btn');
