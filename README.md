@@ -50,6 +50,24 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 
 ## Quick Start
 
+### Fastest: one-line install
+
+These clone the repo from GitHub and then set up and launch everything (uv, Python, the virtual environment, the models, and the app) with no further steps. The app is installed to `~/Meeting Assistant` by default (override with the `MEETING_ASSISTANT_DIR` environment variable).
+
+**macOS (Apple Silicon, macOS 13+):**
+```
+curl -fsSL https://raw.githubusercontent.com/TyLaneTech/Meeting-Assistant/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```
+irm https://raw.githubusercontent.com/TyLaneTech/Meeting-Assistant/main/install.ps1 | iex
+```
+
+The only prerequisite is `git` (plus Homebrew on macOS, which the installer uses to add a native `ffmpeg`). Everything else is bootstrapped for you. When it starts, open http://localhost:6969 and enter your API key in Settings.
+
+### Manual setup
+
 **Windows:**
 ```
 1. Install Python 3.10+ (add to PATH)

@@ -1,0 +1,6 @@
+# Shell launchers must keep LF line endings so they run on macOS/Linux
+# regardless of a contributor's core.autocrlf setting. Without this, a Windows
+# checkout could store CRLF and break the shebang when run on a Mac (and break
+# the `curl | bash` one-line installer served from GitHub raw).
+*.sh        text eol=lf
+*.command   text eol=lf
