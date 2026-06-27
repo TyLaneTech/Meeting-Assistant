@@ -17483,6 +17483,7 @@ function _apRenderSection(containerId, paramDefs, current) {
     const param = document.createElement('div');
     param.className = 'ap-param';
     param.dataset.apKey = key;
+    if (spec.independent) param.dataset.apIndependent = '1';
 
     if (spec.type === 'toggle') {
       // Render as a toggle switch
@@ -17578,7 +17579,9 @@ function _apRenderSection(containerId, paramDefs, current) {
     const pct = ((val - spec.min) / (spec.max - spec.min)) * 100;
     const anyToggleOn = toggleKeys.some(tk => !!parseInt(current[tk] ?? 0));
     const isToggle = toggleKeys.includes(key);
-    const isDisabled = (toggleKeys.length > 0 && !isToggle && (toggleInverted ? anyToggleOn : !anyToggleOn));
+    // Params flagged "independent" are never gated by the section's toggle (e.g.
+    // the desktop-bleed gate works whether or not echo cancellation is enabled).
+    const isDisabled = (toggleKeys.length > 0 && !isToggle && !spec.independent && (toggleInverted ? anyToggleOn : !anyToggleOn));
 
     param.innerHTML = `
       <div class="ap-header">
@@ -17645,6 +17648,7 @@ function _apSetSectionEnabled(containerId, skipKeys, enabled) {
   const skip = new Set(Array.isArray(skipKeys) ? skipKeys : [skipKeys]);
   for (const param of container.querySelectorAll('.ap-param')) {
     if (skip.has(param.dataset.apKey)) continue;
+    if (param.dataset.apIndependent === '1') continue;   // never toggle-gated
     param.classList.toggle('ap-disabled', !enabled);
     for (const el of param.querySelectorAll('input, button')) {
       el.disabled = !enabled;

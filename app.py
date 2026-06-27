@@ -50,7 +50,7 @@ from capture_audio import (
 )
 from capture_audio.params import (
     TRANSCRIPTION_DEFAULTS, DIARIZATION_DEFAULTS, AUTO_GAIN_DEFAULTS,
-    SCREEN_RECORDING_DEFAULTS,
+    ECHO_CANCELLATION_DEFAULTS, SCREEN_RECORDING_DEFAULTS,
     TRANSCRIPTION_PRESETS, TRANSCRIPTION_DEFAULT_PRESET,
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
@@ -1710,6 +1710,9 @@ def start_recording():
         _ec_params.get("mic_bleed_slack",
                        _ec_params.get("bleed_duck_slack",
                                       getattr(_transcriber, "mic_bleed_slack", 2.0))))
+    _transcriber.mic_bleed_threshold = float(
+        _ec_params.get("mic_bleed_threshold",
+                       getattr(_transcriber, "mic_bleed_threshold", 0.0)))
 
     # "Mic = Me": when on and a mic is present, the capture writes per-source
     # tracks so mic audio is always the app user and only desktop is diarized.
@@ -2829,6 +2832,7 @@ def reset_audio_section():
         "transcription": TRANSCRIPTION_DEFAULTS,
         "diarization": DIARIZATION_DEFAULTS,
         "auto_gain": AUTO_GAIN_DEFAULTS,
+        "echo_cancellation": ECHO_CANCELLATION_DEFAULTS,
         "screen_recording": SCREEN_RECORDING_DEFAULTS,
     }
     data = request.get_json(silent=True) or {}
@@ -2995,6 +2999,11 @@ def _apply_audio_params(params: dict) -> None:
     _transcriber.compression_ratio_threshold = float(
         params.get("compression_ratio_threshold", 2.0)
     )
+    # "Mic = Me" desktop-bleed gate (the level gate is the primary mechanism; the
+    # voiceprint check is opt-in). Accept the legacy bleed_duck_slack alias.
+    _transcriber.mic_bleed_slack = float(
+        params.get("mic_bleed_slack", params.get("bleed_duck_slack", 2.0)))
+    _transcriber.mic_bleed_threshold = float(params.get("mic_bleed_threshold", 0.0))
     if _transcriber.diarizer is not None:
         _transcriber.diarizer.apply_params(params)
 

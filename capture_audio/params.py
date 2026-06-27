@@ -426,6 +426,47 @@ ECHO_CANCELLATION_DEFAULTS = {
         "step": 1,
         "type": "toggle",
     },
+    "mic_bleed_slack": {
+        "value": 2.0,
+        "label": "Desktop Bleed Rejection",
+        "description": "How aggressively desktop audio is kept out of your own track.",
+        "tooltip": (
+            "Controls the \"Mic = Me\" bleed gate on macOS: while the desktop is "
+            "playing, a microphone passage is only attributed to you if it rises "
+            "this many times above the measured speaker-bleed level. The gate "
+            "self-calibrates to your speaker volume and microphone, so it works "
+            "whether or not echo cancellation is on.<br><br>"
+            "<b>Higher</b> drops more desktop audio from your track, but can clip "
+            "quiet speech if you talk softly while audio plays loudly.<br>"
+            "<b>Lower</b> keeps more of your microphone, at the risk of some "
+            "desktop audio being labelled as you."
+        ),
+        "min": 1.0,
+        "max": 4.0,
+        "step": 0.1,
+        "type": "number",
+        "independent": True,
+    },
+    "mic_bleed_threshold": {
+        "value": 0.0,
+        "label": "Voiceprint Bleed Match (advanced)",
+        "description": "Also drop mic audio whose voiceprint matches the desktop.",
+        "tooltip": (
+            "An optional secondary check: a microphone passage whose speaker "
+            "voiceprint matches the desktop audio from the same moment is dropped "
+            "as bleed. Off by default (0) because the microphone and speaker "
+            "capture clocks drift apart, so the two rarely line up well enough for "
+            "the match to be reliable; the level gate above is the primary "
+            "mechanism.<br><br>"
+            "<b>0</b> disables this check.<br>"
+            "<b>0.5 to 0.8</b> enables it; lower values drop more aggressively."
+        ),
+        "min": 0.0,
+        "max": 0.95,
+        "step": 0.05,
+        "type": "number",
+        "independent": True,
+    },
 }
 
 
