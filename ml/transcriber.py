@@ -194,6 +194,9 @@ _HALLUCINATION_PHRASES = [
     "transcription by",
     "translated by",
     "captioned by",
+    "closed captioning",
+    "captioning by",
+    "captioning sponsored by",
 ]
 
 # Pre-compile a single regex for efficiency
