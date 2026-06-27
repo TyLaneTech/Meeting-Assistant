@@ -34,6 +34,7 @@ import sounddevice as sd
 from scipy.signal import resample_poly
 
 from core import log as log
+from capture_audio._webrtc import WebRTCMicProcessor
 from capture_audio.wav_writer import WavWriter
 
 # FFT window size for the spectrum visualizer.  2048 samples ≈ 43 ms at 48 kHz,
@@ -617,6 +618,10 @@ class AudioCapture:
         self.mic_gain: float = 1.0
 
         self.echo_cancel_enabled: bool = False
+        # Noise suppression, independent of echo cancellation. Echo cancellation
+        # always includes it; this flag enables it on its own (e.g. to stop the
+        # custom AGC boosting quiet background noise when echo cancellation is off).
+        self.noise_suppress_enabled: bool = False
 
         self.agc_loopback_enabled: bool = True
         self.agc_mic_enabled: bool = True
@@ -1202,11 +1207,8 @@ class AudioCapture:
         _agc_lb_env  = 0.0
         _agc_mic_env = 0.0
 
-        _aec_processor = None
-        _aec_frame_size = 0
-        _aec_mic_buf = np.array([], dtype=np.float32)
-        _aec_lb_buf  = np.array([], dtype=np.float32)
-        _aec_out_buf = np.array([], dtype=np.float32)
+        # Shared WebRTC echo-cancel / noise-suppression processor (raw mic, pre-AGC).
+        _mic_proc = WebRTCMicProcessor(self.CHUNK_SIZE)
 
         # ── Wall-clock pacing ────────────────────────────────────────────────
         # Emit exactly one CHUNK_SIZE-sized mixed chunk per wall-clock period
@@ -1328,69 +1330,21 @@ class AudioCapture:
                         mic_chunk = _zero_chunk
                         raw_mic_rms = 0.0
 
-                    # ── WebRTC echo cancel + noise suppression on the raw mic ──
-                    # Only meaningful when BOTH sides are real this iteration: the
-                    # reference (loopback) must stay in lock-step with the mic, and
-                    # the per-frame buffers desync if either side is fed alone.
-                    # The cleaned, denoised mic replaces mic_chunk; AGC runs on it
-                    # next. Noise suppression also runs here, so it lowers the mic
-                    # noise floor before any gain is applied.
-                    if self.echo_cancel_enabled and have_lb and have_mic:
-                        if _aec_processor is None or _aec_frame_size == 0:
-                            try:
-                                from aec_audio_processing import AudioProcessor
-                                # AEC + noise suppression, but NOT WebRTC's AGC:
-                                # the canceller only partially removes acoustic
-                                # echo, and desktop audio is usually speech, so a
-                                # gain stage (WebRTC's or ours) re-boosts the
-                                # speech-like residual via its VAD and the bleed
-                                # comes back. With echo cancellation on we keep the
-                                # mic clean and un-gained instead.
-                                _aec_processor = AudioProcessor(
-                                    enable_aec=True, enable_ns=True, enable_agc=False,
-                                )
-                                sr = self.sample_rate or 16000
-                                _aec_processor.set_stream_format(sr, 1)
-                                _aec_processor.set_reverse_stream_format(sr, 1)
-                                _aec_frame_size = _aec_processor.get_frame_size()
-                                log.info("audio", f"WebRTC AEC+NS initialised @ {sr} Hz, "
-                                                  f"frame={_aec_frame_size} samples")
-                            except Exception:
-                                traceback.print_exc()
-                                _aec_processor = None
-
-                        if _aec_processor is not None:
-                            _aec_mic_buf = np.concatenate((_aec_mic_buf, mic_chunk))
-                            _aec_lb_buf  = np.concatenate((_aec_lb_buf,  lb_chunk))
-                            cleaned_parts: list[np.ndarray] = []
-                            while (len(_aec_mic_buf) >= _aec_frame_size
-                                   and len(_aec_lb_buf) >= _aec_frame_size):
-                                mf = _aec_mic_buf[:_aec_frame_size]
-                                lf = _aec_lb_buf[:_aec_frame_size]
-                                _aec_mic_buf = _aec_mic_buf[_aec_frame_size:]
-                                _aec_lb_buf  = _aec_lb_buf[_aec_frame_size:]
-                                lb_i16  = (lf * 32767).astype(np.int16).tobytes()
-                                mic_i16 = (mf * 32767).astype(np.int16).tobytes()
-                                _aec_processor.process_reverse_stream(lb_i16)
-                                result = _aec_processor.process_stream(mic_i16)
-                                cleaned_parts.append(
-                                    np.frombuffer(result, dtype=np.int16)
-                                      .astype(np.float32) / 32768.0
-                                )
-                            if cleaned_parts:
-                                _aec_out_buf = np.concatenate(
-                                    (_aec_out_buf, *cleaned_parts)
-                                )
-                            if len(_aec_out_buf) >= self.CHUNK_SIZE:
-                                mic_chunk = _aec_out_buf[:self.CHUNK_SIZE]
-                                _aec_out_buf = _aec_out_buf[self.CHUNK_SIZE:]
-                    elif (not self.echo_cancel_enabled) and _aec_processor is not None:
-                        # Echo cancellation was just disabled - tear down
-                        _aec_processor = None
-                        _aec_frame_size = 0
-                        _aec_mic_buf = np.array([], dtype=np.float32)
-                        _aec_lb_buf  = np.array([], dtype=np.float32)
-                        _aec_out_buf = np.array([], dtype=np.float32)
+                    # ── WebRTC echo cancel / noise suppression on the raw mic ──
+                    # Runs on the RAW mic, before any auto-gain. Echo cancellation
+                    # and noise suppression are independent: noise suppression also
+                    # runs on its own (no loopback needed), so it can lower the mic
+                    # noise floor even when echo cancellation is off. AEC is fed the
+                    # loopback as its reference every tick (zeros when no desktop).
+                    # The custom mic AGC below is bypassed while echo cancellation is
+                    # on, so the cleaned residual is not re-boosted.
+                    if have_mic:
+                        mic_chunk = _mic_proc.process(
+                            mic_chunk, lb_chunk, self.sample_rate or 16000,
+                            enable_aec=self.echo_cancel_enabled,
+                            enable_ns=(self.echo_cancel_enabled
+                                       or self.noise_suppress_enabled),
+                        )
 
                     # ── Loopback auto-gain (for the mix; AEC used the raw ref) ──
                     if have_lb:
@@ -1416,13 +1370,12 @@ class AudioCapture:
                         self.agc_lb_gated = True
 
                     # ── Mic auto-gain ───────────────────────────────────────────
-                    # When echo cancellation is on, the WebRTC processor above has
-                    # already applied VAD-gated gain (alongside AEC + NS), so the
-                    # custom AGC is bypassed: it would otherwise re-boost the quiet
-                    # echo residual and the noise floor straight back up (which is
-                    # the "desktop still bleeds through" and "noise boosted 4x"
-                    # behaviour). When echo cancellation is off, the custom AGC
-                    # runs exactly as before.
+                    # Bypassed while echo cancellation is on: the cleaned mic still
+                    # carries a speech-like echo residual, and any gain stage would
+                    # re-boost it (and the noise floor) straight back up, which is
+                    # the "desktop still bleeds through" / "noise boosted 4x"
+                    # behaviour. With echo off the custom AGC runs exactly as before
+                    # (noise suppression, when enabled, lowers the floor first).
                     if have_mic:
                         if self.agc_mic_enabled and not self.echo_cancel_enabled:
                             mic_chunk, _agc_mic_env, _g, _gated = self._agc_apply(

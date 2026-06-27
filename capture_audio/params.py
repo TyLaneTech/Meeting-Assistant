@@ -426,6 +426,24 @@ ECHO_CANCELLATION_DEFAULTS = {
         "step": 1,
         "type": "toggle",
     },
+    "noise_suppress_enabled": {
+        "value": 0,
+        "label": "Enable Noise Suppression",
+        "description": "Remove steady background noise from the microphone.",
+        "tooltip": (
+            "Uses WebRTC noise suppression to attenuate steady background noise "
+            "(fans, air conditioning, hum) on the microphone. It runs on the mic "
+            "alone, so it works independently of echo cancellation; echo "
+            "cancellation already includes it.<br><br>"
+            "<b>Enable</b> if quiet background noise is being boosted when echo "
+            "cancellation is off.<br>"
+            "<b>Leave disabled</b> to capture the microphone untouched."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+    },
     "mic_bleed_slack": {
         "value": 2.0,
         "label": "Desktop Bleed Rejection",

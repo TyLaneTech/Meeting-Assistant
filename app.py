@@ -1697,6 +1697,7 @@ def start_recording():
     from capture_audio.params import resolve_audio_params
     _ec_params = resolve_audio_params()
     capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
+    capture.noise_suppress_enabled = bool(int(_ec_params.get("noise_suppress_enabled", 0)))
     capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
     capture.agc_mic_enabled = bool(int(_ec_params.get("agc_mic_enabled", 0)))
     capture.agc_target_rms = float(_ec_params.get("agc_target_rms", 0.15))
@@ -3012,6 +3013,7 @@ def _apply_audio_params(params: dict) -> None:
         capture = _state.get("audio_capture")
     if capture is not None:
         capture.echo_cancel_enabled = bool(int(params.get("echo_cancel_enabled", 0)))
+        capture.noise_suppress_enabled = bool(int(params.get("noise_suppress_enabled", 0)))
         capture.agc_loopback_enabled = bool(int(params.get("agc_loopback_enabled", 0)))
         capture.agc_mic_enabled = bool(int(params.get("agc_mic_enabled", 0)))
         capture.agc_target_rms = float(params.get("agc_target_rms", 0.15))
