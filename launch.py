@@ -363,7 +363,12 @@ def _create_macos_app_shortcut():
     if not launcher.exists():
         return
 
-    app_dir    = Path.home() / "Applications" / "Meeting Assistant.app"
+    # Prefer the system /Applications (where Launchpad / the macOS Apps grid
+    # looks) when it is writable by this user; otherwise fall back to the per-user
+    # ~/Applications, which never needs admin rights.
+    _sys_apps  = Path("/Applications")
+    _apps_root = _sys_apps if os.access(_sys_apps, os.W_OK) else (Path.home() / "Applications")
+    app_dir    = _apps_root / "Meeting Assistant.app"
     macos_dir  = app_dir / "Contents" / "MacOS"
     res_dir    = app_dir / "Contents" / "Resources"
     exe_path   = macos_dir / "MeetingAssistant"
@@ -395,16 +400,40 @@ def _create_macos_app_shortcut():
         exe_path.write_text(exe_script)
         exe_path.chmod(0o755)
 
-        # Best-effort app icon: convert the logo PNG to .icns via sips.
+        # App icon: build a proper multi-resolution .icns from the logo PNG via an
+        # iconset + iconutil (a plain `sips -s format icns` often yields nothing on
+        # a non-square / wrong-DPI source, which is why the icon was blank before).
         icon_src  = root / "ui_web" / "static" / "images" / "logo.png"
         icon_name = ""
         if icon_src.exists():
             try:
-                subprocess.run(
-                    ["sips", "-s", "format", "icns", str(icon_src),
-                     "--out", str(res_dir / "AppIcon.icns")],
-                    capture_output=True, timeout=20,
-                )
+                import tempfile
+                with tempfile.TemporaryDirectory() as _td:
+                    iconset = Path(_td) / "icon.iconset"
+                    iconset.mkdir()
+                    specs = [
+                        ("icon_16x16.png", 16),    ("icon_16x16@2x.png", 32),
+                        ("icon_32x32.png", 32),    ("icon_32x32@2x.png", 64),
+                        ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
+                        ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
+                        ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024),
+                    ]
+                    built = True
+                    for fname, px in specs:
+                        r = subprocess.run(
+                            ["sips", "-z", str(px), str(px), str(icon_src),
+                             "--out", str(iconset / fname)],
+                            capture_output=True, timeout=20,
+                        )
+                        if r.returncode != 0:
+                            built = False
+                            break
+                    if built:
+                        subprocess.run(
+                            ["iconutil", "-c", "icns", str(iconset),
+                             "-o", str(res_dir / "AppIcon.icns")],
+                            capture_output=True, timeout=20,
+                        )
                 if (res_dir / "AppIcon.icns").exists():
                     icon_name = "AppIcon"
             except Exception:
@@ -446,7 +475,23 @@ def _create_macos_app_shortcut():
         except Exception:
             pass
 
-        _ok(f"Applications shortcut ready  {GRY}(~/Applications/Meeting Assistant.app){R}")
+        # Remove a stale copy in the other Applications location so the app does
+        # not show up twice (e.g. an old ~/Applications bundle after we move to
+        # /Applications), then make sure Launch Services indexes the new one.
+        _other_root = (Path.home() / "Applications") if _apps_root == _sys_apps else _sys_apps
+        _other = _other_root / "Meeting Assistant.app"
+        if _other != app_dir and _other.exists():
+            shutil.rmtree(_other, ignore_errors=True)
+        try:
+            subprocess.run(
+                ["/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                 "LaunchServices.framework/Support/lsregister", "-f", str(app_dir)],
+                capture_output=True, timeout=20,
+            )
+        except Exception:
+            pass
+
+        _ok(f"Applications shortcut ready  {GRY}({app_dir}){R}")
     except Exception:
         _warn("Could not create the macOS Applications shortcut (non-fatal)")
 
