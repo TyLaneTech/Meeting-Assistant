@@ -25,13 +25,12 @@ except ImportError:
 
 from core import config as config
 
-# macOS menu-bar icons should be rendered as "template images" — black
-# silhouettes with alpha — so AppKit can invert them automatically for
-# dark menu bars. We achieve this two ways:
-#   1. Provide a monochrome (black) variant of each state icon.
-#   2. After pystray creates the NSStatusItem, mark the NSImage as a
-#      template image via setTemplate_(True). Wrapped in try/except so
-#      it degrades cleanly if pystray's internals shift.
+# The menu-bar icon is shown in colour on every platform so macOS matches the
+# Windows tray: the brand green mic when ready, a red mic while recording, a grey
+# mic while models load, and amber when setup (an API key) is required. On macOS
+# we deliberately do NOT mark the NSImage as a template (that would force a
+# monochrome silhouette); we only size it to the menu-bar point size after
+# pystray creates the NSStatusItem (see _size_status_image).
 _IS_MACOS = sys.platform == "darwin"
 
 # ── Icon loading ───────────────────────────────────────────────────────────────
@@ -49,19 +48,6 @@ def _tint(img: "Image.Image", color: tuple[int, int, int]) -> "Image.Image":
     return colored
 
 
-def _to_template(img: "Image.Image") -> "Image.Image":
-    """Convert an icon to a black silhouette suitable for a macOS template image.
-
-    Preserves alpha but flattens all RGB to black. AppKit then renders it
-    correctly on both dark and light menu bars when setTemplate_(True) is
-    set on the NSImage.
-    """
-    alpha = img.split()[3]
-    black = Image.new("RGBA", img.size, (0, 0, 0, 255))
-    black.putalpha(alpha)
-    return black
-
-
 def _ensure_icons() -> None:
     """Load PNG assets and derive tray variants on first call."""
     if _icons:
@@ -77,21 +63,13 @@ def _ensure_icons() -> None:
         idle      = _load("logo.png")
         recording = _load("logo_recording.png")
 
-        if _IS_MACOS:
-            # Menu bar template images: monochrome silhouette, no fill colour.
-            # AppKit inverts them automatically for dark menu bars when the
-            # underlying NSImage is marked template (handled in run()).
-            idle_template      = _to_template(idle)
-            recording_template = _to_template(recording)
-            _icons["ready"]     = idle_template
-            _icons["recording"] = recording_template
-            _icons["loading"]   = idle_template
-            _icons["setup"]     = idle_template
-        else:
-            _icons["ready"]     = idle
-            _icons["recording"] = recording
-            _icons["loading"]   = _tint(idle, (110, 118, 129))   # gray
-            _icons["setup"]     = _tint(idle, (210, 153, 34))    # amber
+        # Same colour scheme on every platform (macOS included, per the note
+        # above): green when ready, red while recording, grey while loading,
+        # amber when setup is required.
+        _icons["ready"]     = idle                               # brand green
+        _icons["recording"] = recording                          # red
+        _icons["loading"]   = _tint(idle, (110, 118, 129))       # gray
+        _icons["setup"]     = _tint(idle, (210, 153, 34))        # amber
     except Exception as e:
         print(f"[tray] Could not load PNG icons, falling back to drawn icons: {e}")
 
@@ -186,10 +164,10 @@ class MeetingTray:
             self._icon.icon = self._pick_icon()
             self._icon.title = self._pick_tooltip()
             self._icon.update_menu()
-            # Re-apply template-image flag: pystray rebuilds the NSImage
-            # whenever .icon is reassigned, so the flag is lost on each refresh.
+            # Re-apply icon sizing: pystray rebuilds the NSImage whenever .icon
+            # is reassigned, so the menu-bar size is lost on each refresh.
             if _IS_MACOS:
-                self._mark_template_image(self._icon)
+                self._size_status_image(self._icon)
         except Exception:
             pass
 
@@ -235,23 +213,22 @@ class MeetingTray:
         def _apply() -> None:
             icon.visible = True
             if _IS_MACOS:
-                self._mark_template_image(icon)
+                self._size_status_image(icon)
         self._call_on_ui_thread(_apply)
 
     @staticmethod
-    def _mark_template_image(icon: "pystray.Icon") -> None:
-        """Style the menu-bar NSImage to match the system icons.
+    def _size_status_image(icon: "pystray.Icon") -> None:
+        """Size the menu-bar NSImage to match the system icons (macOS only).
 
-        Two touches, both macOS-only:
-        1. Mark it a template image so AppKit inverts it for dark menu bars.
-        2. Pin its point size. pystray hands AppKit the full 64px bitmap, which
-           it renders at the full bar height with no padding, so the glyph reads
-           noticeably larger than its neighbours. Sizing it to the bar thickness
-           minus a little padding brings it in line with the system icons.
+        pystray hands AppKit the full 64px bitmap, which it renders at the full
+        bar height with no padding, so the glyph reads noticeably larger than its
+        neighbours; we pin it to the bar thickness minus a little padding. We also
+        clear the template flag so the icon keeps its colour (green / red / grey /
+        amber) instead of being flattened to a monochrome silhouette.
 
         pystray exposes the underlying NSStatusItem via internal attrs; we walk
         it defensively and re-apply on every refresh (pystray rebuilds the
-        NSImage whenever .icon is reassigned, which drops both touches)."""
+        NSImage whenever .icon is reassigned, which drops these touches)."""
         try:
             status_item = getattr(icon, "_status_item", None) or getattr(icon, "_status_bar_item", None)
             if status_item is None:
@@ -261,7 +238,7 @@ class MeetingTray:
             if ns_image is None:
                 return
             if hasattr(ns_image, "setTemplate_"):
-                ns_image.setTemplate_(True)
+                ns_image.setTemplate_(False)  # keep colour; do not flatten to a silhouette
             try:
                 from AppKit import NSStatusBar
                 thickness = float(NSStatusBar.systemStatusBar().thickness()) or 24.0
