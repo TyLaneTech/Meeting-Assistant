@@ -525,13 +525,23 @@ class Transcriber:
         self.vad_speech_pad_ms   = int(p["vad_speech_pad_ms"])
         self.compression_ratio_threshold = float(p["compression_ratio_threshold"])
         self.segment_break_silence = float(p.get("segment_break_silence", 1.5))
-        # "Mic = Me" desktop-bleed rejection. A microphone segment whose speaker
-        # embedding matches the concurrent desktop (loopback) audio at least this
-        # closely (cosine similarity) is treated as the desktop bleeding into the
-        # mic, not the app user, and is dropped instead of labelled "You". This
-        # works on voiceprints, not words, so it catches bleed regardless of what
-        # is said. 0 disables the check.
-        self.mic_bleed_threshold = float(p.get("mic_bleed_threshold", 0.4))
+        # "Mic = Me" desktop-bleed rejection by VOICEPRINT (secondary, opt-in). A
+        # microphone segment whose speaker embedding matches the concurrent desktop
+        # (loopback) audio at least this closely (cosine similarity) is treated as
+        # bleed and dropped. Disabled by default (0.0): with the built-in mic and
+        # speakers the mic and loopback clocks drift, so the two never line up well
+        # enough for the embedding to match reliably; the level gate below carries
+        # the load instead. Set > 0 to re-enable as an extra check.
+        self.mic_bleed_threshold = float(p.get("mic_bleed_threshold", 0.0))
+        # "Mic = Me" desktop-bleed LEVEL gate (the primary, reliable mechanism on
+        # macOS, where the mic and loopback clocks drift and an echo canceller
+        # cannot lock on). When the desktop is playing, a microphone segment is
+        # kept as the user only if its RAW level rises at least this far above the
+        # learned bleed floor (coupling x desktop level); otherwise the whole
+        # segment is dropped as desktop bleed. Higher = stricter (drops more,
+        # needs you clearly louder than the desktop); lower = keeps more mic.
+        self.mic_bleed_slack = float(p.get("mic_bleed_slack",
+                                           p.get("bleed_duck_slack", 2.0)))
 
     @property
     def device_info(self) -> str:
@@ -776,6 +786,58 @@ class Transcriber:
             f"{'DROP (desktop bleed)' if bleed else 'keep'}",
         )
         return bleed
+
+    def _mic_segment_is_bleed(self, start_t: float, end_t: float) -> bool:
+        """True when a "mic = Me" segment is just the desktop bleeding into the
+        microphone, judged on RAW levels over the WHOLE segment.
+
+        This is the primary bleed gate on macOS, where the mic and loopback clocks
+        drift and an echo canceller cannot stay locked. While the desktop plays,
+        pure bleed sits at a roughly fixed coupling below the desktop's own level.
+        We estimate that coupling live as a low percentile of the raw mic/desktop
+        ratio across a trailing window (the quiet-mic moments are pure bleed), then
+        keep the segment only if its mic level, averaged over [start_t, end_t], rose
+        clearly above that bleed floor (i.e. there was genuine near-end speech).
+
+        Deciding once per segment, rather than muting per chunk, means word onsets
+        are never sliced into fragments that Whisper transcribes as spurious "You"
+        lines (the failure mode of the earlier per-chunk gate). Conservative:
+        returns False (keep) when the desktop is silent or there is too little
+        history to judge, so the user's own speech is never dropped on a hunch."""
+        ring = getattr(self, "_level_ring", None)
+        if not ring:
+            return False
+        sr = self.sample_rate or 48000
+        lo, hi = int(start_t * sr), int(end_t * sr)
+        seg_mic: list[float] = []
+        seg_dsk: list[float] = []
+        ratios:  list[float] = []
+        for off, m, l in list(ring):
+            if l > 0.003:                      # desktop audible -> a coupling sample
+                ratios.append(m / l)
+            if off >= 0 and lo <= off <= hi:
+                seg_mic.append(m)
+                seg_dsk.append(l)
+        if not seg_dsk or len(ratios) < 8:
+            return False
+        mean_dsk = sum(seg_dsk) / len(seg_dsk)
+        if mean_dsk < 0.003:                   # desktop effectively silent this segment
+            return False
+        mean_mic = sum(seg_mic) / len(seg_mic)
+        # Bleed floor = how loud pure desktop bleed is in the mic, self-calibrated to
+        # this machine's speaker volume and mic. The 20th percentile tracks the quiet
+        # (pure-bleed) moments while ignoring the user's own speech spikes.
+        coupling = float(np.percentile(np.asarray(ratios, dtype=np.float64), 20.0))
+        coupling = min(max(coupling, 0.02), 1.0)
+        keep_above = coupling * mean_dsk * self.mic_bleed_slack
+        is_bleed = mean_mic < keep_above
+        log.info(
+            "transcriber",
+            f"[me] level gate mic={mean_mic:.4f} dsk={mean_dsk:.4f} "
+            f"coupling={coupling:.2f} need>{keep_above:.4f} -> "
+            f"{'DROP (desktop bleed)' if is_bleed else 'keep'}",
+        )
+        return is_bleed
 
     def _transcribe(
         self,
@@ -1054,9 +1116,11 @@ class Transcriber:
         import collections
         sr = self.sample_rate or 48000
         # Rolling buffer of recent desktop (loopback) audio keyed by the mixer's
-        # sample offset, so a mic segment can be compared against the desktop
-        # audio from the SAME moment for bleed rejection (~20 s window).
+        # sample offset, used by the optional voiceprint bleed check (~20 s window).
         desktop_ring = collections.deque(maxlen=int(20 * sr / self.CHUNK_SIZE) + 8)
+        # Rolling RAW (pre-gain) mic/loopback levels keyed by sample offset, used by
+        # the primary level-based bleed gate to judge whole mic segments (~30 s).
+        self._level_ring = collections.deque(maxlen=int(30 * sr / self.CHUNK_SIZE) + 8)
 
         def _mk(on_flush):
             return _StreamAccumulator(
@@ -1064,9 +1128,14 @@ class Transcriber:
                 silence_chunk_thresh, min_buffer_chunks, max_buffer_chunks, on_flush)
 
         def _mic_flush(buf, s, e):
-            # Drop the segment when the mic is just picking up the desktop audio
-            # (same voiceprint as the concurrent loopback) instead of the user.
-            if self._mic_is_desktop_bleed(buf, s, e, desktop_ring):
+            # Drop a mic segment that is really just the desktop bleeding in. The
+            # level gate is the primary, reliable check (it survives the mic/loopback
+            # clock drift); the voiceprint check is an optional secondary, off unless
+            # mic_bleed_threshold > 0.
+            if self._mic_segment_is_bleed(s, e):
+                return
+            if self.mic_bleed_threshold > 0.0 and \
+                    self._mic_is_desktop_bleed(buf, s, e, desktop_ring):
                 return
             self._transcribe(buf, self.me_label, start_time=s, end_time=e,
                              force_no_diarize=True)
@@ -1078,8 +1147,13 @@ class Transcriber:
         while self.is_running:
             try:
                 item = self.audio_queue.get(timeout=0.5)
-                if isinstance(item, tuple) and len(item) == 5:
-                    _src, _mixed, sample_off, mic_bytes, lb_bytes = item
+                if isinstance(item, tuple) and len(item) >= 5:
+                    _src, _mixed, sample_off, mic_bytes, lb_bytes = item[:5]
+                    # 6th element (macOS): (raw_mic_rms, raw_lb_rms) pre-gain levels
+                    # for the bleed gate. Absent on Windows, where the gate no-ops.
+                    levels = item[5] if len(item) >= 6 else None
+                    if levels is not None and sample_off >= 0:
+                        self._level_ring.append((sample_off, levels[0], levels[1]))
                     if lb_bytes is not None:
                         desktop_ring.append((sample_off, lb_bytes))
                         desktop.feed(lb_bytes, sample_off)
