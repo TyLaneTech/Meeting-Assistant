@@ -4061,6 +4061,17 @@ function onStatus(d) {
         _quietPromptLanding = null;
       }
     } else if (!d.recording) {
+      // Smoothly fade the audio visualizers out rather than freezing on the last
+      // frame: no more audio_level events will arrive to drive them down, so zero
+      // the targets and re-kick the loops, which decay the bars/meters to zero and
+      // then park.
+      vizLbTarget = 0;
+      vizMicTarget = 0;
+      vizLbSpec    = [];
+      vizMicSpec   = [];
+      updateLevelMeters(0, 0, false);
+      _startVizLoop();
+      if (!_isHomePage) _startBrandVizLoop();
       stopDurationCounter();
       _updateBrandIcons(false);
       _updateScreenRecordingStatus(false);
