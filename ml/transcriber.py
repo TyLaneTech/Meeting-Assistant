@@ -522,6 +522,13 @@ class Transcriber:
         self.vad_speech_pad_ms   = int(p["vad_speech_pad_ms"])
         self.compression_ratio_threshold = float(p["compression_ratio_threshold"])
         self.segment_break_silence = float(p.get("segment_break_silence", 1.5))
+        # "Mic = Me" desktop-bleed rejection. A microphone segment whose speaker
+        # embedding matches the concurrent desktop (loopback) audio at least this
+        # closely (cosine similarity) is treated as the desktop bleeding into the
+        # mic, not the app user, and is dropped instead of labelled "You". This
+        # works on voiceprints, not words, so it catches bleed regardless of what
+        # is said. 0 disables the check.
+        self.mic_bleed_threshold = float(p.get("mic_bleed_threshold", 0.4))
 
     @property
     def device_info(self) -> str:
@@ -711,6 +718,61 @@ class Transcriber:
         if self.sample_rate != self.TARGET_RATE:
             audio = scipy_signal.resample_poly(audio, self.TARGET_RATE, self.sample_rate)
         return audio
+
+    def _mic_is_desktop_bleed(
+        self, mic_buffer: list[bytes], start_t: float, end_t: float, desktop_ring,
+    ) -> bool:
+        """True if a "mic = Me" segment is actually desktop audio bleeding into
+        the microphone (same voice as what was playing) rather than the app user.
+
+        Compares the microphone segment's speaker embedding against the embedding
+        of the desktop (loopback) audio from the SAME time window. When the mic is
+        just picking up the speakers, both carry the same voiceprint, so a high
+        cosine similarity means bleed. Deliberately conservative: returns False
+        (keep the segment) whenever it cannot decide, so genuine user speech is
+        never dropped on a hunch."""
+        thr = self.mic_bleed_threshold
+        diar = self.diarizer
+        if thr <= 0.0 or diar is None or getattr(diar, "_emb_model", None) is None:
+            return False
+        try:
+            mic_audio = self._convert(mic_buffer)
+        except Exception:
+            return False
+        min_samples = int(0.6 * self.TARGET_RATE)
+        if len(mic_audio) < min_samples or float(np.sqrt(np.mean(mic_audio ** 2))) < 0.005:
+            return False
+        # Concurrent desktop audio for [start_t, end_t], widened by 1 s on each
+        # side. mic and desktop chunks share the mixer's sample offset, but the
+        # two capture clocks drift, so the desktop that bled into the mic can sit
+        # slightly earlier or later; the margin gives the comparison a stable,
+        # same-speaker reference window.
+        sr = self.sample_rate or 48000
+        lo, hi = int((start_t - 1.0) * sr), int((end_t + 1.0) * sr)
+        parts = [b for (off, b) in list(desktop_ring) if off >= 0 and lo <= off <= hi]
+        if not parts:
+            return False
+        try:
+            dsk_audio = self._convert(parts)
+        except Exception:
+            return False
+        if len(dsk_audio) < min_samples or float(np.sqrt(np.mean(dsk_audio ** 2))) < 0.005:
+            return False
+        try:
+            e_mic = diar._extract_embedding(mic_audio)
+            e_dsk = diar._extract_embedding(dsk_audio)
+        except Exception:
+            return False
+        if e_mic is None or e_dsk is None:
+            return False
+        sim = float(np.dot(e_mic, e_dsk))
+        bleed = sim >= thr
+        log.info(
+            "transcriber",
+            f"[me] bleed check sim={sim:.2f} thr={thr:.2f} -> "
+            f"{'DROP (desktop bleed)' if bleed else 'keep'}",
+        )
+        return bleed
 
     def _transcribe(
         self,
@@ -986,13 +1048,27 @@ class Transcriber:
         min_buffer_chunks    = int(self.min_buffer_seconds * chunks_per_second)
         max_buffer_chunks    = int(self.max_buffer_seconds * chunks_per_second)
 
+        import collections
+        sr = self.sample_rate or 48000
+        # Rolling buffer of recent desktop (loopback) audio keyed by the mixer's
+        # sample offset, so a mic segment can be compared against the desktop
+        # audio from the SAME moment for bleed rejection (~20 s window).
+        desktop_ring = collections.deque(maxlen=int(20 * sr / self.CHUNK_SIZE) + 8)
+
         def _mk(on_flush):
             return _StreamAccumulator(
                 self.sample_rate, self.CHUNK_SIZE, self.silence_threshold,
                 silence_chunk_thresh, min_buffer_chunks, max_buffer_chunks, on_flush)
 
-        mic = _mk(lambda buf, s, e: self._transcribe(
-            buf, self.me_label, start_time=s, end_time=e, force_no_diarize=True))
+        def _mic_flush(buf, s, e):
+            # Drop the segment when the mic is just picking up the desktop audio
+            # (same voiceprint as the concurrent loopback) instead of the user.
+            if self._mic_is_desktop_bleed(buf, s, e, desktop_ring):
+                return
+            self._transcribe(buf, self.me_label, start_time=s, end_time=e,
+                             force_no_diarize=True)
+
+        mic = _mk(_mic_flush)
         desktop = _mk(lambda buf, s, e: self._transcribe(
             buf, "loopback", start_time=s, end_time=e))
 
@@ -1002,6 +1078,7 @@ class Transcriber:
                 if isinstance(item, tuple) and len(item) == 5:
                     _src, _mixed, sample_off, mic_bytes, lb_bytes = item
                     if lb_bytes is not None:
+                        desktop_ring.append((sample_off, lb_bytes))
                         desktop.feed(lb_bytes, sample_off)
                     if mic_bytes is not None:
                         mic.feed(mic_bytes, sample_off)
