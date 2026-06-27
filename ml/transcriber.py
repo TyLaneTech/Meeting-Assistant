@@ -268,6 +268,16 @@ def _clean_ellipses(text: str) -> str:
     return cleaned
 
 
+def _strip_repeated_char_runs(text: str) -> str:
+    """Strip 'stuck character' Whisper hallucinations: long runs of a single
+    repeated letter (e.g. 'ŠŠŠŠŠ…'), which Whisper emits over near-silent or
+    noisy audio. Digit runs (large numbers) and punctuation runs ('...', '!!!')
+    are deliberately left alone."""
+    cleaned = _re.sub(r"([^\W\d_])\1{4,}", " ", text)   # 5+ of the same letter
+    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 # Per-word-period collapse: a single Whisper call can return many tiny
 # Segment objects (one per sentence-boundary timestamp token), each carrying
 # its own trailing period.  Joined with spaces this produces output like
@@ -859,6 +869,14 @@ class Transcriber:
             if parts:
                 text = _strip_fragment_period(" ".join(parts))
                 text = _clean_ellipses(text)
+                # Strip 'stuck character' runs (e.g. 'ŠŠŠŠ…') that Whisper emits
+                # over near-silent audio; if nothing meaningful remains, drop it.
+                stripped = _strip_repeated_char_runs(text)
+                if stripped != text:
+                    log.warn("transcriber", f"[{label}] Repeated-character hallucination cleaned")
+                    text = stripped
+                if len(_re.sub(r"[^\w]", "", text, flags=_re.UNICODE)) < 3:
+                    return
                 # Collapse per-word periods (e.g. "And. Uh. It. Would.") into
                 # normal text. Done after _strip_fragment_period so the latter
                 # still handles the simple single-fragment case.
