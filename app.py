@@ -1702,6 +1702,10 @@ def start_recording():
     capture.agc_target_rms = float(_ec_params.get("agc_target_rms", 0.15))
     capture.agc_max_gain = float(_ec_params.get("agc_max_gain", 4.0))
     capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
+    # macOS desktop-bleed gate aggressiveness (ignored on Windows). Higher ducks
+    # more of the desktop out of the "mic = Me" track; lower keeps more mic.
+    capture.bleed_duck_slack = float(
+        _ec_params.get("bleed_duck_slack", getattr(capture, "bleed_duck_slack", 1.8)))
 
     # "Mic = Me": when on and a mic is present, the capture writes per-source
     # tracks so mic audio is always the app user and only desktop is diarized.

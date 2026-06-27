@@ -631,6 +631,20 @@ class AudioCapture:
         self.agc_mic_envelope: float = 0.0
         self.agc_mic_gated: bool = True
 
+        # Desktop-bleed level gate for the per-source "mic = Me" track. When the
+        # microphone is just the desktop bleeding in, its RAW level tracks the
+        # desktop at a roughly fixed coupling below 1. We learn that coupling and
+        # suppress the per-source mic whenever it carries no energy beyond it, so
+        # desktop audio is never transcribed as the user. It is volume-relative (a
+        # ratio) and envelope-based, so it is immune to the mic/loopback clock
+        # drift that defeats the echo canceller. bleed_duck_slack is how far the
+        # mic must exceed the learned bleed level to count as the user speaking.
+        self.bleed_duck_slack: float = 1.8
+        self._raw_lb_env: float = 0.0
+        self._raw_mic_env: float = 0.0
+        self._bleed_coupling: float = 0.5
+        self._bleed_release: int = 0
+
         self._lb_fft_buf:  collections.deque = collections.deque(maxlen=_FFT_SIZE)
         self._mic_fft_buf: collections.deque = collections.deque(maxlen=_FFT_SIZE)
         self._hann_window: np.ndarray | None = None
@@ -1315,6 +1329,38 @@ class AudioCapture:
                     else:
                         mic_chunk = _zero_chunk
 
+                    # ── Desktop-bleed level gate (per-source "mic = Me" track) ──
+                    # Decide, on the RAW levels, whether the mic this tick is just
+                    # the desktop bleeding in (no genuine near-end speech). Learn
+                    # the bleed coupling from the quiet-mic periods, then treat the
+                    # mic as bleed whenever it carries no energy beyond it.
+                    mic_is_bleed = False
+                    if self._per_source_active and have_lb and have_mic:
+                        raw_lb_rms  = float(np.sqrt(np.mean(lb_chunk ** 2)))
+                        raw_mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
+                        self._raw_lb_env  += 0.05 * (raw_lb_rms  - self._raw_lb_env)
+                        self._raw_mic_env += 0.05 * (raw_mic_rms - self._raw_mic_env)
+                        if self._raw_lb_env > 0.003:        # desktop is actually playing
+                            ratio = self._raw_mic_env / self._raw_lb_env
+                            # Track coupling as the FLOOR of the ratio (pure bleed):
+                            # follow downward fast, rise very slowly, so brief
+                            # near-end speech spikes never inflate it.
+                            if ratio < self._bleed_coupling:
+                                self._bleed_coupling += 0.10 * (ratio - self._bleed_coupling)
+                            else:
+                                self._bleed_coupling += 0.002 * (ratio - self._bleed_coupling)
+                            self._bleed_coupling = min(max(self._bleed_coupling, 0.0), 1.0)
+                            # Near-end speech = mic clearly above the learned bleed
+                            # level; a short release hold avoids clipping word tails.
+                            near_end = (self._raw_mic_env >
+                                        self._bleed_coupling * self._raw_lb_env * self.bleed_duck_slack)
+                            if near_end:
+                                self._bleed_release = max(
+                                    1, int(0.4 * (self.sample_rate or 48000) / self.CHUNK_SIZE))
+                            elif self._bleed_release > 0:
+                                self._bleed_release -= 1
+                            mic_is_bleed = (not near_end) and (self._bleed_release <= 0)
+
                     # ── WebRTC echo cancel + noise suppression on the raw mic ──
                     # Only meaningful when BOTH sides are real this iteration: the
                     # reference (loopback) must stay in lock-step with the mic, and
@@ -1459,7 +1505,13 @@ class AudioCapture:
                     # of truth for sample_offset / video sync.
                     mic_int16 = lb_int16 = None
                     if self._per_source_active:
-                        mic_int16 = (mic_chunk * 32767).astype(np.int16).tobytes()
+                        if mic_is_bleed:
+                            # Desktop bleed: emit a silent mic track for this tick so
+                            # it is not transcribed or attributed to the user. The
+                            # mixed track (for playback) keeps the audio untouched.
+                            mic_int16 = np.zeros(self.CHUNK_SIZE, dtype=np.int16).tobytes()
+                        else:
+                            mic_int16 = (mic_chunk * 32767).astype(np.int16).tobytes()
                         lb_int16  = (lb_chunk * 32767).astype(np.int16).tobytes()
                         if self._desktop_wav_writer is not None:
                             self._desktop_wav_writer.write(lb_int16)
