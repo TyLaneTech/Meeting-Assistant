@@ -1036,6 +1036,31 @@ def main():
         os.environ["PKG_CONFIG_LIBDIR"] = str(_empty_pc)
         os.environ["PKG_CONFIG_PATH"] = ""
 
+        # Clear any x86_64-poisoned uv interpreter cache (once per venv). uv caches
+        # each interpreter's wheel-tag set keyed by the (universal2) framework
+        # python. A prior x86_64 run - e.g. under Rosetta before the arm64 re-exec
+        # in launch.command existed - caches an x86_64 tag set that then persists
+        # globally (it survives deleting this folder, since it is keyed by the
+        # shared framework python) and makes uv pick x86_64 wheels: mlx (arm64-only)
+        # goes unsatisfiable and torch drops to its last x86_64 build. Clearing it
+        # forces uv to re-probe the interpreter natively as arm64. Cheap (re-probe
+        # is instant) and the downloaded wheels in the archive cache are untouched.
+        _cache_marker = VENV_DIR / ".uv-interp-cache-cleared"
+        if not _cache_marker.exists():
+            try:
+                _uv_cache = subprocess.run(
+                    [UV, "cache", "dir"], capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+                if _uv_cache:
+                    for _interp in Path(_uv_cache).glob("interpreter-*"):
+                        shutil.rmtree(_interp, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                _cache_marker.write_text("done\n")
+            except Exception:
+                pass
+
     # PyTorch - only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
 
