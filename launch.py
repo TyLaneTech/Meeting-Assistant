@@ -480,7 +480,11 @@ def _detect_gpu():
         if r.returncode != 0:
             return "cpu", "", ""
 
-        m = re.search(r"CUDA Version: (\d+)\.(\d+)", r.stdout)
+        # nvidia-smi's header label changed with newer drivers: older builds
+        # print "CUDA Version: 12.4", while driver 610+ prints
+        # "CUDA UMD Version: 13.3". Match both so a driver update doesn't make
+        # GPU detection silently fall back to CPU.
+        m = re.search(r"CUDA(?:\s+UMD)?\s+Version:\s*(\d+)\.(\d+)", r.stdout)
         if not m:
             return "cpu", "", ""
 
