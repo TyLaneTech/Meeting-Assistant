@@ -2158,16 +2158,23 @@ function _renderSidebar() {
   // ── Search mode: flat filtered list with snippets ──
   if (_sidebarSearchResults !== null) {
     list.innerHTML = '';
+    // Keep folders pinned at the top so folder navigation never disappears
+    // while searching; the relevance-ranked results render below the strip.
+    _renderPinnedFolders(list);
+    const results = document.createElement('div');
+    results.className = 'sidebar-search-results';
+    list.appendChild(results);
+
     const anyPending = _ftsSearchPending || _semanticSearchPending;
     if (_sidebarSearchResults.size === 0 && _sidebarSearchQuery) {
       if (anyPending) {
-        list.innerHTML =
+        results.innerHTML =
           '<div class="search-empty-state">' +
             '<div class="search-dots"><span></span><span></span><span></span></div>' +
             '<p>Searching…</p>' +
           '</div>';
       } else {
-        list.innerHTML =
+        results.innerHTML =
           '<div class="search-empty-state">' +
             '<div class="search-empty-icon">' +
               '<i class="fa-solid fa-magnifying-glass"></i>' +
@@ -2241,20 +2248,20 @@ function _renderSidebar() {
       fragment.appendChild(el);
     }
     if (visibleResults === 0) {
-      list.innerHTML =
+      results.innerHTML =
         '<div class="search-empty-state">' +
           '<div class="search-empty-icon"><i class="fa-solid fa-filter"></i></div>' +
           '<p>No matches with the current filter</p>' +
         '</div>';
       return;
     }
-    list.appendChild(fragment);
+    results.appendChild(fragment);
     // Show refining indicator when semantic search is still running
     if (_semanticSearchPending && _sidebarSearchResults.size > 0) {
       const refining = document.createElement('div');
       refining.className = 'search-refining';
       refining.innerHTML = '<div class="search-dots sm"><span></span><span></span><span></span></div> Refining with AI…';
-      list.appendChild(refining);
+      results.appendChild(refining);
     }
     return;
   }
@@ -2406,7 +2413,31 @@ function _updateActiveFolderHighlights() {
   });
 }
 
-function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds, filterActive) {
+// Build the folder strip pinned to the top of the sidebar while searching.
+// It mirrors the user's folder tree (headers only, no session rows) so folder
+// navigation never disappears behind a flat, relevance-ranked result list.
+// Counts reflect every session in the folder, not just the search matches.
+// Returns true if anything was appended.
+function _renderPinnedFolders(container) {
+  const folders = _sidebarFolders;
+  if (!folders || !folders.length) return false;
+  const childMap = _buildChildMap(folders);
+  const sessionsByFolder = new Map();
+  for (const s of _sidebarAllSessions) {
+    const key = s.folder_id || null;
+    if (!sessionsByFolder.has(key)) sessionsByFolder.set(key, []);
+    sessionsByFolder.get(key).push(s);
+  }
+  const folderIds = new Set(folders.map(f => f.id));
+  const strip = document.createElement('div');
+  strip.className = 'sidebar-pinned-folders';
+  _renderFolderSubtree(null, 0, strip, childMap, sessionsByFolder, folderIds, false, true);
+  if (!strip.children.length) return false;
+  container.appendChild(strip);
+  return true;
+}
+
+function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds, filterActive, pinned = false) {
   const children = childMap.get(parentId) || [];
   for (const folder of children) {
     const folderSessions = sessionsByFolder.get(folder.id) || [];
@@ -2414,21 +2445,29 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     // Prune empty branches under an active filter — folders whose entire
     // subtree was filtered out shouldn't take up space. Without a filter,
     // empty folders render normally (with the "Drop sessions here" hint).
-    if (filterActive && totalCount === 0) continue;
+    // The pinned strip (search mode) always shows every folder for navigation.
+    if (!pinned && filterActive && totalCount === 0) continue;
     // Always honor the user's saved expand/collapse state; filters never
     // force-expand a folder. Empty folders are pruned above, so a collapsed
     // folder will only appear when it actually contains matches.
     const collapsed = _sidebarCollapsed.has(folder.id);
+    const hasChildFolders = (childMap.get(folder.id) || []).length > 0;
+    // Pinned mode (search): a compact, navigation-only folder strip with
+    // headers plus nested folder headers, but never session rows. A pinned
+    // folder is only "expanded" to reveal its sub-folders.
+    const showBody = pinned ? hasChildFolders : !collapsed;
 
     const folderEl = document.createElement('div');
-    folderEl.className = `sidebar-folder ${collapsed ? 'collapsed' : 'expanded'}`;
+    folderEl.className = `sidebar-folder${pinned ? ' pinned' : ''} ${showBody ? 'expanded' : 'collapsed'}`;
     folderEl.dataset.folderId = folder.id;
 
 
     // Folder header
     const header = document.createElement('div');
     header.className = 'folder-header';
-    header.draggable = true;
+    // Pinned (search) folders are navigation only: they accept dropped
+    // sessions but can't themselves be dragged out of the strip.
+    header.draggable = !pinned;
 
     // Drag start for folder
     header.addEventListener('dragstart', e => {
@@ -2448,7 +2487,12 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
       _dragDescendants.clear();
     });
 
-    header.innerHTML = `
+    header.innerHTML = pinned
+      ? `
+      <span class="folder-icon"><i class="fa-solid fa-folder"></i></span>
+      <span class="folder-name">${escapeHtml(folder.name)}</span>
+      <span class="folder-count">${totalCount}</span>`
+      : `
       <button class="folder-toggle"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
       <span class="folder-icon"><i class="fa-solid fa-folder${collapsed ? '' : '-open'}"></i></span>
       <span class="folder-name">${escapeHtml(folder.name)}</span>
@@ -2458,7 +2502,21 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     //folderMenuBtn.className = 'folder-menu-btn';
     //folderMenuBtn.title = 'More options';
     //folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
-    header.addEventListener('click', e => { _toggleFolder(`${folder.id}`); });
+    header.addEventListener('click', e => {
+      if (pinned) {
+        // The pinned strip is navigation: reveal this folder in the normal
+        // tree and leave search mode so its contents are visible.
+        _sidebarCollapsed.delete(folder.id);
+        try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+        _clearSidebarSearch();
+        requestAnimationFrame(() => {
+          const t = document.querySelector(`.sidebar-folder[data-folder-id="${folder.id}"]`);
+          if (t) t.scrollIntoView({ block: 'nearest' });
+        });
+        return;
+      }
+      _toggleFolder(`${folder.id}`);
+    });
     //folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
     header.addEventListener('contextmenu', e => {
       e.preventDefault();
@@ -2470,44 +2528,46 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
 
     _attachFolderDragHandlers(header, folderEl, folder);
 
-    if (!collapsed) {
+    if (showBody) {
       const body = document.createElement('div');
       body.className = 'folder-body';
 
       // Render child folders first
-      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds, filterActive);
+      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds, filterActive, pinned);
 
-      if (folderSessions.length === 0 && !(childMap.get(folder.id) || []).length) {
-        body.innerHTML += '<div class="folder-empty">Drop sessions here</div>';
-      } else {
-        for (const s of folderSessions) {
-          const el = _makeSessionEl(s);
-          _attachSessionDragHandlers(el, s);
-          body.appendChild(el);
+      if (!pinned) {
+        if (folderSessions.length === 0 && !(childMap.get(folder.id) || []).length) {
+          body.innerHTML += '<div class="folder-empty">Drop sessions here</div>';
+        } else {
+          for (const s of folderSessions) {
+            const el = _makeSessionEl(s);
+            _attachSessionDragHandlers(el, s);
+            body.appendChild(el);
+          }
         }
+
+        // Drop zone for empty area inside folder body
+        body.addEventListener('dragover', e => {
+          if (_isFolderDropBlocked(folder.id)) return;
+          if (e.target === body || e.target.classList.contains('folder-empty')) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            folderEl.classList.add('drag-over');
+          }
+        });
+        body.addEventListener('dragleave', e => {
+          if (!body.contains(e.relatedTarget)) folderEl.classList.remove('drag-over');
+        });
+        body.addEventListener('drop', e => {
+          if (_isFolderDropBlocked(folder.id)) return;
+          if (e.target === body || e.target.classList.contains('folder-empty')) {
+            e.preventDefault();
+            e.stopPropagation();
+            folderEl.classList.remove('drag-over');
+            _handleDropIntoFolder(folder.id);
+          }
+        });
       }
-
-      // Drop zone for empty area inside folder body
-      body.addEventListener('dragover', e => {
-        if (_isFolderDropBlocked(folder.id)) return;
-        if (e.target === body || e.target.classList.contains('folder-empty')) {
-          e.preventDefault();
-          e.dataTransfer.dropEffect = 'move';
-          folderEl.classList.add('drag-over');
-        }
-      });
-      body.addEventListener('dragleave', e => {
-        if (!body.contains(e.relatedTarget)) folderEl.classList.remove('drag-over');
-      });
-      body.addEventListener('drop', e => {
-        if (_isFolderDropBlocked(folder.id)) return;
-        if (e.target === body || e.target.classList.contains('folder-empty')) {
-          e.preventDefault();
-          e.stopPropagation();
-          folderEl.classList.remove('drag-over');
-          _handleDropIntoFolder(folder.id);
-        }
-      });
 
       folderEl.appendChild(body);
     }
@@ -18753,6 +18813,65 @@ async function startExport() {
 let _importDragCount = 0;
 let _internalDragActive = false;  // set by sidebar drag-start, cleared on dragend
 
+// ── Auto-scroll the sidebar list while dragging near an edge ────────────────
+// While an internal sidebar drag (session or folder) is in progress, holding
+// the pointer near the top (or bottom) of the scrollable session list scrolls
+// it smoothly so the user can reach folders/positions that are out of view.
+// A requestAnimationFrame loop does the scrolling; dragover only updates the
+// target velocity, so the scroll keeps going even when the pointer is held
+// perfectly still inside the edge zone.
+function _initSidebarDragAutoScroll() {
+  const EDGE = 60;        // px from an edge that triggers auto-scroll
+  const MAX_SPEED = 16;   // px/frame at the very edge, easing to ~1 at the zone's inner border
+  let raf = null;
+  let lastY = null;       // last pointer clientY while inside the zone (null = disengaged)
+  let listEl = null;
+
+  function velocity() {
+    if (lastY == null || !listEl) return 0;
+    if (listEl.scrollHeight <= listEl.clientHeight) return 0;   // nothing to scroll
+    const r = listEl.getBoundingClientRect();
+    const fromTop = lastY - r.top;
+    const fromBot = r.bottom - lastY;
+    if (fromTop < EDGE) {
+      const ease = 1 - Math.max(0, Math.min(1, fromTop / EDGE));  // 1 at edge → 0 at inner border
+      return -Math.max(1, Math.round(MAX_SPEED * ease));
+    }
+    if (fromBot < EDGE) {
+      const ease = 1 - Math.max(0, Math.min(1, fromBot / EDGE));
+      return Math.max(1, Math.round(MAX_SPEED * ease));
+    }
+    return 0;
+  }
+
+  function tick() {
+    if (!_internalDragActive || lastY == null) { stop(); return; }
+    const v = velocity();
+    if (v) listEl.scrollTop += v;
+    raf = requestAnimationFrame(tick);
+  }
+  function start() { if (raf == null) raf = requestAnimationFrame(tick); }
+  function stop()  { if (raf != null) cancelAnimationFrame(raf); raf = null; lastY = null; }
+
+  document.addEventListener('dragover', e => {
+    if (!_internalDragActive) return;
+    if (!listEl || !listEl.isConnected) listEl = document.getElementById('session-list');
+    if (!listEl) return;
+    const r = listEl.getBoundingClientRect();
+    // Disengage when the pointer leaves the list horizontally or moves well
+    // past its vertical bounds.
+    if (e.clientX < r.left || e.clientX > r.right ||
+        e.clientY < r.top - EDGE || e.clientY > r.bottom + EDGE) {
+      lastY = null;
+      return;
+    }
+    lastY = e.clientY;
+    start();
+  });
+  document.addEventListener('dragend', stop, true);
+  document.addEventListener('drop', stop, true);
+}
+
 function _initImportDragDrop() {
   const overlay = document.getElementById('import-drop-overlay');
   if (!overlay) return;
@@ -18914,6 +19033,7 @@ if (!_isHomePage) {
 
 // Import drag-and-drop init
 _initImportDragDrop();
+_initSidebarDragAutoScroll();
 
 // Shared init (sidebar, SSE, status, devices, models)
 connectSSE();

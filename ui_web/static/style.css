@@ -856,6 +856,27 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 .folder-header:hover .folder-menu-btn { opacity: 1; }
 .folder-menu-btn:hover { color: var(--fg); }
 .folder-body {display: flex;padding-left: 12px;background-color: var(--bg);flex-direction: column;gap: 1px;}
+
+/* Folders pinned to the top of the sidebar while searching (see
+   _renderPinnedFolders in app.js). The strip stays put as the result list
+   scrolls beneath it, so folder navigation is never lost mid-search. */
+.sidebar-pinned-folders {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+.sidebar-folder.pinned > .folder-header { cursor: pointer; }
+.sidebar-folder.pinned > .folder-header .folder-icon { color: var(--accent); }
+/* Keep the strip flat: ignore the heavier expanded/collapsed folder styling. */
+.sidebar-folder.pinned,
+.sidebar-folder.pinned.expanded { background: transparent; }
+.sidebar-folder.pinned.expanded > .folder-header { background: transparent; }
+.sidebar-folder.pinned.expanded > .folder-body { background: transparent; padding-top: 0; }
+.sidebar-folder.pinned > .folder-header:hover { background: var(--surface2); }
+
 .folder-empty {
   padding: 8px 14px;
   font-size: 11px;
