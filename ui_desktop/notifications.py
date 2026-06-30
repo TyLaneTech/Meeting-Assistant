@@ -244,6 +244,55 @@ def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
     )
 
 
+def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
+    """Auto-start recording a just-detected meeting and confirm with a toast.
+
+    Mirrors ``send_meeting_detected_toast`` but, instead of asking, it starts the
+    recording immediately and then shows a confirmation. Starting goes through
+    the session page's ``autostart=1`` path (the only safe way to begin a
+    recording, to avoid the DirectShow echo issue): exactly what the manual
+    "Start recording" action does, just without waiting for a click. Opening that
+    URL again while already recording is a no-op on the page side, so the toast's
+    own "Open" click can reuse it safely.
+
+    Uses the sticky "reminder" scenario so the user reliably sees that recording
+    began even while Focus Assist / Do Not Disturb is on during the meeting.
+    """
+    base = server_url.rstrip("/")
+    start_url = f"{base}/session?autostart=1"
+    stop_url = f"{base}/api/recording/stop"
+
+    # Kick off the recording the same way the "Start recording" action does.
+    webbrowser.open(start_url)
+
+    def _open(_arg: str) -> None:
+        webbrowser.open(start_url)
+
+    def _stop(_arg: str) -> None:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                stop_url, data=b"{}",
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception as e:
+            log.warn("notify", f"Stop-from-toast failed: {e}")
+
+    return notify(
+        f"Recording {app_name} meeting",
+        "Auto-started recording and transcription. Click to open.",
+        on_click=_open,
+        actions=[
+            {"label": "Open", "arg": "open", "on_click": _open},
+            {"label": "Stop recording", "arg": "stop", "on_click": _stop},
+        ],
+        duration="long",
+        scenario="reminder",
+        mac_url=start_url,
+    )
+
+
 def send_test_toast() -> bool:
     """Diagnostic toast — fired from the tray menu's Test Toast item."""
     def _on_body(arg: str) -> None:

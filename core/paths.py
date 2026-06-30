@@ -344,7 +344,7 @@ def reset_to_default() -> None:
 
 # ── Folder picker ──────────────────────────────────────────────────────────
 
-def pick_folder(initial_dir: str | None = None) -> str | None:
+def pick_folder(initial_dir: str | None = None, title: str = "Select Data Folder") -> str | None:
     """Show a native folder picker and return the selected path, or None.
 
     Spawns a subprocess running tkinter — calling tkinter directly from a
@@ -359,18 +359,19 @@ def pick_folder(initial_dir: str | None = None) -> str | None:
         "import tkinter as tk\n"
         "from tkinter import filedialog\n"
         "initial = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None\n"
+        "title = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else 'Select Folder'\n"
         "root = tk.Tk()\n"
         "root.withdraw()\n"
         "try:\n"
         "    root.attributes('-topmost', True)\n"
         "except Exception:\n"
         "    pass\n"
-        "path = filedialog.askdirectory(initialdir=initial, title='Select Data Folder', mustexist=False)\n"
+        "path = filedialog.askdirectory(initialdir=initial, title=title, mustexist=False)\n"
         "sys.stdout.write(path or '')\n"
     )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", helper, initial_dir or ""],
+            [sys.executable, "-c", helper, initial_dir or "", title],
             capture_output=True,
             text=True,
             timeout=600,

@@ -463,10 +463,33 @@
         </div>
         <div class="chat-input-area">
           <div id="chat-attach-preview" class="chat-attach-preview hidden"></div>
+          <div id="chat-context-preview" class="chat-context-preview hidden"></div>
           <div class="chat-input-wrap">
-            <button class="chat-attach-btn" onclick="document.getElementById('chat-file-input').click()" title="Attach file">
-              <i class="fa-solid fa-paperclip"></i>
-            </button>
+            <div class="chat-toolbox-wrap">
+              <button class="chat-toolbox-btn" id="chat-toolbox-btn" type="button"
+                      onclick="toggleChatToolboxMenu(event)" title="Add files or folders"
+                      aria-label="Add files or folders" aria-haspopup="menu" aria-expanded="false">
+                <i class="fa-solid fa-toolbox"></i>
+              </button>
+              <div class="chat-toolbox-menu hidden" id="chat-toolbox-menu" role="menu" aria-label="Add to chat">
+                <button class="chat-toolbox-option" type="button" role="menuitem" onclick="chooseChatFiles()">
+                  <span class="chat-toolbox-option-icon"><i class="fa-solid fa-file-arrow-up"></i></span>
+                  <span class="chat-toolbox-option-copy">
+                    <span class="chat-toolbox-option-title">Attach files</span>
+                    <span class="chat-toolbox-option-desc">Images, PDFs, text, CSV, Markdown, JSON</span>
+                  </span>
+                  <span class="chat-toolbox-badge hidden" id="chat-file-count"></span>
+                </button>
+                <button class="chat-toolbox-option" type="button" role="menuitem" onclick="pickChatContextFolder()">
+                  <span class="chat-toolbox-option-icon context"><i class="fa-solid fa-folder-tree"></i></span>
+                  <span class="chat-toolbox-option-copy">
+                    <span class="chat-toolbox-option-title">Add local folder</span>
+                    <span class="chat-toolbox-option-desc">Read-only context for this session</span>
+                  </span>
+                  <span class="chat-toolbox-badge hidden" id="chat-folder-count"></span>
+                </button>
+              </div>
+            </div>
             <div class="model-picker-wrap model-picker-chat-wrap">
               <button class="chat-model-picker-btn" id="chat-model-btn"
                       title="Chat model" onclick="toggleModelPicker('chat')">
@@ -474,7 +497,7 @@
               </button>
               <div class="model-picker-panel model-picker-panel-up hidden" id="chat-model-picker"></div>
             </div>
-            <input type="file" id="chat-file-input" multiple accept="image/*,.pdf,.txt,.csv,.md,.json" style="display:none"
+            <input type="file" id="chat-file-input" class="chat-file-input" multiple accept="image/*,.pdf,.txt,.csv,.md,.json"
                    onchange="_handleFileSelect(this.files); this.value='';">
             <textarea
               id="chat-input"

@@ -2145,124 +2145,54 @@ function _attachFolderDragHandlers(headerEl, folderEl, folder) {
 // ── Render sidebar ────────────────────────────────────────────────────────────
 
 function _renderSidebar() {
-  // Apply the active filter set first so every code path below operates on
-  // the filtered subset (search results, folder tree, ungrouped list).
+  // Apply the active filter set first so every code path below operates on the
+  // filtered subset. While searching, the rendered set is the matched sessions
+  // in relevance order, intersected with any active filter.
   const filterActive = _filterIsActive(_sidebarFilter);
-  const sessions = _applySidebarFilterToSessions(_sidebarAllSessions);
-  const folders  = _sidebarFolders;
-  const list     = document.getElementById('session-list');
-  const hasAny   = sessions.length > 0 || (folders.length > 0 && !filterActive);
+  const searching    = _sidebarSearchResults !== null;
+  const folders      = _sidebarFolders;
+  const list         = document.getElementById('session-list');
 
   _updateSidebarFilterBtnState();
 
-  // ── Search mode: flat filtered list with snippets ──
-  if (_sidebarSearchResults !== null) {
-    list.innerHTML = '';
-    // Keep folders pinned at the top so folder navigation never disappears
-    // while searching; the relevance-ranked results render below the strip.
-    _renderPinnedFolders(list);
-    const results = document.createElement('div');
-    results.className = 'sidebar-search-results';
-    list.appendChild(results);
+  // While searching, hide the model/device/screen panes below the list so the
+  // results get the sidebar's full height (see .sidebar.sidebar-searching CSS).
+  document.getElementById('sidebar')?.classList.toggle('sidebar-searching', searching);
 
+  let sessions;
+  if (searching) {
+    const byId = new Map(_applySidebarFilterToSessions(_sidebarAllSessions).map(s => [s.id, s]));
+    // Keep the search's relevance order; drop anything the active filter removed.
+    sessions = [..._sidebarSearchResults.keys()].map(id => byId.get(id)).filter(Boolean);
+  } else {
+    sessions = _applySidebarFilterToSessions(_sidebarAllSessions);
+  }
+  const hasAny = sessions.length > 0 || (folders.length > 0 && !filterActive);
+
+  // ── Search: empty / pending state. Actual matches render in the folder tree
+  //    below, grouped into the folders they belong to. ──
+  if (searching && sessions.length === 0) {
     const anyPending = _ftsSearchPending || _semanticSearchPending;
-    if (_sidebarSearchResults.size === 0 && _sidebarSearchQuery) {
-      if (anyPending) {
-        results.innerHTML =
-          '<div class="search-empty-state">' +
-            '<div class="search-dots"><span></span><span></span><span></span></div>' +
-            '<p>Searching…</p>' +
-          '</div>';
-      } else {
-        results.innerHTML =
-          '<div class="search-empty-state">' +
-            '<div class="search-empty-icon">' +
-              '<i class="fa-solid fa-magnifying-glass"></i>' +
-            '</div>' +
-            '<p>No matching sessions</p>' +
-          '</div>';
-      }
-      return;
-    }
-    const sessionMap = new Map(sessions.map(s => [s.id, s]));
-    const fragment = document.createDocumentFragment();
-    let visibleResults = 0;
-    for (const [sid, data] of _sidebarSearchResults) {
-      const s = sessionMap.get(sid);
-      if (!s) continue;   // filtered out by active filter, or not in list
-      visibleResults++;
-      const el = _makeSessionEl(s);
-      const info = el.querySelector('.session-info');
-      if (info) {
-        // Show semantic similarity score bar
-        if (data.score != null) {
-          const scoreEl = document.createElement('div');
-          scoreEl.className = 'session-search-score';
-          const pct = Math.round(data.score * 100);
-          scoreEl.innerHTML = `<span class="score-bar"><span class="score-fill" style="width:${pct}%"></span></span><span class="score-label">${pct}%</span>`;
-          info.appendChild(scoreEl);
-        }
-        // Append match snippets as clickable elements
-        if (data.matches?.length) {
-          const matchesEl = document.createElement('div');
-          matchesEl.className = 'session-search-matches';
-          for (const m of data.matches.slice(0, 2)) {
-            const snip = document.createElement('div');
-            snip.className = 'session-search-snippet';
-            if (m.segment_id != null || m.kind === 'segment') snip.classList.add('clickable');
-            const kindLabel = m.kind === 'title' ? ''
-              : m.kind === 'semantic' ? ''
-              : m.kind === 'participant' ? '<span class="search-match-kind search-match-participant"><i class="fa-solid fa-user"></i> participant</span>'
-              : `<span class="search-match-kind">${escapeHtml(m.kind)}</span>`;
-            snip.innerHTML = kindLabel + m.snippet;
-            // Click snippet → load session and jump to matching segment
-            if (m.segment_id != null) {
-              snip.addEventListener('click', e => {
-                e.stopPropagation();
-                _pendingSearchHighlight = { segmentId: m.segment_id, query: _sidebarSearchQuery };
-                loadSession(sid);
-              });
-            } else if (m.kind === 'segment') {
-              // FTS match without segment_id - fall back to text search
-              snip.addEventListener('click', e => {
-                e.stopPropagation();
-                _pendingSearchHighlight = { query: _sidebarSearchQuery };
-                loadSession(sid);
-              });
-            }
-            matchesEl.appendChild(snip);
-          }
-          info.appendChild(matchesEl);
-        }
-      }
-      // Default click (no specific snippet) - still set query for text highlight
-      const origClick = el.onclick;
-      el.addEventListener('click', () => {
-        if (data.matches?.some(m => m.segment_id != null || m.kind === 'segment')) {
-          const first = data.matches.find(m => m.segment_id != null);
-          _pendingSearchHighlight = first
-            ? { segmentId: first.segment_id, query: _sidebarSearchQuery }
-            : { query: _sidebarSearchQuery };
-        }
-      }, true);  // capture phase - runs before the loadSession click
-      fragment.appendChild(el);
-    }
-    if (visibleResults === 0) {
-      results.innerHTML =
+    if (_sidebarSearchQuery && anyPending) {
+      list.innerHTML =
+        '<div class="search-empty-state">' +
+          '<div class="search-dots"><span></span><span></span><span></span></div>' +
+          '<p>Searching…</p>' +
+        '</div>';
+    } else if (filterActive) {
+      list.innerHTML =
         '<div class="search-empty-state">' +
           '<div class="search-empty-icon"><i class="fa-solid fa-filter"></i></div>' +
           '<p>No matches with the current filter</p>' +
         '</div>';
-      return;
+    } else {
+      list.innerHTML =
+        '<div class="search-empty-state">' +
+          '<div class="search-empty-icon"><i class="fa-solid fa-magnifying-glass"></i></div>' +
+          '<p>No matching sessions</p>' +
+        '</div>';
     }
-    results.appendChild(fragment);
-    // Show refining indicator when semantic search is still running
-    if (_semanticSearchPending && _sidebarSearchResults.size > 0) {
-      const refining = document.createElement('div');
-      refining.className = 'search-refining';
-      refining.innerHTML = '<div class="search-dots sm"><span></span><span></span><span></span></div> Refining with AI…';
-      results.appendChild(refining);
-    }
+    _updateBulkBar();
     return;
   }
 
@@ -2282,10 +2212,17 @@ function _renderSidebar() {
     return;
   }
 
-  // Build lookup structures.
-  // Sessions are already filtered by `_applySidebarFilterToSessions(...)`,
-  // so any folder whose subtree contains zero of these sessions has no
-  // matches under the active filter and gets pruned during render.
+  // Search results are grouped into the folders they belong to, exactly like an
+  // active filter: prune folders with no matches, and keep the incoming
+  // (relevance / sort) order inside each folder. `onSession` decorates each
+  // matched row with its score bar, snippets, and jump-to-segment behavior.
+  const treeFilterActive = filterActive || searching;
+  const onSession = searching
+    ? (el, s) => { const d = _sidebarSearchResults.get(s.id); if (d) _decorateSearchResult(el, s, d); }
+    : null;
+
+  // Build lookup structures. The session set is already narrowed, so any folder
+  // whose subtree contains zero of these sessions gets pruned during render.
   const childMap = _buildChildMap(folders);
   const sessionsByFolder = new Map();
   for (const s of sessions) {
@@ -2293,11 +2230,10 @@ function _renderSidebar() {
     if (!sessionsByFolder.has(key)) sessionsByFolder.set(key, []);
     sessionsByFolder.get(key).push(s);
   }
-  // Within-folder ordering: when no filter is active, honor the user's
-  // manual sort_order from drag-drop. When a filter is active, the filtered
-  // session list arrives pre-sorted by the user's chosen sortBy — preserve
-  // that order inside each folder.
-  if (!filterActive) {
+  // Within-folder ordering: honor the user's manual sort_order only when neither
+  // a filter nor a search is narrowing the list (those arrive pre-ordered, by
+  // sortBy or by relevance respectively).
+  if (!treeFilterActive) {
     for (const [, arr] of sessionsByFolder) {
       arr.sort((a, b) => a.sort_order - b.sort_order);
     }
@@ -2306,9 +2242,9 @@ function _renderSidebar() {
   const folderIds = new Set(folders.map(f => f.id));
   const fragment = document.createDocumentFragment();
 
-  // Render folder tree recursively from top-level. Pass filterActive so the
-  // recursion can prune empty branches and force-expand matching folders.
-  _renderFolderSubtree(null, 0, fragment, childMap, sessionsByFolder, folderIds, filterActive);
+  // Render folder tree recursively from top-level. treeFilterActive prunes
+  // empty branches; onSession decorates matched rows while searching.
+  _renderFolderSubtree(null, 0, fragment, childMap, sessionsByFolder, folderIds, treeFilterActive, onSession);
 
   // Ungrouped sessions (no folder or deleted folder) - also acts as a drop
   // target to remove sessions from folders.
@@ -2317,22 +2253,32 @@ function _renderSidebar() {
 
   const ungrouped = sessions.filter(s => !s.folder_id || !folderIds.has(s.folder_id));
   if (ungrouped.length) {
-    // Preserve filter sort order when a filter is active; otherwise default
-    // to newest-first like the rest of the sidebar always has.
-    if (!filterActive) {
-      ungrouped.sort((a, b) => b.started_at.localeCompare(a.started_at));
-    }
-    const groups = groupByDate(ungrouped);
-    for (const [label, items] of groups) {
-      const groupEl = document.createElement('div');
-      groupEl.className = 'session-group';
-      groupEl.textContent = label;
-      ungroupedZone.appendChild(groupEl);
-      items.forEach(s => {
+    if (searching) {
+      // Flat, relevance-ordered (no date groups) so the ranking stays meaningful.
+      ungrouped.forEach(s => {
         const el = _makeSessionEl(s);
         _attachSessionDragHandlers(el, s);
+        onSession?.(el, s);
         ungroupedZone.appendChild(el);
       });
+    } else {
+      // Preserve filter sort order when a filter is active; otherwise default
+      // to newest-first like the rest of the sidebar always has.
+      if (!filterActive) {
+        ungrouped.sort((a, b) => b.started_at.localeCompare(a.started_at));
+      }
+      const groups = groupByDate(ungrouped);
+      for (const [label, items] of groups) {
+        const groupEl = document.createElement('div');
+        groupEl.className = 'session-group';
+        groupEl.textContent = label;
+        ungroupedZone.appendChild(groupEl);
+        items.forEach(s => {
+          const el = _makeSessionEl(s);
+          _attachSessionDragHandlers(el, s);
+          ungroupedZone.appendChild(el);
+        });
+      }
     }
   }
 
@@ -2361,8 +2307,73 @@ function _renderSidebar() {
 
   list.innerHTML = '';
   list.appendChild(fragment);
+
+  // "Refining with AI…" hint while a semantic pass is still in flight.
+  if (searching && _semanticSearchPending) {
+    const refining = document.createElement('div');
+    refining.className = 'search-refining';
+    refining.innerHTML = '<div class="search-dots sm"><span></span><span></span><span></span></div> Refining with AI…';
+    list.appendChild(refining);
+  }
+
   _updateBulkBar();
   _updateActiveFolderHighlights();
+}
+
+// Decorate a rendered search-result row (in the folder tree) with its
+// similarity score bar, match snippets, and click-to-jump-to-segment behavior.
+// `s` is the session, `data` its entry from _sidebarSearchResults.
+function _decorateSearchResult(el, s, data) {
+  const sid = s.id;
+  const info = el.querySelector('.session-info');
+  if (info) {
+    if (data.score != null) {
+      const scoreEl = document.createElement('div');
+      scoreEl.className = 'session-search-score';
+      const pct = Math.round(data.score * 100);
+      scoreEl.innerHTML = `<span class="score-bar"><span class="score-fill" style="width:${pct}%"></span></span><span class="score-label">${pct}%</span>`;
+      info.appendChild(scoreEl);
+    }
+    if (data.matches?.length) {
+      const matchesEl = document.createElement('div');
+      matchesEl.className = 'session-search-matches';
+      for (const m of data.matches.slice(0, 2)) {
+        const snip = document.createElement('div');
+        snip.className = 'session-search-snippet';
+        if (m.segment_id != null || m.kind === 'segment') snip.classList.add('clickable');
+        const kindLabel = m.kind === 'title' ? ''
+          : m.kind === 'semantic' ? ''
+          : m.kind === 'participant' ? '<span class="search-match-kind search-match-participant"><i class="fa-solid fa-user"></i> participant</span>'
+          : `<span class="search-match-kind">${escapeHtml(m.kind)}</span>`;
+        snip.innerHTML = kindLabel + m.snippet;
+        if (m.segment_id != null) {
+          snip.addEventListener('click', e => {
+            e.stopPropagation();
+            _pendingSearchHighlight = { segmentId: m.segment_id, query: _sidebarSearchQuery };
+            loadSession(sid);
+          });
+        } else if (m.kind === 'segment') {
+          // FTS match without a segment id - fall back to text search.
+          snip.addEventListener('click', e => {
+            e.stopPropagation();
+            _pendingSearchHighlight = { query: _sidebarSearchQuery };
+            loadSession(sid);
+          });
+        }
+        matchesEl.appendChild(snip);
+      }
+      info.appendChild(matchesEl);
+    }
+  }
+  // Default click (anywhere on the row) still primes the in-session highlight.
+  el.addEventListener('click', () => {
+    if (data.matches?.some(m => m.segment_id != null || m.kind === 'segment')) {
+      const first = data.matches.find(m => m.segment_id != null);
+      _pendingSearchHighlight = first
+        ? { segmentId: first.segment_id, query: _sidebarSearchQuery }
+        : { query: _sidebarSearchQuery };
+    }
+  }, true);  // capture phase - runs before the loadSession click
 }
 
 // Returns the set of folder IDs in the active session's ancestor chain
@@ -2413,61 +2424,29 @@ function _updateActiveFolderHighlights() {
   });
 }
 
-// Build the folder strip pinned to the top of the sidebar while searching.
-// It mirrors the user's folder tree (headers only, no session rows) so folder
-// navigation never disappears behind a flat, relevance-ranked result list.
-// Counts reflect every session in the folder, not just the search matches.
-// Returns true if anything was appended.
-function _renderPinnedFolders(container) {
-  const folders = _sidebarFolders;
-  if (!folders || !folders.length) return false;
-  const childMap = _buildChildMap(folders);
-  const sessionsByFolder = new Map();
-  for (const s of _sidebarAllSessions) {
-    const key = s.folder_id || null;
-    if (!sessionsByFolder.has(key)) sessionsByFolder.set(key, []);
-    sessionsByFolder.get(key).push(s);
-  }
-  const folderIds = new Set(folders.map(f => f.id));
-  const strip = document.createElement('div');
-  strip.className = 'sidebar-pinned-folders';
-  _renderFolderSubtree(null, 0, strip, childMap, sessionsByFolder, folderIds, false, true);
-  if (!strip.children.length) return false;
-  container.appendChild(strip);
-  return true;
-}
-
-function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds, filterActive, pinned = false) {
+function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFolder, folderIds, filterActive, onSession = null) {
   const children = childMap.get(parentId) || [];
   for (const folder of children) {
     const folderSessions = sessionsByFolder.get(folder.id) || [];
     const totalCount = _countSessionsRecursive(folder.id, childMap, sessionsByFolder);
-    // Prune empty branches under an active filter — folders whose entire
-    // subtree was filtered out shouldn't take up space. Without a filter,
+    // Prune empty branches under an active filter or search: a folder whose
+    // entire subtree was narrowed out shouldn't take up space. With neither,
     // empty folders render normally (with the "Drop sessions here" hint).
-    // The pinned strip (search mode) always shows every folder for navigation.
-    if (!pinned && filterActive && totalCount === 0) continue;
-    // Always honor the user's saved expand/collapse state; filters never
+    if (filterActive && totalCount === 0) continue;
+    // Always honor the user's saved expand/collapse state; filters/search never
     // force-expand a folder. Empty folders are pruned above, so a collapsed
-    // folder will only appear when it actually contains matches.
+    // folder only appears when it actually contains matches.
     const collapsed = _sidebarCollapsed.has(folder.id);
-    const hasChildFolders = (childMap.get(folder.id) || []).length > 0;
-    // Pinned mode (search): a compact, navigation-only folder strip with
-    // headers plus nested folder headers, but never session rows. A pinned
-    // folder is only "expanded" to reveal its sub-folders.
-    const showBody = pinned ? hasChildFolders : !collapsed;
 
     const folderEl = document.createElement('div');
-    folderEl.className = `sidebar-folder${pinned ? ' pinned' : ''} ${showBody ? 'expanded' : 'collapsed'}`;
+    folderEl.className = `sidebar-folder ${collapsed ? 'collapsed' : 'expanded'}`;
     folderEl.dataset.folderId = folder.id;
 
 
     // Folder header
     const header = document.createElement('div');
     header.className = 'folder-header';
-    // Pinned (search) folders are navigation only: they accept dropped
-    // sessions but can't themselves be dragged out of the strip.
-    header.draggable = !pinned;
+    header.draggable = true;
 
     // Drag start for folder
     header.addEventListener('dragstart', e => {
@@ -2487,12 +2466,7 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
       _dragDescendants.clear();
     });
 
-    header.innerHTML = pinned
-      ? `
-      <span class="folder-icon"><i class="fa-solid fa-folder"></i></span>
-      <span class="folder-name">${escapeHtml(folder.name)}</span>
-      <span class="folder-count">${totalCount}</span>`
-      : `
+    header.innerHTML = `
       <button class="folder-toggle"><i class="fa-solid fa-chevron-${collapsed ? 'right' : 'down'}"></i></button>
       <span class="folder-icon"><i class="fa-solid fa-folder${collapsed ? '' : '-open'}"></i></span>
       <span class="folder-name">${escapeHtml(folder.name)}</span>
@@ -2502,21 +2476,7 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     //folderMenuBtn.className = 'folder-menu-btn';
     //folderMenuBtn.title = 'More options';
     //folderMenuBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
-    header.addEventListener('click', e => {
-      if (pinned) {
-        // The pinned strip is navigation: reveal this folder in the normal
-        // tree and leave search mode so its contents are visible.
-        _sidebarCollapsed.delete(folder.id);
-        try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
-        _clearSidebarSearch();
-        requestAnimationFrame(() => {
-          const t = document.querySelector(`.sidebar-folder[data-folder-id="${folder.id}"]`);
-          if (t) t.scrollIntoView({ block: 'nearest' });
-        });
-        return;
-      }
-      _toggleFolder(`${folder.id}`);
-    });
+    header.addEventListener('click', e => { _toggleFolder(`${folder.id}`); });
     //folderMenuBtn.addEventListener('click', e => { e.stopPropagation(); _openFolderMenu(e, folder); });
     header.addEventListener('contextmenu', e => {
       e.preventDefault();
@@ -2528,46 +2488,45 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
 
     _attachFolderDragHandlers(header, folderEl, folder);
 
-    if (showBody) {
+    if (!collapsed) {
       const body = document.createElement('div');
       body.className = 'folder-body';
 
       // Render child folders first
-      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds, filterActive, pinned);
+      _renderFolderSubtree(folder.id, depth + 1, body, childMap, sessionsByFolder, folderIds, filterActive, onSession);
 
-      if (!pinned) {
-        if (folderSessions.length === 0 && !(childMap.get(folder.id) || []).length) {
-          body.innerHTML += '<div class="folder-empty">Drop sessions here</div>';
-        } else {
-          for (const s of folderSessions) {
-            const el = _makeSessionEl(s);
-            _attachSessionDragHandlers(el, s);
-            body.appendChild(el);
-          }
+      if (folderSessions.length === 0 && !(childMap.get(folder.id) || []).length) {
+        body.innerHTML += '<div class="folder-empty">Drop sessions here</div>';
+      } else {
+        for (const s of folderSessions) {
+          const el = _makeSessionEl(s);
+          _attachSessionDragHandlers(el, s);
+          if (onSession) onSession(el, s);
+          body.appendChild(el);
         }
-
-        // Drop zone for empty area inside folder body
-        body.addEventListener('dragover', e => {
-          if (_isFolderDropBlocked(folder.id)) return;
-          if (e.target === body || e.target.classList.contains('folder-empty')) {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-            folderEl.classList.add('drag-over');
-          }
-        });
-        body.addEventListener('dragleave', e => {
-          if (!body.contains(e.relatedTarget)) folderEl.classList.remove('drag-over');
-        });
-        body.addEventListener('drop', e => {
-          if (_isFolderDropBlocked(folder.id)) return;
-          if (e.target === body || e.target.classList.contains('folder-empty')) {
-            e.preventDefault();
-            e.stopPropagation();
-            folderEl.classList.remove('drag-over');
-            _handleDropIntoFolder(folder.id);
-          }
-        });
       }
+
+      // Drop zone for empty area inside folder body
+      body.addEventListener('dragover', e => {
+        if (_isFolderDropBlocked(folder.id)) return;
+        if (e.target === body || e.target.classList.contains('folder-empty')) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          folderEl.classList.add('drag-over');
+        }
+      });
+      body.addEventListener('dragleave', e => {
+        if (!body.contains(e.relatedTarget)) folderEl.classList.remove('drag-over');
+      });
+      body.addEventListener('drop', e => {
+        if (_isFolderDropBlocked(folder.id)) return;
+        if (e.target === body || e.target.classList.contains('folder-empty')) {
+          e.preventDefault();
+          e.stopPropagation();
+          folderEl.classList.remove('drag-over');
+          _handleDropIntoFolder(folder.id);
+        }
+      });
 
       folderEl.appendChild(body);
     }
@@ -3443,6 +3402,7 @@ async function handleAudioUpload(input) {
     // Clear display for incoming transcript
     clearAll();
     state.sessionId = sessionId;
+    _loadChatContextFoldersForSession(sessionId);
 
     const transcriptEl = document.getElementById('transcript');
     if (transcriptEl) transcriptEl.innerHTML = '';
@@ -4096,6 +4056,7 @@ function onStatus(d) {
       history.replaceState({}, '', '/session?id=' + d.session_id);
       state.sessionId     = d.session_id;
       state.isViewingPast = false;
+      _loadChatContextFoldersForSession(d.session_id);
       dot.className       = 'status-dot recording';
       text.textContent    = 'Recording…';
       _loadPaneVisible(d.session_id);
@@ -4857,6 +4818,33 @@ function _groupProfilesByName(profiles) {
     if (p.custom) g.custom = true;
   }
   return [...groups.values()];
+}
+
+// Noise is a PER-KEY property: a key is noise if it's the reserved noise label
+// or the user flagged it (_manualNoiseKeys). It must never be decided at the
+// group level. A named speaker whose name-group happens to contain a single
+// noise-flagged fragment key is still that speaker, and only the noise key's
+// segments belong to the noise bucket. (Deciding by group with `.some()` is the
+// bug that hid named speakers like "Elise Lippe" from the filter/analytics.)
+function _isNoiseKey(key) {
+  return key === _NOISE_LABEL || _manualNoiseKeys.has(key);
+}
+
+// Split name-grouped profiles into named-speaker groups + a flat list of noise
+// keys, applying noise per-key. Shared by every speaker surface (filter chips,
+// analytics, …) so they always agree on who is a speaker vs noise. A group with
+// only noise keys drops out of `speakerGroups` entirely (it's pure noise);
+// a mixed group keeps its non-noise keys and contributes its noise keys to the
+// noise bucket.
+function _partitionSpeakerGroupsByNoise(groups) {
+  const speakerGroups = [];
+  const noiseKeys = [];
+  for (const g of groups) {
+    const named = g.speakerKeys.filter(k => !_isNoiseKey(k));
+    for (const k of g.speakerKeys) if (_isNoiseKey(k)) noiseKeys.push(k);
+    if (named.length) speakerGroups.push({ ...g, speakerKeys: named });
+  }
+  return { speakerGroups, noiseKeys };
 }
 
 // Select all speaker_keys belonging to a group, with range/toggle support.
@@ -8597,7 +8585,9 @@ function renderSpeakerManager() {
     nameEl.className = 'speaker-row-name';
     nameEl.textContent = group.name;
 
-    const count = group.speakerKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
+    // Count active (non-noise) segments only, so this matches the filter chips
+    // and analytics. The key list below still shows every fragment key.
+    const count = group.speakerKeys.reduce((sum, k) => sum + (_isNoiseKey(k) ? 0 : _speakerBadgeCount(k)), 0);
     const meta = document.createElement('div');
     meta.className = 'speaker-row-meta';
     if (group.custom && !count) {
@@ -10033,17 +10023,20 @@ function _tnRefreshSpeakerPills() {
       }))
     : _groupProfilesByName(profiles);
 
-  const allKeys = new Set();
-  groups.forEach(g => g.speakerKeys.forEach(k => allKeys.add(k)));
+  // Split speakers vs noise PER KEY (see _partitionSpeakerGroupsByNoise) so a
+  // named speaker with a noise-flagged fragment key still shows. In original-key
+  // mode every key is its own pill with nothing folded.
+  let speakerGroups, noiseKeys;
+  if (_showOriginalKeys) {
+    speakerGroups = groups;
+    noiseKeys = [];
+  } else {
+    ({ speakerGroups, noiseKeys } = _partitionSpeakerGroupsByNoise(groups));
+  }
 
-  // Separate noise group from regular speakers (skip in original-key mode - show all individually)
-  const noiseGroups = [];
-  const speakerGroups = [];
-  groups.forEach(g => {
-    if (!_showOriginalKeys && (g.speakerKeys.includes(_NOISE_LABEL) || g.speakerKeys.some(k => _manualNoiseKeys.has(k))))
-      noiseGroups.push(g);
-    else speakerGroups.push(g);
-  });
+  // Toggleable keys = the named speakers' keys (noise toggles via its own pill).
+  const allKeys = new Set();
+  speakerGroups.forEach(g => g.speakerKeys.forEach(k => allKeys.add(k)));
 
   // Sort: labeled speakers first (alphabetical), then unlabeled (alphabetical)
   speakerGroups.sort((a, b) => {
@@ -10087,9 +10080,8 @@ function _tnRefreshSpeakerPills() {
     container.appendChild(pill);
   });
 
-  // Single merged noise pill - all noise groups combined
-  const totalNoiseCount = noiseGroups.reduce(
-    (sum, g) => sum + g.speakerKeys.reduce((s2, k) => s2 + _speakerBadgeCount(k), 0), 0);
+  // Single merged noise pill - every noise-flagged key combined
+  const totalNoiseCount = noiseKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
   if (totalNoiseCount > 0) {
     const pill = document.createElement('button');
     const active = _showNoise || _noiseSolo;
@@ -10123,11 +10115,15 @@ function _tnRefreshSpeakerPills() {
     });
     pill.addEventListener('contextmenu', e => {
       e.preventDefault();
-      const noiseKeys = noiseGroups.flatMap(g => g.speakerKeys);
       _tnJumpToNextSpeaker(noiseKeys, 1);
     });
     container.appendChild(pill);
   }
+
+  // Keep the analytics panel in lock-step with the chips: it reads the same
+  // speaker data, so any change that refreshes the pills must refresh it too.
+  // (_refreshAnalytics is a no-op while the panel is collapsed.)
+  _refreshAnalytics();
 }
 
 function _tnToggleSpeakerPill(keys, allKeys) {
@@ -10444,44 +10440,54 @@ function _refreshAnalytics() {
   // Aggregate noise data separately
   let noiseData = { name: 'Noise', color: _NOISE_COLOR, segCount: 0, speakTime: 0, words: 0, segments: [] };
 
-  groups.forEach(g => {
-    const isNoise = g.speakerKeys.includes(_NOISE_LABEL) || g.speakerKeys.some(k => _manualNoiseKeys.has(k));
-    const keysSet = new Set(g.speakerKeys);
+  // Tally segments/time/words for a set of speaker keys, extending the session
+  // span as a side effect.
+  const tallyKeys = (keys) => {
+    const keysSet = new Set(keys);
     let segCount = 0, speakTime = 0, words = 0;
     const segments = [];
     allSegs.forEach(seg => {
-      if (keysSet.has(seg.dataset.transcriptSource)) {
-        segCount++;
-        const s = parseFloat(seg.dataset.start || 0);
-        const e = parseFloat(seg.dataset.end || 0);
-        if (e > s) {
-          speakTime += e - s;
-          segments.push({ start: s, end: e });
-          if (s < sessionStart) sessionStart = s;
-          if (e > sessionEnd) sessionEnd = e;
-        }
-        // Count words from text content (skip badge)
-        const badge = seg.querySelector('.src-badge');
-        let text = '';
-        for (let n = badge ? badge.nextSibling : seg.firstChild; n; n = n.nextSibling)
-          text += n.textContent || '';
-        words += text.trim().split(/\s+/).filter(w => w).length;
+      if (!keysSet.has(seg.dataset.transcriptSource)) return;
+      segCount++;
+      const s = parseFloat(seg.dataset.start || 0);
+      const e = parseFloat(seg.dataset.end || 0);
+      if (e > s) {
+        speakTime += e - s;
+        segments.push({ start: s, end: e });
+        if (s < sessionStart) sessionStart = s;
+        if (e > sessionEnd) sessionEnd = e;
       }
+      // Count words from text content (skip badge)
+      const badge = seg.querySelector('.src-badge');
+      let text = '';
+      for (let n = badge ? badge.nextSibling : seg.firstChild; n; n = n.nextSibling)
+        text += n.textContent || '';
+      words += text.trim().split(/\s+/).filter(w => w).length;
     });
+    return { segCount, speakTime, words, segments };
+  };
+
+  // Split speakers vs noise PER KEY (see _partitionSpeakerGroupsByNoise) so a
+  // named speaker with a noise-flagged fragment key still appears here.
+  const { speakerGroups, noiseKeys } = _partitionSpeakerGroupsByNoise(groups);
+
+  speakerGroups.forEach(g => {
+    const { segCount, speakTime, words, segments } = tallyKeys(g.speakerKeys);
     if (segCount === 0) return;
-    if (isNoise) {
-      noiseData.segCount += segCount;
-      noiseData.speakTime += speakTime;
-      noiseData.words += words;
-      noiseData.segments.push(...segments);
-    } else {
-      const color = g.color || speakerColor(g.speakerKeys[0]);
-      speakerData.push({ name: g.name, color, segCount, speakTime, words, segments });
-      totalSegCount += segCount;
-      totalSpeakTime += speakTime;
-      totalWords += words;
-    }
+    const color = g.color || speakerColor(g.speakerKeys[0]);
+    speakerData.push({ name: g.name, color, segCount, speakTime, words, segments });
+    totalSegCount += segCount;
+    totalSpeakTime += speakTime;
+    totalWords += words;
   });
+
+  if (noiseKeys.length) {
+    const { segCount, speakTime, words, segments } = tallyKeys(noiseKeys);
+    noiseData.segCount += segCount;
+    noiseData.speakTime += speakTime;
+    noiseData.words += words;
+    noiseData.segments.push(...segments);
+  }
 
   // Sort by speaking time descending
   speakerData.sort((a, b) => b.speakTime - a.speakTime);
@@ -13504,6 +13510,12 @@ function _toolDisplayName(name) {
     get_session_detail: 'Load Session',
     list_speakers: 'List Speakers',
     get_speaker_history: 'Speaker History',
+    inspect_context_codebase: 'Inspect Codebase',
+    list_context_files: 'List Files',
+    read_context_file: 'Read File',
+    search_context_files: 'Search Files',
+    get_context_file_info: 'File Info',
+    run_context_shell: 'Shell',
     web_search: 'Web Search',
   };
   return map[name] || name;
@@ -13518,6 +13530,12 @@ function _toolInputSummary(name, input) {
   if (name === 'get_session_detail' && input?.session_id) return input.session_id.substring(0, 8) + '...';
   if (name === 'list_speakers') return 'Voice Library';
   if (name === 'get_speaker_history' && input?.speaker_name) return `"${input.speaker_name}"`;
+  if (name === 'inspect_context_codebase') return input?.path || input?.root_id || 'selected folders';
+  if (name === 'list_context_files') return input?.path || input?.root_id || 'selected folders';
+  if (name === 'read_context_file') return input?.path || 'file';
+  if (name === 'search_context_files') return input?.query ? `"${input.query}"` : 'searching files';
+  if (name === 'get_context_file_info') return input?.path || 'path';
+  if (name === 'run_context_shell') return input?.command || 'command';
   if (name === 'web_search' && input?.query) return `"${input.query}"`;
   if (name === 'web_search') return 'searching…';
   return JSON.stringify(input || {});
@@ -13532,7 +13550,7 @@ function _setAssistantProcessing(msgWrap, active, label) {
   proc.classList.toggle('active', active);
 }
 
-function appendUserBubble(text, attachments) {
+function appendUserBubble(text, attachments, contextFolders) {
   const el = document.getElementById('chat-messages');
   el.querySelector('.empty-hint')?.remove();
   const wrap = document.createElement('div');
@@ -13546,6 +13564,9 @@ function appendUserBubble(text, attachments) {
   el.appendChild(wrap);
   if (attachments?.length) {
     _renderBubbleAttachments(wrap.querySelector('.chat-msg-body'), attachments);
+  }
+  if (contextFolders?.length) {
+    _renderBubbleContextFolders(wrap.querySelector('.chat-msg-body'), contextFolders);
   }
   // User sent a message - reset flag and force-scroll so the response is visible.
   _chatAtBottom = true;
@@ -14059,6 +14080,208 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/* ── Chat local context folders/toolbox ─────────────────────────────────── */
+const _CHAT_CONTEXT_STORAGE_PREFIX = 'ma-chat-context-folders:';
+let _chatContextFolders = [];  // [{id, name, path}]
+let _chatContextRestorePromise = null;
+
+function _chatContextStorageKey(sessionId = state.sessionId) {
+  return sessionId ? `${_CHAT_CONTEXT_STORAGE_PREFIX}${sessionId}` : null;
+}
+
+function _contextFolderName(folder) {
+  if (folder?.name) return folder.name;
+  const path = folder?.path || '';
+  return path.split(/[\\/]/).filter(Boolean).pop() || path || 'folder';
+}
+
+function _normalizeContextFolders(folders) {
+  const out = [];
+  const seen = new Set();
+  for (const folder of folders || []) {
+    if (!folder || !folder.path) continue;
+    const key = folder.path.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: folder.id || '',
+      name: _contextFolderName(folder),
+      path: folder.path,
+    });
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+function _saveChatContextFoldersForSession(sessionId = state.sessionId) {
+  const key = _chatContextStorageKey(sessionId);
+  if (!key) return;
+  const payload = _chatContextFolders.map(f => ({ id: f.id, name: _contextFolderName(f), path: f.path }));
+  try { localStorage.setItem(key, JSON.stringify(payload)); } catch (_) {}
+}
+
+function _setChatContextFolders(folders, { persist = true } = {}) {
+  _chatContextFolders = _normalizeContextFolders(folders);
+  _renderChatContextFolders();
+  if (persist) _saveChatContextFoldersForSession();
+}
+
+function _syncChatToolboxState() {
+  const btn = document.getElementById('chat-toolbox-btn');
+  const fileBadge = document.getElementById('chat-file-count');
+  const folderBadge = document.getElementById('chat-folder-count');
+  let attachmentCount = 0;
+  try { attachmentCount = _pendingAttachments?.length || 0; } catch (_) {}
+  const folderCount = _chatContextFolders.length;
+  if (btn) btn.classList.toggle('has-items', attachmentCount + folderCount > 0);
+  if (fileBadge) {
+    fileBadge.textContent = String(attachmentCount);
+    fileBadge.classList.toggle('hidden', attachmentCount < 1);
+  }
+  if (folderBadge) {
+    folderBadge.textContent = String(folderCount);
+    folderBadge.classList.toggle('hidden', folderCount < 1);
+  }
+}
+
+function _renderChatContextFolders() {
+  const preview = document.getElementById('chat-context-preview');
+  _syncChatToolboxState();
+  if (!preview) return;
+  preview.innerHTML = '';
+  if (!_chatContextFolders.length) {
+    preview.classList.add('hidden');
+    return;
+  }
+  preview.classList.remove('hidden');
+  for (const folder of _chatContextFolders) {
+    const item = document.createElement('div');
+    item.className = 'chat-context-item';
+    item.title = folder.path || _contextFolderName(folder);
+    item.innerHTML = `
+      <i class="fa-solid fa-folder-open"></i>
+      <span class="chat-context-name"></span>
+      <button class="chat-context-remove" title="Remove folder" type="button">
+        <i class="fa-solid fa-xmark"></i>
+      </button>`;
+    item.querySelector('.chat-context-name').textContent = _contextFolderName(folder);
+    item.querySelector('.chat-context-remove').addEventListener('click', () => {
+      _setChatContextFolders(_chatContextFolders.filter(f => f.path !== folder.path));
+    });
+    preview.appendChild(item);
+  }
+}
+
+function _loadChatContextFoldersForSession(sessionId = state.sessionId) {
+  if (!sessionId) {
+    _chatContextRestorePromise = null;
+    _setChatContextFolders([], { persist: false });
+    return;
+  }
+  const key = _chatContextStorageKey(sessionId);
+  let cached = [];
+  try {
+    const raw = key ? localStorage.getItem(key) : null;
+    cached = raw ? _normalizeContextFolders(JSON.parse(raw)) : [];
+  } catch (_) {
+    cached = [];
+  }
+  _setChatContextFolders(cached, { persist: false });
+  _chatContextRestorePromise = cached.length
+    ? _restoreChatContextFoldersForSession(sessionId, cached)
+    : null;
+}
+
+async function _restoreChatContextFoldersForSession(sessionId, folders) {
+  try {
+    const resp = await fetch('/api/chat/context-folder/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folders }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (sessionId !== state.sessionId) return;
+    if (!resp.ok) {
+      _setChatContextFolders([], { persist: true });
+      return;
+    }
+    _setChatContextFolders(data.folders || [], { persist: true });
+  } catch (_) {
+    if (sessionId === state.sessionId) _syncChatToolboxState();
+  }
+}
+
+function openChatToolboxMenu() {
+  const btn = document.getElementById('chat-toolbox-btn');
+  const menu = document.getElementById('chat-toolbox-menu');
+  if (!btn || !menu) return;
+  menu.classList.remove('hidden');
+  btn.classList.add('open');
+  btn.setAttribute('aria-expanded', 'true');
+  _syncChatToolboxState();
+}
+
+function closeChatToolboxMenu() {
+  const btn = document.getElementById('chat-toolbox-btn');
+  const menu = document.getElementById('chat-toolbox-menu');
+  if (!btn || !menu) return;
+  menu.classList.add('hidden');
+  btn.classList.remove('open');
+  btn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleChatToolboxMenu(e) {
+  e?.preventDefault();
+  e?.stopPropagation();
+  const menu = document.getElementById('chat-toolbox-menu');
+  if (!menu || menu.classList.contains('hidden')) openChatToolboxMenu();
+  else closeChatToolboxMenu();
+}
+
+function chooseChatFiles() {
+  closeChatToolboxMenu();
+  document.getElementById('chat-file-input')?.click();
+}
+
+async function pickChatContextFolder() {
+  closeChatToolboxMenu();
+  const btn = document.getElementById('chat-toolbox-btn');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const initial = _chatContextFolders[_chatContextFolders.length - 1]?.path || '';
+    const resp = await fetch('/api/chat/context-folder/pick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ initial }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      window.alert(data.error || 'Could not add context folder.');
+      return;
+    }
+    if (!data.selected) return;
+    const selected = data.selected;
+    if (_chatContextFolders.some(f => f.path === selected.path)) {
+      flashStatus('Folder already added');
+      return;
+    }
+    _setChatContextFolders([..._chatContextFolders, selected]);
+  } catch (e) {
+    window.alert(`Error: ${e.message || e}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest?.('.chat-toolbox-wrap')) closeChatToolboxMenu();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeChatToolboxMenu();
+});
+
 let _chatRequestId = null;  // tracks the active chat request for cancellation
 
 async function sendMessage() {
@@ -14066,11 +14289,16 @@ async function sendMessage() {
   const input    = document.getElementById('chat-input');
   const question = input.value.trim();
   const attachments = [..._pendingAttachments];
+  if (_chatContextRestorePromise) {
+    await _chatContextRestorePromise.catch(() => {});
+    _chatContextRestorePromise = null;
+  }
+  const contextFolders = [..._chatContextFolders];
   if (!question && !attachments.length) return;
 
   input.value = '';
   _autogrowChatInput();
-  appendUserBubble(question, attachments);
+  appendUserBubble(question, attachments, contextFolders);
   _clearAttachments();
   state.aiChatBusy = true;
   _setChatBusy(true);
@@ -14082,6 +14310,7 @@ async function sendMessage() {
       session_id: state.sessionId,
       question,
       attachments: attachments.map(a => ({id: a.id, filename: a.filename, mime: a.mime, size: a.size, stored: a.stored})),
+      context_roots: contextFolders.map(f => f.id),
     }),
   });
   if (resp.ok) {
@@ -14184,6 +14413,7 @@ let _pendingAttachments = [];  // [{id, filename, mime, size, stored, localUrl?}
 const _IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 function _handleFileSelect(files) {
+  closeChatToolboxMenu();
   for (const f of files) _uploadAttachment(f);
 }
 
@@ -14229,6 +14459,7 @@ async function _uploadAttachment(file) {
     _pendingAttachments.push(meta);
     item.classList.remove('uploading');
     item.dataset.attachId = meta.id;
+    _syncChatToolboxState();
 
     // Add remove button
     const removeBtn = document.createElement('button');
@@ -14250,6 +14481,7 @@ async function _uploadAttachment(file) {
 function _refreshAttachPreview() {
   const preview = document.getElementById('chat-attach-preview');
   if (!preview.children.length) preview.classList.add('hidden');
+  _syncChatToolboxState();
 }
 
 function _clearAttachments() {
@@ -14257,6 +14489,24 @@ function _clearAttachments() {
   const preview = document.getElementById('chat-attach-preview');
   preview.innerHTML = '';
   preview.classList.add('hidden');
+  _syncChatToolboxState();
+}
+
+function _renderBubbleContextFolders(bodyEl, folders) {
+  if (!folders || !folders.length) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-bubble-context-folders';
+  for (const folder of folders) {
+    const chip = document.createElement('span');
+    chip.className = 'chat-bubble-context-folder';
+    chip.title = folder.path || _contextFolderName(folder);
+    chip.innerHTML = '<i class="fa-solid fa-folder-open"></i> ';
+    const name = document.createElement('span');
+    name.textContent = _contextFolderName(folder);
+    chip.appendChild(name);
+    wrap.appendChild(chip);
+  }
+  bodyEl.insertBefore(wrap, bodyEl.firstChild);
 }
 
 /** Render attachment thumbnails/links inside a chat bubble body element. */
@@ -14491,6 +14741,7 @@ async function loadSession(sessionId) {
   _setSessionSplitBackup(!!data.has_split_backup, data.split_group_id || null);
   state.sessionId     = sessionId;
   state.isViewingPast = true;
+  _loadChatContextFoldersForSession(sessionId);
   history.pushState({}, '', '/session?id=' + sessionId);
   updateRecordBtn();
   _loadPaneVisible(sessionId);
@@ -14993,6 +15244,9 @@ function clearAll() {
   state.aiChatBusy = false;
   _setChatBusy(false);
   _clearAttachments();
+  _setChatContextFolders([], { persist: false });
+  _chatContextRestorePromise = null;
+  closeChatToolboxMenu();
   state.summaryBuffer    = '';
   state.summaryStreaming  = false;
   state.summaryCursor    = null;
@@ -16785,17 +17039,26 @@ function saveQuietReminderSettings() {
 function _renderMeetingDetectSettings() {
   const enabled = document.getElementById('meeting-detect-enabled');
   if (!enabled) return;
-  enabled.checked = _prefs.meeting_detect_enabled === true;
+  const on = _prefs.meeting_detect_enabled === true;
+  enabled.checked = on;
   const cd = document.getElementById('meeting-detect-cooldown');
   if (cd) cd.value = _prefs.meeting_detect_cooldown_sec ?? 90;
+  // Auto-start only does anything while auto-detect is on, so disable it then.
+  const auto = document.getElementById('meeting-detect-autostart');
+  if (auto) {
+    auto.checked = _prefs.meeting_detect_autostart === true;
+    auto.disabled = !on;
+  }
 }
 
 function saveMeetingDetectSettings() {
   const updates = {
     meeting_detect_enabled: document.getElementById('meeting-detect-enabled')?.checked === true,
+    meeting_detect_autostart: document.getElementById('meeting-detect-autostart')?.checked === true,
     meeting_detect_cooldown_sec: parseFloat(document.getElementById('meeting-detect-cooldown')?.value || '90'),
   };
   Object.assign(_prefs, updates);
+  _renderMeetingDetectSettings();   // reflect the enabled/disabled dependency immediately
   fetch('/api/preferences', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

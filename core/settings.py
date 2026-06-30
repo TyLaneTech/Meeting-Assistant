@@ -79,6 +79,10 @@ DEFAULTS: dict = {
     "meeting_detect_enabled": False,
     "meeting_detect_debounce": 2,          # consecutive ~2s polls before prompting
     "meeting_detect_cooldown_sec": 90,     # min seconds between meeting prompts
+    # When ON (and auto-detect is enabled), skip the "want to record?" prompt and
+    # start the recording automatically on detection, confirming with a toast.
+    # Default OFF. Has no effect unless meeting_detect_enabled is also on.
+    "meeting_detect_autostart": False,
 
     # Cloudflare WARP auto-toggle. When ON, the app briefly disconnects WARP
     # around package installs, model downloads, AI provider calls, and the

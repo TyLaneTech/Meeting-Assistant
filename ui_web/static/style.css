@@ -857,25 +857,9 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 .folder-menu-btn:hover { color: var(--fg); }
 .folder-body {display: flex;padding-left: 12px;background-color: var(--bg);flex-direction: column;gap: 1px;}
 
-/* Folders pinned to the top of the sidebar while searching (see
-   _renderPinnedFolders in app.js). The strip stays put as the result list
-   scrolls beneath it, so folder navigation is never lost mid-search. */
-.sidebar-pinned-folders {
-  position: sticky;
-  top: 0;
-  z-index: 3;
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 4px;
-}
-.sidebar-folder.pinned > .folder-header { cursor: pointer; }
-.sidebar-folder.pinned > .folder-header .folder-icon { color: var(--accent); }
-/* Keep the strip flat: ignore the heavier expanded/collapsed folder styling. */
-.sidebar-folder.pinned,
-.sidebar-folder.pinned.expanded { background: transparent; }
-.sidebar-folder.pinned.expanded > .folder-header { background: transparent; }
-.sidebar-folder.pinned.expanded > .folder-body { background: transparent; padding-top: 0; }
-.sidebar-folder.pinned > .folder-header:hover { background: var(--surface2); }
+/* While searching, hide the model/device/screen panes below the list so the
+   search results get the sidebar's full height. */
+.sidebar.sidebar-searching .sidebar-pane { display: none; }
 
 .folder-empty {
   padding: 8px 14px;
@@ -3619,7 +3603,7 @@ body.video-fullscreen .playback-bar {
 
 /* ── Chat input ────────────────────────────────────────────────────────────── */
 .chat-input-area {
-  padding: 17px 14px 14px;
+  padding: 10px 14px 14px;
   margin-right: -6px;
   /* border-top: 1px solid var(--border); */
   background: var(--surface);
@@ -3677,26 +3661,161 @@ body.video-fullscreen .playback-bar {
 .chat-stop-btn:hover { color: var(--fg); background: var(--surface4, var(--surface3)); }
 .chat-stop-btn.hidden, .chat-send-btn.hidden { display: none; }
 
-/* ── Attach button ────────────────────────────────────────────────────────── */
-.chat-attach-btn {
-  background: none;
-  border: none;
-  color: var(--fg-muted);
-  cursor: pointer;
-  font-size: 15px;
-  padding: 0 4px 0 0px;
+/* ── Chat toolbox menu ────────────────────────────────────────────────────── */
+.chat-file-input { display: none; }
+.chat-toolbox-wrap {
+  position: relative;
   display: flex;
   align-items: center;
   flex-shrink: 0;
-  transition: color .12s;
 }
-.chat-attach-btn:hover { color: var(--fg); }
+.chat-toolbox-btn {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  line-height: 1;
+  padding: 0;
+  transition: background .12s, border-color .12s, color .12s, transform .12s;
+}
+.chat-toolbox-btn i { font-size: 15px; line-height: 1; }
+.chat-toolbox-btn:hover,
+.chat-toolbox-btn.open {
+  background: var(--surface2);
+  border-color: var(--border);
+  color: var(--fg);
+}
+.chat-toolbox-btn.has-items {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+.chat-toolbox-btn:active { transform: translateY(1px); }
+.chat-toolbox-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+}
+.chat-toolbox-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 10px);
+  z-index: 30;
+  width: min(310px, calc(100vw - 32px));
+  padding: 6px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--border) 82%, var(--fg-subtle));
+  border-radius: 10px;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .42), 0 2px 10px rgba(0, 0, 0, .22);
+}
+.chat-toolbox-menu::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  bottom: -6px;
+  width: 10px;
+  height: 10px;
+  background: inherit;
+  border-right: 1px solid color-mix(in srgb, var(--border) 82%, var(--fg-subtle));
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 82%, var(--fg-subtle));
+  transform: rotate(45deg);
+}
+.chat-toolbox-menu.hidden { display: none; }
+.chat-toolbox-option {
+  width: 100%;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--fg);
+  cursor: pointer;
+  padding: 9px;
+  text-align: left;
+  transition: background .12s, border-color .12s;
+}
+.chat-toolbox-option:hover,
+.chat-toolbox-option:focus-visible {
+  background: var(--surface2);
+  border-color: var(--border);
+  outline: none;
+}
+.chat-toolbox-option-icon {
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg-subtle) 11%, transparent);
+  color: var(--fg-muted);
+}
+.chat-toolbox-option-icon.context {
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  color: var(--accent);
+}
+.chat-toolbox-option-icon i { font-size: 14px; line-height: 1; }
+.chat-toolbox-option-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chat-toolbox-option-title {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.2;
+  color: var(--fg);
+}
+.chat-toolbox-option-desc {
+  overflow: hidden;
+  color: var(--fg-subtle);
+  font-size: 11.5px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-toolbox-badge {
+  min-width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface3));
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  color: var(--fg);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 6px;
+}
+.chat-toolbox-badge.hidden { display: none; }
 
-/* ── Attachment preview strip ─────────────────────────────────────────────── */
-.chat-attach-preview {
-  display: flex; gap: 6px; padding: 8px 10px 4px; flex-wrap: wrap;
+@media (max-width: 560px) {
+  .chat-toolbox-menu {
+    left: -4px;
+    width: min(290px, calc(100vw - 24px));
+  }
+  .chat-toolbox-option-desc { white-space: normal; }
 }
-.chat-attach-preview.hidden { display: none; }
+
+/* ── Attachment/context preview strips ────────────────────────────────────── */
+.chat-attach-preview,
+.chat-context-preview {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px 4px; flex-wrap: wrap;
+}
+.chat-context-preview {padding-top: 0;padding-bottom: 8px;}
+.chat-attach-preview.hidden,
+.chat-context-preview.hidden { display: none; }
 
 .chat-attach-item {
   position: relative; display: flex; align-items: center; gap: 6px;
@@ -3718,6 +3837,59 @@ body.video-fullscreen .playback-bar {
 .chat-attach-item.uploading { opacity: 0.6; }
 .chat-attach-item.upload-error { border-color: var(--red, #f85149); }
 
+.chat-context-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  box-sizing: border-box;
+  height: 28px;
+  max-width: 240px;
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: 12px;
+  user-select: none;
+  transition: all 0.15s linear;
+  box-shadow: 2px 3px 8px -4px #00000087;
+  line-height: 1;
+  padding: 0 7px 0 9px;
+}
+.chat-context-item:hover {
+    box-shadow: 4px 5px 8px -4px #000000bf;
+}
+.chat-context-item > i {
+  color: var(--accent);
+  flex-shrink: 0;
+  font-size: 13px;
+  line-height: 1;
+  text-align: center;
+  width: 14px;
+}
+.chat-context-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-context-remove {
+  background: none;
+  border: none;
+  color: var(--fg-subtle);
+  cursor: pointer;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  line-height: 1;
+  border-radius: 5px;
+  padding: 0;
+}
+.chat-context-remove i { font-size: 11px; line-height: 1; }
+.chat-context-remove:hover { color: var(--fg); }
+
 /* ── Attachments in chat bubbles ──────────────────────────────────────────── */
 .chat-bubble-attachments {
   display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px;
@@ -3734,6 +3906,32 @@ body.video-fullscreen .playback-bar {
   color: var(--fg-muted); text-decoration: none;
 }
 .chat-bubble-attachment-file:hover { border-color: var(--accent); color: var(--fg); }
+
+.chat-bubble-context-folders {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.chat-bubble-context-folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  background: var(--surface2);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: 12px;
+  padding: 4px 9px;
+}
+.chat-bubble-context-folder i { color: var(--accent); }
+.chat-bubble-context-folder span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ── Full-pane drag-and-drop overlay ─────────────────────────────────────── */
 .col-chat { position: relative; }
@@ -5051,6 +5249,7 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
 }
 .toggle-switch input:checked + .toggle-slider { background: var(--accent); }
 .toggle-switch input:checked + .toggle-slider::before {transform: translateX(16px);background: #fff;}
+.toggle-switch input:disabled + .toggle-slider { opacity: 0.4; cursor: not-allowed; }
 
 /* ── Provider toggle ───────────────────────────────────────────── */
 .provider-toggle {
@@ -5494,7 +5693,10 @@ img#shutdown-icon.brand-icon {
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
 }
-.fp-notif-other-wrap { margin-left: -4px; }   /* sit flush against Apply (cancels the row gap) */
+.fp-notif-other-wrap {
+  display: flex;          /* let the toggle stretch to Apply's full height instead of sitting short */
+  margin-left: -4px;      /* sit flush against Apply (cancels the row gap) */
+}
 .fp-notif-other-toggle {
   display: flex;
   align-items: center;

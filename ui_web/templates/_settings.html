@@ -404,6 +404,16 @@
             </div>
             <div class="settings-row">
               <div class="settings-row-info">
+                <div class="settings-row-label">Auto-Start Recording</div>
+                <div class="settings-row-desc">Start recording automatically on detection instead of asking, and show a notification that it started</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="meeting-detect-autostart" onchange="saveMeetingDetectSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
                 <div class="settings-row-label">Detection Cooldown</div>
                 <div class="settings-row-desc">Minimum seconds between repeated meeting prompts</div>
               </div>

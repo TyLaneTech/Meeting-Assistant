@@ -6,6 +6,7 @@ Provider and model are runtime-configurable via reload_client().
 import base64
 import json
 import re
+import threading
 import traceback
 from typing import Callable
 
@@ -440,9 +441,13 @@ class AIAssistant:
         cancel: "threading.Event | None" = None,
         frame_extractor: FrameExtractor | None = None,
         on_tool_event: ToolEventCallback | None = None,
+        tools_anthropic: list | None = None,
+        tools_openai: list | None = None,
+        tool_executor: "ToolExecutor | None" = None,
         provider: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_context: str | None = None,
     ) -> None:
         """Stream an answer to the latest question in chat_history.
 
@@ -462,6 +467,8 @@ class AIAssistant:
         # the built-in QA prompt. The transcript/meta/screen-recording blocks
         # are still appended below so the model always gets meeting context.
         system = (system_prompt.strip() if system_prompt and system_prompt.strip() else self._SYSTEM_QA)
+        if system_context and system_context.strip():
+            system += "\n\n" + system_context.strip()
         if frame_extractor:
             system += (
                 "\n\n## Screen recording\n"
@@ -490,10 +497,24 @@ class AIAssistant:
             f"{summary_block}"
         )
 
+        active_tools_anthropic = tools_anthropic
+        active_tools_openai = tools_openai
+        if tools_anthropic is not None or tools_openai is not None or tool_executor is not None:
+            active_tools_anthropic = []
+            active_tools_openai = []
+            if frame_extractor:
+                active_tools_anthropic.append(_SCREENSHOT_TOOL)
+                active_tools_openai.append(_SCREENSHOT_FUNC_OAI)
+            active_tools_anthropic.extend(tools_anthropic or [])
+            active_tools_openai.extend(tools_openai or [])
+
         self._stream_with_tools(
             system, chat_history, on_token, on_done,
             cancel=cancel, frame_extractor=frame_extractor,
             on_tool_event=on_tool_event,
+            tools_anthropic=active_tools_anthropic,
+            tools_openai=active_tools_openai,
+            tool_executor=tool_executor,
             provider=provider, model=model,
         )
 
@@ -1247,8 +1268,10 @@ class AIAssistant:
                     f"Add it in Settings.*"
                 )
                 return
-            a_tools = (tools_anthropic or [_SCREENSHOT_TOOL]) + [_WEB_SEARCH_ANTHROPIC]
-            o_tools = (tools_openai or [_SCREENSHOT_FUNC_OAI]) + [_WEB_SEARCH_OAI]
+            base_a_tools = tools_anthropic if tools_anthropic is not None else [_SCREENSHOT_TOOL]
+            base_o_tools = tools_openai if tools_openai is not None else [_SCREENSHOT_FUNC_OAI]
+            a_tools = base_a_tools + [_WEB_SEARCH_ANTHROPIC]
+            o_tools = base_o_tools + [_WEB_SEARCH_OAI]
             if prov == "openai":
                 self._tool_loop_openai(
                     system, messages, on_token, cancel, frame_extractor,
@@ -1302,8 +1325,25 @@ class AIAssistant:
                         payload.update(extra)
                     on_tool_event("tool_result", payload)
                 return result
-            except Exception:
+            except KeyError:
                 pass  # fall through to built-in handlers
+            except Exception as exec_err:
+                log.error("ai", f"Tool executor failed for {tu['name']!r}: {exec_err}")
+                traceback.print_exc()
+                summary = f"Tool {tu['name']} failed"
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "id": tu_id,
+                        "name": tu["name"],
+                        "success": False,
+                        "summary": summary,
+                    })
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tu_id,
+                    "content": f"{summary}: {exec_err}",
+                    "is_error": True,
+                }
 
         # Built-in: get_screenshot
         if tu["name"] == "get_screenshot" and frame_extractor:
@@ -1374,8 +1414,6 @@ class AIAssistant:
         client=None,
         model: str | None = None,
     ) -> None:
-        import anthropic
-
         c = client or self.client
         m = model or self.model
         msgs = list(messages)  # working copy
