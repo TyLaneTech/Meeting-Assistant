@@ -8769,7 +8769,7 @@ function _simIndexFromCleanupState(cs) {
   const library = (cs.library || []).map(g => ({
     global_id: g.global_id, name: g.name, color: g.color, emb_count: g.emb_count, centroid: g.centroid || null,
   }));
-  return { sessionId: cs.sessionId, keyCentroid, library };
+  return { sessionId: cs.sessionId, keyCentroid, library, thresholds: cs.thresholds };
 }
 
 function _buildSimIndexFromClusters(payload) {
@@ -8781,7 +8781,7 @@ function _buildSimIndexFromClusters(payload) {
   const library = (payload.library || []).map(g => ({
     global_id: g.global_id, name: g.name, color: g.color, emb_count: g.emb_count, centroid: _decodeCentroidB64(g.centroid),
   }));
-  return { sessionId: payload.session_id, keyCentroid, library };
+  return { sessionId: payload.session_id, keyCentroid, library, thresholds: payload.thresholds };
 }
 
 async function _ensureSimIndex() {
@@ -8849,6 +8849,24 @@ function _speakerSimScorers(srcKey, idx) {
       return best(idx.library.filter(x => (x.name || '').toLowerCase() === name.toLowerCase()).map(x => x.centroid));
     },
   };
+}
+
+// Add/update the small similarity badge on a picker option. score is a cosine
+// in [-1,1], or null to remove the badge. Color tiers mirror the cleanup
+// picker (muted < suggest ≤ accent < auto ≤ green).
+function _setOptSim(el, score, thresholds) {
+  let badge = el.querySelector('.speaker-picker-sim');
+  if (score == null) { if (badge) badge.remove(); return; }
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.className = 'speaker-picker-sim';
+    el.appendChild(badge);
+  }
+  badge.textContent = Math.round(score * 100) + '%';
+  const auto = (thresholds && thresholds.auto) || 0.82;
+  const suggest = (thresholds && thresholds.suggest) || 0.65;
+  badge.classList.toggle('high', score >= auto);
+  badge.classList.toggle('mid', score >= suggest && score < auto);
 }
 
 // Sort comparator: higher similarity first, unscored entries last, then a
@@ -8936,13 +8954,17 @@ function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey 
     vlHeader.style.display = vlVisible > 0 ? '' : 'none';
   }
 
-  // Re-order both groups by voice similarity once the centroid index resolves.
-  // Idempotent — safe to call again when the VL list finishes loading.
+  // Re-order both groups by voice similarity once the centroid index resolves,
+  // tagging each option with a small similarity badge. Idempotent — safe to
+  // call again when the VL list finishes loading.
   function applySimSort(idx) {
     const scorers = _speakerSimScorers(srcKey, idx);
     if (!scorers.available) return;
-    meetingEntries.sort(_simComparator(e => scorers.meetingScore(e.name), e => e.name));
-    vlEntries.sort(_simComparator(e => scorers.libScore(e.gid, e.name), e => e.name));
+    const th = idx.thresholds;
+    meetingEntries.forEach(e => { e.score = scorers.meetingScore(e.name); _setOptSim(e.el, e.score, th); });
+    vlEntries.forEach(e => { e.score = scorers.libScore(e.gid, e.name); _setOptSim(e.el, e.score, th); });
+    meetingEntries.sort(_simComparator(e => e.score, e => e.name));
+    vlEntries.sort(_simComparator(e => e.score, e => e.name));
     meetingEntries.forEach(e => optionsWrap.insertBefore(e.el, vlHeader));  // keep between the two headers
     vlEntries.forEach(e => optionsWrap.appendChild(e.el));                  // after the VL header
   }
