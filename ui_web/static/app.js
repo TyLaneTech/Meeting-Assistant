@@ -7000,6 +7000,7 @@ let _fpNotifQueue = [];          // persistent queue: [{session_id, speaker_key,
 let _fpToastActive = null;
 let _fpToastTimer  = null;
 let _fpRejected    = new Set();  // global_ids the user rejected ("not in this meeting") this session
+let _fpOpenPopout  = null;       // the notif-panel candidate popout currently open (fixed-positioned), or null
 
 // True if a suggestion is redundant - the speaker is already labeled with
 // the same name as the top match (e.g. "Jason Palmer → Jason Palmer").
@@ -7146,6 +7147,7 @@ function toggleFpNotifPanel() {
 function _fpRenderNotifPanel() {
   const list = document.getElementById('fp-notif-list');
   if (!list) return;
+  _fpCloseCandPopouts();   // any open candidate popout points at a card we're about to discard
   list.innerHTML = '';
 
   for (const item of _fpNotifQueue) {
@@ -7191,15 +7193,21 @@ function _fpRenderNotifPanel() {
     // Similarity-ranked picker of alternatives (defaults to the top match).
     const otherList = document.createElement('div');
     otherList.className = 'fp-notif-other-list hidden';
-    const nCands = _fpPopulateCandidates(otherList, item, gid => _fpNotifConfirm(item, gid));
+    const nCands = _fpPopulateCandidates(otherList, item,
+      gid => { _fpCloseCandPopouts(); _fpNotifConfirm(item, gid); });
     if (nCands > 1) {
+      applyBtn.classList.add('has-alts');   // flatten Apply's right edge for the split button
       const otherWrap = document.createElement('div');
       otherWrap.className = 'fp-notif-other-wrap';
       const otherBtn = document.createElement('button');
       otherBtn.className = 'fp-notif-btn fp-notif-other-toggle';
-      otherBtn.innerHTML = '<i class="fa-solid fa-chevron-down" style="font-size:9px"></i>';
+      otherBtn.innerHTML = '<i class="fa-solid fa-chevron-down"></i>';
       otherBtn.title = 'Pick a different speaker';
-      otherBtn.addEventListener('click', () => otherList.classList.toggle('hidden'));
+      otherBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        if (_fpOpenPopout === otherList) _fpCloseCandPopouts();
+        else _fpOpenCandPopout(otherList, otherBtn);
+      });
       otherWrap.appendChild(otherBtn);
       otherWrap.appendChild(otherList);
       actions.appendChild(otherWrap);
@@ -7259,6 +7267,59 @@ function _fpPopulateCandidates(listEl, item, onPick) {
     listEl.appendChild(empty);
   }
   return shown;
+}
+
+// The notif panel lives inside an overflow-clipped, scrollable container, so an
+// absolutely-positioned candidate popout gets cut off. Open it as a viewport-
+// fixed layer positioned against its toggle button instead, so it escapes the
+// clipping. (The toast picker is already a fixed-position layer, so it keeps
+// its own CSS positioning.)
+function _fpOpenCandPopout(listEl, btnEl) {
+  _fpCloseCandPopouts();
+  listEl.classList.remove('hidden');
+  // Fixed positioning, measured against the button. Reset the CSS anchors so
+  // our inline top/left win.
+  Object.assign(listEl.style, { position: 'fixed', bottom: 'auto', right: 'auto', zIndex: '1000' });
+  const br = btnEl.getBoundingClientRect();
+  const lr = listEl.getBoundingClientRect();
+  // Prefer opening upward (above the button); flip below if there isn't room.
+  let top = br.top - lr.height - 4;
+  if (top < 8) top = br.bottom + 4;
+  // Right-align to the button, clamped into the viewport.
+  let left = Math.min(br.right - lr.width, window.innerWidth - lr.width - 8);
+  left = Math.max(8, left);
+  listEl.style.top  = `${Math.round(top)}px`;
+  listEl.style.left = `${Math.round(left)}px`;
+  btnEl.classList.add('open');
+  _fpOpenPopout = listEl;
+  // Defer global listeners so the opening click doesn't immediately close it.
+  setTimeout(() => {
+    document.addEventListener('mousedown', _fpPopoutDocClick, true);
+    window.addEventListener('scroll', _fpCloseCandPopouts, true);
+    window.addEventListener('resize', _fpCloseCandPopouts);
+  }, 0);
+}
+
+function _fpCloseCandPopouts() {
+  if (_fpOpenPopout) {
+    _fpOpenPopout.classList.add('hidden');
+    // Drop the inline overrides so the element reverts to its stylesheet state.
+    for (const p of ['position', 'top', 'left', 'bottom', 'right', 'zIndex']) {
+      _fpOpenPopout.style[p] = '';
+    }
+    const wrap = _fpOpenPopout.closest('.fp-notif-other-wrap');
+    wrap?.querySelector('.fp-notif-other-toggle')?.classList.remove('open');
+    _fpOpenPopout = null;
+  }
+  document.removeEventListener('mousedown', _fpPopoutDocClick, true);
+  window.removeEventListener('scroll', _fpCloseCandPopouts, true);
+  window.removeEventListener('resize', _fpCloseCandPopouts);
+}
+
+function _fpPopoutDocClick(e) {
+  if (!_fpOpenPopout) return;
+  if (_fpOpenPopout.contains(e.target) || e.target.closest('.fp-notif-other-toggle')) return;
+  _fpCloseCandPopouts();
 }
 
 // "No": the user says this profile isn't in the meeting. Suppress it for every

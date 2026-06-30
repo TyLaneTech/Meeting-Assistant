@@ -5487,7 +5487,33 @@ img#shutdown-icon.brand-icon {
 .fp-notif-other-opt:hover { background: var(--surface3); }
 .fp-notif-btn.fp-notif-no { color: var(--red); background: transparent; }
 .fp-notif-btn.fp-notif-no:hover { background: color-mix(in srgb, var(--red) 14%, transparent); }
-.fp-notif-other-toggle { display: flex; align-items: center; }
+
+/* Apply + chevron form a split button: the primary action plus a dropdown of
+   similarity-ranked alternatives. */
+.fp-notif-btn.fp-notif-apply.has-alts {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.fp-notif-other-wrap { margin-left: -4px; }   /* sit flush against Apply (cancels the row gap) */
+.fp-notif-other-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 7px;
+  background: var(--green);
+  color: #0d1117;
+  border-color: transparent;
+  border-left: 1px solid rgba(13, 17, 23, 0.28);
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.fp-notif-other-toggle i {
+  font-size: 10px;
+  line-height: 1;
+  display: block;
+  transition: transform 0.15s ease;
+}
+.fp-notif-other-toggle.open i { transform: rotate(180deg); }
 
 /* Similarity-ranked candidate picker shared by the suggestion toast + panel.
    Reuses .speaker-picker-opt / .speaker-picker-sim styling for a consistent
