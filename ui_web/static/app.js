@@ -5009,6 +5009,8 @@ function _cleanupBuildState(payload) {
   _cleanupSelectedKeys = new Set();
   _cleanupSelAnchor = null;
   _cleanupClosePicker();
+  // The picker similarity index derives from this state; force it to refresh.
+  _simIndex = null;
   // Decode all centroids once. We keep both labeled + unlabeled clusters in
   // one homogenous list, plus a separate noise bucket.
   const decode = b64 => {
@@ -7964,27 +7966,130 @@ function _toggleTranscriptSegSelection(segEl, { range = false } = {}) {
   }
   if (!range) _transcriptSelectionAnchor = segEl;
   _updateTranscriptSelectionUI();
+  // Reassignment is driven by the same speaker-picker widget used for renaming,
+  // anchored to the right of the just-clicked pill so the column underneath
+  // stays clickable for growing the selection.
+  if (_transcriptSelectedSegs.size > 0) _openBulkSpeakerPicker(segEl);
 }
 
 function _updateTranscriptSelectionUI() {
   _segmentRegistry.forEach(seg => {
     seg.classList.toggle('transcript-seg-selected', _transcriptSelectedSegs.has(seg));
   });
-  const bar = document.getElementById('transcript-selection-bar');
-  if (!bar) return;
-  const count = _transcriptSelectedSegs.size;
-  if (count > 0) {
-    bar.classList.remove('hidden');
-    _tsbEnsureVoiceLibrary();
-    const countEl = document.getElementById('tsb-count');
-    if (countEl) countEl.textContent = `${count} segment${count === 1 ? '' : 's'} selected`;
-    const input = document.getElementById('tsb-input');
-    if (input) input.value = '';
+  if (_transcriptSelectedSegs.size > 0) {
+    _bulkPickerUpdateCount(_transcriptSelectedSegs.size);
   } else {
-    bar.classList.add('hidden');
-    document.getElementById('tsb-autocomplete')?.classList.add('hidden');
+    _closeBulkSpeakerPicker();
   }
   _syncPanelBottomRadius();
+}
+
+/* ── Bulk-reassign speaker picker ───────────────────────────────────────────
+ * Opened on ctrl/⌘/shift-click of a transcript speaker pill. Reuses the same
+ * .speaker-picker widget as single-segment renaming (similarity-ranked meeting
+ * speakers + Voice Library + Mark as Noise), but committing reassigns every
+ * currently-selected segment. It pops out to the right of the clicked pill and
+ * stays open while the user keeps ctrl/⌘/shift-clicking more pills.
+ */
+let _bulkPicker = null;   // { el, input, hint, anchorKey } or null
+
+function _openBulkSpeakerPicker(anchorSeg) {
+  const badge = anchorSeg.querySelector('.src-badge');
+  if (!badge) return;
+  // Already open → just follow the latest click and refresh the count.
+  if (_bulkPicker) {
+    _bulkPickerUpdateCount(_transcriptSelectedSegs.size);
+    _positionPicker(_bulkPicker.el, badge.getBoundingClientRect(), 'right');
+    return;
+  }
+  document.querySelector('.speaker-picker')?.remove();  // close any single-rename picker
+
+  const anchorKey = badge.dataset.speakerKey || anchorSeg.dataset.transcriptSource || '';
+  const color = _speakerColors[anchorKey] || speakerColor(anchorKey) || '#58a6ff';
+
+  const picker = document.createElement('div');
+  picker.className = 'speaker-picker speaker-picker-bulk';
+  picker.style.borderColor = color + '80';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'speaker-picker-input';
+  input.placeholder = 'Reassign to…';
+  input.style.borderColor = color + '60';
+  input.style.color = color;
+  picker.appendChild(input);
+
+  const optionsWrap = document.createElement('div');
+  optionsWrap.className = 'speaker-picker-options';
+  picker.appendChild(optionsWrap);
+
+  const commit = name => {
+    const val = (name || '').trim();
+    if (!val) return;
+    _closeBulkSpeakerPicker();
+    _bulkReassignSelectedTo(val);  // clears the selection when done
+  };
+
+  const { filterOpts } = _buildPickerSpeakerOptions(optionsWrap, {
+    currentName: '', excludeKey: '', srcKey: anchorKey, baseColor: color, onPick: commit,
+  });
+
+  const noiseBtn = document.createElement('button');
+  noiseBtn.className = 'speaker-picker-noise-btn';
+  noiseBtn.innerHTML = '<i class="fa-solid fa-volume-xmark"></i> Mark as Noise';
+  noiseBtn.addEventListener('mousedown', e => { e.preventDefault(); commit(_NOISE_LABEL); });
+  picker.appendChild(noiseBtn);
+
+  const hint = document.createElement('div');
+  hint.className = 'speaker-picker-hint';
+  picker.appendChild(hint);
+
+  _bulkPicker = { el: picker, input, hint, anchorKey };
+  _pickerOpen = true;
+  document.body.appendChild(picker);
+  _bulkPickerUpdateCount(_transcriptSelectedSegs.size);
+  _positionPicker(picker, badge.getBoundingClientRect(), 'right');
+  input.focus();
+
+  input.addEventListener('input', () => filterOpts(input.value.trim().toLowerCase()));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { e.preventDefault(); commit(input.value); }
+    if (e.key === 'Escape') { e.preventDefault(); clearTranscriptSelection(); }
+  });
+
+  // Defer wiring the outside-click guard so the click that opened us doesn't
+  // immediately close it.
+  requestAnimationFrame(() => {
+    document.addEventListener('mousedown', _bulkPickerOutside, true);
+    document.addEventListener('keydown', _bulkPickerKey, true);
+  });
+}
+
+function _bulkPickerUpdateCount(count) {
+  if (_bulkPicker) _bulkPicker.hint.textContent = `Reassign ${count} segment${count === 1 ? '' : 's'}`;
+}
+
+function _closeBulkSpeakerPicker() {
+  document.removeEventListener('mousedown', _bulkPickerOutside, true);
+  document.removeEventListener('keydown', _bulkPickerKey, true);
+  if (_bulkPicker) {
+    _bulkPicker.el.remove();
+    _bulkPicker = null;
+    _pickerOpen = false;
+  }
+}
+
+function _bulkPickerOutside(e) {
+  if (!_bulkPicker) return;
+  if (_bulkPicker.el.contains(e.target)) return;
+  // Keep the picker open while the user grows the selection by
+  // ctrl/⌘/shift-clicking more pills; only a plain click elsewhere cancels.
+  if (e.target.closest('.src-badge') && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
+  clearTranscriptSelection();  // clears selection → closes the picker
+}
+
+function _bulkPickerKey(e) {
+  if (e.key === 'Escape') { e.preventDefault(); clearTranscriptSelection(); }
 }
 
 let _tsbVoiceLibraryCache = null;
@@ -8136,11 +8241,17 @@ function clearTranscriptSelection() {
   _updateTranscriptSelectionUI();
 }
 
-async function applyTranscriptBulkReassign() {
+function applyTranscriptBulkReassign() {
   const input = document.getElementById('tsb-input');
-  const name = (input?.value || '').trim();
-  if (!name) return;
   document.getElementById('tsb-autocomplete')?.classList.add('hidden');
+  _bulkReassignSelectedTo((input?.value || '').trim());
+}
+
+// Reassign every currently-selected segment to `name` (or mark them as Noise
+// when name is the noise sentinel). Shared by the inline bulk picker and the
+// legacy selection bar.
+function _bulkReassignSelectedTo(name) {
+  if (!name) return;
 
   // Resolve the target speaker_key for the given display name.
   // If a speaker with this name already exists, reuse their key so
@@ -8628,8 +8739,249 @@ function _isDefaultName(name) {
   return /^Speaker \d+$/i.test(name);
 }
 
+/* ── Voice-similarity ranking for the speaker pickers ───────────────────────
+ * The pickers rank suggestions by how close each candidate's voice is to the
+ * clicked speaker's voice. Centroids come from the same payload the cleanup
+ * tab uses (/api/sessions/<id>/speaker_clusters); we cache a flat per-session
+ * index of { speaker_key → centroid, library:[…] } so opening a picker doesn't
+ * re-hit the server once it's warm. When no centroid is available (model not
+ * ready, no embeddings yet) the pickers silently fall back to their default
+ * ordering.
+ */
+let _simIndex = null;          // { sessionId, keyCentroid: Map<key,Float32Array>, library:[…] }
+let _simIndexPromise = null;   // { sid, p } — in-flight load, deduped per session
+
+function _decodeCentroidB64(b64) {
+  if (!b64) return null;
+  const bin = atob(b64);
+  const view = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i);
+  return new Float32Array(view.buffer);
+}
+
+// Derive the flat index from an already-loaded cleanup state (centroids there
+// are pre-decoded) so we avoid a redundant fetch when the user has the cleanup
+// tab open.
+function _simIndexFromCleanupState(cs) {
+  const keyCentroid = new Map();
+  cs.clusters.forEach(cl => cl.members.forEach(m => keyCentroid.set(m.speaker_key, m.centroid || null)));
+  cs.noiseMembers.forEach((m, k) => keyCentroid.set(k, m.centroid || null));
+  const library = (cs.library || []).map(g => ({
+    global_id: g.global_id, name: g.name, color: g.color, emb_count: g.emb_count, centroid: g.centroid || null,
+  }));
+  return { sessionId: cs.sessionId, keyCentroid, library };
+}
+
+function _buildSimIndexFromClusters(payload) {
+  const keyCentroid = new Map();
+  const add = cl => (cl?.members || []).forEach(m => keyCentroid.set(m.speaker_key, _decodeCentroidB64(m.centroid)));
+  (payload.labeled_clusters || []).forEach(add);
+  (payload.unlabeled_clusters || []).forEach(add);
+  add(payload.noise_cluster);
+  const library = (payload.library || []).map(g => ({
+    global_id: g.global_id, name: g.name, color: g.color, emb_count: g.emb_count, centroid: _decodeCentroidB64(g.centroid),
+  }));
+  return { sessionId: payload.session_id, keyCentroid, library };
+}
+
+async function _ensureSimIndex() {
+  const sid = state.sessionId;
+  if (!sid) return null;
+  if (_simIndex && _simIndex.sessionId === sid) return _simIndex;
+  if (_cleanupState && _cleanupState.sessionId === sid) {
+    _simIndex = _simIndexFromCleanupState(_cleanupState);
+    return _simIndex;
+  }
+  if (_simIndexPromise && _simIndexPromise.sid === sid) return _simIndexPromise.p;
+  const p = fetch(`/api/sessions/${sid}/speaker_clusters`)
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => {
+      if (!data || data.error) return null;
+      _simIndex = _buildSimIndexFromClusters(data);
+      return _simIndex;
+    })
+    .catch(() => null)
+    .finally(() => { if (_simIndexPromise && _simIndexPromise.sid === sid) _simIndexPromise = null; });
+  _simIndexPromise = { sid, p };
+  return p;
+}
+
+// Cosine similarity of two L2-normalized centroids (a plain dot product), or
+// null when either side is missing.
+function _cosineSim(a, b) {
+  if (!a || !b || a.length !== b.length) return null;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+// Build similarity scorers for the source speaker_key against the given index.
+// meetingScore(displayName) ranks a meeting speaker (taking the best match over
+// the speaker_keys that share that display name); libScore(gid, name) ranks a
+// Voice Library profile. Both return a cosine in [-1,1] or null.
+function _speakerSimScorers(srcKey, idx) {
+  const src = (idx && srcKey) ? (idx.keyCentroid.get(srcKey) || null) : null;
+  const nameKeys = new Map();   // lower(name) → [speaker_key,…]
+  _groupProfilesByName(_getSortedSpeakerProfiles()).forEach(g => {
+    nameKeys.set((g.name || '').toLowerCase(), g.speakerKeys);
+  });
+  const libByGid = new Map();
+  if (idx) idx.library.forEach(g => libByGid.set(g.global_id, g));
+  const best = centroids => {
+    let b = null;
+    centroids.forEach(c => { const s = _cosineSim(src, c); if (s != null && (b == null || s > b)) b = s; });
+    return b;
+  };
+  return {
+    available: !!src,
+    meetingScore(name) {
+      if (!src) return null;
+      const keys = nameKeys.get((name || '').toLowerCase()) || [];
+      return best(keys.map(k => idx.keyCentroid.get(k)));
+    },
+    libScore(gid, name) {
+      if (!src) return null;
+      const g = gid && libByGid.get(gid);
+      if (g) return _cosineSim(src, g.centroid);
+      // The full VL list can include profiles missing from the centroid index;
+      // fall back to matching by name so they still rank when possible.
+      if (!name) return null;
+      return best(idx.library.filter(x => (x.name || '').toLowerCase() === name.toLowerCase()).map(x => x.centroid));
+    },
+  };
+}
+
+// Sort comparator: higher similarity first, unscored entries last, then a
+// natural-name tiebreak so ordering stays stable.
+function _simComparator(scoreOf, nameOf) {
+  return (a, b) => {
+    const sa = scoreOf(a), sb = scoreOf(b);
+    if (sa == null && sb == null) return nameOf(a).localeCompare(nameOf(b), undefined, { numeric: true });
+    if (sa == null) return 1;
+    if (sb == null) return -1;
+    if (sb !== sa) return sb - sa;
+    return nameOf(a).localeCompare(nameOf(b), undefined, { numeric: true });
+  };
+}
+
+// Position a floating picker relative to an anchor rect. 'below' is the legacy
+// drop-down placement; 'right' pops the picker out beside the anchor so a
+// vertical column of pills underneath stays visible and clickable.
+function _positionPicker(picker, anchorRect, placement = 'below') {
+  const pw = picker.offsetWidth, ph = picker.offsetHeight, margin = 8;
+  let top, left;
+  if (placement === 'right') {
+    left = anchorRect.right + 6;
+    if (left + pw > window.innerWidth - margin) left = anchorRect.left - pw - 6;  // flip to the left edge if no room
+    top = anchorRect.top;
+    if (top + ph > window.innerHeight - margin) top = window.innerHeight - ph - margin;
+  } else {
+    const spaceBelow = window.innerHeight - anchorRect.bottom - margin;
+    const spaceAbove = anchorRect.top - margin;
+    top = (spaceBelow >= ph || spaceBelow >= spaceAbove) ? anchorRect.bottom + 2 : anchorRect.top - ph - 2;
+    left = Math.min(anchorRect.left, window.innerWidth - pw - margin);
+  }
+  picker.style.top = Math.max(margin, top) + 'px';
+  picker.style.left = Math.max(margin, left) + 'px';
+}
+
+/* Populate a picker's options container with two voice-similarity-ranked
+ * groups: current meeting speakers (top) and saved Voice Library profiles
+ * (below). Shared by the rename picker (editSpeakerLabel) and the bulk-reassign
+ * picker so both rank and look identical. onPick(name) is called when an option
+ * is chosen. Returns { filterOpts } for the picker's text input.
+ */
+function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey = '', srcKey = '', baseColor = '#58a6ff', onPick }) {
+  const meetingEntries = [];   // { name, el }
+  const vlEntries = [];        // { name, gid, el }
+
+  // ── Meeting speakers ──
+  const existingNames = _speakerOptionNames(currentName, excludeKey);
+  const meetingNameSet = new Set(existingNames.map(n => n.toLowerCase()));
+  const meetingHeader = document.createElement('div');
+  meetingHeader.className = 'speaker-picker-section';
+  meetingHeader.textContent = 'Meeting speakers';
+  meetingHeader.style.display = existingNames.length ? '' : 'none';
+  optionsWrap.appendChild(meetingHeader);
+  existingNames.forEach(name => {
+    const optKey = _speakerNameKey(name, excludeKey);
+    const optColor = (optKey && (_speakerColors[optKey] || speakerColor(optKey))) || baseColor;
+    const opt = document.createElement('button');
+    opt.className = 'speaker-picker-opt';
+    opt.dataset.optName = name.toLowerCase();
+    opt.textContent = name;
+    opt.style.borderColor = optColor + '60';
+    opt.style.color = optColor;
+    opt.addEventListener('mousedown', e => { e.preventDefault(); onPick(name); });
+    optionsWrap.appendChild(opt);
+    meetingEntries.push({ name, el: opt });
+  });
+
+  // ── Voice Library (populated asynchronously) ──
+  const vlHeader = document.createElement('div');
+  vlHeader.className = 'speaker-picker-section speaker-picker-vl-section';
+  vlHeader.textContent = 'Voice Library';
+  vlHeader.style.display = 'none';
+  optionsWrap.appendChild(vlHeader);
+
+  function filterOpts(query) {
+    let meetingVisible = 0, vlVisible = 0;
+    optionsWrap.querySelectorAll('.speaker-picker-opt').forEach(opt => {
+      const name = opt.dataset.optName || '';
+      const show = !query || name.includes(query);
+      opt.style.display = show ? '' : 'none';
+      if (show) { opt.classList.contains('speaker-picker-vl-opt') ? vlVisible++ : meetingVisible++; }
+    });
+    meetingHeader.style.display = meetingVisible > 0 ? '' : 'none';
+    vlHeader.style.display = vlVisible > 0 ? '' : 'none';
+  }
+
+  // Re-order both groups by voice similarity once the centroid index resolves.
+  // Idempotent — safe to call again when the VL list finishes loading.
+  function applySimSort(idx) {
+    const scorers = _speakerSimScorers(srcKey, idx);
+    if (!scorers.available) return;
+    meetingEntries.sort(_simComparator(e => scorers.meetingScore(e.name), e => e.name));
+    vlEntries.sort(_simComparator(e => scorers.libScore(e.gid, e.name), e => e.name));
+    meetingEntries.forEach(e => optionsWrap.insertBefore(e.el, vlHeader));  // keep between the two headers
+    vlEntries.forEach(e => optionsWrap.appendChild(e.el));                  // after the VL header
+  }
+
+  fetch('/api/fingerprint/speakers').then(r => r.json()).then(speakers => {
+    if (!speakers || !speakers.length) return;
+    speakers.forEach(sp => {
+      const name = (sp.name || '').trim();
+      if (!name || meetingNameSet.has(name.toLowerCase())) return;
+      if (currentName && name.toLowerCase() === currentName.toLowerCase()) return;
+      // Never offer the "You" (Me) profile as a label for a desktop speaker —
+      // mic audio is the only thing that is ever you.
+      if (window._meSpeakerGlobalId && sp.id === window._meSpeakerGlobalId) return;
+      const vlColor = sp.color || 'var(--fg-muted)';
+      const opt = document.createElement('button');
+      opt.className = 'speaker-picker-opt speaker-picker-vl-opt';
+      opt.dataset.optName = name.toLowerCase();
+      opt.textContent = name;
+      opt.style.borderColor = vlColor + '60';
+      opt.style.color = vlColor;
+      opt.addEventListener('mousedown', e => { e.preventDefault(); onPick(name); });
+      optionsWrap.appendChild(opt);
+      vlEntries.push({ name, gid: sp.id, el: opt });
+    });
+    if (vlEntries.length) {
+      vlHeader.style.display = '';
+      if (_simIndex && _simIndex.sessionId === state.sessionId) applySimSort(_simIndex);
+    }
+  }).catch(() => {});
+
+  // Kick off (or reuse) the centroid index; re-sort when it's ready.
+  _ensureSimIndex().then(idx => { if (idx) applySimSort(idx); });
+
+  return { filterOpts };
+}
+
 function editSpeakerLabel(badge, speakerKey) {
-  // Remove any existing picker first
+  // Remove any existing picker first (including an in-progress bulk selection)
+  _closeBulkSpeakerPicker();
   document.querySelector('.speaker-picker')?.remove();
 
   const currentName = badge.textContent;
@@ -8662,93 +9014,12 @@ function editSpeakerLabel(badge, speakerKey) {
   optionsWrap.className = 'speaker-picker-options';
   picker.appendChild(optionsWrap);
 
-  // Collect unique display names already assigned (excluding this key's current name)
-  const existingNames = _speakerOptionNames(currentName, speakerKey);
-  const meetingNameSet = new Set(existingNames.map(n => n.toLowerCase()));
-
-  // Option buttons for existing meeting labels (section header)
-  if (existingNames.length > 0) {
-    const secLabel = document.createElement('div');
-    secLabel.className = 'speaker-picker-section';
-    secLabel.textContent = 'Meeting speakers';
-    optionsWrap.appendChild(secLabel);
-  }
-  existingNames.forEach(name => {
-    const optKey = _speakerNameKey(name, speakerKey);
-    const optColor = (optKey && (_speakerColors[optKey] || speakerColor(optKey))) || color;
-    const opt = document.createElement('button');
-    opt.className = 'speaker-picker-opt';
-    opt.dataset.optName = name.toLowerCase();
-    opt.textContent = name;
-    opt.style.borderColor = optColor + '60';
-    opt.style.color = optColor;
-    opt.addEventListener('mousedown', e => {
-      e.preventDefault();
-      commit(name);
-    });
-    optionsWrap.appendChild(opt);
+  // Meeting speakers + Voice Library options, both ranked by voice similarity
+  // to the clicked speaker. commit is referenced lazily (defined below).
+  const { filterOpts } = _buildPickerSpeakerOptions(optionsWrap, {
+    currentName, excludeKey: speakerKey, srcKey: speakerKey, baseColor: color,
+    onPick: name => commit(name),
   });
-
-  // Voice Library section - populated asynchronously
-  const vlSection = document.createElement('div');
-  vlSection.className = 'speaker-picker-section speaker-picker-vl-section';
-  vlSection.style.display = 'none';
-  vlSection.textContent = 'Voice Library';
-  optionsWrap.appendChild(vlSection);
-
-  fetch('/api/fingerprint/speakers').then(r => r.json()).then(speakers => {
-    if (!speakers || !speakers.length) return;
-    const vlOpts = [];
-    speakers.forEach(sp => {
-      const name = (sp.name || '').trim();
-      if (!name || meetingNameSet.has(name.toLowerCase())) return;
-      if (name.toLowerCase() === currentName.toLowerCase()) return;
-      // Never offer the "You" (Me) profile as a label for a desktop speaker —
-      // mic audio is the only thing that is ever you.
-      if (window._meSpeakerGlobalId && sp.id === window._meSpeakerGlobalId) return;
-      const opt = document.createElement('button');
-      opt.className = 'speaker-picker-opt speaker-picker-vl-opt';
-      opt.dataset.optName = name.toLowerCase();
-      opt.textContent = name;
-      const vlColor = sp.color || 'var(--fg-muted)';
-      opt.style.borderColor = vlColor + '60';
-      opt.style.color = vlColor;
-      opt.addEventListener('mousedown', e => {
-        e.preventDefault();
-        commit(name);
-      });
-      vlOpts.push(opt);
-    });
-    if (vlOpts.length > 0) {
-      vlSection.style.display = '';
-      vlOpts.forEach(o => optionsWrap.appendChild(o));
-      // Apply current filter if user already typed something
-      const typed = input.value.trim().toLowerCase();
-      if (typed && typed !== currentName.toLowerCase()) _filterPickerOpts(typed);
-    }
-  }).catch(() => {});
-
-  // Filter function for options
-  function _filterPickerOpts(query) {
-    let meetingVisible = 0, vlVisible = 0;
-    optionsWrap.querySelectorAll('.speaker-picker-opt').forEach(opt => {
-      const name = opt.dataset.optName || '';
-      const show = !query || name.includes(query);
-      opt.style.display = show ? '' : 'none';
-      if (show) {
-        if (opt.classList.contains('speaker-picker-vl-opt')) vlVisible++;
-        else meetingVisible++;
-      }
-    });
-    // Hide section headers when no items visible
-    optionsWrap.querySelectorAll('.speaker-picker-section').forEach(sec => {
-      if (sec.classList.contains('speaker-picker-vl-section')) {
-        sec.style.display = vlVisible > 0 ? '' : 'none';
-      } else {
-        sec.style.display = meetingVisible > 0 ? '' : 'none';
-      }
-    });
-  }
 
   // Highlight all matching badges when in global mode
   const _highlighted = [];
@@ -8834,21 +9105,11 @@ function editSpeakerLabel(badge, speakerKey) {
     picker.remove();
   };
 
-  // Append first so we can measure the picker's rendered height,
-  // then position above or below the badge depending on available space.
+  // Append first so we can measure the picker's rendered size, then drop it
+  // below/above the badge depending on available space.
   _pickerOpen = true;
   document.body.appendChild(picker);
-  const rect = badge.getBoundingClientRect();
-  const pickerH = picker.offsetHeight;
-  const pickerW = picker.offsetWidth;
-  const spaceBelow = window.innerHeight - rect.bottom - 8;
-  const spaceAbove = rect.top - 8;
-  const top = (spaceBelow >= pickerH || spaceBelow >= spaceAbove)
-    ? rect.bottom + 2
-    : rect.top - pickerH - 2;
-  const left = Math.min(rect.left, window.innerWidth - pickerW - 8);
-  picker.style.top  = top + 'px';
-  picker.style.left = left + 'px';
+  _positionPicker(picker, badge.getBoundingClientRect(), 'below');
   input.focus();
   input.select();
 
@@ -8856,7 +9117,7 @@ function editSpeakerLabel(badge, speakerKey) {
   input.addEventListener('input', () => {
     const typed = input.value.trim().toLowerCase();
     // Filter option buttons
-    _filterPickerOpts(typed);
+    filterOpts(typed);
 
     // In global mode, show a live merge hint when the typed name matches an existing speaker
     if (editMode === 'global') {
@@ -14496,6 +14757,9 @@ function clearAll() {
   _speakerColorIdx = 0;
   _transcriptSelectedSegs.clear();
   _transcriptSelectionAnchor = null;
+  _closeBulkSpeakerPicker();
+  _simIndex = null;
+  _simIndexPromise = null;
   _pendingSpeakerProfiles = [];
   _sessionLinks = {};
   _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
