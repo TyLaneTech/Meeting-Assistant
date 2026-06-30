@@ -5464,6 +5464,18 @@ img#shutdown-icon.brand-icon {
   border-radius: 4px;
 }
 .fp-notif-other-opt:hover { background: var(--surface3); }
+.fp-notif-btn.fp-notif-no { color: var(--red); background: transparent; }
+.fp-notif-btn.fp-notif-no:hover { background: color-mix(in srgb, var(--red) 14%, transparent); }
+.fp-notif-other-toggle { display: flex; align-items: center; }
+
+/* Similarity-ranked candidate picker shared by the suggestion toast + panel.
+   Reuses .speaker-picker-opt / .speaker-picker-sim styling for a consistent
+   look with the transcript speaker-picker. */
+.fp-notif-other-list, .fp-toast-other-list { display: flex; flex-direction: column; gap: 2px; }
+.fp-cand-opt { width: 100%; }
+.fp-cand-opt .fp-cand-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fp-cand-opt.fp-cand-top { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.fp-cand-empty { font-size: 11px; color: var(--fg-subtle); padding: 4px 8px; font-style: italic; }
 
 /* ── Inline speaker identify icon ─────────────────────────────────────────── */
 .src-speaker:not(.speaker-linked) .speaker-identify-icon {
@@ -5578,6 +5590,9 @@ img#shutdown-icon.brand-icon {
   border-radius: 5px;
 }
 .fp-toast-opt:hover { background: var(--surface3); }
+.fp-toast-btn.fp-toast-no { color: var(--red); }
+.fp-toast-btn.fp-toast-no:hover { background: color-mix(in srgb, var(--red) 14%, transparent); filter: none; }
+.fp-toast-other { display: inline-flex; align-items: center; gap: 4px; }
 
 /* ── Speaker cleanup view (drag-drop cluster rectification) ──────────────── */
 #speaker-manager-overlay .speaker-manager-dialog {

@@ -143,8 +143,9 @@ _state: dict = {
     "summary_manual_pending": False,  # True when /api/summarize was triggered; clears when it runs
     "speaker_audio_accum":    {},  # speaker_key → {"audio": np.ndarray, "total_sec": float}
     "speaker_emb_counts":     {},  # speaker_key → int (embeddings extracted this session)
-    "fingerprint_dismissals": {},  # speaker_key → set[global_id]
-    "fingerprint_suggestions": {},  # speaker_key → {session_id, speaker_key, current_name, matches}
+    "fingerprint_dismissals": {},  # speaker_key → set[global_id] (per-key "not now")
+    "fingerprint_rejected":   set(),  # global_ids the user said aren't in this meeting at all
+    "fingerprint_suggestions": {},  # speaker_key → {session_id, speaker_key, current_name, matches, candidates}
     "speaker_offer_counts":   {},  # speaker_key → int (audio offers for diminishing returns)
     "last_audio_activity_at": 0.0,
     "last_transcript_activity_at": 0.0,
@@ -1212,6 +1213,7 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         accum[speaker_key] = {"audio": accum[speaker_key]["audio"][-tail_len:], "total_sec": 0.5}
         counts[speaker_key] = counts.get(speaker_key, 0) + 1
         dismissals = {k: set(v) for k, v in _state["fingerprint_dismissals"].items()}
+        rejected = set(_state["fingerprint_rejected"])
 
     # Check if already linked (strengthen profile)
     existing_link = fingerprint_db.get_link(sid, speaker_key)
@@ -1240,18 +1242,20 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         except Exception as e:
             log.warn("fingerprint", f"add_unlabeled_embedding failed: {e}")
 
-        excluded = dismissals.get(speaker_key, set()) | other_links
+        # `rejected` = profiles the user said aren't in this meeting at all, so
+        # they're suppressed for every speaker_key (not just the one dismissed).
+        excluded = dismissals.get(speaker_key, set()) | other_links | rejected
         # Never suggest the "You" (Me) profile for a desktop speaker. The purge
         # already drops it from find_matches (NULL centroid); this is an explicit
         # backstop in case it ever holds a centroid.
         if fingerprint_db._me_id:
             excluded = excluded | {fingerprint_db._me_id}
 
-        # Diagnostic: pull top candidates regardless of threshold so we can see
-        # *why* a speaker isn't getting matched (closest profile sim too low,
-        # library empty, all candidates excluded, etc.).
+        # Diagnostic + candidate list: pull the top profiles regardless of
+        # threshold so we can see *why* a speaker isn't matching, and so the
+        # suggestion UI can offer a similarity-ranked picker of alternatives.
         all_candidates = fingerprint_db.find_matches(
-            emb, exclude_global_ids=excluded, min_similarity=0.0,
+            emb, exclude_global_ids=excluded, min_similarity=0.0, top_k=8,
         )
         if all_candidates:
             top_summary = ", ".join(
@@ -1280,7 +1284,10 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
             with _state_lock:
                 current_name = _state["speaker_labels"].get(speaker_key, speaker_key)
                 suggestion = {"session_id": sid, "speaker_key": speaker_key,
-                              "current_name": current_name, "matches": matches}
+                              "current_name": current_name, "matches": matches,
+                              # Fuller ranked list (incl. sub-threshold) for the
+                              # picker dropdown in the suggestion UI.
+                              "candidates": all_candidates}
                 _state["fingerprint_suggestions"][speaker_key] = suggestion
             _push("fingerprint_match", suggestion)
 
@@ -1777,6 +1784,7 @@ def start_recording():
             "speaker_audio_accum":    {},
             "speaker_emb_counts":     {},
             "fingerprint_dismissals": {},
+            "fingerprint_rejected":   set(),
             "fingerprint_suggestions": {},
             "_confirmed_speakers":    set(),
             "last_audio_activity_at": now_mono,
@@ -4876,6 +4884,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 _state["speaker_emb_counts"] = {}
                 _state["speaker_offer_counts"] = {}
                 _state["fingerprint_dismissals"] = {}
+                _state["fingerprint_rejected"] = set()
                 _state["fingerprint_suggestions"] = {}
                 _state["_confirmed_speakers"] = set()
 
@@ -6146,6 +6155,36 @@ def fp_dismiss():
                 dismissals[speaker_key].add(global_id)
             _state["fingerprint_suggestions"].pop(speaker_key, None)
 
+    return jsonify({"ok": True})
+
+
+@app.route("/api/fingerprint/reject", methods=["POST"])
+def fp_reject():
+    """User said this profile isn't in the current meeting at all.
+
+    Stronger than a dismiss: the profile is suppressed as a candidate for *every*
+    speaker_key in the session (so it can't keep re-suggesting on other diarizer
+    fragments of the same voice), and any pending suggestion pointing at it is
+    dropped. Lives for the running session; matching only happens live, so this
+    covers the meeting it was raised in.
+    """
+    data = request.get_json(silent=True) or {}
+    session_id = (data.get("session_id") or "").strip()
+    global_id  = (data.get("global_id") or "").strip()
+    if not session_id or not global_id:
+        return jsonify({"error": "session_id and global_id required"}), 400
+
+    with _state_lock:
+        if _state.get("session_id") == session_id:
+            _state["fingerprint_rejected"].add(global_id)
+            # Drop any pending suggestions whose top match is the rejected profile.
+            sugg = _state["fingerprint_suggestions"]
+            stale = [k for k, s in sugg.items()
+                     if ((s.get("matches") or [{}])[0] or {}).get("global_id") == global_id]
+            for k in stale:
+                sugg.pop(k, None)
+
+    log.info("fingerprint", f"Rejected profile {global_id} for session {session_id[:8]}")
     return jsonify({"ok": True})
 
 

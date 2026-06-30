@@ -3860,6 +3860,7 @@ function connectSSE(afterSegId = 0) {
     _tnRefreshSpeakerPills();
     // Clear notification queue on transcript reset (reanalysis)
     _fpNotifQueue = [];
+    _fpRejected = new Set();
     _fpToastActive = null;
     if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
     _fpUpdateBell();
@@ -6935,9 +6936,10 @@ closeSpeakerManager = function () {
  *   1. The bell panel (always available for review)
  *   2. A brief toast (fires once for attention, then auto-hides)
  * ────────────────────────────────────────────────────────────────────────── */
-let _fpNotifQueue = [];          // persistent queue: [{session_id, speaker_key, current_name, matches}, ...]
+let _fpNotifQueue = [];          // persistent queue: [{session_id, speaker_key, current_name, matches, candidates}, ...]
 let _fpToastActive = null;
 let _fpToastTimer  = null;
+let _fpRejected    = new Set();  // global_ids the user rejected ("not in this meeting") this session
 
 // True if a suggestion is redundant - the speaker is already labeled with
 // the same name as the top match (e.g. "Jason Palmer → Jason Palmer").
@@ -7090,6 +7092,7 @@ function _fpRenderNotifPanel() {
     const top = item.matches[0];
     if (!top) continue;
     if (_fpIsRedundantSuggestion(item)) continue;
+    if (_fpRejected.has(top.global_id)) continue;   // user said this profile isn't here
 
     const card = document.createElement('div');
     card.className = 'fp-notif-card';
@@ -7123,37 +7126,38 @@ function _fpRenderNotifPanel() {
     applyBtn.className = 'fp-notif-btn fp-notif-apply';
     applyBtn.textContent = 'Apply';
     applyBtn.addEventListener('click', () => _fpNotifConfirm(item, top.global_id));
-
-    const skipBtn = document.createElement('button');
-    skipBtn.className = 'fp-notif-btn fp-notif-skip';
-    skipBtn.textContent = 'Skip';
-    skipBtn.addEventListener('click', () => _fpNotifDismiss(item));
-
     actions.appendChild(applyBtn);
 
-    // "Other" dropdown if multiple matches
-    if (item.matches.length > 1) {
+    // Similarity-ranked picker of alternatives (defaults to the top match).
+    const otherList = document.createElement('div');
+    otherList.className = 'fp-notif-other-list hidden';
+    const nCands = _fpPopulateCandidates(otherList, item, gid => _fpNotifConfirm(item, gid));
+    if (nCands > 1) {
       const otherWrap = document.createElement('div');
       otherWrap.className = 'fp-notif-other-wrap';
       const otherBtn = document.createElement('button');
-      otherBtn.className = 'fp-notif-btn';
+      otherBtn.className = 'fp-notif-btn fp-notif-other-toggle';
       otherBtn.innerHTML = '<i class="fa-solid fa-chevron-down" style="font-size:9px"></i>';
-      otherBtn.title = 'Other matches';
-      const otherList = document.createElement('div');
-      otherList.className = 'fp-notif-other-list hidden';
-      item.matches.slice(1).forEach(m => {
-        const opt = document.createElement('button');
-        opt.className = 'fp-notif-other-opt';
-        opt.textContent = `${m.name} (${Math.round(m.similarity * 100)}%)`;
-        opt.addEventListener('click', () => _fpNotifConfirm(item, m.global_id));
-        otherList.appendChild(opt);
-      });
+      otherBtn.title = 'Pick a different speaker';
       otherBtn.addEventListener('click', () => otherList.classList.toggle('hidden'));
       otherWrap.appendChild(otherBtn);
       otherWrap.appendChild(otherList);
       actions.appendChild(otherWrap);
     }
 
+    // "No": this profile isn't in the meeting; stop suggesting it everywhere.
+    const noBtn = document.createElement('button');
+    noBtn.className = 'fp-notif-btn fp-notif-no';
+    noBtn.textContent = 'No';
+    noBtn.title = `Not ${top.name}: stop suggesting them in this meeting`;
+    noBtn.addEventListener('click', () => _fpNotifReject(item, top.global_id));
+    actions.appendChild(noBtn);
+
+    const skipBtn = document.createElement('button');
+    skipBtn.className = 'fp-notif-btn fp-notif-skip';
+    skipBtn.textContent = 'Skip';
+    skipBtn.title = 'Dismiss this suggestion for now';
+    skipBtn.addEventListener('click', () => _fpNotifDismiss(item));
     actions.appendChild(skipBtn);
 
     card.appendChild(speaker);
@@ -7163,6 +7167,61 @@ function _fpRenderNotifPanel() {
     card.appendChild(actions);
     list.appendChild(card);
   }
+}
+
+// Fill a dropdown with a similarity-ranked list of candidate profiles for a
+// suggestion (top match first). Reuses the speaker-picker option styling, with
+// a % badge per row. onPick(globalId, name) confirms that profile.
+function _fpPopulateCandidates(listEl, item, onPick) {
+  listEl.innerHTML = '';
+  const cands = (item.candidates && item.candidates.length ? item.candidates : item.matches) || [];
+  const topGid = item.matches?.[0]?.global_id;
+  let shown = 0;
+  cands.forEach(c => {
+    if (!c.global_id || _fpRejected.has(c.global_id)) return;
+    const opt = document.createElement('button');
+    opt.className = 'speaker-picker-opt fp-cand-opt' + (c.global_id === topGid ? ' fp-cand-top' : '');
+    opt.style.borderColor = (c.color ? c.color + '60' : 'var(--border)');
+    if (c.color) opt.style.color = c.color;
+    const nm = document.createElement('span');
+    nm.className = 'fp-cand-name';
+    nm.textContent = c.name;
+    opt.appendChild(nm);
+    _setOptSim(opt, c.similarity, { auto: 0.82, suggest: 0.70 });
+    opt.addEventListener('mousedown', e => { e.preventDefault(); onPick(c.global_id, c.name); });
+    listEl.appendChild(opt);
+    shown++;
+  });
+  if (!shown) {
+    const empty = document.createElement('div');
+    empty.className = 'fp-cand-empty';
+    empty.textContent = 'No other matches';
+    listEl.appendChild(empty);
+  }
+  return shown;
+}
+
+// "No": the user says this profile isn't in the meeting. Suppress it for every
+// speaker (server-side, session-wide) and drop all cards pointing at it.
+async function _fpNotifReject(item, globalId) {
+  if (!globalId) { _fpNotifDismiss(item); return; }
+  _fpRejected.add(globalId);
+  _fpNotifQueue = _fpNotifQueue.filter(d => d.matches?.[0]?.global_id !== globalId);
+  _fpUpdateBell();
+  _fpRenderNotifPanel();
+  _fpUpdateInlineIcons();
+  _fpAutoCollapseIfEmpty();
+  if (_fpToastActive && (_fpToastActive.speaker_key === item.speaker_key ||
+                         _fpToastActive.matches?.[0]?.global_id === globalId)) {
+    _fpHideToast();
+  }
+  try {
+    await fetch('/api/fingerprint/reject', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: item.session_id, global_id: globalId }),
+    });
+  } catch (e) { console.warn('fp reject failed', e); }
 }
 
 async function _fpNotifConfirm(item, globalId) {
@@ -7283,24 +7342,10 @@ function _fpShowNextToast() {
   document.getElementById('fp-toast-sim').textContent = `${Math.round(top.similarity * 100)}%`;
 
   const otherList = document.getElementById('fp-toast-other-list');
-  otherList.innerHTML = '';
   otherList.classList.add('hidden');
-  const others = _fpToastActive.matches.slice(1);
-  if (others.length) {
-    document.getElementById('fp-toast-other').style.display = '';
-    others.forEach(m => {
-      const btn = document.createElement('button');
-      btn.className = 'fp-toast-opt';
-      btn.textContent = `${m.name} (${Math.round(m.similarity * 100)}%)`;
-      btn.addEventListener('mousedown', e => {
-        e.preventDefault();
-        _fpNotifConfirm(_fpToastActive, m.global_id);
-      });
-      otherList.appendChild(btn);
-    });
-  } else {
-    document.getElementById('fp-toast-other').style.display = 'none';
-  }
+  const nCands = _fpPopulateCandidates(otherList, _fpToastActive, gid => _fpNotifConfirm(_fpToastActive, gid));
+  // Show the "Others" picker only when there's an alternative beyond the top match.
+  document.getElementById('fp-toast-other').style.display = nCands > 1 ? '' : 'none';
 
   toast.classList.remove('hidden');
   toast.style.animation = 'none';
@@ -7319,6 +7364,13 @@ function fpToastApply() {
 
 function fpToastToggleOther() {
   document.getElementById('fp-toast-other-list').classList.toggle('hidden');
+}
+
+function fpToastNo() {
+  if (!_fpToastActive) return;
+  const top = _fpToastActive.matches[0];
+  if (top) _fpNotifReject(_fpToastActive, top.global_id);  // removes from queue + hides toast
+  else fpToastSkip();
 }
 
 function _fpAnimateOut(cb) {
@@ -8749,7 +8801,7 @@ function _isDefaultName(name) {
  * ordering.
  */
 let _simIndex = null;          // { sessionId, keyCentroid: Map<key,Float32Array>, library:[…] }
-let _simIndexPromise = null;   // { sid, p } — in-flight load, deduped per session
+let _simIndexPromise = null;   // { sid, p }: in-flight load, deduped per session
 
 function _decodeCentroidB64(b64) {
   if (!b64) return null;
@@ -8955,7 +9007,7 @@ function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey 
   }
 
   // Re-order both groups by voice similarity once the centroid index resolves,
-  // tagging each option with a small similarity badge. Idempotent — safe to
+  // tagging each option with a small similarity badge. Idempotent; safe to
   // call again when the VL list finishes loading.
   function applySimSort(idx) {
     const scorers = _speakerSimScorers(srcKey, idx);
@@ -8975,7 +9027,7 @@ function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey 
       const name = (sp.name || '').trim();
       if (!name || meetingNameSet.has(name.toLowerCase())) return;
       if (currentName && name.toLowerCase() === currentName.toLowerCase()) return;
-      // Never offer the "You" (Me) profile as a label for a desktop speaker —
+      // Never offer the "You" (Me) profile as a label for a desktop speaker;
       // mic audio is the only thing that is ever you.
       if (window._meSpeakerGlobalId && sp.id === window._meSpeakerGlobalId) return;
       const vlColor = sp.color || 'var(--fg-muted)';
@@ -14782,6 +14834,7 @@ function clearAll() {
   _closeBulkSpeakerPicker();
   _simIndex = null;
   _simIndexPromise = null;
+  _fpRejected = new Set();
   _pendingSpeakerProfiles = [];
   _sessionLinks = {};
   _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };

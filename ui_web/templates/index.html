@@ -766,10 +766,10 @@
   <div class="fp-toast-actions">
     <button class="fp-toast-btn fp-toast-apply" id="fp-toast-apply" onclick="fpToastApply()">Apply</button>
     <div class="fp-toast-more-wrap">
-      <button class="fp-toast-btn fp-toast-other" id="fp-toast-other" onclick="fpToastToggleOther()">Not this</button>
+      <button class="fp-toast-btn fp-toast-other" id="fp-toast-other" onclick="fpToastToggleOther()" title="Pick a different speaker">Others <i class="fa-solid fa-chevron-down" style="font-size:9px"></i></button>
       <div class="fp-toast-other-list hidden" id="fp-toast-other-list"></div>
     </div>
-    <button class="fp-toast-btn fp-toast-skip" onclick="fpToastSkip()">Skip</button>
+    <button class="fp-toast-btn fp-toast-no" onclick="fpToastNo()" title="Not in this meeting: stop suggesting them">No</button>
   </div>
 </div>
 
