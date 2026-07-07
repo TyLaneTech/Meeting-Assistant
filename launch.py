@@ -363,7 +363,12 @@ def _create_macos_app_shortcut():
     if not launcher.exists():
         return
 
-    app_dir    = Path.home() / "Applications" / "Meeting Assistant.app"
+    # Prefer the system /Applications (where Launchpad / the macOS Apps grid
+    # looks) when it is writable by this user; otherwise fall back to the per-user
+    # ~/Applications, which never needs admin rights.
+    _sys_apps  = Path("/Applications")
+    _apps_root = _sys_apps if os.access(_sys_apps, os.W_OK) else (Path.home() / "Applications")
+    app_dir    = _apps_root / "Meeting Assistant.app"
     macos_dir  = app_dir / "Contents" / "MacOS"
     res_dir    = app_dir / "Contents" / "Resources"
     exe_path   = macos_dir / "MeetingAssistant"
@@ -395,16 +400,44 @@ def _create_macos_app_shortcut():
         exe_path.write_text(exe_script)
         exe_path.chmod(0o755)
 
-        # Best-effort app icon: convert the logo PNG to .icns via sips.
-        icon_src  = root / "ui_web" / "static" / "images" / "logo.png"
+        # App icon: build a proper multi-resolution .icns from the logo PNG via an
+        # iconset + iconutil (a plain `sips -s format icns` often yields nothing on
+        # a non-square / wrong-DPI source, which is why the icon was blank before).
+        # Prefer the macOS-styled tile (squircle, margins, depth) over the bare
+        # web logo, which looks unfinished full-bleed in Launchpad / the Dock.
+        _img_dir = root / "ui_web" / "static" / "images"
+        _macos_icon = _img_dir / "app_icon_macos.png"
+        icon_src  = _macos_icon if _macos_icon.exists() else (_img_dir / "logo.png")
         icon_name = ""
         if icon_src.exists():
             try:
-                subprocess.run(
-                    ["sips", "-s", "format", "icns", str(icon_src),
-                     "--out", str(res_dir / "AppIcon.icns")],
-                    capture_output=True, timeout=20,
-                )
+                import tempfile
+                with tempfile.TemporaryDirectory() as _td:
+                    iconset = Path(_td) / "icon.iconset"
+                    iconset.mkdir()
+                    specs = [
+                        ("icon_16x16.png", 16),    ("icon_16x16@2x.png", 32),
+                        ("icon_32x32.png", 32),    ("icon_32x32@2x.png", 64),
+                        ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
+                        ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
+                        ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024),
+                    ]
+                    built = True
+                    for fname, px in specs:
+                        r = subprocess.run(
+                            ["sips", "-z", str(px), str(px), str(icon_src),
+                             "--out", str(iconset / fname)],
+                            capture_output=True, timeout=20,
+                        )
+                        if r.returncode != 0:
+                            built = False
+                            break
+                    if built:
+                        subprocess.run(
+                            ["iconutil", "-c", "icns", str(iconset),
+                             "-o", str(res_dir / "AppIcon.icns")],
+                            capture_output=True, timeout=20,
+                        )
                 if (res_dir / "AppIcon.icns").exists():
                     icon_name = "AppIcon"
             except Exception:
@@ -446,7 +479,23 @@ def _create_macos_app_shortcut():
         except Exception:
             pass
 
-        _ok(f"Applications shortcut ready  {GRY}(~/Applications/Meeting Assistant.app){R}")
+        # Remove a stale copy in the other Applications location so the app does
+        # not show up twice (e.g. an old ~/Applications bundle after we move to
+        # /Applications), then make sure Launch Services indexes the new one.
+        _other_root = (Path.home() / "Applications") if _apps_root == _sys_apps else _sys_apps
+        _other = _other_root / "Meeting Assistant.app"
+        if _other != app_dir and _other.exists():
+            shutil.rmtree(_other, ignore_errors=True)
+        try:
+            subprocess.run(
+                ["/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                 "LaunchServices.framework/Support/lsregister", "-f", str(app_dir)],
+                capture_output=True, timeout=20,
+            )
+        except Exception:
+            pass
+
+        _ok(f"Applications shortcut ready  {GRY}({app_dir}){R}")
     except Exception:
         _warn("Could not create the macOS Applications shortcut (non-fatal)")
 
@@ -911,9 +960,44 @@ elif task == "sentence-transformers":
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _reexec_native_arm64():
+    """On Apple Silicon, re-exec natively as arm64 if running x86_64 under Rosetta.
+
+    The python.org interpreter is a universal2 build, so inside a Rosetta-translated
+    process (e.g. the Terminal is set to "Open using Rosetta") it runs its x86_64
+    slice. uv then resolves an x86_64 wheel-tag set: mlx ships arm64-only wheels and
+    becomes unsatisfiable, and torch falls back to its last x86_64 macOS wheel.
+    Forcing arm64 makes uv resolve arm64 and the app run native. An env var guards
+    against a re-exec loop; a genuine Intel Mac (not translated) is left alone.
+
+    launch.command applies the same guard before this script runs; this covers the
+    direct ``python launch.py`` path and the in-app relaunch as a safety net.
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("_MA_NATIVE_ARM64") == "1":
+        return
+    if os.uname().machine != "x86_64":
+        return                       # already running arm64
+    try:
+        translated = subprocess.run(
+            ["sysctl", "-n", "sysctl.proc_translated"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        translated = ""
+    if translated != "1":
+        return                       # genuine Intel Mac: an arm64 slice cannot run
+    os.environ["_MA_NATIVE_ARM64"] = "1"
+    try:
+        os.execvp("arch", ["arch", "-arm64", sys.executable, *sys.argv])
+    except Exception:
+        pass                         # best effort: fall through if arch is missing
+
+
 def main():
     global UV
 
+    _reexec_native_arm64()   # ensure native arm64 before any venv / uv work
     os.chdir(Path(__file__).parent)
     _ensure_venv()   # re-execs into .venv if not already running inside it
 
@@ -1000,6 +1084,31 @@ def main():
         _empty_pc.mkdir(parents=True, exist_ok=True)
         os.environ["PKG_CONFIG_LIBDIR"] = str(_empty_pc)
         os.environ["PKG_CONFIG_PATH"] = ""
+
+        # Clear any x86_64-poisoned uv interpreter cache (once per venv). uv caches
+        # each interpreter's wheel-tag set keyed by the (universal2) framework
+        # python. A prior x86_64 run - e.g. under Rosetta before the arm64 re-exec
+        # in launch.command existed - caches an x86_64 tag set that then persists
+        # globally (it survives deleting this folder, since it is keyed by the
+        # shared framework python) and makes uv pick x86_64 wheels: mlx (arm64-only)
+        # goes unsatisfiable and torch drops to its last x86_64 build. Clearing it
+        # forces uv to re-probe the interpreter natively as arm64. Cheap (re-probe
+        # is instant) and the downloaded wheels in the archive cache are untouched.
+        _cache_marker = VENV_DIR / ".uv-interp-cache-cleared"
+        if not _cache_marker.exists():
+            try:
+                _uv_cache = subprocess.run(
+                    [UV, "cache", "dir"], capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+                if _uv_cache:
+                    for _interp in Path(_uv_cache).glob("interpreter-*"):
+                        shutil.rmtree(_interp, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                _cache_marker.write_text("done\n")
+            except Exception:
+                pass
 
     # PyTorch - only install/replace when the installed variant doesn't match
     installed_build = _torch_build()   # e.g. "cu126", "cpu", or "" (not installed)
