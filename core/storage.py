@@ -178,6 +178,18 @@ def init_db() -> None:
                 attachments     TEXT DEFAULT NULL,
                 tool_calls      TEXT DEFAULT NULL
             )""",
+            # AI-generated chapters: high-level topic markers per session.
+            # start_time is seconds from recording start (same scale as segments).
+            """CREATE TABLE IF NOT EXISTS chapters (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                start_time REAL NOT NULL DEFAULT 0,
+                title      TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_chapters_session ON chapters(session_id)",
+            # Per-session chapters system prompt override (NULL = use global/default)
+            "ALTER TABLE sessions ADD COLUMN chapters_system_prompt TEXT DEFAULT NULL",
         ]:
             try:
                 conn.execute(migration)
@@ -697,6 +709,25 @@ def set_session_summary_prompt(session_id: str, prompt: str | None) -> None:
     with _conn() as conn:
         conn.execute(
             "UPDATE sessions SET summary_system_prompt = ? WHERE id = ?",
+            (prompt, session_id),
+        )
+
+
+def get_session_chapters_prompt(session_id: str) -> str | None:
+    """Return the per-session chapters system prompt override, or None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT chapters_system_prompt FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return row["chapters_system_prompt"] if row else None
+
+
+def set_session_chapters_prompt(session_id: str, prompt: str | None) -> None:
+    """Store a per-session chapters system prompt override. Pass None to clear."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET chapters_system_prompt = ? WHERE id = ?",
             (prompt, session_id),
         )
 
@@ -1267,6 +1298,12 @@ def get_session(session_id: str) -> dict | None:
             (session_id,),
         ).fetchall()
 
+        chapters = conn.execute(
+            "SELECT id, start_time, title FROM chapters WHERE session_id = ? "
+            "ORDER BY start_time, id",
+            (session_id,),
+        ).fetchall()
+
     notes_payload = None
     if row["notes"]:
         try:
@@ -1292,6 +1329,10 @@ def get_session(session_id: str) -> dict | None:
         "speaker_profiles": [
             {"speaker_key": r["speaker_key"], "name": r["name"], "color": r["color"]}
             for r in speaker_labels
+        ],
+        "chapters": [
+            {"id": r["id"], "start_time": r["start_time"], "title": r["title"]}
+            for r in chapters
         ],
         "notes": notes_payload,
     }
@@ -1357,6 +1398,76 @@ def save_summary(session_id: str, content: str) -> None:
             "INSERT INTO summaries (session_id, content, created_at) VALUES (?, ?, ?)",
             (session_id, content, _now()),
         )
+
+
+# ── Chapters ──────────────────────────────────────────────────────────────────
+
+def get_chapters(session_id: str) -> list[dict]:
+    """Return a session's chapters ordered by timestamp: [{id, start_time, title}]."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, start_time, title FROM chapters WHERE session_id = ? "
+            "ORDER BY start_time, id",
+            (session_id,),
+        ).fetchall()
+    return [{"id": r["id"], "start_time": r["start_time"], "title": r["title"]} for r in rows]
+
+
+def replace_chapters(session_id: str, chapters: list[dict]) -> list[dict]:
+    """Replace all chapters for a session (delete-all + bulk insert).
+
+    *chapters* is a list of {start_time, title}. Returns the freshly stored rows
+    with their new ids, ordered by timestamp.
+    """
+    now = _now()
+    with _conn() as conn:
+        conn.execute("DELETE FROM chapters WHERE session_id = ?", (session_id,))
+        for ch in chapters:
+            title = (ch.get("title") or "").strip()
+            if not title:
+                continue
+            conn.execute(
+                "INSERT INTO chapters (session_id, start_time, title, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, float(ch.get("start_time") or 0.0), title, now),
+            )
+    return get_chapters(session_id)
+
+
+def add_chapter(session_id: str, start_time: float, title: str) -> dict:
+    """Insert a single chapter. Returns the stored row {id, start_time, title}."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO chapters (session_id, start_time, title, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, float(start_time or 0.0), title.strip(), _now()),
+        )
+        cid = cur.lastrowid
+    return {"id": cid, "start_time": float(start_time or 0.0), "title": title.strip()}
+
+
+def update_chapter_title(chapter_id: int, title: str) -> None:
+    """Rename a chapter."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE chapters SET title = ? WHERE id = ?",
+            (title.strip(), chapter_id),
+        )
+
+
+def delete_chapter(chapter_id: int) -> None:
+    """Delete a single chapter."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM chapters WHERE id = ?", (chapter_id,))
+
+
+def chapter_belongs_to(chapter_id: int) -> str | None:
+    """Return the session_id owning a chapter, or None if it doesn't exist."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT session_id FROM chapters WHERE id = ?", (chapter_id,)
+        ).fetchone()
+    return row["session_id"] if row else None
 
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
@@ -1672,7 +1783,7 @@ def export_session_data(session_id: str, include: set[str] | None = None) -> dic
     Media files (audio/video) are handled by the caller since they are large
     binary files that go straight into the zip.
     """
-    all_cats = {"metadata", "transcription", "summary", "chat", "speakers", "speaker_embeddings", "notes"}
+    all_cats = {"metadata", "transcription", "summary", "chapters", "chat", "speakers", "speaker_embeddings", "notes"}
     cats = all_cats if include is None else (include & all_cats)
 
     with _conn() as conn:
@@ -1720,6 +1831,14 @@ def export_session_data(session_id: str, include: set[str] | None = None) -> dic
                 (session_id,),
             ).fetchone()
             pkg["summary"] = srow["content"] if srow else ""
+
+        if "chapters" in cats:
+            chapters = conn.execute(
+                "SELECT start_time, title FROM chapters WHERE session_id = ? "
+                "ORDER BY start_time, id",
+                (session_id,),
+            ).fetchall()
+            pkg["chapters"] = [dict(c) for c in chapters]
 
         if "chat" in cats:
             msgs = conn.execute(
@@ -1814,6 +1933,17 @@ def import_session_data(pkg: dict) -> str:
             conn.execute(
                 "INSERT INTO summaries (session_id, content, created_at) VALUES (?, ?, ?)",
                 (sid, summary, now),
+            )
+
+        # Chapters (time-anchored topic markers)
+        for ch in pkg.get("chapters", []):
+            title = (ch.get("title") or "").strip()
+            if not title:
+                continue
+            conn.execute(
+                "INSERT INTO chapters (session_id, start_time, title, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (sid, float(ch.get("start_time") or 0.0), title, now),
             )
 
         # Chat messages

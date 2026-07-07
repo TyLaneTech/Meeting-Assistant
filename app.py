@@ -146,6 +146,9 @@ _state: dict = {
     "is_reanalyzing": False,
     "summary_generating": False,   # True while any _run_summary call is executing
     "summary_manual_pending": False,  # True when /api/summarize was triggered; clears when it runs
+    "pending_chapter_segments": 0,  # segments since last auto-chapters run
+    "last_chapter_gen_at": 0.0,     # monotonic time of last auto-chapters run (min-gap throttle)
+    "chapters_generating": False,   # True while any _run_chapters call is executing
     "speaker_audio_accum":    {},  # speaker_key → {"audio": np.ndarray, "total_sec": float}
     "speaker_emb_counts":     {},  # speaker_key → int (embeddings extracted this session)
     "fingerprint_dismissals": {},  # speaker_key → set[global_id] (per-key "not now")
@@ -160,6 +163,7 @@ _state: dict = {
 }
 _state_lock = threading.Lock()
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
+_chapters_lock = threading.Lock()  # serializes chapter runs; prevents auto/manual overlap
 _recording_cleanup_done = threading.Event()   # signalled when stop_recording cleanup finishes
 _recording_cleanup_done.set()                 # initially "done" (no cleanup pending)
 _screen_recorder = ScreenRecorder()
@@ -175,6 +179,12 @@ _startup_init_lock = threading.Lock()
 _startup_init_started = False
 
 AUTO_SUMMARY_EVERY = 6  # trigger summary after this many new segments
+# Auto-chapters cadence. Chapters are coarser than summaries, so they run less
+# often: only after BOTH enough new segments AND a minimum wall-clock gap have
+# elapsed since the last run. This is what stops chapters from being added "too
+# frequently just because you can".
+AUTO_CHAPTERS_EVERY = 12          # min new segments since last chapters run
+AUTO_CHAPTERS_MIN_GAP_SEC = 90.0  # min seconds between auto-chapters runs
 _CUSTOM_SPEAKER_PREFIX = "custom:"
 
 # Reserved speaker key for microphone audio. When the "mic is me" feature is on,
@@ -390,6 +400,80 @@ def _build_session_meta(
     }
 
 
+# ── Chapter helpers ───────────────────────────────────────────────────────────
+
+def _parse_ts_to_seconds(ts) -> float | None:
+    """Parse a transcript-style timestamp ('M:SS', 'H:MM:SS', or bare seconds).
+
+    Returns seconds as a float, or None if it can't be parsed.
+    """
+    if ts is None:
+        return None
+    ts = str(ts).strip().strip("[]").strip()
+    if not ts:
+        return None
+    try:
+        if ":" in ts:
+            secs = 0.0
+            for part in ts.split(":"):
+                secs = secs * 60 + float(part)
+            return secs
+        return float(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _snap_to_segment(seconds: float, seg_times: list[float]) -> float:
+    """Snap a timestamp to the nearest transcript segment start_time.
+
+    Guarantees chapter ticks land on a real spoken moment (and seek is exact).
+    Falls back to the raw value when there are no segment times.
+    """
+    if not seg_times:
+        return max(0.0, seconds)
+    return min(seg_times, key=lambda t: abs(t - seconds))
+
+
+def _prepare_chapters(raw: list[dict], seg_times: list[float]) -> list[dict]:
+    """Turn AI output [{timestamp,title}] into stored rows [{start_time,title}].
+
+    Parses timestamps, snaps them to segment boundaries, drops unparseable or
+    empty entries, de-duplicates by snapped time, and sorts chronologically.
+    """
+    prepared: list[dict] = []
+    seen: set[float] = set()
+    for item in raw or []:
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        secs = _parse_ts_to_seconds(item.get("timestamp"))
+        if secs is None:
+            continue
+        snapped = round(_snap_to_segment(secs, seg_times), 3)
+        if snapped in seen:
+            continue
+        seen.add(snapped)
+        prepared.append({"start_time": snapped, "title": title})
+    prepared.sort(key=lambda c: c["start_time"])
+    return prepared
+
+
+def _chapters_for_meta(session_id: str) -> list[dict]:
+    """Chapters formatted for the AI meta block: [{timestamp:'M:SS', title}]."""
+    out = []
+    try:
+        for ch in storage.get_chapters(session_id):
+            out.append({"timestamp": _fmt_time(ch["start_time"]), "title": ch["title"]})
+    except Exception:
+        pass
+    return out
+
+
+def _segment_times(segments: list[dict]) -> list[float]:
+    """Sorted list of segment start_times, for snapping chapter timestamps."""
+    return sorted((s.get("start_time", 0) or 0) for s in segments)
+
+
 # ── Noise / filler detection ──────────────────────────────────────────────────
 
 _NOISE_LABEL = "[Noise]"
@@ -538,6 +622,7 @@ def _on_segment(
             _state["quiet_prompt_armed"] = True
 
         _state["pending_segments"] += 1
+        _state["pending_chapter_segments"] += 1
         should_summarize = (
             settings.get("auto_summary", True)
             and _state["pending_segments"] >= AUTO_SUMMARY_EVERY
@@ -559,6 +644,30 @@ def _on_segment(
                 is_live=True,
                 custom_prompt=custom_prompt,
                 current_summary=existing_summary,
+            )
+
+        # Auto-chapters: coarser cadence than summaries - gated on BOTH a segment
+        # count and a minimum elapsed gap so chapters aren't added too often.
+        should_gen_chapters = (
+            settings.get("chapters_auto", True)
+            and _state["pending_chapter_segments"] >= AUTO_CHAPTERS_EVERY
+            and (time.monotonic() - _state["last_chapter_gen_at"]) >= AUTO_CHAPTERS_MIN_GAP_SEC
+            and not _state["is_reanalyzing"]
+            and not _state["chapters_generating"]
+        )
+        if should_gen_chapters:
+            _state["pending_chapter_segments"] = 0
+            _state["last_chapter_gen_at"] = time.monotonic()
+            ch_transcript = _build_transcript(
+                _state["segments"], _state["speaker_labels"]
+            )
+            ch_seg_times = _segment_times(_state["segments"])
+            ch_meta = _build_session_meta(
+                _state["segments"],
+                _state["speaker_labels"],
+                is_live=True,
+                custom_prompt=_state["custom_prompt"],
+                current_summary=_state["summary"],
             )
 
     if merged and merge_seg_id is not None:
@@ -593,6 +702,14 @@ def _on_segment(
         threading.Thread(
             target=_run_summary,
             args=(sid, existing_summary, new_transcript, new_seg_count, custom_prompt, meta),
+            daemon=True,
+        ).start()
+
+    if should_gen_chapters:
+        threading.Thread(
+            target=_run_chapters,
+            args=(sid, ch_transcript, ch_seg_times, ch_meta),
+            kwargs={"is_auto": True},
             daemon=True,
         ).start()
 
@@ -637,6 +754,10 @@ def _run_summary(
                 existing_summary = _state["summary"]
             if is_active:
                 _state["summary_generating"] = True
+
+        # Feed the current chapter outline into the summary's context so it is
+        # aware of the meeting's high-level structure.
+        meta = {**(meta or {}), "chapters": _chapters_for_meta(session_id)}
 
         mode = "generating" if not existing_summary else "updating"
         _push("summary_busy", {"busy": True, "mode": mode, "session_id": session_id})
@@ -700,6 +821,65 @@ def _run_summary(
             _push("summary_busy", {"busy": False, "session_id": session_id})
             # Refresh semantic embedding after summary (content is most complete now)
             update_session_embedding(session_id)
+
+
+def _run_chapters(
+    session_id: str,
+    transcript: str,
+    seg_times: list[float],
+    meta: dict | None = None,
+    is_auto: bool = False,
+) -> None:
+    """Generate chapters for a session and broadcast them via SSE (full replace).
+
+    Serialized via _chapters_lock so auto and manual runs never overlap.
+
+    is_auto=True  (segment-triggered while live): passes the already-established
+                  chapters to the model so early ones stay stable; skips if the
+                  session is no longer active, and never wipes to an empty list.
+    is_auto=False (manual /api/chapters/generate): always runs, full rebuild;
+                  an empty result clears chapters.
+    """
+    with _chapters_lock:
+        with _state_lock:
+            is_active = _state["session_id"] == session_id
+            if is_auto and not is_active:
+                return
+            if is_active:
+                _state["chapters_generating"] = True
+
+        _push("chapters_busy", {"busy": True, "session_id": session_id})
+        try:
+            existing = _chapters_for_meta(session_id) if is_auto else None
+            cp, cm = _resolve_tool_ai("chapters")
+            # Effective system prompt: session override > global > built-in.
+            sess_sp = storage.get_session_chapters_prompt(session_id)
+            global_sp = settings.get("chapters_system_prompt") or None
+            effective_sp = sess_sp or global_sp
+            granularity = settings.get("chapters_granularity", "balanced")
+
+            raw = ai.generate_chapters(
+                transcript,
+                meta=meta,
+                system_prompt=effective_sp,
+                existing=existing,
+                granularity=granularity,
+                provider=cp, model=cm,
+            )
+            prepared = _prepare_chapters(raw, seg_times)
+            # A live auto-run that yields nothing keeps the existing chapters
+            # rather than wiping them; a manual run is authoritative.
+            if not prepared and is_auto:
+                return
+            chapters = storage.replace_chapters(session_id, prepared)
+            _push("chapters_updated", {"session_id": session_id, "chapters": chapters})
+        except Exception as e:
+            log.warn("chapters", f"generation run failed: {e}")
+        finally:
+            with _state_lock:
+                if _state["session_id"] == session_id:
+                    _state["chapters_generating"] = False
+            _push("chapters_busy", {"busy": False, "session_id": session_id})
 
 
 def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None:
@@ -1354,6 +1534,7 @@ def events():
                     "segments":        segs,
                     "speaker_profiles": sess.get("speaker_profiles", []),
                     "summary":         sess.get("summary", "") or "",
+                    "chapters":        sess.get("chapters", []),
                 }
                 q.put(f"event: replay\ndata: {json.dumps(replay_payload)}\n\n")
         except Exception:
@@ -1793,6 +1974,9 @@ def start_recording():
             "chat_history": existing_chat,
             "pending_segments": 0,
             "summarized_seg_count": existing_seg_count,
+            "pending_chapter_segments": 0,
+            "last_chapter_gen_at": 0.0,
+            "chapters_generating": False,
             "audio_capture": capture,
             "speaker_labels": existing_labels,
             "speaker_audio_accum":    {},
@@ -4888,6 +5072,9 @@ def chat():
             current_summary=sess.get("summary", ""),
         )
 
+    # Feed the chapter outline into the chat context so answers are structure-aware.
+    meta = {**(meta or {}), "chapters": _chapters_for_meta(session_id)}
+
     # Build the new user message (possibly multimodal)
     user_entry = _build_chat_entry("user", question, attachments or None)
     chat_history.append(user_entry)
@@ -5107,6 +5294,142 @@ def api_set_session_summary_prompt(sid):
     if prompt is not None and not isinstance(prompt, str):
         return jsonify({"error": "prompt must be a string or null"}), 400
     storage.set_session_summary_prompt(sid, prompt)
+    return jsonify({"ok": True, "session_prompt": prompt})
+
+
+# ── Chapters (AI topic markers) ─────────────────────────────────────────────
+
+@app.route("/api/chapters/generate", methods=["POST"])
+def api_generate_chapters():
+    """Manually (re)generate a session's chapters - full replace, on a thread."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+
+    # Live session → in-memory segments; otherwise load from DB (mirrors
+    # /api/summarize so chapters work during and after a recording).
+    with _state_lock:
+        active_sid = _state["session_id"]
+        if session_id == active_sid:
+            segments = list(_state["segments"])
+            labels = dict(_state["speaker_labels"])
+            transcript = _build_transcript(segments, labels)
+            seg_times = _segment_times(segments)
+            meta = _build_session_meta(
+                segments, labels,
+                is_live=_state["is_recording"],
+                custom_prompt=_state["custom_prompt"],
+                current_summary=_state["summary"],
+            )
+        else:
+            transcript = None
+            seg_times = None
+            meta = None
+
+    if transcript is None:
+        sess = storage.get_session(session_id)
+        if not sess:
+            return jsonify({"error": "Session not found"}), 404
+        labels = sess.get("speaker_labels") or {}
+        transcript = _build_transcript(sess["segments"], labels)
+        seg_times = _segment_times(sess["segments"])
+        meta = _build_session_meta(
+            sess["segments"], labels,
+            session_title=sess.get("title", ""),
+            is_live=False,
+            started_at=sess.get("started_at", ""),
+            ended_at=sess.get("ended_at", ""),
+            current_summary=sess.get("summary", ""),
+        )
+
+    if not transcript.strip():
+        return jsonify({"error": "No transcript to generate chapters from"}), 400
+
+    threading.Thread(
+        target=_run_chapters,
+        args=(session_id, transcript, seg_times, meta),
+        kwargs={"is_auto": False},
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sessions/<sid>/chapters", methods=["GET"])
+def api_get_chapters(sid):
+    """Return a session's chapters ordered by timestamp."""
+    return jsonify({"chapters": storage.get_chapters(sid)})
+
+
+@app.route("/api/sessions/<sid>/chapters", methods=["POST"])
+def api_add_chapter(sid):
+    """Add a single chapter (manual, e.g. at the current playhead)."""
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    try:
+        start_time = max(0.0, float(data.get("start_time")))
+    except (TypeError, ValueError):
+        return jsonify({"error": "start_time must be a number"}), 400
+    storage.add_chapter(sid, start_time, title)
+    chapters = storage.get_chapters(sid)
+    _push("chapters_updated", {"session_id": sid, "chapters": chapters})
+    return jsonify({"ok": True, "chapters": chapters})
+
+
+@app.route("/api/sessions/<sid>/chapters/<int:cid>", methods=["PATCH"])
+def api_update_chapter(sid, cid):
+    """Rename a chapter."""
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    if storage.chapter_belongs_to(cid) != sid:
+        return jsonify({"error": "Chapter not found"}), 404
+    storage.update_chapter_title(cid, title)
+    chapters = storage.get_chapters(sid)
+    _push("chapters_updated", {"session_id": sid, "chapters": chapters})
+    return jsonify({"ok": True, "chapters": chapters})
+
+
+@app.route("/api/sessions/<sid>/chapters/<int:cid>", methods=["DELETE"])
+def api_delete_chapter(sid, cid):
+    """Delete a chapter."""
+    if storage.chapter_belongs_to(cid) != sid:
+        return jsonify({"error": "Chapter not found"}), 404
+    storage.delete_chapter(cid)
+    chapters = storage.get_chapters(sid)
+    _push("chapters_updated", {"session_id": sid, "chapters": chapters})
+    return jsonify({"ok": True, "chapters": chapters})
+
+
+@app.route("/api/chapters/default-prompt", methods=["GET"])
+def api_chapters_default_prompt():
+    """Return the built-in default chapters system prompt (read-only)."""
+    return jsonify({"prompt": AIAssistant._SYSTEM_CHAPTERS})
+
+
+@app.route("/api/sessions/<sid>/chapters-prompt", methods=["GET"])
+def api_get_session_chapters_prompt(sid):
+    """Return all three prompt layers so the UI can show what's in effect."""
+    return jsonify({
+        "session_prompt": storage.get_session_chapters_prompt(sid),
+        "global_prompt":  settings.get("chapters_system_prompt") or "",
+        "default_prompt": AIAssistant._SYSTEM_CHAPTERS,
+    })
+
+
+@app.route("/api/sessions/<sid>/chapters-prompt", methods=["PUT"])
+def api_set_session_chapters_prompt(sid):
+    """Store a per-session chapters prompt override. Empty string or null clears."""
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt")
+    if isinstance(prompt, str) and prompt.strip() == "":
+        prompt = None
+    if prompt is not None and not isinstance(prompt, str):
+        return jsonify({"error": "prompt must be a string or null"}), 400
+    storage.set_session_chapters_prompt(sid, prompt)
     return jsonify({"ok": True, "session_prompt": prompt})
 
 
@@ -6316,6 +6639,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 # only the transcript is being recomputed.
                 _state["pending_segments"] = 0
                 _state["summarized_seg_count"] = 0
+                _state["pending_chapter_segments"] = 0
                 _state["speaker_labels"] = {}
                 # Reset fingerprint accumulators for fresh collection
                 _state["speaker_audio_accum"] = {}
@@ -6422,6 +6746,7 @@ def reanalyze_session(session_id: str):
         _state["segments"] = []
         _state["pending_segments"] = 0
         _state["summarized_seg_count"] = 0
+        _state["pending_chapter_segments"] = 0
         _state["speaker_labels"] = {}
 
     body = request.get_json(silent=True) or {}
@@ -6503,6 +6828,7 @@ def upload_session():
         _state["segments"] = []
         _state["pending_segments"] = 0
         _state["summarized_seg_count"] = 0
+        _state["pending_chapter_segments"] = 0
         _state["speaker_labels"] = {}
 
     threading.Thread(

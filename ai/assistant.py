@@ -77,6 +77,75 @@ _PATCH_TOOL = {
     },
 }
 
+# Tool definition for Anthropic structured chapter output. A flat list of
+# time-anchored topic markers. Timestamps are returned as the transcript's own
+# [M:SS]/[H:MM:SS] strings so the model never has to do second arithmetic; the
+# caller parses + snaps them to real segment boundaries.
+_CHAPTERS_TOOL = {
+    "name": "set_chapters",
+    "description": (
+        "Return the ordered list of chapters (high-level topic markers) for the "
+        "meeting. Each chapter marks where a distinct subject or agenda item "
+        "begins. Return an empty list only if the transcript has no discernible "
+        "structure yet."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "chapters": {
+                "type": "array",
+                "description": "Chapters in chronological order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "timestamp": {
+                            "type": "string",
+                            "description": (
+                                "The transcript timestamp where this topic begins, "
+                                "copied verbatim from a transcript line, e.g. '4:12' "
+                                "or '1:03:47'. Must be one of the timestamps that "
+                                "actually appears in the transcript."
+                            ),
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "A concise, descriptive chapter title in Title Case "
+                                "(roughly 2-6 words) naming the subject discussed, "
+                                "e.g. 'Q3 Roadmap Review' or 'Budget Concerns'."
+                            ),
+                        },
+                    },
+                    "required": ["timestamp", "title"],
+                },
+            }
+        },
+        "required": ["chapters"],
+        "additionalProperties": False,
+    },
+}
+
+# OpenAI Responses json_schema mirror of _CHAPTERS_TOOL.input_schema.
+_CHAPTERS_OAI_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "chapters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "timestamp": {"type": "string"},
+                    "title": {"type": "string"},
+                },
+                "required": ["timestamp", "title"],
+            },
+        },
+    },
+    "required": ["chapters"],
+}
+
 _SCREENSHOT_TOOL = {
     "name": "get_screenshot",
     "description": (
@@ -300,6 +369,18 @@ def _format_meta_block(meta: dict | None) -> str:
     if meta.get("custom_prompt"):
         lines.append(f"\n  User-provided context: {meta['custom_prompt']}")
 
+    # Chapters: a high-level topic outline of the meeting, if any exist. Gives
+    # the summary/chat models a scaffold of what was discussed when.
+    chapters = meta.get("chapters")
+    if chapters:
+        lines.append("\n  Chapters (topic outline):")
+        for ch in chapters:
+            ts = ch.get("timestamp") or ""
+            title = (ch.get("title") or "").strip()
+            if not title:
+                continue
+            lines.append(f"    - [{ts}] {title}" if ts else f"    - {title}")
+
     return "\n".join(lines)
 
 
@@ -386,6 +467,55 @@ class AIAssistant:
         "- Prefer nested structure over long flat lists when topics have sub-points\n"
         "- Always write in English regardless of any foreign words or phrases in the transcript"
     )
+
+    _SYSTEM_CHAPTERS = (
+        "You divide a meeting transcript into chapters: a short, ordered list of "
+        "the high-level talking points or subjects discussed, each anchored to the "
+        "moment it begins.\n\n"
+        "## What a chapter is\n"
+        "- A chapter marks where a distinct topic, agenda item, or phase of the "
+        "conversation STARTS. Think of the table of contents a listener would want "
+        "to jump around with.\n"
+        "- Chapters are about SUBJECTS, not speakers or individual sentences. Do "
+        "not create a chapter every time the speaker changes.\n\n"
+        "## Transcript format\n"
+        "Each line follows: [M:SS] [Speaker Name] spoken text\n"
+        "- Timestamps mark when each segment was spoken (use these exact values)\n"
+        "- The transcript is machine-generated, so expect minor errors - interpret charitably\n\n"
+        "## How to choose chapters\n"
+        "- Only break on a genuine shift in subject matter - a new agenda item, a "
+        "clear pivot in discussion, a decision block, a Q&A turn, etc.\n"
+        "- Do NOT over-segment. Resist adding a chapter just because time has "
+        "passed; brief tangents and back-and-forth within one topic stay in one "
+        "chapter.\n"
+        "- The first chapter should start at or near the beginning (e.g. an "
+        "intro/opening), unless the meeting opens mid-topic.\n"
+        "- Space chapters out sensibly for the meeting's length. A short meeting "
+        "may have just 2-4 chapters; a long one more - but quality over quantity.\n\n"
+        "## Titles\n"
+        "- Concise, descriptive, Title Case, roughly 2-6 words.\n"
+        "- Name the subject, don't summarize the discussion: 'Q3 Roadmap Review', "
+        "'Budget Concerns', 'Hiring Plan', 'Next Steps' - not full sentences.\n\n"
+        "## Output\n"
+        "- Return each chapter's timestamp copied verbatim from a real transcript "
+        "line, plus its title. Chapters must be in chronological order.\n"
+        "- Always write titles in English regardless of the transcript language."
+    )
+
+    _CHAPTERS_GRANULARITY_HINT = {
+        "coarse": (
+            "Granularity: COARSE. Favour a small number of broad chapters - only "
+            "the major phases or agenda items. Merge related sub-topics together."
+        ),
+        "balanced": (
+            "Granularity: BALANCED. Aim for a natural table of contents - one "
+            "chapter per genuine topic, neither too sparse nor too granular."
+        ),
+        "fine": (
+            "Granularity: FINE. Capture finer topic shifts and sub-topics, but "
+            "still never break on mere speaker changes or single sentences."
+        ),
+    }
 
     def __init__(self, provider: str = "anthropic", model: str = "claude-sonnet-4-6") -> None:
         self.provider = provider
@@ -680,6 +810,85 @@ class AIAssistant:
 
         log.info("summary", f"Updated: {updated}")
         return self._build_summary(sections)
+
+    def generate_chapters(
+        self,
+        transcript: str,
+        meta: dict | None = None,
+        system_prompt: str | None = None,
+        existing: list[dict] | None = None,
+        granularity: str = "balanced",
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> list[dict]:
+        """Generate high-level topic chapters from a transcript.
+
+        Returns ``[{"timestamp": "M:SS", "title": str}, ...]`` in chronological
+        order. Timestamps are the transcript's own strings; the caller parses
+        them and snaps to real segment boundaries. Returns [] on failure or an
+        empty transcript.
+
+        ``system_prompt`` overrides the built-in ``_SYSTEM_CHAPTERS`` when
+        provided. ``existing`` (list of {timestamp, title}) is supplied on live
+        auto-runs so the model keeps already-established early chapters stable.
+        """
+        if not transcript.strip():
+            return []
+
+        system = (
+            system_prompt.strip()
+            if system_prompt and system_prompt.strip()
+            else self._SYSTEM_CHAPTERS
+        )
+        system += "\n\n" + self._CHAPTERS_GRANULARITY_HINT.get(
+            granularity, self._CHAPTERS_GRANULARITY_HINT["balanced"]
+        )
+        meta_block = _format_meta_block(meta)
+        if meta_block:
+            system += f"\n\n{meta_block}"
+
+        existing_note = ""
+        if existing:
+            listed = "\n".join(
+                f"    - [{c.get('timestamp', '')}] {c.get('title', '')}"
+                for c in existing if c.get("title")
+            )
+            if listed:
+                existing_note = (
+                    "\n\nChapters already established earlier in this live meeting - "
+                    "keep these stable (same timestamps and titles) and only add or "
+                    "refine chapters for the later part of the transcript:\n" + listed
+                )
+
+        prompt = (
+            "Divide the following meeting transcript into chapters, following the "
+            "instructions above. Use only timestamps that actually appear in the "
+            f"transcript.{existing_note}\n\n"
+            f"Transcript:\n---\n{transcript}\n---"
+        )
+
+        try:
+            raw = self._complete_structured(
+                system, prompt,
+                provider=provider, model=model,
+                tool=_CHAPTERS_TOOL,
+                oai_schema=_CHAPTERS_OAI_SCHEMA,
+                oai_schema_name="chapters",
+            )
+        except Exception as e:
+            log.warn("chapters", f"generation failed ({e})")
+            return []
+
+        items = raw.get("chapters", []) if isinstance(raw, dict) else []
+        out: list[dict] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ts = str(it.get("timestamp", "")).strip().strip("[]")
+            title = str(it.get("title", "")).strip()
+            if title:
+                out.append({"timestamp": ts, "title": title})
+        return out
 
     _SYSTEM_GLOBAL_QA = (
         "You are an intelligent meeting assistant with access to a library of "
@@ -1168,13 +1377,44 @@ class AIAssistant:
             return response.content[0].text.strip()
 
     def _complete_structured(self, system: str, prompt: str,
-                              provider: str | None = None, model: str | None = None) -> dict:
-        """Structured completion returning a dict with section arrays.
+                              provider: str | None = None, model: str | None = None,
+                              tool: dict | None = None,
+                              oai_schema: dict | None = None,
+                              oai_schema_name: str = "summary_patch",
+                              max_tokens: int = 1024) -> dict:
+        """Structured completion returning a dict enforced by a tool / JSON schema.
 
         Anthropic: uses tool use so the SDK enforces the schema.
-        OpenAI: uses json_object response format + prompt instructions.
-        Returns {} on empty or unparseable responses.
+        OpenAI: uses the Responses API json_schema text format.
+        Defaults to the summary-patch contract (``_PATCH_TOOL``); pass *tool* +
+        *oai_schema* to reuse the same plumbing for other structured outputs
+        (e.g. chapters). Returns {} on empty or unparseable responses.
         """
+        if tool is None:
+            tool = _PATCH_TOOL
+        if oai_schema is None:
+            # Strict json_schema mirror of _PATCH_TOOL.input_schema (needs
+            # additionalProperties:false on every nested object for OpenAI).
+            oai_schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "sections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name":    {"type": "string"},
+                                "action":  {"type": "string", "enum": ["append", "replace"]},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["name", "action", "content"],
+                        },
+                    },
+                },
+                "required": ["sections"],
+            }
         from core.network import warp_disconnect
         warp_disconnect()
         client, prov, mdl = self._resolve(provider, model)
@@ -1183,8 +1423,8 @@ class AIAssistant:
                 f"No {prov.title()} API key configured. Add it in Settings."
             )
         if prov == "openai":
-            # Responses API with a JSON-schema text format for the
-            # patch-summary contract. Mirrors _PATCH_TOOL.input_schema.
+            # Responses API with a JSON-schema text format that enforces the
+            # requested contract (defaults to the summary patch schema).
             response = client.responses.create(
                 model=mdl,
                 instructions=system,
@@ -1195,28 +1435,9 @@ class AIAssistant:
                 text={
                     "format": {
                         "type": "json_schema",
-                        "name": "summary_patch",
+                        "name": oai_schema_name,
                         "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "sections": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "additionalProperties": False,
-                                        "properties": {
-                                            "name":    {"type": "string"},
-                                            "action":  {"type": "string", "enum": ["append", "replace"]},
-                                            "content": {"type": "string"},
-                                        },
-                                        "required": ["name", "action", "content"],
-                                    },
-                                },
-                            },
-                            "required": ["sections"],
-                        },
+                        "schema": oai_schema,
                     },
                 },
             )
@@ -1225,11 +1446,11 @@ class AIAssistant:
         else:
             response = client.messages.create(
                 model=mdl,
-                max_tokens=1024,
+                max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
-                tools=[_PATCH_TOOL],
-                tool_choice={"type": "tool", "name": _PATCH_TOOL["name"]},
+                tools=[tool],
+                tool_choice={"type": "tool", "name": tool["name"]},
             )
             for block in response.content:
                 if block.type == "tool_use":

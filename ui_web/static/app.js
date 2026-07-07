@@ -3600,6 +3600,7 @@ function connectSSE(afterSegId = 0) {
         linkifyTimestamps(sumEl);
       }
     }
+    if (d.chapters) setSessionChapters(d.chapters);
   });
 
   src.addEventListener('summary_busy', e => {
@@ -3619,6 +3620,18 @@ function connectSSE(afterSegId = 0) {
     } else {
       badge.classList.add('hidden');
     }
+  });
+
+  src.addEventListener('chapters_updated', e => {
+    const d = JSON.parse(e.data);
+    if (d.session_id && d.session_id !== state.sessionId) return;
+    setSessionChapters(d.chapters || []);
+  });
+
+  src.addEventListener('chapters_busy', e => {
+    const d = JSON.parse(e.data);
+    if (d.session_id && d.session_id !== state.sessionId) return;
+    _setChaptersBusy(!!d.busy);
   });
 
   src.addEventListener('summary_start', e => {
@@ -9722,6 +9735,7 @@ function applyTranscriptFilter() {
   _visibleRangesCache = null;  // filter changed - invalidate cached ranges
   _tnHighlightMatches();
   _refreshMinimap(true);
+  renderTranscriptChapterHeadings();  // re-place headings + hide empty sections
 }
 
 // The time-range slider fires dozens-to-hundreds of 'input' events per drag, and
@@ -11020,6 +11034,7 @@ function initPlayback(sessionId) {
   _playbackAudio.onloadedmetadata = () => {
     document.getElementById('playback-duration').textContent = fmtTime(_playbackAudio.duration);
     document.getElementById('playback-seek').max = _playbackAudio.duration || 100;
+    renderChapterTicks();  // now that duration is known, place the chapter ticks
   };
 
   _playbackAudio.ontimeupdate = () => {
@@ -11055,6 +11070,7 @@ function destroyPlayback() {
   document.getElementById('playback-duration').textContent = '0:00';
   document.getElementById('playback-seek').value = 0;
   clearPlayingHighlight();
+  renderChapterTicks();  // _playbackActive is now false, so this clears the ticks
   destroyVideo();
 }
 
@@ -13185,6 +13201,7 @@ function _renderMinimap() {
     ctx.globalAlpha = 1.0;
     y += blockH + gap;
   }
+  renderMinimapChapters();  // overlay chapter markers on top of the segment blocks
 }
 
 /** Draw a rounded rectangle path. */
@@ -13956,6 +13973,408 @@ async function clearSessionSummaryPrompt() {
   } catch (e) {
     console.error('Failed to clear session summary prompt', e);
   }
+}
+
+/* ── Chapters (AI topic markers) ─────────────────────────────────────────── */
+
+let _chapters = [];                 // current session's chapters [{id, start_time, title}]
+let _chaptersModalOpen = false;
+let _chaptersBusy = false;
+let _chapterTicksWired = false;
+let _chapterTipEl = null;
+
+/** Set the current session's chapters and refresh every surface. */
+function setSessionChapters(list) {
+  _chapters = (Array.isArray(list) ? list.slice() : [])
+    .sort((a, b) => (a.start_time || 0) - (b.start_time || 0));
+  // Update each surface independently and isolate failures: a throw in one
+  // (e.g. the minimap when collapsed, or ticks before audio metadata loads)
+  // must never stop the transcript headings from re-rendering in real time.
+  try { renderTranscriptChapterHeadings(); } catch (e) { console.warn('[chapters] headings render failed', e); }
+  try { renderChapterTicks(); }              catch (e) { console.warn('[chapters] ticks render failed', e); }
+  try { renderMinimapChapters(); }           catch (e) { console.warn('[chapters] minimap render failed', e); }
+  if (_chaptersModalOpen) {
+    try { renderChaptersList(); } catch (e) { console.warn('[chapters] list render failed', e); }
+  }
+}
+
+/* ── Modal ─────────────────────────────────────────────────────────────── */
+
+function openChaptersManager() {
+  _chaptersModalOpen = true;
+  document.getElementById('chapters-overlay').classList.remove('hidden');
+  _chaptersSwitchTab('list');
+  renderChaptersList();
+  loadChaptersTuning();
+}
+
+function closeChaptersManager() {
+  _chaptersModalOpen = false;
+  document.getElementById('chapters-overlay').classList.add('hidden');
+}
+
+function _chaptersSwitchTab(name) {
+  const overlay = document.getElementById('chapters-overlay');
+  if (!overlay) return;
+  overlay.querySelectorAll('.chapters-tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.chTab === name));
+  overlay.querySelectorAll('.chapters-body').forEach(b => {
+    b.hidden = (b.dataset.chView !== name);
+  });
+}
+
+function renderChaptersList() {
+  const list = document.getElementById('chapters-list');
+  if (!list) return;
+  const countEl = document.getElementById('chapters-count');
+  if (countEl) countEl.textContent = _chapters.length
+    ? `${_chapters.length} chapter${_chapters.length === 1 ? '' : 's'}` : '';
+  const addBtn = document.getElementById('chapters-add-btn');
+  if (addBtn) {
+    addBtn.disabled = !_playbackActive;
+    addBtn.title = _playbackActive
+      ? 'Add a chapter at the current playback position'
+      : 'Play the recording to add a chapter at a position';
+  }
+  if (!_chapters.length) {
+    list.innerHTML = `
+      <div class="chapters-empty">
+        <i class="fa-solid fa-bookmark chapters-empty-icon"></i>
+        <div class="chapters-empty-title">No chapters yet</div>
+        <div class="chapters-empty-sub">Generate topic markers from the transcript, or add them manually.</div>
+        <button type="button" class="chapters-btn chapters-btn-primary" onclick="regenerateChapters()">
+          <i class="fa-solid fa-wand-magic-sparkles"></i> Generate chapters
+        </button>
+      </div>`;
+    return;
+  }
+  list.innerHTML = _chapters.map(ch => `
+    <div class="chapters-row" data-cid="${ch.id}">
+      <button type="button" class="chapters-row-time" onclick="seekToTime(${ch.start_time})" title="Jump to this point">${escapeHtml(fmtTime(ch.start_time))}</button>
+      <input class="chapters-row-title" type="text" value="${escapeHtml(ch.title || '')}"
+             onblur="renameChapter(${ch.id}, this)"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}" />
+      <button type="button" class="chapters-row-del icon-btn" onclick="deleteChapter(${ch.id})" title="Delete chapter"><i class="fa-solid fa-trash-can"></i></button>
+    </div>`).join('');
+}
+
+async function regenerateChapters() {
+  if (!state.sessionId) { flashStatus('Open a session first'); return; }
+  _setChaptersBusy(true);
+  try {
+    const r = await fetch('/api/chapters/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: state.sessionId }),
+    }).then(r => r.json());
+    if (r.error) { _setChaptersBusy(false); flashStatus(r.error); }
+    // Success arrives asynchronously via chapters_busy / chapters_updated SSE.
+  } catch (_) {
+    _setChaptersBusy(false);
+    flashStatus('Chapter generation failed');
+  }
+}
+
+async function addChapterAtPlayhead() {
+  if (!state.sessionId || !_playbackActive) return;
+  const t = _playbackAudio.currentTime || 0;
+  const title = 'New chapter';
+  try {
+    const r = await fetch(`/api/sessions/${state.sessionId}/chapters`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start_time: t, title }),
+    }).then(r => r.json());
+    if (r.chapters) {
+      setSessionChapters(r.chapters);
+      // Focus the freshly-added row so the user can rename it immediately.
+      requestAnimationFrame(() => {
+        const rows = document.querySelectorAll('#chapters-list .chapters-row');
+        for (const row of rows) {
+          const inp = row.querySelector('.chapters-row-title');
+          if (inp && inp.value === title) { inp.focus(); inp.select(); break; }
+        }
+      });
+    }
+  } catch (_) { flashStatus('Could not add chapter'); }
+}
+
+async function renameChapter(cid, inputEl) {
+  const ch = _chapters.find(c => c.id === cid);
+  if (!ch) return;
+  const title = (inputEl.value || '').trim();
+  if (!title) { inputEl.value = ch.title || ''; return; }  // don't allow empty
+  if (title === ch.title) return;                          // no change
+  try {
+    const r = await fetch(`/api/sessions/${state.sessionId}/chapters/${cid}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }).then(r => r.json());
+    if (r.chapters) setSessionChapters(r.chapters);
+  } catch (_) { flashStatus('Could not rename chapter'); }
+}
+
+async function deleteChapter(cid) {
+  try {
+    const r = await fetch(`/api/sessions/${state.sessionId}/chapters/${cid}`, {
+      method: 'DELETE',
+    }).then(r => r.json());
+    if (r.chapters) setSessionChapters(r.chapters);
+  } catch (_) { flashStatus('Could not delete chapter'); }
+}
+
+function _setChaptersBusy(busy) {
+  _chaptersBusy = busy;
+  // Show the generating state on the Regenerate button itself so the header
+  // (title + description) never reflows. The button has a fixed min-width.
+  const regen = document.getElementById('chapters-regen-btn');
+  if (regen) {
+    regen.disabled = busy;
+    regen.innerHTML = busy
+      ? '<i class="fa-solid fa-spinner fa-spin"></i> Generating…'
+      : '<i class="fa-solid fa-wand-magic-sparkles"></i> Regenerate';
+  }
+  document.getElementById('chapters-btn')?.classList.toggle('busy', busy);
+}
+
+/* ── Playback-bar ticks + tooltip ────────────────────────────────────────── */
+
+function _ensureChapterTipWiring() {
+  if (_chapterTicksWired) return;
+  const layer = document.getElementById('playback-chapters');
+  if (!layer) return;
+  layer.addEventListener('mouseover', e => {
+    const tick = e.target.closest('.chapter-tick');
+    if (tick) _showChapterTip(tick, tick.dataset.label || '');
+  });
+  layer.addEventListener('mouseout', e => {
+    if (e.target.closest('.chapter-tick')) _hideChapterTip();
+  });
+  layer.addEventListener('click', e => {
+    const tick = e.target.closest('.chapter-tick');
+    if (!tick) return;
+    const t = parseFloat(tick.dataset.t);
+    if (isFinite(t)) seekToTime(t);
+  });
+  _chapterTicksWired = true;
+}
+
+function renderChapterTicks() {
+  const layer = document.getElementById('playback-chapters');
+  if (!layer) return;
+  const dur = _playbackAudio && _playbackAudio.duration;
+  if (!_playbackActive || !isFinite(dur) || dur <= 0 || !_chapters.length) {
+    layer.innerHTML = '';
+    return;
+  }
+  _ensureChapterTipWiring();
+  layer.innerHTML = _chapters.map(ch => {
+    const frac = Math.max(0, Math.min(1, (ch.start_time || 0) / dur));
+    // Align the tick to the slider-thumb centre: the thumb (12px) travels
+    // inset by 6px on each side, so map the fraction across (100% - 12px).
+    const label = `${fmtTime(ch.start_time)} · ${ch.title || ''}`;
+    return `<span class="chapter-tick" style="left:calc(6px + ${frac.toFixed(5)} * (100% - 12px))"
+              data-t="${ch.start_time}" data-label="${escapeHtml(label)}"></span>`;
+  }).join('');
+}
+
+function _showChapterTip(tick, label) {
+  if (!_chapterTipEl) {
+    _chapterTipEl = document.createElement('div');
+    _chapterTipEl.className = 'chapter-tip';
+    document.body.appendChild(_chapterTipEl);
+  }
+  _chapterTipEl.textContent = label;
+  _chapterTipEl.style.display = 'block';
+  const r = tick.getBoundingClientRect();
+  const tr = _chapterTipEl.getBoundingClientRect();
+  let left = r.left + r.width / 2 - tr.width / 2;
+  left = Math.max(6, Math.min(left, window.innerWidth - tr.width - 6));
+  _chapterTipEl.style.left = left + 'px';
+  _chapterTipEl.style.top = Math.max(6, r.top - tr.height - 8) + 'px';
+}
+
+function _hideChapterTip() {
+  if (_chapterTipEl) _chapterTipEl.style.display = 'none';
+}
+
+/* ── Minimap markers ─────────────────────────────────────────────────────── */
+
+function renderMinimapChapters() {
+  const container = document.getElementById('transcript-minimap');
+  if (!container) return;
+  container.querySelectorAll('.minimap-chapter').forEach(el => el.remove());
+  if (!_minimapActive || !_chapters.length || !_segmentTimes.length) return;
+  const transcript = document.getElementById('transcript');
+  if (!transcript) return;
+  const scrollH = transcript.scrollHeight;
+  const mapH = container.clientHeight;
+  if (scrollH <= 0 || mapH <= 0) return;
+  for (const ch of _chapters) {
+    let idx = -1;
+    for (let i = 0; i < _segmentTimes.length; i++) {
+      if (_segmentTimes[i].start <= (ch.start_time || 0)) idx = i; else break;
+    }
+    if (idx < 0) idx = 0;
+    const segEl = _segmentTimes[idx].el;
+    if (!segEl) continue;
+    const yPos = (segEl.offsetTop / scrollH) * mapH;
+    const marker = document.createElement('div');
+    marker.className = 'minimap-chapter';
+    marker.style.top = yPos + 'px';
+    marker.title = ch.title || '';
+    container.appendChild(marker);
+  }
+}
+
+/* ── Inline transcript headings ──────────────────────────────────────────── */
+
+function _makeChapterHeading(ch) {
+  const h = document.createElement('div');
+  h.className = 'transcript-chapter-heading';
+  h.dataset.chapterTime = ch.start_time;
+  h.title = 'Jump to chapter';
+  h.innerHTML = '<i class="fa-solid fa-bookmark tch-icon"></i>' +
+                '<span class="tch-title"></span><span class="tch-time"></span>';
+  h.querySelector('.tch-title').textContent = ch.title || '';
+  h.querySelector('.tch-time').textContent = fmtTime(ch.start_time);
+  h.addEventListener('click', () => seekToTime(ch.start_time));
+  return h;
+}
+
+/**
+ * Insert a pronounced heading into the transcript before the first segment at
+ * or after each chapter's timestamp. Idempotent: clears and re-places on every
+ * call, so it's safe to run after (re)render, chapter change, or filter change.
+ */
+function renderTranscriptChapterHeadings() {
+  const container = document.getElementById('transcript');
+  if (!container) return;
+  container.querySelectorAll('.transcript-chapter-heading').forEach(el => el.remove());
+  if (!_chapters.length) return;
+  const segs = container.querySelectorAll('.transcript-segment[data-start]');
+  if (!segs.length) return;
+
+  let ci = 0;
+  for (const seg of segs) {
+    const st = parseFloat(seg.dataset.start);
+    if (!isFinite(st)) continue;
+    while (ci < _chapters.length && (_chapters[ci].start_time || 0) <= st + 0.05) {
+      container.insertBefore(_makeChapterHeading(_chapters[ci]), seg);
+      ci++;
+    }
+    if (ci >= _chapters.length) break;
+  }
+  while (ci < _chapters.length) {   // chapters after the last timed segment
+    container.appendChild(_makeChapterHeading(_chapters[ci]));
+    ci++;
+  }
+
+  // Under an active filter, hide any heading whose section has no visible
+  // segment (segments are hidden with style.display='none').
+  container.querySelectorAll('.transcript-chapter-heading').forEach(h => {
+    let node = h.nextElementSibling, visible = false;
+    while (node && !node.classList.contains('transcript-chapter-heading')) {
+      if (node.classList.contains('transcript-segment') && node.style.display !== 'none') {
+        visible = true; break;
+      }
+      node = node.nextElementSibling;
+    }
+    h.style.display = visible ? '' : 'none';
+  });
+}
+
+/* ── Tuning tab ──────────────────────────────────────────────────────────── */
+
+async function loadChaptersTuning() {
+  const autoTog = document.getElementById('chapters-auto-toggle');
+  if (autoTog) autoTog.checked = _prefs.chapters_auto !== false;
+  _highlightGranularity(_prefs.chapters_granularity || 'balanced');
+
+  const ta = document.getElementById('chapters-system-prompt');
+  const chip = document.getElementById('chapters-prompt-source-chip');
+  const loadBtn = document.getElementById('chapters-prompt-load-default-btn');
+  const defTog = document.getElementById('chapters-prompt-default-toggle');
+  if (!state.sessionId) {
+    if (ta) ta.value = '';
+    if (chip) { chip.textContent = 'Default'; chip.classList.remove('custom'); }
+    if (defTog) defTog.checked = false;
+    return;
+  }
+  try {
+    const r = await fetch(`/api/sessions/${state.sessionId}/chapters-prompt`).then(r => r.json());
+    if (ta) ta.value = r.session_prompt || '';
+    if (chip) {
+      const isOverride = !!r.session_prompt;
+      chip.textContent = isOverride ? 'Session override' : 'Default';
+      chip.classList.toggle('custom', isOverride);
+    }
+    if (loadBtn) loadBtn._cachedDefault = (r.global_prompt || '').trim() || (r.default_prompt || '');
+    if (defTog) defTog.checked = !!(r.global_prompt || '').trim();
+  } catch (_) {}
+}
+
+function _highlightGranularity(g) {
+  document.querySelectorAll('#chapters-granularity .chapters-gran-opt').forEach(b =>
+    b.classList.toggle('active', b.dataset.gran === g));
+}
+
+function _setChaptersGranularity(g) {
+  _highlightGranularity(g);
+  savePref('chapters_granularity', g);
+}
+
+function _onChaptersAutoToggle(checked) {
+  savePref('chapters_auto', !!checked);
+}
+
+async function saveChaptersSystemPrompt() {
+  if (!state.sessionId) return;
+  const ta = document.getElementById('chapters-system-prompt');
+  const value = ta ? ta.value : '';
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/chapters-prompt`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: value }),
+    });
+    // If "use as default" is checked, also persist the global default.
+    const defTog = document.getElementById('chapters-prompt-default-toggle');
+    if (defTog && defTog.checked) savePref('chapters_system_prompt', value);
+    const chip = document.getElementById('chapters-prompt-source-chip');
+    if (chip) {
+      chip.textContent = 'Saved';
+      chip.classList.add('saved-flash');
+      setTimeout(() => { chip.classList.remove('saved-flash'); loadChaptersTuning(); }, 1200);
+    }
+  } catch (_) { flashStatus('Could not save chapters prompt'); }
+}
+
+async function clearChaptersSystemPrompt() {
+  if (!state.sessionId) return;
+  try {
+    await fetch(`/api/sessions/${state.sessionId}/chapters-prompt`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: null }),
+    });
+    const ta = document.getElementById('chapters-system-prompt');
+    if (ta) ta.value = '';
+    loadChaptersTuning();
+  } catch (_) {}
+}
+
+async function loadDefaultIntoChaptersPrompt() {
+  const ta = document.getElementById('chapters-system-prompt');
+  if (!ta) return;
+  const btn = document.getElementById('chapters-prompt-load-default-btn');
+  let text = (btn && btn._cachedDefault) || '';
+  if (!text) {
+    try { text = (await fetch('/api/chapters/default-prompt').then(r => r.json())).prompt || ''; }
+    catch (_) {}
+  }
+  ta.value = text;
+}
+
+function _onChaptersPromptDefaultToggle(checked) {
+  const ta = document.getElementById('chapters-system-prompt');
+  savePref('chapters_system_prompt', checked ? (ta ? ta.value : '') : '');
 }
 
 /* ── Session-level override: chat-header gear icon + dialog ──────────────── */
@@ -14825,6 +15244,10 @@ async function loadSession(sessionId) {
     body: JSON.stringify({ custom_prompt: storedPrompt }),
   }).catch(() => {});
 
+  // Load this session's chapters (playback-bar ticks render once the audio
+  // metadata loads; the modal list + minimap markers update immediately).
+  setSessionChapters(data.chapters || []);
+
   // Show playback bar if audio is available
   if (data.has_audio) initPlayback(sessionId);
   if (data.has_video) initVideo(sessionId, data.video_offset);
@@ -15229,6 +15652,11 @@ function clearAll() {
   document.getElementById('analytics-btn')?.classList.remove('active');
   _updateFilterBtnState();
   closeSpeakerManager();
+  closeChaptersManager();
+  _chapters = [];
+  renderChapterTicks();
+  renderMinimapChapters();
+  _setChaptersBusy(false);
   const bar = document.getElementById('transcript-selection-bar');
   if (bar) bar.classList.add('hidden');
   _syncPanelBottomRadius();
@@ -18951,6 +19379,7 @@ const _EXPORT_STEP_LABELS = {
   metadata:           'Session metadata',
   transcription:      'Transcription',
   summary:            'Summary',
+  chapters:           'Chapters',
   chat:               'Chat & screenshots',
   notes:              'Notes & attachments',
   speakers:           'Speaker labels',
@@ -19011,7 +19440,7 @@ async function startExport() {
   if (!sid) return;
 
   const cats = [];
-  ['metadata', 'transcription', 'summary', 'chat', 'notes', 'speakers', 'speaker_embeddings', 'audio', 'video']
+  ['metadata', 'transcription', 'summary', 'chapters', 'chat', 'notes', 'speakers', 'speaker_embeddings', 'audio', 'video']
     .forEach(cat => {
       const cb = document.getElementById('export-opt-' + cat);
       if (cb && cb.checked) cats.push(cat);

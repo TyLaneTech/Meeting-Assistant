@@ -149,6 +149,7 @@
           <div class="col-actions left">
             <span class="col-title">Transcript</span>
             <button class="icon-btn" id="speakers-btn" title="Manage speakers" onclick="openSpeakerManager()">Speakers</button>
+            <button class="icon-btn" id="chapters-btn" title="Chapters" onclick="openChaptersManager()">Chapters</button>
             <button class="icon-btn active" id="auto-scroll-btn" title="Auto-scroll to latest" onclick="toggleAutoScroll()">Auto</button>
           </div>
           <div class="col-actions right">
@@ -281,8 +282,11 @@
         <div id="playback-bar" class="playback-bar hidden">
           <button class="icon-btn playback-play-btn" id="playback-play" onclick="togglePlayback()" title="Play/Pause"><i class="fa-solid fa-play"></i></button>
           <span class="playback-time" id="playback-time">0:00</span>
-          <input type="range" class="playback-seek" id="playback-seek" min="0" max="100" step="0.1" value="0"
-                 oninput="seekPlayback(this.value)" />
+          <div class="playback-seek-wrap" id="playback-seek-wrap">
+            <input type="range" class="playback-seek" id="playback-seek" min="0" max="100" step="0.1" value="0"
+                   oninput="seekPlayback(this.value)" />
+            <div class="playback-chapters" id="playback-chapters"></div>
+          </div>
           <span class="playback-time" id="playback-duration">0:00</span>
           <div class="playback-volume" id="playback-volume">
             <button class="icon-btn playback-volume-btn" id="playback-volume-btn" type="button"
@@ -966,6 +970,83 @@
   </div>
 </div>
 
+<!-- ── Chapters manager ──────────────────────────────────────────────── -->
+<div class="overlay hidden" id="chapters-overlay" onclick="if(event.target===this)closeChaptersManager()">
+  <div class="dialog chapters-dialog">
+    <div class="chapters-header">
+      <div class="chapters-header-main">
+        <h3 class="chapters-title">Chapters</h3>
+        <p class="chapters-subtitle">High-level topic markers across the meeting. They show on the playback bar and feed the Summary and Chat.</p>
+      </div>
+      <button class="icon-btn chapters-close" onclick="closeChaptersManager()"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+
+    <div class="chapters-tabs">
+      <button type="button" class="chapters-tab active" data-ch-tab="list" onclick="_chaptersSwitchTab('list')">
+        <i class="fa-solid fa-list-ul"></i> Chapters
+      </button>
+      <button type="button" class="chapters-tab" data-ch-tab="tuning" onclick="_chaptersSwitchTab('tuning')">
+        <i class="fa-solid fa-sliders"></i> Tuning
+      </button>
+    </div>
+
+    <!-- Chapters list -->
+    <div class="chapters-body" data-ch-view="list">
+      <div class="chapters-toolbar">
+        <button type="button" class="chapters-btn chapters-btn-primary" id="chapters-regen-btn" onclick="regenerateChapters()">
+          <i class="fa-solid fa-wand-magic-sparkles"></i> Regenerate
+        </button>
+        <button type="button" class="chapters-btn chapters-btn-ghost" id="chapters-add-btn" onclick="addChapterAtPlayhead()" title="Add a chapter at the current playback position">
+          <i class="fa-solid fa-plus"></i> Add at current time
+        </button>
+        <span class="chapters-count" id="chapters-count"></span>
+      </div>
+      <div class="chapters-list" id="chapters-list"></div>
+    </div>
+
+    <!-- Tuning -->
+    <div class="chapters-body" data-ch-view="tuning" hidden>
+      <div class="chapters-tune-row">
+        <label class="chapters-tune-toggle" title="Automatically add chapters as the meeting progresses">
+          <input type="checkbox" id="chapters-auto-toggle" onchange="_onChaptersAutoToggle(this.checked)">
+          <span>Auto-generate chapters as the meeting progresses</span>
+        </label>
+      </div>
+      <div class="chapters-tune-row chapters-tune-row-inline">
+        <span class="chapters-tune-label">Granularity</span>
+        <div class="chapters-granularity" id="chapters-granularity">
+          <button type="button" class="chapters-gran-opt" data-gran="coarse" onclick="_setChaptersGranularity('coarse')">Coarse</button>
+          <button type="button" class="chapters-gran-opt" data-gran="balanced" onclick="_setChaptersGranularity('balanced')">Balanced</button>
+          <button type="button" class="chapters-gran-opt" data-gran="fine" onclick="_setChaptersGranularity('fine')">Fine</button>
+        </div>
+      </div>
+      <div class="sp-pane chapters-tune-prompt">
+        <div class="sp-pane-header">
+          <span class="sp-pane-title">Chapters System Prompt for this session</span>
+          <span class="sp-pane-hint">Overrides the default rules for how chapters are chosen. Leave empty to use the default.</span>
+        </div>
+        <div class="sp-source-bar">
+          <span class="sp-source-label">Currently using:</span>
+          <span class="sp-source-chip" id="chapters-prompt-source-chip">Default</span>
+        </div>
+        <textarea id="chapters-system-prompt" class="summary-prompt-input summary-prompt-input-lg"
+                  placeholder="Leave empty to fall back to the default." rows="8" spellcheck="false"></textarea>
+        <div class="sp-pane-footer sp-pane-footer-actions">
+          <div class="sp-pane-footer-left">
+            <button type="button" class="sp-ghost-btn" id="chapters-prompt-load-default-btn" onclick="loadDefaultIntoChaptersPrompt()" title="Replace textarea with the current default"><i class="fa-regular fa-file-lines"></i> Load default</button>
+            <button type="button" class="sp-ghost-btn sp-ghost-danger" onclick="clearChaptersSystemPrompt()" title="Remove the override; use the default"><i class="fa-solid fa-eraser"></i> Clear override</button>
+          </div>
+          <label class="sp-default-toggle" title="Also save this as the default for any new session you start">
+            <input type="checkbox" id="chapters-prompt-default-toggle" onchange="_onChaptersPromptDefaultToggle(this.checked)">
+            <span>Use as default</span>
+          </label>
+          <button type="button" class="sp-primary-btn" onclick="saveChaptersSystemPrompt()">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="overlay hidden" id="export-overlay" onclick="if(event.target===this)closeExportModal()">
   <div class="dialog export-dialog">
     <div class="export-header">
@@ -997,6 +1078,11 @@
             <input type="checkbox" id="export-opt-summary" checked>
             <i class="fa-solid fa-file-lines export-opt-icon"></i>
             <div class="export-opt-text"><span class="export-opt-name">Summary</span><span class="export-opt-desc">AI-generated meeting summary</span></div>
+          </label>
+          <label class="export-option">
+            <input type="checkbox" id="export-opt-chapters" checked>
+            <i class="fa-solid fa-bookmark export-opt-icon"></i>
+            <div class="export-opt-text"><span class="export-opt-name">Chapters</span><span class="export-opt-desc">AI topic markers with timestamps</span></div>
           </label>
           <label class="export-option">
             <input type="checkbox" id="export-opt-chat" checked>

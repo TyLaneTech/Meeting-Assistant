@@ -10812,3 +10812,299 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
     background-color: var(--surface3);
     color: var(--fg);
 }
+
+
+.ql-snow.ql-toolbar button:hover .ql-stroke, .ql-snow .ql-toolbar button:hover .ql-stroke, .ql-snow.ql-toolbar button:focus .ql-stroke, .ql-snow .ql-toolbar button:focus .ql-stroke, .ql-snow.ql-toolbar button.ql-active .ql-stroke, .ql-snow .ql-toolbar button.ql-active .ql-stroke, .ql-snow.ql-toolbar .ql-picker-label:hover .ql-stroke, .ql-snow .ql-toolbar .ql-picker-label:hover .ql-stroke, .ql-snow.ql-toolbar .ql-picker-label.ql-active .ql-stroke, .ql-snow .ql-toolbar .ql-picker-label.ql-active .ql-stroke, .ql-snow.ql-toolbar .ql-picker-item:hover .ql-stroke, .ql-snow .ql-toolbar .ql-picker-item:hover .ql-stroke, .ql-snow.ql-toolbar .ql-picker-item.ql-selected .ql-stroke, .ql-snow .ql-toolbar .ql-picker-item.ql-selected .ql-stroke, .ql-snow.ql-toolbar button:hover .ql-stroke-miter, .ql-snow .ql-toolbar button:hover .ql-stroke-miter, .ql-snow.ql-toolbar button:focus .ql-stroke-miter, .ql-snow .ql-toolbar button:focus .ql-stroke-miter, .ql-snow.ql-toolbar button.ql-active .ql-stroke-miter, .ql-snow .ql-toolbar button.ql-active .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-label:hover .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-label:hover .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-label.ql-active .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-label.ql-active .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-item:hover .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-item:hover .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-item.ql-selected .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-item.ql-selected .ql-stroke-miter {
+    stroke: var(--accent) !important;
+}
+
+
+/* ══ Chapters feature ═══════════════════════════════════════════════════════ */
+
+/* Header button busy state */
+#chapters-btn.busy { color: var(--accent); }
+
+/* Playback-bar ticks */
+.playback-seek-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+.playback-seek-wrap .playback-seek { flex: 1; }
+.playback-chapters {
+  position: absolute;
+  left: 0; right: 0;
+  top: 50%;
+  height: 14px;
+  transform: translateY(-50%);
+  pointer-events: none;   /* container passes clicks to the range input... */
+}
+.chapter-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  background: var(--accent);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--bg);
+  cursor: pointer;
+  pointer-events: auto;   /* ...but the ticks themselves stay hoverable */
+  opacity: 0.85;
+  transition: height .12s ease, opacity .12s ease, background .12s ease;
+}
+.chapter-tick:hover { height: 16px; opacity: 1; background: #fff; }
+.chapter-tip {
+  position: fixed;
+  z-index: 10001;
+  display: none;
+  max-width: 280px;
+  padding: 5px 9px;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--fg);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Minimap markers */
+.minimap-chapter {
+  position: absolute;
+  left: 0; right: 0;
+  height: 2px;
+  background: var(--accent);
+  opacity: 0.9;
+  box-shadow: 0 0 4px rgba(88, 166, 255, 0.5);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Modal shell */
+.chapters-dialog {
+  width: min(560px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+  text-align: left;   /* the base .dialog centres text; chapters are left-aligned */
+}
+.chapters-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 20px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.chapters-header-main { flex: 1; min-width: 0; }
+.chapters-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 680;
+  letter-spacing: 0.2px;
+  color: var(--fg);
+}
+.chapters-subtitle {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  line-height: 1.45;
+  max-width: 46ch;
+}
+.chapters-close { flex: none; margin: -2px -4px 0 0; }
+
+.chapters-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+.chapters-tab {
+  appearance: none;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chapters-tab:hover { color: var(--fg); }
+.chapters-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.chapters-body { padding: 16px 20px 20px; overflow-y: auto; }
+.chapters-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+.chapters-count { margin-left: auto; font-size: 12px; color: var(--fg-subtle); white-space: nowrap; }
+/* Fixed width so the label swap to "Generating…" doesn't resize the button. */
+#chapters-regen-btn { min-width: 140px; justify-content: center; }
+/* Keep the generating state legible rather than greyed out like a plain disable. */
+#chapters-regen-btn:disabled { opacity: 0.78; cursor: progress; }
+.chapters-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 13px;
+  border-radius: var(--radius-sm);
+  padding: 7px 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--fg);
+  transition: background .12s ease, border-color .12s ease, opacity .12s ease;
+}
+.chapters-btn:hover { border-color: var(--accent); }
+.chapters-btn:disabled { opacity: 0.5; cursor: default; }
+.chapters-btn:disabled:hover { border-color: var(--border); }
+.chapters-btn-primary { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
+.chapters-btn-primary:hover { background: var(--accent); border-color: var(--accent); }
+.chapters-btn-ghost { background: transparent; }
+
+.chapters-list { display: flex; flex-direction: column; gap: 2px; }
+.chapters-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 6px 5px 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  transition: background .1s ease, border-color .1s ease;
+}
+.chapters-row:hover { background: var(--surface2); border-color: var(--border); }
+.chapters-row-time {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim2);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 3px 9px;
+  min-width: 52px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .1s ease, filter .1s ease;
+}
+.chapters-row-time:hover { border-color: var(--accent); filter: brightness(1.12); }
+.chapters-row-title {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 5px 8px;
+  transition: background .1s ease, border-color .1s ease;
+}
+.chapters-row-title:hover { border-color: var(--border); background: var(--bg); }
+.chapters-row-title:focus { outline: none; background: var(--bg); border-color: var(--accent); }
+.chapters-row-del {
+  flex: none;
+  color: var(--fg-subtle);
+  opacity: 0.5;
+  transition: opacity .1s ease, color .1s ease;
+}
+.chapters-row:hover .chapters-row-del { opacity: 1; }
+.chapters-row-del:hover { color: var(--red); }
+
+.chapters-empty {
+  text-align: center;
+  padding: 36px 20px;
+  color: var(--fg-muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.chapters-empty-icon { font-size: 26px; color: var(--fg-subtle); margin-bottom: 4px; }
+.chapters-empty-title { font-size: 15px; color: var(--fg); font-weight: 600; }
+.chapters-empty-sub { font-size: 12.5px; max-width: 320px; line-height: 1.4; }
+.chapters-empty .chapters-btn { margin-top: 10px; }
+
+/* Tuning tab */
+.chapters-tune-row { margin-bottom: 16px; }
+.chapters-tune-row-inline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.chapters-tune-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.chapters-tune-label { font-size: 13px; color: var(--fg); font-weight: 550; }
+.chapters-granularity {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.chapters-gran-opt {
+  appearance: none;
+  border: none;
+  background: var(--surface2);
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 12px;
+  cursor: pointer;
+  border-right: 1px solid var(--border);
+}
+.chapters-gran-opt:last-child { border-right: none; }
+.chapters-gran-opt:hover { color: var(--fg); }
+.chapters-gran-opt.active { background: var(--accent-dim); color: #fff; }
+.chapters-tune-prompt { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+
+/* Inline transcript chapter headings */
+.transcript-chapter-heading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 16px 2px 9px;
+  padding: 7px 11px 7px 12px;
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-dim2);
+  cursor: pointer;
+  user-select: none;
+  scroll-margin-top: 10px;
+  transition: border-left-width .12s ease, padding-left .12s ease;
+}
+.transcript-chapter-heading:first-child { margin-top: 4px; }
+.transcript-chapter-heading:hover { border-left-width: 5px; padding-left: 10px; }
+.transcript-chapter-heading .tch-icon { flex: none; color: var(--accent); font-size: 12px; }
+.transcript-chapter-heading .tch-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.transcript-chapter-heading .tch-time {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  opacity: 0.85;
+}

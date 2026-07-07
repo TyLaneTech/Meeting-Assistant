@@ -61,6 +61,16 @@ DEFAULTS: dict = {
     "summary_model": None,
     "chat_provider": None,
     "chat_model": None,
+    "chapters_provider": None,
+    "chapters_model": None,
+
+    # AI Chapters. Auto-generate high-level topic markers as a meeting
+    # progresses (gated so they aren't added too frequently). Granularity tunes
+    # how coarse/fine the chapter breaks are. The system prompt is tunable in
+    # the same 3-tier way as summary/chat (built-in default < global < session).
+    "chapters_auto": True,
+    "chapters_granularity": "balanced",   # "coarse" | "balanced" | "fine"
+    "chapters_system_prompt": "",
 
     # Screen recording
     "screen_display": 0,
