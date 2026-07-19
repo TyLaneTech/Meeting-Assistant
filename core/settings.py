@@ -24,6 +24,12 @@ def _path():
 DEFAULTS: dict = {
     # Audio devices (indices or special values like -1=none, -2=browser mic)
     "loopback_device": "",       # "" = system default
+    # Friendly name paired with loopback_device. PyAudio indices are positional
+    # and get renumbered when the device list changes (headset plugged in,
+    # meeting app adds a virtual endpoint, driver update, reboot), so the index
+    # alone silently drifts onto the wrong device. The name lets capture
+    # re-resolve the same physical device, the way mic_device already does.
+    "loopback_device_name": "",
     "mic_device": "-2",          # -2 = browser mic
 
     # Whisper model preset id (e.g. "cuda-large-v3", "cpu-small")

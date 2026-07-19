@@ -4242,10 +4242,17 @@ async function toggleRecording() {
     }
 
     // Read selected device indices from the dropdowns
-    const lbVal  = document.getElementById('viz-loopback-sel')?.value ?? '';
+    const lbSel  = document.getElementById('viz-loopback-sel');
+    const lbVal  = lbSel?.value ?? '';
     const micVal = document.getElementById('viz-mic-sel')?.value ?? '';
     const body = {};
-    if (lbVal  !== '' && lbVal  !== null && lbVal  !== undefined) body.loopback_device = parseInt(lbVal, 10);
+    if (lbVal  !== '' && lbVal  !== null && lbVal  !== undefined) {
+      body.loopback_device = parseInt(lbVal, 10);
+      // Send the device name too so the backend can re-find the same physical
+      // device if PyAudio has renumbered the index since it was saved.
+      const lbName = lbSel?.selectedOptions?.[0]?.textContent;
+      if (lbName) body.loopback_device_name = lbName;
+    }
     Object.assign(body, parseMicSelection(micVal));
 
     if (state.isViewingPast) {
@@ -16650,8 +16657,9 @@ async function loadAudioDevices() {
   if (!lbSel || !micSel) return;
 
   // Saved choices from server prefs (with localStorage fallback for migration)
-  const savedLb  = _prefs.loopback_device ?? localStorage.getItem('viz-loopback-idx') ?? '';
-  const savedMic = _prefs.mic_device      ?? localStorage.getItem('viz-mic-idx')      ?? '';
+  const savedLb      = _prefs.loopback_device ?? localStorage.getItem('viz-loopback-idx') ?? '';
+  const savedLbName  = _prefs.loopback_device_name ?? '';
+  const savedMic     = _prefs.mic_device      ?? localStorage.getItem('viz-mic-idx')      ?? '';
 
   lbSel.innerHTML  = '<option value="">- loading -</option>';
   micSel.innerHTML = '<option value="-1">None</option>';
@@ -16675,8 +16683,33 @@ async function loadAudioDevices() {
       opt.textContent = d.name;
       lbSel.appendChild(opt);
     }
-    if (savedLb && [...lbSel.options].some(o => o.value === String(savedLb))) {
+    // Re-select the saved device, preferring its NAME over the stored index.
+    // PyAudio indices are positional and drift when the device list changes
+    // (headset plugged in, meeting app adds a virtual endpoint, driver update,
+    // reboot), so a matching index can point at a different device now.
+    const optByName = savedLbName
+      ? [...lbSel.options].find(o => o.textContent === savedLbName)
+      : null;
+    const idxMatches = savedLb && [...lbSel.options].some(o => o.value === String(savedLb));
+    if (optByName) {
+      lbSel.value = optByName.value;
+      // Index shifted since we saved it: rewrite it so the backend fast path
+      // and any caller that only sends the index stay correct.
+      if (String(optByName.value) !== String(savedLb)) savePref('loopback_device', optByName.value);
+    } else if (idxMatches) {
       lbSel.value = savedLb;
+      // Legacy pref that predates name-saving: back-fill the name now so the
+      // selection can self-heal next time the list is renumbered.
+      if (!savedLbName && lbSel.selectedOptions[0])
+        savePref('loopback_device_name', lbSel.selectedOptions[0].textContent);
+    } else if (savedLbName) {
+      // Saved device is gone entirely; loose fuzzy match as a last resort.
+      const fuzzy = [...lbSel.options].find(o =>
+        o.textContent.includes(savedLbName) || savedLbName.includes(o.textContent));
+      if (fuzzy) {
+        lbSel.value = fuzzy.value;
+        savePref('loopback_device', fuzzy.value);
+      }
     }
   }
 
@@ -16739,17 +16772,27 @@ async function loadAudioDevices() {
   lbSel.disabled  = state.isRecording;
   micSel.disabled = state.isRecording;
 
-  // Persist the resolved selection so pages without dropdowns (e.g. home page)
-  // can send the same device IDs when starting a recording.
-  if (lbSel.value && !_prefs.loopback_device) savePref('loopback_device', lbSel.value);
+  // Persist the resolved selection so the backend fallback (home-page / tray
+  // starts, which send no device IDs) reuses the same device.  Save the name
+  // alongside the index; an index on its own drifts when the list is
+  // renumbered, which is what caused the desktop device to reset.
+  if (lbSel.value && !_prefs.loopback_device) {
+    savePref('loopback_device', lbSel.value);
+    if (lbSel.selectedOptions[0]) savePref('loopback_device_name', lbSel.selectedOptions[0].textContent);
+  }
   if (micSel.value && !_prefs.mic_device)     savePref('mic_device',      micSel.value);
 }
 
 function saveDeviceSelection() {
   const lbSel  = document.getElementById('viz-loopback-sel');
   const micSel = document.getElementById('viz-mic-sel');
-  if (lbSel)  savePref('loopback_device', lbSel.value);
-  if (micSel) savePref('mic_device',      micSel.value);
+  if (lbSel) {
+    savePref('loopback_device', lbSel.value);
+    // Persist the friendly name alongside the index so the selection can be
+    // re-resolved by name after the audio-device list is renumbered.
+    savePref('loopback_device_name', lbSel.selectedOptions?.[0]?.textContent || '');
+  }
+  if (micSel) savePref('mic_device', micSel.value);
 }
 
 async function toggleAudioTest() {
@@ -16762,10 +16805,15 @@ async function toggleAudioTest() {
     state.isTesting = false;
     updateTestBtn();
   } else {
-    const lbVal  = document.getElementById('viz-loopback-sel')?.value;
+    const lbSel  = document.getElementById('viz-loopback-sel');
+    const lbVal  = lbSel?.value;
     const micVal = document.getElementById('viz-mic-sel')?.value;
     const body   = {};
-    if (lbVal  !== '' && lbVal  != null) body.loopback_device = parseInt(lbVal,  10);
+    if (lbVal  !== '' && lbVal  != null) {
+      body.loopback_device = parseInt(lbVal,  10);
+      const lbName = lbSel?.selectedOptions?.[0]?.textContent;
+      if (lbName) body.loopback_device_name = lbName;
+    }
     Object.assign(body, parseMicSelection(micVal));
 
     const resp = await fetch('/api/audio/test/start', {

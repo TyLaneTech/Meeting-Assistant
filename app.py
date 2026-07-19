@@ -1738,6 +1738,7 @@ def start_audio_test():
 
     body = request.get_json(silent=True) or {}
     loopback_device = body.get("loopback_device")
+    loopback_name   = body.get("loopback_device_name")
     mic_device      = body.get("mic_device")
     ffmpeg_mic_name = body.get("ffmpeg_mic_name")
 
@@ -1759,7 +1760,7 @@ def start_audio_test():
 
     try:
         capture.start(loopback_index=loopback_device, mic_index=mic_device,
-                      ffmpeg_mic_name=ffmpeg_mic_name)
+                      ffmpeg_mic_name=ffmpeg_mic_name, loopback_name=loopback_name)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1829,20 +1830,26 @@ def start_recording():
 
     body = request.get_json(silent=True) or {}
     title             = body.get("title")
-    loopback_device   = body.get("loopback_device")   # int | None
-    mic_device        = body.get("mic_device")         # int | None | -1
-    ffmpeg_mic_name   = body.get("ffmpeg_mic_name")    # str | None (for mic_device=-3)
-    resume_session_id = body.get("resume_session_id")  # str | None
+    loopback_device   = body.get("loopback_device")       # int | None
+    loopback_name     = body.get("loopback_device_name")  # str | None (self-heal)
+    mic_device        = body.get("mic_device")             # int | None | -1
+    ffmpeg_mic_name   = body.get("ffmpeg_mic_name")        # str | None (for mic_device=-3)
+    resume_session_id = body.get("resume_session_id")      # str | None
 
     # Fall back to saved user preferences when the caller didn't specify devices
     # (e.g. recording started from the home page which has no device selectors).
     if loopback_device is None or mic_device is None:
         _saved = settings.load()
-        if loopback_device is None and _saved.get("loopback_device"):
-            try:
-                loopback_device = int(_saved["loopback_device"])
-            except (ValueError, TypeError):
-                pass
+        if loopback_device is None:
+            # Pull the index and its paired name together so the capture layer
+            # can re-find the same physical device if the PyAudio index drifted.
+            if _saved.get("loopback_device"):
+                try:
+                    loopback_device = int(_saved["loopback_device"])
+                except (ValueError, TypeError):
+                    pass
+            if loopback_name is None and _saved.get("loopback_device_name"):
+                loopback_name = str(_saved["loopback_device_name"]) or None
         if mic_device is None and _saved.get("mic_device"):
             _mic_pref = str(_saved["mic_device"])
             if _mic_pref.startswith("ffmpeg:"):
@@ -1895,8 +1902,8 @@ def start_recording():
         existing_seg_count = 0
         next_speaker_label = 1
 
-    log.info("recording", f"Device selection: loopback={loopback_device}, "
-             f"mic={mic_device}, ffmpeg_mic={ffmpeg_mic_name!r}")
+    log.info("recording", f"Device selection: loopback={loopback_device} "
+             f"({loopback_name!r}), mic={mic_device}, ffmpeg_mic={ffmpeg_mic_name!r}")
 
     capture = AudioCapture(_audio_queue)
 
@@ -1936,6 +1943,7 @@ def start_recording():
             loopback_index=loopback_device,
             mic_index=mic_device,
             ffmpeg_mic_name=ffmpeg_mic_name,
+            loopback_name=loopback_name,
         )
     except Exception as e:
         capture.stop_wav()

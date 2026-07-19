@@ -11079,9 +11079,9 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   gap: 9px;
   margin: 16px 2px 9px;
   padding: 7px 11px 7px 12px;
-  border-left: 3px solid var(--accent);
+  /* border-left: 3px solid var(--accent); */
   border-radius: var(--radius-sm);
-  background: var(--accent-dim2);
+  background: var(--bg);
   cursor: pointer;
   user-select: none;
   scroll-margin-top: 10px;
@@ -11093,7 +11093,7 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
 .transcript-chapter-heading .tch-title {
   flex: 1;
   min-width: 0;
-  font-size: 15px;
+  font-size: 1.3em;
   font-weight: 700;
   letter-spacing: 0.2px;
   color: var(--fg);

@@ -248,6 +248,89 @@ class AudioCapture:
                           f"Using '{all_loopbacks[0]['name']}' as fallback.")
         return all_loopbacks[0]
 
+    def _match_loopback_by_name(self, wanted: str) -> dict | None:
+        """Find a loopback device whose name matches ``wanted``.
+
+        Uses the same tiered matching as _find_loopback_device (exact,
+        substring, truncated-prefix, word-level) so a device survives the small
+        name variations Windows introduces between sessions, but returns None
+        instead of falling back to the first device: a wrong first-device is
+        exactly the bug we are guarding against, so the caller picks the
+        fallback (system default) itself.
+        """
+        try:
+            all_lb = list(self._pa.get_loopback_device_info_generator())
+        except Exception:
+            return None
+        if not all_lb:
+            return None
+        # 1. Exact
+        for lb in all_lb:
+            if lb["name"] == wanted:
+                return lb
+        # 2. Substring either direction (added/removed suffixes)
+        for lb in all_lb:
+            if wanted in lb["name"] or lb["name"] in wanted:
+                return lb
+        # 3. Truncated prefix (Windows truncates long output vs loopback names
+        #    differently)
+        prefix = wanted[:20]
+        for lb in all_lb:
+            if prefix and prefix in lb["name"]:
+                return lb
+        # 4. Word level (e.g. "USB Audio" shared between both names)
+        words = [w for w in wanted.split() if len(w) >= 4]
+        for lb in all_lb:
+            if any(w in lb["name"] for w in words):
+                return lb
+        return None
+
+    def _resolve_loopback(self, index: int | None, name: str | None) -> dict:
+        """Resolve the loopback (desktop) capture device, self-healing when a
+        saved PyAudio index has drifted onto a different endpoint.
+
+        PyAudio device indices are positional and unstable: plugging in a
+        headset, a meeting app spinning up a virtual audio endpoint, a driver
+        update or a reboot can renumber them. We persist the device *name*
+        alongside the index and treat the name as authoritative; the index is
+        only trusted when the device still sitting there carries the expected
+        name. This mirrors resolve_dshow_mic_name() for the microphone, which is
+        why mic selections already survived re-enumeration and loopback ones did
+        not.
+        """
+        # No hint at all: follow the current system default render device.
+        if index is None and not name:
+            return self._find_loopback_device()
+
+        # Fast path: the saved index still points at the saved device.
+        if index is not None:
+            try:
+                info = self._pa.get_device_info_by_index(index)
+                if info.get("maxInputChannels", 0) > 0 and (
+                        not name or info["name"] == name):
+                    return info
+                if name:
+                    log.info("audio", f"Loopback index {index} now "
+                             f"'{info.get('name')}', expected '{name}'; "
+                             f"re-resolving by name")
+            except Exception:
+                if name:
+                    log.info("audio", f"Loopback index {index} no longer valid; "
+                             f"re-resolving by name")
+
+        # Name-based re-resolution against the live loopback list.
+        if name:
+            match = self._match_loopback_by_name(name)
+            if match is not None:
+                if index is None or match.get("index") != index:
+                    log.info("audio", f"Loopback '{name}' re-resolved to index "
+                             f"{match.get('index')}")
+                return match
+            log.warn("audio", f"Loopback device '{name}' not found; "
+                     f"using system default")
+
+        return self._find_loopback_device()
+
     def _find_mic_device(self) -> dict | None:
         """Find the system default microphone input device (WASAPI only)."""
         try:
@@ -413,21 +496,25 @@ class AudioCapture:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self, loopback_index: int | None = None, mic_index: int | None = None,
-              ffmpeg_mic_name: str | None = None) -> None:
+              ffmpeg_mic_name: str | None = None, loopback_name: str | None = None) -> None:
         """
         Start capture.  loopback_index / mic_index override auto-detection;
         pass mic_index=-1 to explicitly disable the microphone,
         mic_index=-2 to receive mic audio injected from the browser
         (via inject_mic_data()), or mic_index=-3 to capture via an ffmpeg
         subprocess using DirectShow (requires ffmpeg_mic_name).
+
+        loopback_name, when given, is the friendly name saved alongside
+        loopback_index; if that index has since been renumbered onto a
+        different device the capture re-resolves to the named device instead.
         """
         self._pa = pyaudio.PyAudio()
 
         # --- Loopback stream (required) ---
-        if loopback_index is not None:
-            lb_info = self._pa.get_device_info_by_index(loopback_index)
-        else:
-            lb_info = self._find_loopback_device()
+        # Resolve name-first so a drifted PyAudio index self-heals onto the same
+        # physical device instead of silently capturing whatever now sits at
+        # that index (see _resolve_loopback).
+        lb_info = self._resolve_loopback(loopback_index, loopback_name)
         self.sample_rate = int(lb_info["defaultSampleRate"])
         self._loopback_channels = max(1, lb_info["maxInputChannels"])
         self._loopback_device_name = lb_info["name"]
