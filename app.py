@@ -5574,62 +5574,358 @@ def global_chat_clear():
     return jsonify({"ok": True})
 
 
+def _as_int(value, default: int) -> int:
+    """Coerce a model-supplied number, falling back when it isn't one.
+
+    Tool arguments come from an LLM, so a value can arrive as 7, "7", 7.0 or
+    nonsense. The caller of the tool executor swallows exceptions and drops
+    the tool result entirely, so a bare int() here would stall the
+    conversation instead of surfacing anything.
+    """
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value, default: float) -> float:
+    """Float counterpart to _as_int. 0 is preserved, None/garbage fall back."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_folder_path(text: str) -> str:
+    """Lower-case a folder name or path and normalize any separator style.
+
+    'Engineering/backend ' and 'Engineering > Backend' both become
+    'engineering / backend' so the model can be loose about formatting.
+    """
+    parts = [p.strip() for p in re.split(r"[/>\\]", text or "") if p.strip()]
+    return storage.FOLDER_PATH_SEP.join(parts).lower()
+
+
+def _match_folders(spec: str, folders: list[dict]) -> tuple[list[dict], str]:
+    """Match a folder spec (ID, name, or path) against the folder tree.
+
+    Returns (matches, how). Tiers are tried most-precise first and the first
+    tier that hits wins, so an exact name never loses to a substring match on
+    some other folder. Returning every hit in the winning tier lets the caller
+    disambiguate instead of guessing.
+    """
+    exact_id = [f for f in folders if f["id"] == spec]
+    if exact_id:
+        return exact_id, "id"
+
+    want = _normalize_folder_path(spec)
+    if not want:
+        return [], "none"
+
+    suffix = storage.FOLDER_PATH_SEP + want
+    tiers = (
+        ("full path", lambda f: _normalize_folder_path(f["path"]) == want),
+        ("name", lambda f: f["name"].strip().lower() == want),
+        ("path suffix", lambda f: _normalize_folder_path(f["path"]).endswith(suffix)),
+        ("partial name", lambda f: want in f["name"].strip().lower()),
+        ("partial path", lambda f: want in _normalize_folder_path(f["path"])),
+    )
+    for how, pred in tiers:
+        hits = [f for f in folders if pred(f)]
+        if hits:
+            return hits, how
+    return [], "none"
+
+
+def _folder_scope(tool_input: dict, folders: list[dict]) -> dict:
+    """Resolve the optional `folder` tool argument into a folder-ID filter.
+
+    Returns {folder_ids, error, folder, label}:
+      - folder_ids: the folder and its descendants, or None when unscoped
+      - error: payload to hand back to the model (not found / ambiguous)
+      - folder: the resolved entry from storage.folder_tree()
+      - label: human-readable scope for the UI tool summary
+    """
+    spec = (tool_input.get("folder") or "").strip()
+    if not spec:
+        return {"folder_ids": None, "error": None, "folder": None, "label": ""}
+
+    include_sub = tool_input.get("include_subfolders")
+    include_sub = True if include_sub is None else bool(include_sub)
+
+    matches, how = _match_folders(spec, folders)
+
+    if not matches:
+        return {"folder_ids": [], "folder": None, "label": spec, "error": {
+            "error": f"No folder matches '{spec}'.",
+            "available_folders": [
+                {"id": f["id"], "path": f["path"],
+                 "total_session_count": f["total_session_count"]}
+                for f in folders
+            ],
+            "hint": (
+                "Retry with one of the folder IDs or paths above, or omit "
+                "`folder` to search the whole library."
+            ),
+        }}
+
+    if len(matches) > 1:
+        return {"folder_ids": [], "folder": None, "label": spec, "error": {
+            "error": f"'{spec}' is ambiguous - {len(matches)} folders match.",
+            "matched_by": how,
+            "candidates": [
+                {"id": f["id"], "name": f["name"], "path": f["path"],
+                 "session_count": f["session_count"],
+                 "total_session_count": f["total_session_count"]}
+                for f in matches
+            ],
+            "hint": (
+                "Retry with the folder ID or the full path of the intended "
+                "folder, or ask the user which one they meant."
+            ),
+        }}
+
+    folder = matches[0]
+    label = folder["path"] if include_sub else f"{folder['path']} (direct only)"
+    return {
+        "folder_ids": storage.folder_with_descendants(folder["id"], recursive=include_sub),
+        "error": None, "folder": folder, "label": label,
+    }
+
+
+def _iso_bounds(tool_input: dict) -> tuple:
+    """Normalize within_days / start_date / end_date into comparable bounds.
+
+    Every stored timestamp comes from storage._now() - a naive UTC isoformat
+    string - so bounds are converted to that same shape and compared as
+    strings in SQL. Returns (start, end, description); any part may be None/"".
+    """
+    from datetime import datetime, timedelta, timezone
+
+    def parse(s: str):
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        # Collapse to naive UTC so string comparison against stored values holds.
+        return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+    within = _as_int(tool_input.get("within_days"), 0)
+    start_date = (tool_input.get("start_date") or "").strip()
+    end_date = (tool_input.get("end_date") or "").strip()
+
+    start = end = None
+    if within > 0:
+        start = datetime.utcnow() - timedelta(days=within)
+    if start_date:
+        start = parse(start_date) or start
+    if end_date:
+        parsed_end = parse(end_date)
+        if parsed_end is not None:
+            # A bare date means "through the end of that day".
+            bare = "T" not in end_date and " " not in end_date
+            end = (parsed_end + timedelta(days=1) - timedelta(microseconds=1)
+                   if bare else parsed_end)
+
+    if within > 0:
+        desc = f"last {within} day{'s' if within != 1 else ''}"
+    elif start_date and end_date:
+        desc = f"{start_date} to {end_date}"
+    elif start_date:
+        desc = f"since {start_date}"
+    elif end_date:
+        desc = f"until {end_date}"
+    else:
+        desc = ""
+
+    return (start.isoformat() if start else None,
+            end.isoformat() if end else None, desc)
+
+
+def _scope_filters(tool_input: dict) -> dict:
+    """Resolve the folder / date / speaker arguments shared by the search and
+    browse tools into a single filter set.
+
+    Returns {folder_ids, start, end, speaker, error, desc, active, folders}.
+    ``desc`` is a ready-to-append scope phrase for the UI summary, and
+    ``folders`` is the folder tree fetched once so callers can annotate
+    results without re-querying.
+    """
+    folders = storage.folder_tree()
+    scope = _folder_scope(tool_input, folders)
+    start, end, date_desc = _iso_bounds(tool_input)
+    speaker = (tool_input.get("speaker") or "").strip() or None
+
+    parts = [p for p in (scope["label"], date_desc) if p]
+    if speaker:
+        parts.append(f"with {speaker}")
+
+    return {
+        "folder_ids": scope["folder_ids"],
+        "start": start, "end": end, "speaker": speaker,
+        "error": scope["error"], "label": scope["label"], "folders": folders,
+        "desc": f" in {', '.join(parts)}" if parts else "",
+        "active": bool(scope["folder_ids"] is not None or start or end or speaker),
+    }
+
+
+def _scoped_session_ids(filters: dict) -> "list[str] | None":
+    """Resolve a filter set to in-scope session IDs, or None when unfiltered."""
+    if not filters["active"]:
+        return None
+    return storage.list_session_ids(
+        folder_ids=filters["folder_ids"], start=filters["start"],
+        end=filters["end"], speaker=filters["speaker"],
+    )
+
+
+def _folder_error_result(scope: dict) -> tuple:
+    """Turn an unresolved folder scope into a tool result the model can act on.
+
+    Ambiguity is a normal disambiguation round-trip rather than a failure, so
+    only a genuinely unknown folder is flagged as an error.
+    """
+    payload = scope["error"]
+    ambiguous = "candidates" in payload
+    summary = (f"Folder '{scope['label']}' is ambiguous" if ambiguous
+               else f"Folder '{scope['label']}' not found")
+    return json.dumps(payload, indent=2), not ambiguous, summary, None
+
+
+def _folder_labels(folders: list[dict] | None = None) -> dict[str, dict]:
+    """Map folder ID → folder entry for annotating tool results.
+
+    Pass the tree from ``_scope_filters`` to avoid re-querying it.
+    """
+    return {f["id"]: f for f in (folders if folders is not None else storage.folder_tree())}
+
+
+def _annotate_folder(entry: dict, folder_id: str | None, labels: dict) -> None:
+    """Attach folder name and full path so citations keep project context."""
+    info = labels.get(folder_id) if folder_id else None
+    entry["folder"] = info["name"] if info else None
+    entry["folder_path"] = info["path"] if info else None
+
+
+def _label_speaker(match: dict) -> dict:
+    """Give a match's speaker its display label when it's a raw capture source.
+
+    storage resolves as far as the speaker_labels table; unlabelled segments
+    come back as the raw key ('loopback'/'mic'), which only app-side knows how
+    to present.
+    """
+    if match.get("speaker") in _SOURCE_LABELS:
+        match["speaker"] = _SOURCE_LABELS[match["speaker"]]
+    return match
+
+
+def _describe_session(meta: dict, labels: dict, *, summary_chars: int) -> dict:
+    """Build the per-session payload shared by every search and browse result."""
+    entry = {
+        "session_id": meta["session_id"],
+        "title": meta["title"],
+        "started_at": meta["started_at"],
+        "ended_at": meta["ended_at"],
+        "speakers": meta["speakers"],
+        "segment_count": meta["segment_count"],
+    }
+    if meta["duration_sec"]:
+        # Minutes, not _fmt_time's M:SS — a 2-hour meeting reads as "120:00"
+        # there, which is ambiguous out of transcript context.
+        entry["duration_min"] = round(meta["duration_sec"] / 60, 1)
+    _annotate_folder(entry, meta["folder_id"], labels)
+    summary = meta["summary"]
+    if summary:
+        entry["summary"] = summary[:summary_chars] + ("…" if len(summary) > summary_chars else "")
+    return entry
+
+
 def _global_tool_executor(name: str, tool_input: dict) -> tuple:
     """Execute a global chat tool call. Returns (content, is_error, summary, extra)."""
+    if name == "list_folders":
+        folders = storage.folder_tree()
+        if not folders:
+            return ("No folders exist yet - every session is unfiled.",
+                    False, "No folders", None)
+        return (json.dumps(folders, indent=2), False,
+                f"Listed {len(folders)} folders", None)
+
     if name == "search_transcripts":
         query = tool_input.get("query", "")
-        limit = tool_input.get("limit", 10)
-        results = storage.search_sessions(query, limit=limit)
+        limit = max(1, min(50, _as_int(tool_input.get("limit"), 10)))
+        match = tool_input.get("match") or "all"
+        if match not in storage.MATCH_MODES:
+            return (f"Invalid match mode '{match}'. Use one of: "
+                    f"{', '.join(storage.MATCH_MODES)}.", True, "Bad match mode", None)
+        filters = _scope_filters(tool_input)
+        if filters["error"]:
+            return _folder_error_result(filters)
+        desc = filters["desc"]
+
+        results = storage.search_sessions(
+            query, limit=limit, match=match,
+            session_ids=_scoped_session_ids(filters),
+        )
         if not results:
-            return "No matching sessions found.", False, f"Search: '{query}' - no results", None
-        # Enrich results with folder names and summaries
-        folders = {f["id"]: f["name"] for f in storage.list_folders()}
+            return (f"No matching sessions found{desc}.", False,
+                    f"Search: '{query}'{desc} - no results", None)
+
+        labels = _folder_labels(filters["folders"])
+        metas = storage.get_sessions_meta([r["session_id"] for r in results])
+        enriched = []
         for r in results:
-            sess = storage.get_session(r["session_id"])
-            if sess:
-                fid = sess.get("folder_id")
-                r["folder"] = folders.get(fid) if fid else None
-                summary = sess.get("summary", "")
-                if summary:
-                    r["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
-        text = json.dumps(results, indent=2)
-        return text, False, f"Search: '{query}' - {len(results)} results", None
+            meta = metas.get(r["session_id"])
+            entry = (_describe_session(meta, labels, summary_chars=500) if meta
+                     else {"session_id": r["session_id"], "title": r["title"]})
+            entry["matches"] = [_label_speaker(m) for m in r["matches"]]
+            enriched.append(entry)
+        text = json.dumps(enriched, indent=2)
+        return text, False, f"Search: '{query}'{desc} - {len(enriched)} results", None
 
     if name == "semantic_search":
         query = tool_input.get("query", "")
-        limit = tool_input.get("limit", 5)
+        limit = max(1, min(50, _as_int(tool_input.get("limit"), 5)))
         if not text_embeddings.is_ready():
             return "Semantic search model is still loading.", True, "Semantic search unavailable", None
+        filters = _scope_filters(tool_input)
+        if filters["error"]:
+            return _folder_error_result(filters)
+        desc = filters["desc"]
         query_vec = text_embeddings.encode(query)
         if query_vec is None:
             return "Failed to encode query.", True, "Encoding failed", None
-        all_embs = storage.get_all_session_embeddings()
+
+        in_scope = _scoped_session_ids(filters)
+        in_scope = set(in_scope) if in_scope is not None else None
+        # _as_float keeps an explicit 0.0, which is a valid "widest net".
+        min_score = max(0.0, min(1.0, _as_float(tool_input.get("min_score"), 0.25)))
         scored = []
-        for row in all_embs:
+        for row in storage.get_all_session_embeddings():
+            # Filter before scoring so the scope gets the full `limit` slots.
+            if in_scope is not None and row["session_id"] not in in_scope:
+                continue
             vec = text_embeddings.bytes_to_embedding(row["embedding_bytes"])
             score = text_embeddings.cosine_similarity(query_vec, vec)
-            if score >= 0.25:
-                scored.append({
-                    "session_id": row["session_id"],
-                    "title": row["title"],
-                    "score": round(score, 4),
-                })
-        scored.sort(key=lambda x: x["score"], reverse=True)
+            if score >= min_score:
+                scored.append((score, row["session_id"]))
+        scored.sort(reverse=True)
         results = scored[:limit]
         if not results:
-            return "No semantically similar sessions found.", False, f"Semantic: '{query}' - no results", None
-        # Enrich with folder names and summaries
-        folders = {f["id"]: f["name"] for f in storage.list_folders()}
-        for r in results:
-            sess = storage.get_session(r["session_id"])
-            if sess:
-                fid = sess.get("folder_id")
-                r["folder"] = folders.get(fid) if fid else None
-                summary = sess.get("summary", "")
-                if summary:
-                    r["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
-        text = json.dumps(results, indent=2)
-        return text, False, f"Semantic: '{query}' - {len(results)} results", None
+            return (f"No semantically similar sessions found{desc}.", False,
+                    f"Semantic: '{query}'{desc} - no results", None)
+
+        labels = _folder_labels(filters["folders"])
+        metas = storage.get_sessions_meta([sid for _, sid in results])
+        enriched = []
+        for score, sid in results:
+            meta = metas.get(sid)
+            if not meta:
+                continue
+            entry = _describe_session(meta, labels, summary_chars=500)
+            entry["score"] = round(score, 4)
+            enriched.append(entry)
+        text = json.dumps(enriched, indent=2)
+        return text, False, f"Semantic: '{query}'{desc} - {len(enriched)} results", None
 
     if name == "get_session_detail":
         session_id = tool_input.get("session_id", "")
@@ -5670,87 +5966,24 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         return text, False, f"Found {len(enriched)} speakers", None
 
     if name == "list_recent_meetings":
-        from datetime import datetime, timedelta, timezone
-        within_days = tool_input.get("within_days") or 0
-        start_date = (tool_input.get("start_date") or "").strip()
-        end_date = (tool_input.get("end_date") or "").strip()
-        limit = max(1, min(200, int(tool_input.get("limit") or 30)))
+        limit = max(1, min(200, _as_int(tool_input.get("limit"), 30)))
+        filters = _scope_filters(tool_input)
+        if filters["error"]:
+            return _folder_error_result(filters)
 
-        def _parse_iso(s: str):
-            try:
-                return datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                return None
-
-        start_dt = _parse_iso(start_date) if start_date else None
-        end_dt = _parse_iso(end_date) if end_date else None
-        if end_dt:
-            # Inclusive end-of-day if a bare date was given
-            if "T" not in end_date and " " not in end_date:
-                end_dt = end_dt + timedelta(days=1) - timedelta(seconds=1)
-        cutoff = None
-        if within_days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=int(within_days))
-
-        sessions = storage.list_sessions()  # already sorted started_at DESC
-
-        def in_range(s):
-            sa = s.get("started_at")
-            if not sa:
-                return False
-            ts = _parse_iso(sa)
-            if ts is None:
-                return False
-            # Make naive timestamps timezone-aware for comparison
-            if ts.tzinfo is None and (cutoff or start_dt or end_dt):
-                ts = ts.replace(tzinfo=timezone.utc)
-            if cutoff and ts < cutoff:
-                return False
-            if start_dt:
-                sd = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=timezone.utc)
-                if ts < sd:
-                    return False
-            if end_dt:
-                ed = end_dt if end_dt.tzinfo else end_dt.replace(tzinfo=timezone.utc)
-                if ts > ed:
-                    return False
-            return True
-
-        if cutoff or start_dt or end_dt:
-            sessions = [s for s in sessions if in_range(s)]
-        sessions = sessions[:limit]
-
-        folders = {f["id"]: f["name"] for f in storage.list_folders()}
-        enriched = []
-        for s in sessions:
-            sess = storage.get_session(s["id"])
-            entry = {
-                "session_id": s["id"],
-                "title": s.get("title") or "Untitled",
-                "started_at": s.get("started_at"),
-                "ended_at": s.get("ended_at"),
-                "speakers": [sp["name"] for sp in (s.get("speakers") or []) if sp.get("name")],
-            }
-            if sess:
-                fid = sess.get("folder_id")
-                entry["folder"] = folders.get(fid) if fid else None
-                summary = sess.get("summary", "") or ""
-                if summary:
-                    entry["summary"] = summary[:300] + ("…" if len(summary) > 300 else "")
-                entry["segment_count"] = len(sess.get("segments") or [])
-            enriched.append(entry)
-
-        if within_days > 0:
-            range_desc = f"last {within_days} day{'s' if within_days != 1 else ''}"
-        elif start_date and end_date:
-            range_desc = f"{start_date} to {end_date}"
-        elif start_date:
-            range_desc = f"since {start_date}"
-        elif end_date:
-            range_desc = f"until {end_date}"
-        else:
-            range_desc = "all time"
-
+        # Newest-first ordering and every filter are applied in SQL, so the
+        # limit is a real page rather than a post-filter truncation.
+        session_ids = storage.list_session_ids(
+            folder_ids=filters["folder_ids"], start=filters["start"],
+            end=filters["end"], speaker=filters["speaker"], limit=limit,
+        )
+        labels = _folder_labels(filters["folders"])
+        metas = storage.get_sessions_meta(session_ids)
+        enriched = [
+            _describe_session(metas[sid], labels, summary_chars=300)
+            for sid in session_ids if sid in metas
+        ]
+        range_desc = filters["desc"].removeprefix(" in ") or "all time"
         text = json.dumps(enriched, indent=2)
         return text, False, f"Listed {len(enriched)} meetings ({range_desc})", None
 
@@ -5767,25 +6000,20 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         if not matched:
             return f"No speaker named '{speaker_name}' found in the Voice Library.", False, f"Speaker '{speaker_name}' not found", None
         results = []
+        labels = _folder_labels()
         for sp in matched:
             sessions = fingerprint_db.get_profile_sessions(sp["id"])
             # Enrich sessions with summaries and folder info
-            folders = {f["id"]: f["name"] for f in storage.list_folders()}
+            metas = storage.get_sessions_meta([s["session_id"] for s in sessions])
             enriched_sessions = []
             for sess_info in sessions:
-                sess = storage.get_session(sess_info["session_id"])
-                entry = {
+                meta = metas.get(sess_info["session_id"])
+                entry = (_describe_session(meta, labels, summary_chars=500) if meta else {
                     "session_id": sess_info["session_id"],
                     "title": sess_info["title"],
                     "started_at": sess_info["started_at"],
-                    "segments_by_speaker": sess_info["seg_count"],
-                }
-                if sess:
-                    fid = sess.get("folder_id")
-                    entry["folder"] = folders.get(fid) if fid else None
-                    summary = sess.get("summary", "")
-                    if summary:
-                        entry["summary"] = summary[:500] + ("…" if len(summary) > 500 else "")
+                })
+                entry["segments_by_speaker"] = sess_info["seg_count"]
                 enriched_sessions.append(entry)
             results.append({
                 "speaker_id": sp["id"],

@@ -186,20 +186,134 @@ _WEB_SEARCH_OAI       = {"type": "web_search_preview"}
 
 # ── Global Chat tools ────────────────────────────────────────────────────────
 
+# Shared `folder` / `include_subfolders` schema for the tools that support
+# folder scoping. Spliced into each input_schema so the wording stays in sync.
+_FOLDER_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional. Restrict results to one folder. Accepts a folder ID, a "
+        "case-insensitive full or partial folder name, or a path like "
+        "'Engineering / Backend'. Call `list_folders` first to resolve an "
+        "approximate name the user mentioned — if the value is ambiguous this "
+        "tool returns the candidate folders instead of guessing. Sessions that "
+        "are not in any folder are excluded while this filter is active. Omit "
+        "to search the entire library."
+    ),
+}
+
+_INCLUDE_SUBFOLDERS_PARAM = {
+    "type": "boolean",
+    "description": (
+        "Whether to also include sessions in sub-folders of the matched folder "
+        "(default true). Set false to match only sessions filed directly in it. "
+        "Ignored when `folder` is omitted."
+    ),
+    "default": True,
+}
+
+# Shared date-window and participant filters. Every search/browse tool accepts
+# these, so they can be combined freely with `folder` in a single call.
+_SPEAKER_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional. Restrict results to meetings this person took part in "
+        "(case-insensitive, partial name match). Use `list_speakers` to see "
+        "known names. This filters by participation, not by who said the "
+        "matching line - `search_transcripts` labels each snippet with its "
+        "speaker so you can tell exactly who said what."
+    ),
+}
+
+_WITHIN_DAYS_PARAM = {
+    "type": "integer",
+    "description": (
+        "Optional. Restrict to meetings from the last N days. Use for "
+        "relative ranges (e.g. 7 for last week). Omit or 0 to use "
+        "start_date/end_date instead."
+    ),
+}
+
+_START_DATE_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional. ISO date (YYYY-MM-DD) for the earliest meeting to include. "
+        "Combine with end_date for an explicit range."
+    ),
+}
+
+_END_DATE_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional. ISO date (YYYY-MM-DD) for the latest meeting to include. "
+        "A bare date includes that whole day."
+    ),
+}
+
+
+def _filter_params(**extra) -> dict:
+    """Build an input_schema properties block with the shared filters appended."""
+    return {
+        **extra,
+        "folder": _FOLDER_PARAM,
+        "include_subfolders": _INCLUDE_SUBFOLDERS_PARAM,
+        "speaker": _SPEAKER_PARAM,
+        "within_days": _WITHIN_DAYS_PARAM,
+        "start_date": _START_DATE_PARAM,
+        "end_date": _END_DATE_PARAM,
+    }
+
+
 _GLOBAL_TOOLS = [
+    {
+        "name": "list_folders",
+        "description": (
+            "List every folder in the meeting library, including nested "
+            "sub-folders. Returns each folder's ID, name, parent folder ID "
+            "(null for top-level), full path (e.g. 'Engineering / Backend / "
+            "Sprint Planning'), and session counts — `session_count` for "
+            "sessions filed directly in it and `total_session_count` including "
+            "all descendants. "
+            "Call this FIRST whenever the user names a folder, project, team, "
+            "or client so you can resolve their approximate wording to a real "
+            "folder before passing it to the `folder` parameter of "
+            "`search_transcripts`, `semantic_search`, or `list_recent_meetings`. "
+            "Also useful on its own to show how the library is organized."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
     {
         "name": "search_transcripts",
         "description": (
             "Search across all meeting transcripts using keyword/full-text search. "
-            "Returns matching snippets with session titles, IDs, and context. "
-            "Use this for specific words, phrases, or names."
+            "Use this for specific words, phrases, or names. "
+            "Each result carries the session's title, ID, folder, date, speakers "
+            "and summary, plus up to 3 matching snippets — and every transcript "
+            "snippet is labelled with WHO said it and how far into the meeting, "
+            "so you can attribute quotes without loading the full transcript. "
+            "All filters below combine: you can search one folder, one date "
+            "window, and one participant in a single call."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query terms"},
-                "limit": {"type": "integer", "description": "Max results (default 10)", "default": 10},
-            },
+            "properties": _filter_params(
+                query={"type": "string", "description": "Search query terms"},
+                limit={"type": "integer", "description": "Max sessions to return (default 10, max 50)", "default": 10},
+                match={
+                    "type": "string",
+                    "enum": ["all", "any", "phrase"],
+                    "description": (
+                        "How the query terms combine. 'all' (default): every term "
+                        "must appear, prefix-matched — best for most searches. "
+                        "'any': broaden to sessions matching any term. 'phrase': "
+                        "the terms must appear together in that exact order — use "
+                        "for quoted phrases or names like 'series B funding'."
+                    ),
+                    "default": "all",
+                },
+            ),
             "required": ["query"],
         },
     },
@@ -208,14 +322,27 @@ _GLOBAL_TOOLS = [
         "description": (
             "Search meetings by meaning and topic similarity. Better for conceptual "
             "queries like 'discussions about project deadlines' or 'feedback on the design' "
-            "rather than exact words. Returns ranked session matches."
+            "rather than exact words. Returns ranked whole-session matches with "
+            "folder, date, speakers and summary. Prefer `search_transcripts` when "
+            "you need the exact line someone said; use this to find the right "
+            "meetings when you don't know the vocabulary they used. "
+            "Supports the same folder/date/speaker filters."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Conceptual search query"},
-                "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
-            },
+            "properties": _filter_params(
+                query={"type": "string", "description": "Conceptual search query"},
+                limit={"type": "integer", "description": "Max results (default 5)", "default": 5},
+                min_score={
+                    "type": "number",
+                    "description": (
+                        "Minimum similarity score, 0-1 (default 0.25). Raise "
+                        "toward 0.4+ for only strong topical matches; lower it "
+                        "to cast a wider net when a search comes back empty."
+                    ),
+                    "default": 0.25,
+                },
+            ),
             "required": ["query"],
         },
     },
@@ -275,41 +402,21 @@ _GLOBAL_TOOLS = [
             "and Apr 14'. This is the right tool when the user wants an "
             "overview rather than a keyword search. Returns titles, IDs, "
             "dates, durations, speakers, folders, and truncated summaries. "
+            "Pass `folder` to browse a single folder — e.g. 'what happened in "
+            "the Backend project last week'; use `list_folders` first if you "
+            "only have the user's approximate name for it. "
             "Follow up with `get_session_detail` to load the full transcript "
             "of any specific meeting from the list."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "within_days": {
-                    "type": "integer",
-                    "description": (
-                        "Limit to meetings from the last N days. Use this "
-                        "for relative ranges (e.g. 7 for last week). Omit "
-                        "or set to 0 to use start_date/end_date instead."
-                    ),
-                },
-                "start_date": {
-                    "type": "string",
-                    "description": (
-                        "ISO date (YYYY-MM-DD) for the earliest meeting to "
-                        "include. Optional — combine with end_date for an "
-                        "explicit range."
-                    ),
-                },
-                "end_date": {
-                    "type": "string",
-                    "description": (
-                        "ISO date (YYYY-MM-DD) for the latest meeting to "
-                        "include. Defaults to now if omitted."
-                    ),
-                },
-                "limit": {
+            "properties": _filter_params(
+                limit={
                     "type": "integer",
                     "description": "Max number of meetings to return (default 30, max 200).",
                     "default": 30,
                 },
-            },
+            ),
         },
     },
 ]
@@ -926,11 +1033,50 @@ class AIAssistant:
         "- You may call tools multiple times to gather enough context. "
         "Combine tools freely — e.g. list recent meetings, then load "
         "details for the ones that look relevant.\n\n"
+        "## Scoping to a folder\n"
+        "Meetings are organized into folders, which can be nested (e.g. "
+        "'Engineering / Backend / Sprint Planning').\n"
+        "- When the user names a folder, project, team, or client, call "
+        "`list_folders` FIRST to resolve their wording to a real folder, then "
+        "pass it to the `folder` parameter of `search_transcripts`, "
+        "`semantic_search`, or `list_recent_meetings`\n"
+        "- Passing the folder ID is the most reliable; a name or path also works\n"
+        "- If a tool reports the folder is ambiguous it returns the candidate "
+        "folders with their full paths — ask the user which one they meant, or "
+        "re-run with the ID if the context makes it obvious\n"
+        "- `include_subfolders` defaults to true. Set it false only when the "
+        "user clearly wants just that one folder and not the work nested under it\n"
+        "- A folder filter excludes meetings that aren't in any folder, and an "
+        "empty result means that folder genuinely has no matches — say so "
+        "rather than silently widening the search\n"
+        "- Omit `folder` entirely for library-wide questions\n\n"
+        "## Filtering (folder / date / speaker)\n"
+        "`search_transcripts`, `semantic_search` and `list_recent_meetings` all "
+        "accept the same filters, and they stack in a single call — prefer one "
+        "filtered call over fetching broadly and sifting manually.\n"
+        "- `folder` + `include_subfolders` — scope to a project or team\n"
+        "- `within_days`, or `start_date`/`end_date` — scope to a time window\n"
+        "- `speaker` — only meetings that person took part in\n"
+        "So \"what did Priya flag about billing last quarter\" is ONE call: "
+        "`search_transcripts(query='billing', speaker='Priya', within_days=90)`\n"
+        "- Search results already include each session's summary, speakers, "
+        "date and folder — only call `get_session_detail` when you need the "
+        "actual transcript, not just to identify a meeting\n"
+        "- If a search returns nothing, loosen one filter at a time rather than "
+        "dropping them all: try `match='any'`, a lower `min_score`, or a wider "
+        "date range, and say what you had to broaden\n\n"
+        "## Attributing quotes\n"
+        "Every `search_transcripts` snippet is labelled with the speaker who "
+        "said it and its offset into the meeting. Use that to attribute quotes "
+        "precisely — say who said something, not just which meeting it was in. "
+        "Note `speaker` filters by who ATTENDED; the snippet labels are what "
+        "tell you who actually said a given line, so check them before "
+        "attributing.\n\n"
         "## Context in results\n"
         "- Search results include session summaries (truncated) so you can often "
         "answer without loading the full transcript\n"
-        "- Results include folder names when sessions are organized into folders - "
-        "use this to provide project/team context\n"
+        "- Results include the folder name and its full path when sessions are "
+        "organized into folders - use this to provide project/team context\n"
         "- Speaker history shows segment counts per session to indicate how "
         "active someone was in each meeting\n\n"
         "## Web search\n"

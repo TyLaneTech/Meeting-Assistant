@@ -68,6 +68,14 @@ def init_db() -> None:
                 PRIMARY KEY (session_id, speaker_key)
             );
         """)
+        # Upgrade a v1 search index (no source_id column) to v2 by rebuilding
+        # it. Probed rather than dropped unconditionally: the original
+        # migration re-dropped the index on every single startup, throwing
+        # away a valid index and re-tokenizing the whole library each launch.
+        fts_cols = {r["name"] for r in conn.execute("PRAGMA table_info(search_fts)")}
+        if fts_cols and "source_id" not in fts_cols:
+            conn.execute("DROP TABLE search_fts")
+
         # Live migrations: add columns / tables to databases created before these versions
         for migration in [
             "ALTER TABLE transcript_segments ADD COLUMN source TEXT NOT NULL DEFAULT 'loopback'",
@@ -140,15 +148,10 @@ def init_db() -> None:
             # Split rollback: sessions created from the same split share a group id
             "ALTER TABLE sessions ADD COLUMN split_group_id TEXT DEFAULT NULL",
             "CREATE INDEX IF NOT EXISTS idx_sessions_split_group ON sessions(split_group_id)",
-            # Full-text search on session titles and transcript segments
-            """CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
-                session_id UNINDEXED,
-                kind UNINDEXED,
-                text,
-                tokenize='porter unicode61'
-            )""",
-            # v2: recreate FTS with source_id column for segment-level linking
-            "DROP TABLE IF EXISTS search_fts",
+            # Full-text search on session titles and transcript segments.
+            # v2 added source_id for segment-level linking; the upgrade drop
+            # is handled by the guarded probe above, not here, so this CREATE
+            # is a no-op once the table exists.
             """CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
                 session_id UNINDEXED,
                 source_id UNINDEXED,
@@ -200,6 +203,42 @@ def init_db() -> None:
         fts_count = conn.execute("SELECT COUNT(*) FROM search_fts").fetchone()[0]
         if fts_count == 0:
             _rebuild_fts(conn)
+        else:
+            pruned = prune_search_index(conn)
+            if pruned:
+                from core import log as _log
+                _log.info("storage", f"Pruned {pruned} stale search index rows")
+
+
+def prune_search_index(conn) -> int:
+    """Drop index rows that no longer point at anything, returning the count.
+
+    Earlier versions deleted transcript segments without clearing their FTS
+    rows, so re-analysed sessions accumulated entries for text that is no
+    longer in the transcript: they surfaced as search hits with no segment to
+    link to and diluted ranking. Runs at startup so an affected database heals
+    itself. Only provably dangling rows are removed, and the whole index is
+    rebuildable from source anyway.
+    """
+    targets = (
+        # Segment rows whose segment is gone (or now belongs to another session).
+        "FROM search_fts WHERE kind = 'segment' AND source_id IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM transcript_segments ts"
+        "                 WHERE ts.id = search_fts.source_id"
+        "                   AND ts.session_id = search_fts.session_id)",
+        # Anything left over from a deleted session.
+        "FROM search_fts WHERE NOT EXISTS"
+        " (SELECT 1 FROM sessions s WHERE s.id = search_fts.session_id)",
+        "FROM session_embeddings WHERE NOT EXISTS"
+        " (SELECT 1 FROM sessions s WHERE s.id = session_embeddings.session_id)",
+    )
+    removed = 0
+    for clause in targets:
+        # Counted up front: total_changes over-reports here, because deleting
+        # one FTS5 row cascades into its shadow tables.
+        removed += conn.execute(f"SELECT COUNT(*) {clause}").fetchone()[0]
+        conn.execute(f"DELETE {clause}")
+    return removed
 
 
 def _rebuild_fts(conn) -> None:
@@ -242,57 +281,241 @@ def fts_remove_session(session_id: str) -> None:
         conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
 
 
-def search_sessions(query: str, limit: int = 50) -> list[dict]:
+MATCH_MODES = ("all", "any", "phrase")
+
+
+def _fts_query(query: str, match: str) -> str:
+    """Build an FTS5 MATCH expression from a plain-language query.
+
+    Double quotes are stripped from terms first so user text can never break
+    out of the quoting and inject FTS5 operators.
+    """
+    terms = [t for t in (w.replace('"', "") for w in query.split()) if t]
+    if not terms:
+        return ""
+    if match == "phrase":
+        return '"' + " ".join(terms) + '"'
+    joiner = " OR " if match == "any" else " "
+    return joiner.join(f'"{t}"*' for t in terms)
+
+
+# Resolves a segment's display speaker with the same precedence the transcript
+# renderer uses: per-segment label override, then the session's speaker label
+# for the (possibly reassigned) source, then the raw source key.
+_SPEAKER_EXPR = (
+    "COALESCE(ts.label_override, sl.name, ts.source_override, ts.source)"
+)
+
+
+def search_sessions(
+    query: str,
+    limit: int = 50,
+    *,
+    session_ids: "list[str] | set[str] | None" = None,
+    match: str = "all",
+    max_snippets: int = 3,
+) -> list[dict]:
     """Search sessions by title and transcript content using FTS5.
 
-    Returns a list of {session_id, title, matches: [{kind, snippet}]} dicts,
-    ordered by relevance.
+    Returns [{session_id, title, started_at, best_rank, matches}] ordered by
+    relevance. Each match is {kind, snippet, segment_id?, speaker?,
+    start_time?} — segment matches carry the resolved speaker name and offset
+    so callers can report who said it without loading the transcript.
+
+    ``match`` controls how query terms combine:
+      - "all"    every term must appear, prefix-matched (default)
+      - "any"    any term may appear
+      - "phrase" the terms must appear together, in order
+
+    ``session_ids`` restricts the search in SQL. The per-session snippet cap
+    and the result limit are enforced with window functions rather than by
+    over-fetching, so one session with hundreds of hits can no longer crowd
+    every other session out of the results.
     """
-    if not query or not query.strip():
+    fts = _fts_query(query or "", match)
+    if not fts:
         return []
-    # Escape FTS5 special characters and build a prefix query
-    terms = query.strip().split()
-    fts_query = " ".join(f'"{t}"*' for t in terms if t)
-    if not fts_query:
-        return []
+
+    where = ["search_fts MATCH ?"]
+    params: list = [fts]
+    if session_ids is not None:
+        ids = [s for s in dict.fromkeys(session_ids) if s]
+        if not ids:
+            return []
+        where.append(f"search_fts.session_id IN ({','.join('?' * len(ids))})")
+        params.extend(ids)
+    params.extend([max(1, max_snippets), max(1, limit)])
+
+    # The FTS table is deliberately not aliased: fts5 auxiliary functions like
+    # snippet() only accept the real table name.
+    sql = f"""
+        WITH hits AS (
+            SELECT search_fts.session_id AS session_id,
+                   search_fts.source_id  AS source_id,
+                   search_fts.kind       AS kind,
+                   search_fts.rank       AS rnk,
+                   snippet(search_fts, 3, '<mark>', '</mark>', '…', 40) AS snippet,
+                   s.title      AS title,
+                   s.started_at AS started_at,
+                   ts.start_time AS start_time,
+                   {_SPEAKER_EXPR} AS speaker
+            FROM search_fts
+            JOIN sessions s ON s.id = search_fts.session_id
+            LEFT JOIN transcript_segments ts ON ts.id = search_fts.source_id
+            LEFT JOIN speaker_labels sl
+                   ON sl.session_id = search_fts.session_id
+                  AND sl.speaker_key = COALESCE(ts.source_override, ts.source)
+            WHERE {' AND '.join(where)}
+        ),
+        ranked AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY rnk) AS rn,
+                   MIN(rnk)     OVER (PARTITION BY session_id)              AS best
+            FROM hits
+        ),
+        capped AS (
+            SELECT *, DENSE_RANK() OVER (ORDER BY best, session_id) AS srank
+            FROM ranked WHERE rn <= ?
+        )
+        SELECT * FROM capped WHERE srank <= ? ORDER BY best, rn
+    """
+    with _conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    from collections import OrderedDict
+    sessions: OrderedDict[str, dict] = OrderedDict()
+    for r in rows:
+        sid = r["session_id"]
+        if sid not in sessions:
+            sessions[sid] = {
+                "session_id": sid,
+                "title": r["title"] or "",
+                "started_at": r["started_at"],
+                "matches": [],
+                "best_rank": r["best"],
+            }
+        entry = {"kind": r["kind"], "snippet": r["snippet"]}
+        if r["source_id"] is not None:
+            entry["segment_id"] = r["source_id"]
+            if r["speaker"]:
+                entry["speaker"] = r["speaker"]
+            if r["start_time"] is not None:  # 0.0 is a valid offset
+                entry["start_time"] = round(r["start_time"], 1)
+        sessions[sid]["matches"].append(entry)
+
+    return list(sessions.values())
+
+
+def list_session_ids(
+    *,
+    folder_ids: "list[str] | None" = None,
+    start: str | None = None,
+    end: str | None = None,
+    speaker: str | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    """Return session IDs matching the given filters, newest first.
+
+    The single source of truth for "which sessions are in scope", shared by
+    every search and browse path so the filters can't drift apart.
+
+    ``start`` / ``end`` are naive-UTC ISO strings compared lexicographically -
+    safe because every stored timestamp comes from ``_now()`` in that exact
+    format. ``speaker`` matches sessions where someone with that name (partial,
+    case-insensitive) was labelled. ``folder_ids`` should already include any
+    descendant folders the caller wants; an empty list matches nothing.
+    """
+    where = ["1=1"]
+    params: list = []
+    if folder_ids is not None:
+        if not folder_ids:
+            return []
+        where.append(f"s.folder_id IN ({','.join('?' * len(folder_ids))})")
+        params.extend(folder_ids)
+    if start:
+        where.append("s.started_at >= ?")
+        params.append(start)
+    if end:
+        where.append("s.started_at <= ?")
+        params.append(end)
+    if speaker:
+        where.append(
+            "EXISTS (SELECT 1 FROM speaker_labels sp"
+            " WHERE sp.session_id = s.id AND sp.name LIKE ? COLLATE NOCASE)"
+        )
+        params.append(f"%{speaker}%")
+
+    sql = (f"SELECT s.id FROM sessions s WHERE {' AND '.join(where)}"
+           f" ORDER BY s.started_at DESC")
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(max(1, limit))
+
+    with _conn() as conn:
+        return [r["id"] for r in conn.execute(sql, params).fetchall()]
+
+
+def get_sessions_meta(session_ids: "list[str] | set[str]") -> dict[str, dict]:
+    """Batch-load lightweight metadata for many sessions at once.
+
+    Returns {session_id: {session_id, title, started_at, ended_at, folder_id,
+    summary, segment_count, duration_sec, speakers}}.
+
+    Unlike ``get_session`` this never loads transcript segments or chat
+    messages, so describing a page of search results costs a fixed four
+    queries instead of five per result plus every segment of every hit.
+    """
+    ids = [s for s in dict.fromkeys(session_ids) if s]
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
 
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT f.session_id, f.source_id, f.kind,"
-            "       snippet(search_fts, 3, '<mark>', '</mark>', '…', 40) AS snippet,"
-            "       rank"
-            " FROM search_fts f"
-            " WHERE search_fts MATCH ?"
-            " ORDER BY rank"
-            " LIMIT ?",
-            (fts_query, limit * 3),  # over-fetch so we can group
+            f"SELECT id, title, started_at, ended_at, folder_id"
+            f" FROM sessions WHERE id IN ({ph})", ids
+        ).fetchall()
+        # Bare `content` alongside MAX(id) is SQLite's documented "row that
+        # produced the max" behaviour - same latest-summary-wins rule as
+        # get_session()'s ORDER BY id DESC LIMIT 1.
+        summaries = conn.execute(
+            f"SELECT session_id, content, MAX(id) FROM summaries"
+            f" WHERE session_id IN ({ph}) GROUP BY session_id", ids
+        ).fetchall()
+        stats = conn.execute(
+            f"SELECT session_id, COUNT(*) AS n, MAX(end_time) AS dur"
+            f" FROM transcript_segments WHERE session_id IN ({ph})"
+            f" GROUP BY session_id", ids
+        ).fetchall()
+        speakers = conn.execute(
+            f"SELECT session_id, name FROM speaker_labels"
+            f" WHERE session_id IN ({ph}) AND name != ''"
+            f" GROUP BY session_id, lower(name)"
+            f" ORDER BY session_id, lower(name)", ids
         ).fetchall()
 
-        # Group by session, collect match snippets
-        from collections import OrderedDict
-        sessions: OrderedDict[str, dict] = OrderedDict()
-        for r in rows:
-            sid = r["session_id"]
-            if sid not in sessions:
-                # Look up session title
-                title_row = conn.execute("SELECT title FROM sessions WHERE id = ?", (sid,)).fetchone()
-                sessions[sid] = {
-                    "session_id": sid,
-                    "title": title_row["title"] if title_row else "",
-                    "matches": [],
-                    "best_rank": r["rank"],
-                }
-            if len(sessions[sid]["matches"]) < 3:  # max 3 snippets per session
-                match = {
-                    "kind": r["kind"],
-                    "snippet": r["snippet"],
-                }
-                if r["source_id"] is not None:
-                    match["segment_id"] = r["source_id"]
-                sessions[sid]["matches"].append(match)
+    summary_by = {r["session_id"]: r["content"] for r in summaries}
+    stats_by = {r["session_id"]: r for r in stats}
+    speakers_by: dict[str, list[str]] = {}
+    for r in speakers:
+        speakers_by.setdefault(r["session_id"], []).append(r["name"])
 
-    results = list(sessions.values())[:limit]
-    return results
+    out: dict[str, dict] = {}
+    for r in rows:
+        sid = r["id"]
+        st = stats_by.get(sid)
+        out[sid] = {
+            "session_id": sid,
+            "title": r["title"] or "Untitled",
+            "started_at": r["started_at"],
+            "ended_at": r["ended_at"],
+            "folder_id": r["folder_id"],
+            "summary": summary_by.get(sid) or "",
+            "segment_count": st["n"] if st else 0,
+            "duration_sec": round(st["dur"], 1) if st and st["dur"] else 0.0,
+            "speakers": speakers_by.get(sid, []),
+        }
+    return out
 
 
 def search_speakers(query: str, limit: int = 20) -> list[dict]:
@@ -936,34 +1159,38 @@ def list_session_ids_in_folder(folder_id: str, *, recursive: bool = True) -> lis
     the single source of truth about folder membership instead of the client
     snapshot, which can drift.
     """
-    with _conn() as conn:
-        # Collect all relevant folder IDs (BFS through parent_id graph)
-        folder_ids = [folder_id]
-        if recursive:
-            seen = {folder_id}
-            queue = [folder_id]
-            while queue:
-                next_round = []
-                placeholders = ",".join("?" * len(queue))
-                rows = conn.execute(
-                    f"SELECT id FROM folders WHERE parent_id IN ({placeholders})",
-                    queue,
-                ).fetchall()
-                for r in rows:
-                    fid = r["id"]
-                    if fid not in seen:
-                        seen.add(fid)
-                        next_round.append(fid)
-                folder_ids.extend(next_round)
-                queue = next_round
+    return list_session_ids(
+        folder_ids=folder_with_descendants(folder_id, recursive=recursive)
+    )
 
-        placeholders = ",".join("?" * len(folder_ids))
-        rows = conn.execute(
-            f"SELECT id FROM sessions WHERE folder_id IN ({placeholders}) "
-            f"ORDER BY started_at DESC",
-            folder_ids,
-        ).fetchall()
-    return [r["id"] for r in rows]
+
+def folder_with_descendants(folder_id: str, *, recursive: bool = True) -> list[str]:
+    """Return ``folder_id`` plus every folder nested beneath it.
+
+    Breadth-first through the parent_id graph with a seen-set, so a cycle in
+    the folder table terminates instead of hanging.
+    """
+    if not recursive:
+        return [folder_id]
+    folder_ids = [folder_id]
+    seen = {folder_id}
+    queue = [folder_id]
+    with _conn() as conn:
+        while queue:
+            next_round = []
+            placeholders = ",".join("?" * len(queue))
+            rows = conn.execute(
+                f"SELECT id FROM folders WHERE parent_id IN ({placeholders})",
+                queue,
+            ).fetchall()
+            for r in rows:
+                fid = r["id"]
+                if fid not in seen:
+                    seen.add(fid)
+                    next_round.append(fid)
+            folder_ids.extend(next_round)
+            queue = next_round
+    return folder_ids
 
 
 def delete_session(session_id: str) -> None:
@@ -1034,6 +1261,15 @@ def list_sessions() -> list[dict]:
 
 # ── Folders ───────────────────────────────────────────────────────────────────
 
+# Separator used when rendering a nested folder as a single readable path,
+# e.g. "Engineering / Backend / Sprint Planning".
+FOLDER_PATH_SEP = " / "
+
+# Safety net for the parent_id walk. Real trees are a handful of levels deep;
+# anything past this is corrupt data, not legitimate nesting.
+_MAX_FOLDER_DEPTH = 64
+
+
 def list_folders() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
@@ -1041,6 +1277,75 @@ def list_folders() -> list[dict]:
             " FROM folders ORDER BY sort_order ASC, created_at ASC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def folder_tree() -> list[dict]:
+    """Return every folder with its full path and session counts.
+
+    Each entry is {id, name, parent_id, path, session_count,
+    total_session_count}, where ``session_count`` counts sessions filed
+    directly in the folder and ``total_session_count`` also includes every
+    descendant sub-folder. Sorted by path so callers can show the tree in
+    reading order.
+
+    Both traversals are iterative and guarded by a seen-set, so a parent_id
+    cycle or a dangling parent (possible if rows were edited out-of-band)
+    degrades to a truncated path instead of hanging.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, parent_id FROM folders"
+            " ORDER BY sort_order ASC, created_at ASC"
+        ).fetchall()
+        count_rows = conn.execute(
+            "SELECT folder_id, COUNT(*) AS n FROM sessions"
+            " WHERE folder_id IS NOT NULL GROUP BY folder_id"
+        ).fetchall()
+
+    direct = {r["folder_id"]: r["n"] for r in count_rows}
+    by_id = {r["id"]: dict(r) for r in rows}
+
+    # Re-root folders whose parent no longer exists so they stay reachable.
+    children: dict[str, list[str]] = {}
+    for fid, f in by_id.items():
+        if f["parent_id"] not in by_id:
+            f["parent_id"] = None
+        if f["parent_id"]:
+            children.setdefault(f["parent_id"], []).append(fid)
+
+    out = []
+    for fid, f in by_id.items():
+        # Walk up for the path.
+        segments = [f["name"]]
+        seen = {fid}
+        pid = f["parent_id"]
+        while pid and pid not in seen and len(segments) < _MAX_FOLDER_DEPTH:
+            seen.add(pid)
+            segments.append(by_id[pid]["name"])
+            pid = by_id[pid]["parent_id"]
+
+        # Walk down for the descendant-inclusive session count.
+        total = direct.get(fid, 0)
+        queue, visited = list(children.get(fid, [])), {fid}
+        while queue:
+            cid = queue.pop()
+            if cid in visited:
+                continue
+            visited.add(cid)
+            total += direct.get(cid, 0)
+            queue.extend(children.get(cid, []))
+
+        out.append({
+            "id": fid,
+            "name": f["name"],
+            "parent_id": f["parent_id"],
+            "path": FOLDER_PATH_SEP.join(reversed(segments)),
+            "session_count": direct.get(fid, 0),
+            "total_session_count": total,
+        })
+
+    out.sort(key=lambda f: f["path"].lower())
+    return out
 
 
 def create_folder(name: str, parent_id: str | None = None) -> str:
@@ -1099,6 +1404,8 @@ def delete_folder(folder_id: str, delete_contents: bool = False) -> list[str]:
             deleted_session_ids = [r["id"] for r in rows]
 
             for sid in deleted_session_ids:
+                conn.execute("DELETE FROM search_fts WHERE session_id=?", (sid,))
+                conn.execute("DELETE FROM session_embeddings WHERE session_id=?", (sid,))
                 conn.execute("DELETE FROM transcript_segments WHERE session_id=?", (sid,))
                 conn.execute("DELETE FROM summaries WHERE session_id=?", (sid,))
                 conn.execute("DELETE FROM chat_messages WHERE session_id=?", (sid,))
@@ -1190,6 +1497,13 @@ def reset_session_transcript(session_id: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM transcript_segments WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+        # Drop the segment index too. The replacement transcript gets fresh
+        # segment IDs, so leaving these behind would keep the old text
+        # searchable forever with no segment to link back to.
+        conn.execute(
+            "DELETE FROM search_fts WHERE session_id = ? AND kind = 'segment'",
+            (session_id,),
+        )
 
 
 def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
@@ -1270,7 +1584,7 @@ def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
 def get_session(session_id: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, title, started_at, ended_at, notes, notes_updated_at "
+            "SELECT id, title, started_at, ended_at, folder_id, notes, notes_updated_at "
             "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
@@ -1315,7 +1629,7 @@ def get_session(session_id: str) -> dict | None:
             notes_payload = None
 
     return {
-        **{k: row[k] for k in ("id", "title", "started_at", "ended_at")},
+        **{k: row[k] for k in ("id", "title", "started_at", "ended_at", "folder_id")},
         "segments": [
             {"id": r["id"], "text": r["text"], "source": r["source"],
              "start_time": r["start_time"], "end_time": r["end_time"],

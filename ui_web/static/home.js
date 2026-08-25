@@ -58,14 +58,36 @@ function _toolDisplayName(name) {
     get_session_detail: 'Load Session',
     list_speakers: 'List Speakers',
     get_speaker_history: 'Speaker History',
+    list_recent_meetings: 'Recent Meetings',
+    list_folders: 'List Folders',
     web_search: 'Web Search',
   };
   return map[name] || name;
 }
 
+// Scope suffix, so a filtered search reads as: "kickoff" in Engineering, last 7 days
+function _scopeSuffix(input) {
+  if (!input) return '';
+  const parts = [];
+  if (input.folder) {
+    parts.push(input.folder + (input.include_subfolders === false ? ' (direct only)' : ''));
+  }
+  if (input.within_days) parts.push(`last ${input.within_days} day${input.within_days === 1 ? '' : 's'}`);
+  else if (input.start_date && input.end_date) parts.push(`${input.start_date} to ${input.end_date}`);
+  else if (input.start_date) parts.push(`since ${input.start_date}`);
+  else if (input.end_date) parts.push(`until ${input.end_date}`);
+  if (input.speaker) parts.push(`with ${input.speaker}`);
+  return parts.length ? ` in ${parts.join(', ')}` : '';
+}
+
 function _toolInputSummary(name, input) {
-  if (name === 'search_transcripts' && input?.query) return `"${input.query}"`;
-  if (name === 'semantic_search' && input?.query) return `"${input.query}"`;
+  if (name === 'list_folders') return 'All folders';
+  if (name === 'list_recent_meetings') return _scopeSuffix(input).replace(/^ in /, '') || 'all time';
+  if (name === 'search_transcripts' && input?.query) {
+    const mode = input.match && input.match !== 'all' ? ` (${input.match})` : '';
+    return `"${input.query}"${mode}` + _scopeSuffix(input);
+  }
+  if (name === 'semantic_search' && input?.query) return `"${input.query}"` + _scopeSuffix(input);
   if (name === 'get_session_detail' && input?.session_id) return input.session_id.substring(0, 8) + '...';
   if (name === 'list_speakers') return 'Voice Library';
   if (name === 'get_speaker_history' && input?.speaker_name) return `"${input.speaker_name}"`;
