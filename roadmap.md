@@ -4,6 +4,18 @@ Postponed ideas and feature plans. Not yet scheduled for implementation.
 
 ---
 
+## Agent API: follow-on ideas
+
+The Agent API (agent_api/ + mcp_server.py, docs/AGENT_API.md) shipped with REST + stdio MCP. Deferred extensions:
+
+- **Streamable-HTTP MCP transport** so remote MCP clients (claude.ai connectors) could attach without spawning a process. Needs auth hardening first since it implies non-loopback exposure.
+- **Agent event stream**: an SSE or long-poll feed of app events (recording started/stopped, new segment, summary updated) so agents can react instead of polling `/live`.
+- **Trigger AI actions via agents**: let an agent kick off summary regeneration, reanalysis, or chapter generation (currently read-only over AI outputs by design; would need a job/status pattern since those run minutes-long).
+- **Speaker-scoped audio clips**: stitch per-speaker WAV excerpts (the per-source Opus tracks exist already) so an agent can pull "everything Alice said".
+- **MCP write-guard mode**: per-tool allow/deny toggles in the Agent API settings panel for users who want read-only agents.
+
+---
+
 ## Idle cooldown / VRAM unload
 
 **Goal:** When the app sits idle (no webpage or tray interaction) for a configurable duration, unload the Whisper + pyannote models from VRAM and enter an idle state to conserve GPU resources. Toggleable from the System tab of the settings pane.

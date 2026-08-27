@@ -18183,6 +18183,150 @@ function switchSettingsSection(btn) {
   if (btn.dataset.target === 'section-changelog' && !_changelogLoaded) {
     loadChangelog(false);
   }
+  // Lazy-load the Agent API tab (fetches connection info + config snippets)
+  if (btn.dataset.target === 'section-agent-api') {
+    loadAgentApiPanel();
+  }
+}
+
+/* ── Settings: Agent API tab ──────────────────────────────────────────────── */
+
+let _agentApiInfo = null;
+
+async function loadAgentApiPanel() {
+  const enabledToggle = document.getElementById('agent-api-enabled');
+  const recToggle     = document.getElementById('agent-api-rec-control');
+  if (enabledToggle) enabledToggle.checked = _prefs.agent_api_enabled !== false;
+  if (recToggle)     recToggle.checked     = !!_prefs.agent_api_allow_recording_control;
+  _syncAgentApiTokenUI();
+
+  const urlEl = document.getElementById('agent-api-url');
+  try {
+    if (!_agentApiInfo) {
+      _agentApiInfo = await fetch('/api/agent/v1/').then(r => r.json());
+    }
+    const info = _agentApiInfo;
+    if (urlEl) urlEl.textContent = info.base_url;
+    const selftest = document.getElementById('agent-api-selftest');
+    if (selftest && info.mcp) {
+      selftest.textContent = 'Self-test: ' + (info.mcp.selftest || '');
+    }
+    document.querySelectorAll('.agent-config-code').forEach(pre => {
+      const snippet = info.mcp && info.mcp.configs && info.mcp.configs[pre.dataset.key];
+      pre.textContent = snippet || 'Unavailable';
+    });
+  } catch {
+    if (urlEl) urlEl.textContent = 'Could not reach the Agent API.';
+  }
+}
+
+function _syncAgentApiTokenUI() {
+  const stateEl  = document.getElementById('agent-api-token-state');
+  const clearBtn = document.getElementById('agent-api-token-clear');
+  const genBtn   = document.getElementById('agent-api-token-gen');
+  const token = (_prefs.agent_api_token || '').trim();
+  if (stateEl) {
+    stateEl.textContent = token
+      ? `Token required: ${token.slice(0, 8)}…  (agents send it as a Bearer header)`
+      : 'No token: any local process may connect.';
+  }
+  if (clearBtn) clearBtn.style.display = token ? '' : 'none';
+  if (genBtn)   genBtn.textContent = token ? 'Regenerate' : 'Generate';
+}
+
+function agentApiSetEnabled(on) {
+  savePref('agent_api_enabled', !!on);
+}
+
+function agentApiSetRecControl(on) {
+  savePref('agent_api_allow_recording_control', !!on);
+}
+
+function agentApiGenerateToken() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  const token = 'ma_' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  savePref('agent_api_token', token);
+  _syncAgentApiTokenUI();
+  navigator.clipboard?.writeText(token).catch(() => {});
+  const stateEl = document.getElementById('agent-api-token-state');
+  if (stateEl) stateEl.textContent = `Token set and copied to clipboard: ${token}`;
+}
+
+function agentApiClearToken() {
+  savePref('agent_api_token', '');
+  _syncAgentApiTokenUI();
+}
+
+function agentApiOpenDocs() {
+  window.open('/api/agent/v1/docs', '_blank');
+}
+
+async function agentApiCopy(key, btn) {
+  const info = _agentApiInfo;
+  const snippet = info && info.mcp && info.mcp.configs && info.mcp.configs[key];
+  if (!snippet) return;
+  try {
+    await navigator.clipboard.writeText(snippet);
+    const orig = btn.innerHTML;
+    btn.innerHTML = '<i class="fa-solid fa-check"></i>';
+    setTimeout(() => { btn.innerHTML = orig; }, 1500);
+  } catch {}
+}
+
+function _agentApiHeaders() {
+  const token = (_prefs.agent_api_token || '').trim();
+  return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+
+async function agentApiRunSetup(client, btn) {
+  const resultEl = document.getElementById(`agent-setup-result-${client}`);
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running…';
+  if (resultEl) { resultEl.textContent = ''; resultEl.className = 'agent-config-result'; }
+  try {
+    const r = await fetch(`/api/agent/v1/setup/${client}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ..._agentApiHeaders() },
+    });
+    const data = await r.json();
+    if (resultEl) {
+      if (data.ok) {
+        resultEl.classList.add('agent-config-result-ok');
+        const parts = [`✓ Config ${data.action}`];
+        if (data.path) parts.push(data.path);
+        resultEl.textContent = parts.join(': ') + (data.note ? ` · ${data.note}` : '');
+        if (data.backup) resultEl.textContent += ` (backup: ${data.backup})`;
+      } else {
+        resultEl.classList.add('agent-config-result-err');
+        resultEl.textContent = `✗ ${data.error || 'Setup failed.'}`;
+      }
+    }
+    btn.innerHTML = data.ok ? '<i class="fa-solid fa-check"></i> Done'
+                            : '<i class="fa-solid fa-bolt"></i> Retry';
+  } catch (e) {
+    if (resultEl) {
+      resultEl.classList.add('agent-config-result-err');
+      resultEl.textContent = `✗ Could not reach the app: ${e}`;
+    }
+    btn.innerHTML = '<i class="fa-solid fa-bolt"></i> Retry';
+  }
+  btn.disabled = false;
+  setTimeout(() => { btn.innerHTML = orig; }, 4000);
+}
+
+async function agentApiTest() {
+  const btn = document.getElementById('agent-api-test-btn');
+  if (btn) btn.textContent = 'Testing…';
+  try {
+    const h = await fetch('/api/agent/v1/system/health').then(r => r.json());
+    if (btn) btn.textContent = h.ok ? (h.agent_api_enabled ? 'OK ✓' : 'Disabled') : 'Failed';
+  } catch {
+    if (btn) btn.textContent = 'Failed';
+  }
+  setTimeout(() => { const b = document.getElementById('agent-api-test-btn');
+                     if (b) b.textContent = 'Test'; }, 2500);
 }
 
 let _changelogLoaded = false;

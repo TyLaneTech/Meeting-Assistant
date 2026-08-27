@@ -350,8 +350,13 @@ class SpeakerFingerprintDB:
                 """
                 SELECT s.id AS session_id, s.title, s.started_at,
                        sl.speaker_key,
+                       -- Match on the effective key (source_override wins over
+                       -- source, as everywhere else); counting raw `source`
+                       -- misses segments reassigned to another speaker.
                        (SELECT COUNT(*) FROM transcript_segments ts
-                        WHERE ts.session_id = s.id AND ts.source = sl.speaker_key) AS seg_count
+                        WHERE ts.session_id = s.id
+                          AND COALESCE(NULLIF(ts.source_override, ''), ts.source)
+                              = sl.speaker_key) AS seg_count
                 FROM speaker_labels sl
                 JOIN sessions s ON s.id = sl.session_id
                 WHERE sl.global_id = ?

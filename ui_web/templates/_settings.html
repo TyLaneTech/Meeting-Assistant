@@ -40,6 +40,9 @@
         <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-microchip"></i><span>System</span>
         </button>
+        <button class="settings-nav-item" data-target="section-agent-api" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-plug"></i><span>Agent API</span>
+        </button>
         {# Pinned to the bottom of the nav via margin-top:auto in CSS so any
            future tabs slot above it without re-anchoring. #}
         <button class="settings-nav-item settings-nav-item-pinned"
@@ -557,6 +560,117 @@
                 <div class="settings-row-desc" id="settings-update-status"></div>
               </div>
               <button class="btn-settings-action" id="check-update-btn" onclick="checkForUpdates()">Check for Updates</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Agent API -->
+        <div class="settings-panel" id="section-agent-api">
+          <p class="settings-setup-hint" style="display:block">
+            Let AI agents (Claude Desktop, Claude Code, Codex, scripts) query your
+            meetings directly: transcripts, summaries, notes, video frames, search,
+            logs, and settings. Local only: the server never leaves this machine.
+          </p>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Enable Agent API</div>
+                <div class="settings-row-desc">Master switch for all /api/agent/v1 endpoints and MCP tools</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="agent-api-enabled" onchange="agentApiSetEnabled(this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Status</div>
+                <div class="settings-row-desc settings-row-mono" id="agent-api-url">…</div>
+              </div>
+              <div class="settings-row-actions">
+                <button class="btn-settings-action btn-settings-secondary" onclick="agentApiOpenDocs()">API Docs</button>
+                <button class="btn-settings-action" id="agent-api-test-btn" onclick="agentApiTest()">Test</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-group-title">Access control</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Require access token</div>
+                <div class="settings-row-desc">
+                  Optional: agents must send this bearer token. The bundled MCP
+                  server picks it up automatically.
+                </div>
+                <div class="settings-row-desc settings-row-mono" id="agent-api-token-state">…</div>
+              </div>
+              <div class="settings-row-actions">
+                <button class="btn-settings-action" id="agent-api-token-gen" onclick="agentApiGenerateToken()">Generate</button>
+                <button class="btn-settings-action btn-settings-secondary" id="agent-api-token-clear" onclick="agentApiClearToken()" style="display:none">Remove</button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Allow recording control</div>
+                <div class="settings-row-desc">
+                  Let agents start/stop recordings. Off by default: reading your
+                  library never needs this.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="agent-api-rec-control" onchange="agentApiSetRecControl(this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-group-title">Connect an agent (MCP)</div>
+          <div class="settings-group">
+            <div class="agent-config" id="agent-config-claude-desktop">
+              <div class="agent-config-head">
+                <span class="settings-row-label">Claude Desktop</span>
+                <span class="settings-row-desc">Writes claude_desktop_config.json (merged with what's already there)</span>
+                <button class="icon-btn agent-config-copy" title="Copy the snippet instead"
+                        onclick="agentApiCopy('claude_desktop', this)"><i class="fa-solid fa-copy"></i></button>
+                <button class="btn-settings-action" id="agent-setup-btn-claude_desktop"
+                        onclick="agentApiRunSetup('claude_desktop', this)"><i class="fa-solid fa-bolt"></i> Run setup</button>
+              </div>
+              <pre class="agent-config-code" data-key="claude_desktop">Loading…</pre>
+              <div class="agent-config-result" id="agent-setup-result-claude_desktop"></div>
+            </div>
+            <div class="agent-config" id="agent-config-claude-code">
+              <div class="agent-config-head">
+                <span class="settings-row-label">Claude Code</span>
+                <span class="settings-row-desc">Registers via the claude CLI (user scope, all projects)</span>
+                <button class="icon-btn agent-config-copy" title="Copy the command instead"
+                        onclick="agentApiCopy('claude_code', this)"><i class="fa-solid fa-copy"></i></button>
+                <button class="btn-settings-action" id="agent-setup-btn-claude_code"
+                        onclick="agentApiRunSetup('claude_code', this)"><i class="fa-solid fa-bolt"></i> Run setup</button>
+              </div>
+              <pre class="agent-config-code" data-key="claude_code">Loading…</pre>
+              <div class="agent-config-result" id="agent-setup-result-claude_code"></div>
+            </div>
+            <div class="agent-config" id="agent-config-codex">
+              <div class="agent-config-head">
+                <span class="settings-row-label">Codex CLI</span>
+                <span class="settings-row-desc">Updates ~/.codex/config.toml (existing content preserved)</span>
+                <button class="icon-btn agent-config-copy" title="Copy the snippet instead"
+                        onclick="agentApiCopy('codex', this)"><i class="fa-solid fa-copy"></i></button>
+                <button class="btn-settings-action" id="agent-setup-btn-codex"
+                        onclick="agentApiRunSetup('codex', this)"><i class="fa-solid fa-bolt"></i> Run setup</button>
+              </div>
+              <pre class="agent-config-code" data-key="codex">Loading…</pre>
+              <div class="agent-config-result" id="agent-setup-result-codex"></div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-desc">
+                  Any other MCP client: spawn the script below over stdio, or hit the
+                  REST API directly (OpenAPI spec at <span class="settings-row-mono">/api/agent/v1/openapi.json</span>).
+                </div>
+                <div class="settings-row-desc settings-row-mono" id="agent-api-selftest">…</div>
+              </div>
             </div>
           </div>
         </div>

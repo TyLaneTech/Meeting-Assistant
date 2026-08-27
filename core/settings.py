@@ -113,6 +113,16 @@ DEFAULTS: dict = {
     # `video_offset_<session_id>` flat-key scheme — `_migrate_video_offsets()`
     # auto-migrates older settings files at load time.
     "video_offsets": {},
+
+    # Agent API (REST + MCP interface for external AI agents, agent_api/).
+    # The server only ever binds to 127.0.0.1, so exposure is local-only.
+    # agent_api_token, when non-empty, additionally requires a Bearer token on
+    # every /api/agent/v1 request (the bundled MCP server picks it up
+    # automatically from this file). Recording control via agents is opt-in
+    # and OFF by default - reading data never is.
+    "agent_api_enabled": True,
+    "agent_api_token": "",
+    "agent_api_allow_recording_control": False,
 }
 
 

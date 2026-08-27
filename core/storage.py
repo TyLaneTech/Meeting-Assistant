@@ -193,6 +193,12 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_chapters_session ON chapters(session_id)",
             # Per-session chapters system prompt override (NULL = use global/default)
             "ALTER TABLE sessions ADD COLUMN chapters_system_prompt TEXT DEFAULT NULL",
+            # Composite index for transcript lookups. Session loads filter on
+            # session_id and the speaker-history/talk-time paths additionally
+            # group on source; without this every lookup scanned the whole
+            # segments table (seconds per query on large libraries).
+            "CREATE INDEX IF NOT EXISTS idx_segments_session_source"
+            " ON transcript_segments(session_id, source)",
         ]:
             try:
                 conn.execute(migration)
@@ -2040,7 +2046,7 @@ def get_dashboard_analytics() -> dict:
         top_speakers = conn.execute(
             "SELECT gs.name, gs.color,"
             "  COUNT(DISTINCT sl.session_id) AS session_count,"
-            "  COALESCE(SUM(ts.end_time - ts.start_time), 0) AS talk_seconds"
+            "  COALESCE(SUM(MAX(ts.end_time - ts.start_time, 0)), 0) AS talk_seconds"
             " FROM global_speakers gs"
             " JOIN speaker_labels sl ON sl.global_id = gs.id"
             " LEFT JOIN transcript_segments ts"
@@ -2055,8 +2061,12 @@ def get_dashboard_analytics() -> dict:
             "SELECT s.id, s.title, s.started_at,"
             "  (SELECT MAX(ts.end_time) FROM transcript_segments ts"
             "   WHERE ts.session_id = s.id) AS duration_seconds,"
-            "  (SELECT COUNT(DISTINCT ts.source) FROM transcript_segments ts"
-            "   WHERE ts.session_id = s.id) AS speaker_count"
+            # Named participants, matching the `speakers` list every browse and
+            # search result carries. Counting distinct ts.source instead reports
+            # raw diarization clusters, which runs far higher than the number of
+            # people in the room (one person often spans several clusters).
+            "  (SELECT COUNT(DISTINCT lower(sl.name)) FROM speaker_labels sl"
+            "   WHERE sl.session_id = s.id AND sl.name != '') AS speaker_count"
             " FROM sessions s ORDER BY s.started_at DESC LIMIT 10"
         ).fetchall()
 
@@ -2079,6 +2089,302 @@ def get_dashboard_analytics() -> dict:
         "top_speakers": [dict(r) for r in top_speakers],
         "recent_sessions": [dict(r) for r in recent_sessions],
     }
+
+
+# ── Agent API queries ────────────────────────────────────────────────────────
+# Read-mostly helpers used by the Agent REST/MCP interface (agent_api/). They
+# live here so external-agent features go through the same storage layer as
+# the UI instead of opening their own SQLite connections.
+
+SUBSTRING_SCOPES = ("transcript", "titles", "summaries", "notes", "chat", "global_chat")
+
+
+def _excerpt(text: str, needle: str, case_sensitive: bool, context_chars: int) -> str:
+    """Window ``text`` around the first occurrence of ``needle``."""
+    hay = text if case_sensitive else text.lower()
+    idx = hay.find(needle if case_sensitive else needle.lower())
+    if idx < 0:
+        return text[: context_chars * 2]
+    start = max(0, idx - context_chars)
+    end = min(len(text), idx + len(needle) + context_chars)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{text[start:end]}{suffix}"
+
+
+def substring_search(
+    needle: str,
+    *,
+    scopes: "list[str] | None" = None,
+    session_ids: "list[str] | set[str] | None" = None,
+    case_sensitive: bool = False,
+    limit: int = 100,
+    context_chars: int = 90,
+) -> list[dict]:
+    """Exact substring scan across stored text, complementing FTS.
+
+    FTS5 tokenizes, so it can't find punctuation-bearing strings ("v2.3.1",
+    "foo_bar()"), partial words, or text living outside the index (summaries,
+    notes, chat). This walks the raw columns with ``instr`` instead. Returns
+    [{session_id, kind, excerpt, ...}] with per-kind extras (segment matches
+    carry segment_id / start_time / speaker; chat carries role; global_chat
+    carries conversation_id and its title). Ordered newest-session-first,
+    capped at ``limit`` total rows.
+    """
+    needle = (needle or "").strip()
+    if not needle:
+        return []
+    active = [s for s in (scopes or SUBSTRING_SCOPES) if s in SUBSTRING_SCOPES]
+    if not active:
+        return []
+
+    ids = None
+    if session_ids is not None:
+        ids = [s for s in dict.fromkeys(session_ids) if s]
+        if not ids:
+            return []
+
+    def _scope_clause(col_expr: str, sid_col: str | None) -> tuple[str, list]:
+        params: list = []
+        if case_sensitive:
+            cond = f"instr({col_expr}, ?) > 0"
+            params.append(needle)
+        else:
+            cond = f"instr(lower({col_expr}), ?) > 0"
+            params.append(needle.lower())
+        if ids is not None and sid_col:
+            cond += f" AND {sid_col} IN ({','.join('?' * len(ids))})"
+            params.extend(ids)
+        return cond, params
+
+    limit = max(1, min(500, limit))
+    out: list[dict] = []
+    with _conn() as conn:
+        if "titles" in active:
+            cond, params = _scope_clause("s.title", "s.id")
+            rows = conn.execute(
+                f"SELECT s.id AS session_id, s.title AS text FROM sessions s"
+                f" WHERE {cond} ORDER BY s.started_at DESC LIMIT ?",
+                [*params, limit],
+            ).fetchall()
+            out.extend({"session_id": r["session_id"], "kind": "title",
+                        "excerpt": r["text"]} for r in rows)
+
+        if "transcript" in active and len(out) < limit:
+            cond, params = _scope_clause("ts.text", "ts.session_id")
+            rows = conn.execute(
+                f"SELECT ts.id, ts.session_id, ts.text, ts.start_time,"
+                f"       {_SPEAKER_EXPR} AS speaker"
+                f" FROM transcript_segments ts"
+                f" JOIN sessions s ON s.id = ts.session_id"
+                f" LEFT JOIN speaker_labels sl"
+                f"        ON sl.session_id = ts.session_id"
+                f"       AND sl.speaker_key = COALESCE(ts.source_override, ts.source)"
+                f" WHERE {cond}"
+                f" ORDER BY s.started_at DESC, ts.start_time LIMIT ?",
+                [*params, limit - len(out)],
+            ).fetchall()
+            out.extend({
+                "session_id": r["session_id"], "kind": "transcript",
+                "segment_id": r["id"],
+                "start_time": round(r["start_time"] or 0.0, 1),
+                "speaker": r["speaker"],
+                "excerpt": _excerpt(r["text"], needle, case_sensitive, context_chars),
+            } for r in rows)
+
+        if "summaries" in active and len(out) < limit:
+            # Latest summary per session only - superseded rows are stale text.
+            cond, params = _scope_clause("su.content", "su.session_id")
+            rows = conn.execute(
+                f"SELECT su.session_id, su.content FROM summaries su"
+                f" JOIN sessions s ON s.id = su.session_id"
+                f" WHERE su.id = (SELECT MAX(id) FROM summaries"
+                f"                 WHERE session_id = su.session_id)"
+                f"   AND {cond}"
+                f" ORDER BY s.started_at DESC LIMIT ?",
+                [*params, limit - len(out)],
+            ).fetchall()
+            out.extend({
+                "session_id": r["session_id"], "kind": "summary",
+                "excerpt": _excerpt(r["content"], needle, case_sensitive, context_chars),
+            } for r in rows)
+
+        if "notes" in active and len(out) < limit:
+            cond, params = _scope_clause("s.notes", "s.id")
+            rows = conn.execute(
+                f"SELECT s.id AS session_id, s.notes FROM sessions s"
+                f" WHERE s.notes IS NOT NULL AND {cond}"
+                f" ORDER BY s.started_at DESC LIMIT ?",
+                [*params, limit - len(out)],
+            ).fetchall()
+            for r in rows:
+                # Notes are stored as Quill Delta JSON; excerpt the readable
+                # insert text rather than raw JSON when possible.
+                text = r["notes"] or ""
+                try:
+                    ops = json.loads(text)
+                    ops = ops.get("ops", ops) if isinstance(ops, dict) else ops
+                    plain = "".join(op.get("insert", "") for op in ops
+                                    if isinstance(op, dict) and isinstance(op.get("insert"), str))
+                    hay = plain if case_sensitive else plain.lower()
+                    if (needle if case_sensitive else needle.lower()) in hay:
+                        text = plain
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                out.append({
+                    "session_id": r["session_id"], "kind": "notes",
+                    "excerpt": _excerpt(text, needle, case_sensitive, context_chars),
+                })
+
+        if "chat" in active and len(out) < limit:
+            cond, params = _scope_clause("cm.content", "cm.session_id")
+            rows = conn.execute(
+                f"SELECT cm.session_id, cm.role, cm.content, cm.created_at"
+                f" FROM chat_messages cm"
+                f" JOIN sessions s ON s.id = cm.session_id"
+                f" WHERE {cond}"
+                f" ORDER BY s.started_at DESC, cm.id LIMIT ?",
+                [*params, limit - len(out)],
+            ).fetchall()
+            out.extend({
+                "session_id": r["session_id"], "kind": "chat",
+                "role": r["role"], "created_at": r["created_at"],
+                "excerpt": _excerpt(r["content"], needle, case_sensitive, context_chars),
+            } for r in rows)
+
+        if "global_chat" in active and len(out) < limit:
+            cond, params = _scope_clause("gm.content", None)
+            rows = conn.execute(
+                f"SELECT gm.conversation_id, gc.title, gm.role, gm.content, gm.created_at"
+                f" FROM global_chat_messages gm"
+                f" JOIN global_chat_conversations gc ON gc.id = gm.conversation_id"
+                f" WHERE {cond}"
+                f" ORDER BY gm.id DESC LIMIT ?",
+                [*params, limit - len(out)],
+            ).fetchall()
+            out.extend({
+                "session_id": None, "kind": "global_chat",
+                "conversation_id": r["conversation_id"],
+                "conversation_title": r["title"],
+                "role": r["role"], "created_at": r["created_at"],
+                "excerpt": _excerpt(r["content"], needle, case_sensitive, context_chars),
+            } for r in rows)
+
+    return out[:limit]
+
+
+def sessions_have_notes(session_ids: "list[str] | set[str]") -> set[str]:
+    """Return the subset of ``session_ids`` that have non-empty notes."""
+    ids = [s for s in dict.fromkeys(session_ids) if s]
+    if not ids:
+        return set()
+    ph = ",".join("?" * len(ids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT id FROM sessions WHERE id IN ({ph})"
+            f" AND notes IS NOT NULL AND notes != ''", ids
+        ).fetchall()
+    return {r["id"] for r in rows}
+
+
+def speaker_time_stats(session_id: str) -> list[dict]:
+    """Per-speaker stats for one session, grouped by effective speaker key.
+
+    Effective key = source_override when set, else source (matching how the
+    transcript resolves speakers). Returns [{speaker_key, name, color,
+    global_id, segment_count, talk_seconds, word_count}] sorted by talk time.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(ts.source_override, ''), ts.source) AS speaker_key,
+                   sl.name, sl.color, sl.global_id,
+                   COUNT(*) AS segment_count,
+                   COALESCE(SUM(MAX(ts.end_time - ts.start_time, 0)), 0) AS talk_seconds,
+                   COALESCE(SUM(LENGTH(ts.text) - LENGTH(REPLACE(ts.text, ' ', '')) + 1), 0)
+                       AS word_count
+            FROM transcript_segments ts
+            LEFT JOIN speaker_labels sl
+                   ON sl.session_id = ts.session_id
+                  AND sl.speaker_key = COALESCE(NULLIF(ts.source_override, ''), ts.source)
+            WHERE ts.session_id = ?
+            -- Group by the expression, not the `speaker_key` alias: SQLite
+            -- resolves a bare name to the joined sl.speaker_key column first,
+            -- which is NULL for every unlabeled speaker and would collapse
+            -- them all into one row.
+            GROUP BY COALESCE(NULLIF(ts.source_override, ''), ts.source)
+            ORDER BY talk_seconds DESC
+            """,
+            (session_id,),
+        ).fetchall()
+    return [
+        {
+            "speaker_key": r["speaker_key"],
+            "name": r["name"],
+            "color": r["color"],
+            "global_id": r["global_id"],
+            "segment_count": r["segment_count"],
+            "talk_seconds": round(r["talk_seconds"] or 0.0, 1),
+            "word_count": r["word_count"] or 0,
+        }
+        for r in rows
+    ]
+
+
+def get_summary_history(session_id: str) -> list[dict]:
+    """All stored summary revisions for a session, oldest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, content, created_at FROM summaries"
+            " WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def global_speaker_session_counts() -> dict[str, dict]:
+    """Session count + last appearance per voice-library profile, in one query.
+
+    Returns {global_id: {session_count, last_seen}}. Replaces the
+    per-speaker ``get_profile_sessions`` loop for roster listings, which ran a
+    correlated segment-count subquery per label row and took ~30s on large
+    libraries.
+    """
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT sl.global_id,"
+            "       COUNT(DISTINCT sl.session_id) AS n,"
+            "       MAX(s.started_at) AS last_seen"
+            " FROM speaker_labels sl"
+            " JOIN sessions s ON s.id = sl.session_id"
+            " WHERE sl.global_id IS NOT NULL"
+            " GROUP BY sl.global_id"
+        ).fetchall()
+    return {r["global_id"]: {"session_count": r["n"], "last_seen": r["last_seen"]}
+            for r in rows}
+
+
+def agent_counts() -> dict:
+    """Cheap library-wide row counts for the agent system endpoints."""
+    with _conn() as conn:
+        counts = {}
+        for key, sql in [
+            ("sessions", "SELECT COUNT(*) FROM sessions"),
+            ("segments", "SELECT COUNT(*) FROM transcript_segments"),
+            ("folders", "SELECT COUNT(*) FROM folders"),
+            ("chapters", "SELECT COUNT(*) FROM chapters"),
+            ("global_speakers", "SELECT COUNT(*) FROM global_speakers"),
+            ("chat_messages", "SELECT COUNT(*) FROM chat_messages"),
+            ("global_chat_conversations", "SELECT COUNT(*) FROM global_chat_conversations"),
+            ("sessions_with_notes",
+             "SELECT COUNT(*) FROM sessions WHERE notes IS NOT NULL AND notes != ''"),
+            ("sessions_embedded", "SELECT COUNT(*) FROM session_embeddings"),
+        ]:
+            try:
+                counts[key] = conn.execute(sql).fetchone()[0]
+            except Exception:
+                counts[key] = None
+    return counts
 
 
 # ── Import / Export ─────────────────────────────────────────────────────────

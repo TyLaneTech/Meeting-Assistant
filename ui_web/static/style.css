@@ -5226,6 +5226,38 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
   opacity: 0.85;
 }
 
+/* Settings: Agent API tab - MCP connection snippets */
+.agent-config { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.agent-config:last-of-type { border-bottom: none; }
+.agent-config-head {
+  display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px;
+}
+.agent-config-head .settings-row-desc { flex: 1; }
+.agent-config-copy { flex-shrink: 0; }
+.agent-config-code {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  background: var(--surface4, var(--surface2));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+.agent-config-result {
+  font-size: 11px;
+  margin-top: 6px;
+  word-break: break-all;
+  color: var(--fg-muted);
+}
+.agent-config-result:empty { display: none; }
+.agent-config-result-ok  { color: var(--green, #3fb950); }
+.agent-config-result-err { color: var(--red, #f85149); }
+
 .toggle-switch { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; }
 .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
 .toggle-slider {

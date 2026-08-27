@@ -68,6 +68,7 @@ from ml.transcriber import (
     Transcriber,
     get_cuda_available,
 )
+from agent_api import AgentContext, register_agent_api
 
 config.ensure_env()
 storage.init_db()
@@ -174,6 +175,7 @@ _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
 _retitle_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retitle")
 _tray = None  # MeetingTray instance (set in main(), None if no tray)
 _server_url = f"http://localhost:{int(os.getenv('PORT', 6969))}"
+_APP_STARTED_AT = time.time()   # wall-clock start, surfaced via the Agent API
 _quiet_audio_rms_threshold = float(settings.get("quiet_prompt_audio_rms_threshold", 0.006))
 _startup_init_lock = threading.Lock()
 _startup_init_started = False
@@ -5952,15 +5954,16 @@ def _global_tool_executor(name: str, tool_input: dict) -> tuple:
         speakers = fingerprint_db.list_global_speakers()
         if not speakers:
             return "No speakers in the Voice Library yet.", False, "No speakers found", None
-        # Enrich with session counts
+        # Enrich with session counts (batched - a per-speaker
+        # get_profile_sessions loop took ~30s on large voice libraries)
+        counts = storage.global_speaker_session_counts()
         enriched = []
         for sp in speakers:
-            sessions = fingerprint_db.get_profile_sessions(sp["id"])
             enriched.append({
                 "id": sp["id"],
                 "name": sp["name"],
                 "color": sp.get("color"),
-                "session_count": len(sessions),
+                "session_count": counts.get(sp["id"], {}).get("session_count", 0),
             })
         text = json.dumps(enriched, indent=2)
         return text, False, f"Found {len(enriched)} speakers", None
@@ -8646,6 +8649,133 @@ def update_apply():
 
     threading.Thread(target=_restart, daemon=True).start()
     return jsonify({"ok": True})
+
+
+# ── Agent API (REST + MCP interface for external AI agents) ──────────────────
+# All routes live in agent_api/rest.py under /api/agent/v1. App-owned state
+# and the shared search/browse helpers are handed over via AgentContext so
+# the blueprint never has to import app.py. The MCP server (mcp_server.py at
+# the repo root) proxies to these routes over localhost HTTP.
+
+def _agent_live_extras() -> dict:
+    """Live-only readings for the Agent API: audio levels + screen state."""
+    with _state_lock:
+        capture = _state["audio_capture"]
+    levels = None
+    if capture is not None:
+        try:
+            levels = {
+                "loopback": round(float(getattr(capture, "loopback_level", 0.0)), 4),
+                "mic": round(float(getattr(capture, "mic_level", 0.0)), 4),
+            }
+        except Exception:
+            levels = None
+    return {
+        "audio_levels": levels,
+        "screen_recording": _screen_recorder.is_recording,
+    }
+
+
+def _agent_live_media() -> dict:
+    """Live media state for the Agent API's frame endpoints.
+
+    elapsed_sec comes from the WAV writer (the meeting-timeline clock that
+    video_offset is measured against), so agents can map "now" onto the
+    transcript timeline and the live frag file.
+    """
+    with _state_lock:
+        recording = _state["is_recording"]
+        sid = _state["session_id"] if recording else None
+        capture = _state["audio_capture"]
+    elapsed = None
+    if recording and capture is not None:
+        try:
+            elapsed = float(capture.wav_writer.elapsed_seconds)
+        except Exception:
+            elapsed = None
+    return {
+        "recording": recording,
+        "session_id": sid,
+        "live_video_path": _screen_recorder.live_video_path,
+        "elapsed_sec": elapsed,
+    }
+
+
+def _agent_model_snapshot() -> dict:
+    with _state_lock:
+        snap = {
+            "model_ready": _state["model_ready"],
+            "model_info": _state["model_info"],
+            "diarizer_ready": _state["diarizer_ready"],
+            "diarizer_failed": _state["diarizer_failed"],
+        }
+    snap.update({
+        "whisper_preset": _transcriber.whisper_preset_id,
+        "diarization_enabled": _transcriber.diarization_enabled,
+        "diarizer_device": _transcriber.diarizer_device,
+        "cuda_available": get_cuda_available(),
+    })
+    return snap
+
+
+def _agent_ai_snapshot() -> dict:
+    return {
+        "provider": ai.provider,
+        "model": ai.model,
+        "overrides": {
+            k: settings.get(k)
+            for k in ("summary_provider", "summary_model",
+                      "chat_provider", "chat_model",
+                      "global_chat_provider", "global_chat_model",
+                      "chapters_provider", "chapters_model")
+        },
+    }
+
+
+def _agent_apply_ai_settings(provider, model) -> dict:
+    """Apply an agent-requested provider/model change through the same
+    normalization + reload path the settings UI uses."""
+    target_provider = provider or ai.provider
+    target_model = model if model is not None else ai.model
+    target_provider, target_model = _normalize_ai_selection(target_provider, target_model)
+    updates = {}
+    if target_provider != ai.provider:
+        updates["ai_provider"] = target_provider
+    if target_model != ai.model:
+        updates["ai_model"] = target_model
+    if updates:
+        settings.update(updates)
+        ai.reload_client(provider=target_provider, model=target_model)
+        log.info("ai", f"Provider switched via Agent API: {ai.provider}, model: {ai.model}")
+    return {"provider": ai.provider, "model": ai.model}
+
+
+def _agent_changelog(limit: int) -> list:
+    payload = _build_changelog(Path(__file__).parent)
+    return (payload.get("commits") or [])[:limit]
+
+
+register_agent_api(app, AgentContext(
+    status_payload=_status_payload,
+    live_extras=_agent_live_extras,
+    live_media=_agent_live_media,
+    scope_filters=_scope_filters,
+    scoped_session_ids=_scoped_session_ids,
+    folder_labels=_folder_labels,
+    describe_session=_describe_session,
+    source_labels=_SOURCE_LABELS,
+    model_snapshot=_agent_model_snapshot,
+    ai_snapshot=_agent_ai_snapshot,
+    apply_ai_settings=_agent_apply_ai_settings,
+    list_global_speakers=lambda: fingerprint_db.list_global_speakers(),
+    get_profile_sessions=lambda gid: fingerprint_db.get_profile_sessions(gid),
+    changelog=_agent_changelog,
+    stop_recording=stop_recording,
+    push_status=_push_status,
+    push_event=_push,
+    server_url=_server_url,
+    app_started_at=_APP_STARTED_AT,
+))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
