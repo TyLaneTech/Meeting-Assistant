@@ -2348,12 +2348,19 @@ def stop_recording():
     def _cleanup() -> None:
         try:
             if capture:
-                capture.stop()   # joins threads then finalizes WAV
+                # Joins threads and finalizes the mixed WAV (what playback and
+                # the transcript need), but defers the per-source Opus encode:
+                # measured on a 34-minute meeting it was 27 of the 28 seconds
+                # the button spent saying "Stopping…", and nothing in the UI
+                # waits on those tracks.
+                capture.stop(encode_per_source=False)
             _transcriber.stop()
             # Stop screen recording if active
             if _screen_recorder.is_recording:
                 _screen_recorder.stop()
-            # Concatenate video parts from pause/resume cycles
+            # Concatenate video parts from pause/resume cycles. Kept ahead of
+            # the status push because the UI opens the video as soon as it sees
+            # the session end, and a stream copy is quick.
             if sid:
                 _concat_video_parts(sid)
             if sid:
@@ -2361,6 +2368,19 @@ def stop_recording():
                 seg_count = len(_state.get("segments", []))
                 log.info("recording", f"Stopped - session {sid} ({seg_count} segments)")
             _push_status({"recording": False, "session_id": sid})
+        finally:
+            # Streams, transcriber, video and the session row are all settled,
+            # which is everything a new recording needs to wait for. Release it
+            # here rather than after the slow tail below, so pressing Record
+            # again right away doesn't stall on work this session owns alone.
+            _recording_cleanup_done.set()
+
+        # ── Deferred tail: the UI is already out of "Stopping…" ─────────────
+        try:
+            # Encoding the per-source tracks guards itself against a resumed
+            # recording touching the same temp WAVs.
+            if capture:
+                capture.finalize_per_source_tracks()
             # Auto-title: use full formatted transcript (with speaker labels) for better context.
             # Skip entirely if the user has manually renamed the session — their title wins.
             if sid and (transcript_snapshot or plain_snapshot).strip():
@@ -2376,8 +2396,10 @@ def stop_recording():
                     if title:
                         storage.update_session_title(sid, title, user_set=False)
                         _push("session_title", {"session_id": sid, "title": title})
-        finally:
-            _recording_cleanup_done.set()
+        except Exception:
+            import traceback
+            log.warn("recording", f"Post-stop tasks failed for session {sid}:")
+            traceback.print_exc()
 
     threading.Thread(target=_cleanup, daemon=True).start()
     # Update semantic embedding in background after session ends

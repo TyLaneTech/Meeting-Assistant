@@ -2993,6 +2993,73 @@ function renameFolderInline(e, folderId, currentName) {
   });
 }
 
+/* ── Optimistic sidebar moves ──────────────────────────────────────────────
+ * A drop used to wait for the write AND a full sidebar refetch before the item
+ * appeared in its new place, so every move visibly snapped back first. The new
+ * arrangement is already computed on the client (it is exactly what gets sent),
+ * so apply it to the local model, repaint at once, and only fall back to the
+ * server if the write fails.
+ */
+function _applyReorderLocally({ sessions, folders }) {
+  if (sessions && sessions.length) {
+    const byId = new Map(_sidebarAllSessions.map(s => [s.id, s]));
+    for (const p of sessions) {
+      const s = byId.get(p.id);
+      if (!s) continue;
+      s.sort_order = p.sort_order;
+      if (p.folder_id !== undefined) s.folder_id = p.folder_id;
+    }
+  }
+  if (folders && folders.length) {
+    const byId = new Map(_sidebarFolders.map(f => [f.id, f]));
+    for (const p of folders) {
+      const f = byId.get(p.id);
+      if (!f) continue;
+      f.sort_order = p.sort_order;
+      if (p.parent_id !== undefined) f.parent_id = p.parent_id;
+    }
+    // Folders render in array order within each parent, and the server hands
+    // them back ordered by sort_order then created_at. Match that here so the
+    // optimistic tree and the next refresh agree.
+    _sidebarFolders.sort((a, b) =>
+      (a.sort_order || 0) - (b.sort_order || 0) ||
+      String(a.created_at || '').localeCompare(String(b.created_at || '')));
+  }
+}
+
+/** Paint `payload` immediately, then persist it. `request` returns the fetch
+ *  promise; any failure resyncs from the server so the sidebar can never keep
+ *  showing a move the database rejected. */
+function _commitSidebarMove(payload, request) {
+  _applyReorderLocally(payload);
+  _sidebarSelected.clear();
+  _renderSidebar();
+  return request()
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); })
+    .catch(() => {
+      flashStatus('Could not save the new order');
+      refreshSidebar();
+    });
+}
+
+function _postJson(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+/** Mirror of storage.bulk_set_folder: moved sessions land at the end of the
+ *  target folder, numbered from its current highest sort_order. */
+function _sessionMovePayload(ids, folderId) {
+  const maxOrder = folderId
+    ? _sidebarAllSessions.reduce(
+        (m, s) => (s.folder_id === folderId ? Math.max(m, s.sort_order || 0) : m), 0)
+    : 0;
+  return ids.map((id, i) => ({ id, sort_order: maxOrder + 1 + i, folder_id: folderId || null }));
+}
+
 // ── Drop handlers ─────────────────────────────────────────────────────────────
 
 function _handleDropIntoFolder(folderId) {
@@ -3005,18 +3072,14 @@ function _handleDropIntoFolder(folderId) {
     if (ids.some(id => _dragDescendants.has(folderId))) return;
     // Move folder(s) into another folder as sub-folders
     const payload = ids.map((id, i) => ({ id, sort_order: i, parent_id: folderId }));
-    fetch('/api/reorder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ folders: payload }),
-    }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+    return _commitSidebarMove({ folders: payload },
+      () => _postJson('/api/reorder', { folders: payload }));
   } else {
-    // Move session(s) into folder
-    fetch('/api/sessions/bulk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'move', session_ids: ids, folder_id: folderId }),
-    }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+    // Move session(s) into folder (or out of one, when folderId is null)
+    const payload = _sessionMovePayload(ids, folderId);
+    return _commitSidebarMove({ sessions: payload },
+      () => _postJson('/api/sessions/bulk',
+                      { action: 'move', session_ids: ids, folder_id: folderId }));
   }
 }
 
@@ -3027,11 +3090,8 @@ function _handleDropFolderToTopLevel() {
   const topFolders = _sidebarFolders.filter(f => !f.parent_id);
   const maxOrder = topFolders.reduce((m, f) => Math.max(m, f.sort_order || 0), 0);
   const payload = ids.map((id, i) => ({ id, sort_order: maxOrder + 1 + i, parent_id: null }));
-  fetch('/api/reorder', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ folders: payload }),
-  }).then(() => refreshSidebar());
+  return _commitSidebarMove({ folders: payload },
+    () => _postJson('/api/reorder', { folders: payload }));
 }
 
 function _handleDrop(targetId, targetType, zone, parentContext) {
@@ -3085,11 +3145,8 @@ function _reorderSessions(targetSessionId, zone, folderId) {
     folder_id: inFolder,
   }));
 
-  fetch('/api/reorder', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessions: payload }),
-  }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+  return _commitSidebarMove({ sessions: payload },
+    () => _postJson('/api/reorder', { sessions: payload }));
 }
 
 function _reorderFolders(targetFolderId, zone) {
@@ -3119,11 +3176,8 @@ function _reorderFolders(targetFolderId, zone) {
     parent_id: parentId,
   }));
 
-  fetch('/api/reorder', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ folders: payload }),
-  }).then(() => { _sidebarSelected.clear(); refreshSidebar(); });
+  return _commitSidebarMove({ folders: payload },
+    () => _postJson('/api/reorder', { folders: payload }));
 }
 
 // Legacy alias for any remaining references

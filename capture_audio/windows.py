@@ -72,6 +72,11 @@ _N_BARS   = 32   # number of log-spaced frequency bands sent to the frontend
 # all open streams/handles when the process exits normally.
 _stream_graveyard: list = []
 
+# Guards the per-source Opus encode, which now runs after a recording has
+# already been reported as stopped. Module level (not per instance) because the
+# capture object that produced the temp WAVs is not the one that resumes them.
+_PER_SOURCE_ENCODE_LOCK = threading.Lock()
+
 
 class AudioCapture:
     CHUNK_SIZE = 512
@@ -411,6 +416,10 @@ class AudioCapture:
         """Open the mic-only and desktop-only temp WAV writers. On resume
         (append) with an existing Opus part, decode it back to the temp WAV first
         so the final encode covers the whole session."""
+        # A previous session's deferred encode may still be running; it deletes
+        # the temp WAV on success, so wait it out before deciding what exists.
+        with _PER_SOURCE_ENCODE_LOCK:
+            pass
         p = self._per_source_paths(base_wav_path)
         self._mic_wav_path     = p["mic_wav"]
         self._desktop_wav_path = p["desktop_wav"]
@@ -452,41 +461,79 @@ class AudioCapture:
             log.warn("audio", f"Could not decode {os.path.basename(opus_path)} for resume")
             return False
 
+    @staticmethod
+    def _encode_one_opus(wav_path: str, opus_path: str, ffmpeg: str) -> None:
+        """Encode a single per-source temp WAV to Opus, deleting the WAV only on
+        success. Never raises: a failed track keeps its WAV as a fallback."""
+        from capture_video.ffmpeg_util import subprocess_no_window_flag
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-i", wav_path,
+                 "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
+                 "-application", "voip", opus_path],
+                capture_output=True, timeout=600,
+                creationflags=subprocess_no_window_flag(),
+            )
+            if r.returncode == 0 and os.path.isfile(opus_path):
+                os.remove(wav_path)
+            else:
+                log.warn("audio", f"Opus encode failed for {os.path.basename(wav_path)} "
+                                  f"(rc={r.returncode}); keeping WAV")
+        except Exception:
+            log.warn("audio", f"Opus encode error for {os.path.basename(wav_path)}; keeping WAV")
+            traceback.print_exc()
+
     def _encode_per_source_opus(self) -> None:
-        """Encode the per-source temp WAVs to Opus and delete the temps. Called
-        from stop() after writers are closed. Failures are non-fatal: the temp
-        WAV is kept so reanalysis can still fall back to it."""
-        from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+        """Encode the per-source temp WAVs to Opus and delete the temps.
+
+        The two tracks encode concurrently: libopus is single-threaded per
+        stream, so running them back to back doubled the wall time of the
+        slowest step in stopping a recording for no reason. Failures are
+        non-fatal: the temp WAV is kept so reanalysis can still fall back to it.
+        """
+        from capture_video.ffmpeg_util import find_ffmpeg
         ffmpeg = find_ffmpeg()
         pairs = []
         if self._mic_wav_path:
             pairs.append((self._mic_wav_path, self._per_source_paths_opus(self._mic_wav_path)))
         if self._desktop_wav_path:
             pairs.append((self._desktop_wav_path, self._per_source_paths_opus(self._desktop_wav_path)))
-        for wav_path, opus_path in pairs:
-            if not os.path.isfile(wav_path):
-                continue
-            if not ffmpeg:
-                log.warn("audio", "ffmpeg not found - keeping per-source WAV (no Opus encode)")
-                continue
-            try:
-                r = subprocess.run(
-                    [ffmpeg, "-y", "-i", wav_path,
-                     "-c:a", "libopus", "-b:a", "32k", "-vbr", "on",
-                     "-application", "voip", opus_path],
-                    capture_output=True, timeout=600,
-                    creationflags=subprocess_no_window_flag(),
-                )
-                if r.returncode == 0 and os.path.isfile(opus_path):
-                    os.remove(wav_path)
-                else:
-                    log.warn("audio", f"Opus encode failed for {os.path.basename(wav_path)} "
-                                      f"(rc={r.returncode}); keeping WAV")
-            except Exception:
-                log.warn("audio", f"Opus encode error for {os.path.basename(wav_path)}; keeping WAV")
-                traceback.print_exc()
+        pairs = [(w, o) for w, o in pairs if os.path.isfile(w)]
         self._mic_wav_path = None
         self._desktop_wav_path = None
+        if not pairs:
+            return
+        if not ffmpeg:
+            log.warn("audio", "ffmpeg not found - keeping per-source WAV (no Opus encode)")
+            return
+        # Held for the whole encode so a recording started (or resumed) while
+        # this runs cannot append to a temp WAV that ffmpeg is about to delete.
+        with _PER_SOURCE_ENCODE_LOCK:
+            t0 = time.monotonic()
+            threads = [threading.Thread(target=self._encode_one_opus,
+                                        args=(w, o, ffmpeg), daemon=True)
+                       for w, o in pairs]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            log.info("audio", f"Per-source Opus encode finished: {len(pairs)} track(s) "
+                              f"in {time.monotonic() - t0:.1f}s")
+
+    def finalize_per_source_tracks(self) -> None:
+        """Run the deferred per-source Opus encode.
+
+        ``stop(encode_per_source=False)`` closes the writers but leaves the
+        encode for the caller to run once the UI has been told the recording
+        ended (it is by far the slowest part of stopping). Safe to call when
+        nothing is pending, and safe to skip entirely: the temp WAVs simply
+        stay on disk and reanalysis still finds them."""
+        try:
+            self._encode_per_source_opus()
+        except Exception:
+            log.warn("audio", "Per-source Opus encode raised; per-source temp "
+                              "WAVs left in place.")
+            traceback.print_exc()
 
     @staticmethod
     def _per_source_paths_opus(wav_path: str) -> str:
@@ -735,7 +782,12 @@ class AudioCapture:
         self._mixer_thread = threading.Thread(target=self._mixer_loop, daemon=True)
         self._mixer_thread.start()
 
-    def stop(self) -> None:
+    def stop(self, encode_per_source: bool = True) -> None:
+        """Stop capture and finalize the mixed WAV.
+
+        ``encode_per_source=False`` closes the per-source writers but leaves the
+        Opus encode to a later ``finalize_per_source_tracks()`` call, so the
+        caller can report the recording as stopped without waiting on it."""
         self.is_running = False
         # Terminate ffmpeg subprocess so the capture thread unblocks on stdout.read()
         if self._ffmpeg_proc is not None:
@@ -756,18 +808,14 @@ class AudioCapture:
         # while the mixer is still running is a race condition that can corrupt
         # the file or crash on a write to a closed handle.
         self.stop_wav()
-        # Close + encode the per-source tracks (mic-only / desktop-only) to Opus.
-        # Done after the mixer thread joins so no writes race the close. Encode
-        # failures are non-fatal (the temp WAV is kept as a reanalysis fallback).
+        # Close the per-source tracks (mic-only / desktop-only). Done after the
+        # mixer thread joins so no writes race the close. The Opus encode that
+        # follows is the slowest step in stopping, so callers can defer it.
         if self._per_source_active:
             self._close_per_source_writers()
-            try:
-                self._encode_per_source_opus()
-            except Exception:
-                log.warn("audio", "Per-source Opus encode raised; per-source temp "
-                                  "WAVs left in place.")
-                traceback.print_exc()
             self._per_source_active = False
+            if encode_per_source:
+                self.finalize_per_source_tracks()
         # Park streams + PyAudio instance in the graveyard instead of closing them.
         # Pa_StopStream / Pa_CloseStream on a WASAPI loopback stream calls
         # ExitProcess() at the C level on Windows, killing the whole process.
