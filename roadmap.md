@@ -4,6 +4,56 @@ Postponed ideas and feature plans. Not yet scheduled for implementation.
 
 ---
 
+## Speaker attribution: follow-ons from the speaker_lab findings
+
+The "link v2" auto-apply policy (exclusion removal + margin/streak routes,
+validated in the gitignored `speaker_lab/` replay harness against 10
+hand-corrected meetings) shipped in `app.py` / `ml/speaker_db.py` behind the
+`speaker_link_v2` settings key (default on). Deferred follow-ups, in impact
+order:
+
+- ~~**Library hygiene pass.**~~ Done 2026-08-27: `SpeakerFingerprintDB` grew a
+  maintenance pipeline (`library_health` / `run_maintenance`: same-name
+  duplicate merges, foreign-embedding sweep via leave-one-out vs rival
+  centroids, 2-means pollution purges, full centroid canonicalization),
+  exposed at `/api/fingerprint/library/{health,maintenance,auto}`, in the
+  Voice Library "Health" tab, and as a weekly idle-time scheduler
+  (`library_maintenance_*` settings). Validated on a DB copy
+  (`speaker_lab/test_maintenance.py`), then applied live: 141 -> 131
+  profiles, 11,102 -> 10,331 embeddings, changelog + pre-cleanup backup in
+  the data folder's `backups/`. Replay showed the cleanup is
+  accuracy-NEUTRAL for attribution (the linking-policy change carries the
+  accuracy win); its value is consolidated identities and stopping further
+  pollution. NOTE: S-norm magnet score normalization was tested in the lab
+  and REJECTED (kills depressed-similarity meetings); the remaining
+  confusions (Kristen Maddox <-> Sarah Elliott 0.845, Snehitha <-> Sireesha
+  0.767) are surfaced as Health-tab warnings instead. A possible future
+  refinement: audio-snippet preview for review-class split profiles (Rich
+  Nelson, Riley Preiss, Amber OReilly) so the user can adjudicate the second
+  voice by ear.
+- **Per-meeting similarity calibration.** One meeting regime (e.g. Carrier
+  Contact Tool Review 76da00bd, likely narrowband/phone-bridge audio) has
+  every profile similarity depressed below ~0.66 for the whole meeting, so
+  even the new floors never fire (35 correct suggestions, 0 auto-links).
+  Idea: track the session's running max-sim distribution and lower the
+  margin/streak floors when the whole distribution is shifted down (z-score
+  the top-match sims within the session instead of using absolute floors).
+- **Within-key confusion (the oracle gap).** Even with perfect per-key
+  naming, ~19% of speech time is misattributed because the online clusterer
+  assigns windows of one voice to another voice's key (worst on 7+ person
+  calls). This is the diarizer layer itself; candidate ideas: multiple
+  anchors per session speaker, overlap-aware embedding exclusion, or
+  replacing max(centroid, anchor) with a small per-speaker embedding pool.
+  Test any of these in speaker_lab before touching the live path (oracle
+  accuracy is the metric to move; it is insensitive to the linking layer).
+- **Settings UI checkbox** for `speaker_link_v2` in the Diarization settings
+  section (the backend honors the key today; there is no UI control yet).
+- **Suggestion popup ranking.** With exclusion removed, suggestions can
+  include a profile already linked to another key; consider annotating those
+  in the picker ("also matched Speaker 3") rather than hiding them.
+
+---
+
 ## Agent API: follow-on ideas
 
 The Agent API (agent_api/ + mcp_server.py, docs/AGENT_API.md) shipped with REST + stdio MCP. Deferred extensions:

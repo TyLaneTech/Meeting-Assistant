@@ -7429,6 +7429,90 @@ div#fp-detail-color-grid {
     display: none !important;
 }
 
+/* ── Library Health tab ────────────────────────────────────────────────── */
+.fp-tab-content#fp-tab-health {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    width: 100%;
+}
+#fp-tab-health .fp-health-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.fp-health-summary { display: flex; gap: 8px; margin-bottom: 6px; }
+.fp-health-chip {
+    background: var(--surface2);
+    border: 1px solid var(--border-sub);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: .74rem;
+    color: var(--fg-muted);
+}
+.fp-health-clean {
+    padding: 24px 8px;
+    text-align: center;
+    color: var(--green);
+    font-size: .85rem;
+}
+.fp-health-sec {
+    margin: 12px 0 2px;
+    font-size: .72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--fg-muted);
+}
+.fp-health-note { font-size: .74rem; color: var(--fg-muted); margin-bottom: 2px; }
+.fp-health-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--surface2);
+    border-radius: var(--radius-sm);
+    font-size: .8rem;
+    line-height: 1.4;
+}
+.fp-health-row > span:last-of-type { flex: 1; }
+.fp-health-badge {
+    flex: none;
+    font-size: .66rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    padding: 2px 8px;
+    border-radius: 999px;
+}
+.fp-health-badge.fix    { background: color-mix(in srgb, var(--green) 18%, transparent); color: var(--green); }
+.fp-health-badge.review { background: color-mix(in srgb, var(--yellow) 18%, transparent); color: var(--yellow); }
+.fp-health-badge.info   { background: var(--surface3); color: var(--fg-muted); }
+.fp-health-mini-btn { flex: none; padding: 3px 10px; font-size: .72rem; }
+.fp-health-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border-sub);
+}
+.fp-health-auto {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: .78rem;
+    color: var(--fg-muted);
+    cursor: pointer;
+    user-select: none;
+}
+.fp-health-lastrun { flex: 1; font-size: .72rem; color: var(--fg-subtle); }
+.fp-health-lastrun.error { color: var(--red); }
+
 /* ── Match Speakers tab ────────────────────────────────────────────────── */
 #fp-tab-match .fp-match-scroll {
     flex: 1;

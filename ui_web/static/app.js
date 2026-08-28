@@ -7884,11 +7884,176 @@ function fpSwitchTab(tab) {
     t.classList.toggle('active', t.dataset.tab === tab));
   const profilesTab = document.getElementById('fp-tab-profiles');
   const matchTab = document.getElementById('fp-tab-match');
+  const healthTab = document.getElementById('fp-tab-health');
   const footer = document.getElementById('fp-footer-profiles');
   if (profilesTab) profilesTab.classList.toggle('hidden', tab !== 'profiles');
   if (matchTab) matchTab.classList.toggle('hidden', tab !== 'match');
+  if (healthTab) healthTab.classList.toggle('hidden', tab !== 'health');
   if (footer) footer.style.display = tab === 'profiles' ? '' : 'none';
   if (tab === 'match') fpLoadUnlinked();
+  if (tab === 'health') fpLoadHealth();
+}
+
+// ── Library health tab ───────────────────────────────────────────────────────
+
+let _fpHealth = null;
+
+async function fpLoadHealth() {
+  const scroll = document.getElementById('fp-health-scroll');
+  scroll.innerHTML = '<div class="fp-panel-empty">Checking library health…</div>';
+  try {
+    const resp = await fetch('/api/fingerprint/library/health');
+    if (!resp.ok) throw new Error(await resp.text());
+    _fpHealth = await resp.json();
+    _fpRenderHealth();
+  } catch (e) {
+    scroll.innerHTML = '<div class="fp-panel-empty">Could not check library health.</div>';
+  }
+}
+
+function _fpRenderHealth() {
+  const h = _fpHealth;
+  if (!h) return;
+  const scroll = document.getElementById('fp-health-scroll');
+  const esc = s => String(s ?? '').replace(/[&<>"]/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const parts = [];
+
+  parts.push(`<div class="fp-health-summary">
+    <span class="fp-health-chip">${h.profiles} profiles</span>
+    <span class="fp-health-chip">${h.embeddings.toLocaleString()} voice samples</span>
+  </div>`);
+
+  const dupsAuto = h.duplicates.filter(d => d.auto);
+  const dupsReview = h.duplicates.filter(d => !d.auto);
+  const foreignN = h.foreign.removed_total;
+  const purgeable = h.splits.filter(s => s.class === 'pollution');
+  const cleanable = dupsAuto.length + foreignN + purgeable.length;
+
+  if (!cleanable && !dupsReview.length && !h.splits.length && !h.confusable.length) {
+    parts.push('<div class="fp-health-clean"><i class="fa-solid fa-circle-check"></i> Library looks healthy. Nothing to clean.</div>');
+  }
+
+  if (dupsAuto.length || dupsReview.length) {
+    parts.push('<div class="fp-health-sec">Duplicate profiles</div>');
+    for (const d of dupsAuto) {
+      parts.push(`<div class="fp-health-row">
+        <span class="fp-health-badge fix">will merge</span>
+        <span>${esc(d.merge_name)} (${d.merge_count}) &rarr; ${esc(d.keep_name)} (${d.keep_count})${d.similarity != null ? ` &middot; voice match ${Math.round(d.similarity * 100)}%` : ''}</span>
+      </div>`);
+    }
+    for (const d of dupsReview) {
+      parts.push(`<div class="fp-health-row">
+        <span class="fp-health-badge review">same voice</span>
+        <span>${esc(d.merge_name)} and ${esc(d.keep_name)} &middot; voice match ${Math.round(d.similarity * 100)}%</span>
+        <button class="speaker-manager-btn speaker-manager-btn-secondary fp-health-mini-btn"
+          onclick="fpHealthMerge('${d.keep_id}', '${d.merge_id}', '${esc(d.merge_name)}', '${esc(d.keep_name)}')">Merge</button>
+      </div>`);
+    }
+  }
+
+  if (foreignN || h.foreign.flagged.length) {
+    parts.push('<div class="fp-health-sec">Misfiled voice samples</div>');
+    for (const [gid, p] of Object.entries(h.foreign.profiles)) {
+      const from = Object.entries(p.absorbed_from)
+        .map(([n, c]) => `${esc(n)} (${c})`).join(', ');
+      parts.push(`<div class="fp-health-row">
+        <span class="fp-health-badge fix">will remove</span>
+        <span>${esc(p.name)}: ${p.removed} of ${p.count} samples sound like ${from}</span>
+      </div>`);
+    }
+    for (const f of h.foreign.flagged) {
+      parts.push(`<div class="fp-health-row">
+        <span class="fp-health-badge review">check</span>
+        <span>${esc(f.name)}: most samples (${f.foreign}/${f.count}) sound like someone else. Open the profile and check who this really is.</span>
+      </div>`);
+    }
+  }
+
+  if (h.splits.length) {
+    parts.push('<div class="fp-health-sec">Profiles containing two voices</div>');
+    for (const s of h.splits) {
+      const fix = s.class === 'pollution';
+      parts.push(`<div class="fp-health-row">
+        <span class="fp-health-badge ${fix ? 'fix' : 'review'}">${fix ? 'will fix' : 'check'}</span>
+        <span>${esc(s.name)}: ${s.minority_count} of ${s.count} samples are a second voice${s.minority_matches ? `, closest to ${esc(s.minority_matches)} (${Math.round(s.minority_match_sim * 100)}%)` : ''}</span>
+      </div>`);
+    }
+  }
+
+  if (h.confusable.length) {
+    parts.push('<div class="fp-health-sec">Similar-sounding people</div>');
+    parts.push('<div class="fp-health-note">These voices are close; automatic naming can occasionally swap them. Nothing to clean, just good to know.</div>');
+    for (const c of h.confusable) {
+      parts.push(`<div class="fp-health-row">
+        <span class="fp-health-badge info">${Math.round(c.similarity * 100)}%</span>
+        <span>${esc(c.a)} and ${esc(c.b)}</span>
+      </div>`);
+    }
+  }
+
+  scroll.innerHTML = parts.join('');
+
+  const cb = document.getElementById('fp-health-auto-cb');
+  if (cb && h.auto) cb.checked = !!h.auto.enabled;
+  const last = document.getElementById('fp-health-lastrun');
+  if (last && h.auto) {
+    last.textContent = h.auto.last_run
+      ? `Last cleanup: ${new Date(h.auto.last_run + 'Z').toLocaleDateString()}`
+      : 'Never cleaned yet';
+  }
+  const runBtn = document.getElementById('fp-health-run-btn');
+  if (runBtn) runBtn.disabled = !cleanable;
+}
+
+async function fpHealthMerge(keepId, mergeId, mergeName, keepName) {
+  if (!confirm(`Merge "${mergeName}" into "${keepName}"? All voice samples will be combined. This cannot be undone.`)) return;
+  await fetch(`/api/fingerprint/speakers/${keepId}/merge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_id: mergeId }),
+  });
+  await _fpLoadProfiles();
+  await fpLoadHealth();
+}
+
+async function fpHealthRun() {
+  const btn = document.getElementById('fp-health-run-btn');
+  if (!confirm('Run library cleanup now?\n\nThis merges duplicate profiles, removes voice samples that belong to someone else, and re-tunes every profile. Review items are left alone.')) return;
+  btn.disabled = true;
+  btn.textContent = 'Cleaning…';
+  try {
+    const resp = await fetch('/api/fingerprint/library/maintenance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: false }),
+    });
+    const r = await resp.json();
+    if (!resp.ok) throw new Error(r.error || 'cleanup failed');
+    _fpHealthStatus(`Cleaned: ${r.merges.length} merged, `
+      + `${r.foreign.removed_total} misfiled samples removed`);
+  } catch (e) {
+    _fpHealthStatus(e.message || 'Library cleanup failed', true);
+  } finally {
+    btn.textContent = 'Run Cleanup Now';
+    await _fpLoadProfiles();
+    await fpLoadHealth();
+  }
+}
+
+async function fpHealthToggleAuto(enabled) {
+  await fetch('/api/fingerprint/library/auto', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+function _fpHealthStatus(msg, isError) {
+  const el = document.getElementById('fp-health-lastrun');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle('error', !!isError);
 }
 
 async function fpLoadUnlinked() {

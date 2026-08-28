@@ -811,6 +811,7 @@
     <div class="fp-tab-bar">
       <button class="fp-tab active" data-tab="profiles" onclick="fpSwitchTab('profiles')">Profiles</button>
       <button class="fp-tab" data-tab="match" onclick="fpSwitchTab('match')">Match Speakers</button>
+      <button class="fp-tab" data-tab="health" onclick="fpSwitchTab('health')">Health</button>
     </div>
     <div class="fingerprint-panel-body">
       <div class="fp-tab-content" id="fp-tab-profiles">
@@ -869,6 +870,18 @@
         <div class="fp-match-scroll" id="fp-match-scroll"></div>
         <div class="fp-match-actions hidden" id="fp-match-actions">
           <button class="speaker-manager-btn speaker-manager-btn-primary" onclick="fpBulkLinkAll()">Apply All</button>
+        </div>
+      </div>
+      <div class="fp-tab-content hidden" id="fp-tab-health">
+        <div class="fp-health-scroll" id="fp-health-scroll">
+          <div class="fp-panel-empty">Checking library health…</div>
+        </div>
+        <div class="fp-health-actions" id="fp-health-actions">
+          <label class="fp-health-auto" title="Runs the same cleanup automatically while the app is idle">
+            <input type="checkbox" id="fp-health-auto-cb" onchange="fpHealthToggleAuto(this.checked)"> Auto-clean weekly
+          </label>
+          <span class="fp-health-lastrun" id="fp-health-lastrun"></span>
+          <button class="speaker-manager-btn speaker-manager-btn-primary" id="fp-health-run-btn" onclick="fpHealthRun()">Run Cleanup Now</button>
         </div>
       </div>
     </div>

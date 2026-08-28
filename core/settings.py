@@ -114,6 +114,16 @@ DEFAULTS: dict = {
     # auto-migrates older settings files at load time.
     "video_offsets": {},
 
+    # Voice-library automated maintenance. When enabled, the app periodically
+    # (every library_maintenance_days, while idle) runs the same hygiene pass
+    # exposed at POST /api/fingerprint/library/maintenance: merge same-name
+    # duplicate profiles, remove embeddings that clearly belong to another
+    # person's voice, purge pollution modes, prune, and recompute centroids.
+    # last_run is machine-managed (UTC ISO timestamp of the last applied run).
+    "library_maintenance_enabled": True,
+    "library_maintenance_days": 7,
+    "library_maintenance_last_run": "",
+
     # Agent API (REST + MCP interface for external AI agents, agent_api/).
     # The server only ever binds to 127.0.0.1, so exposure is local-only.
     # agent_api_token, when non-empty, additionally requires a Bearer token on

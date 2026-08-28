@@ -155,6 +155,7 @@ _state: dict = {
     "fingerprint_dismissals": {},  # speaker_key → set[global_id] (per-key "not now")
     "fingerprint_rejected":   set(),  # global_ids the user said aren't in this meeting at all
     "fingerprint_suggestions": {},  # speaker_key → {session_id, speaker_key, current_name, matches, candidates}
+    "fingerprint_streaks":    {},  # speaker_key → [global_id, consecutive_top_count]
     "speaker_offer_counts":   {},  # speaker_key → int (audio offers for diminishing returns)
     "last_audio_activity_at": 0.0,
     "last_transcript_activity_at": 0.0,
@@ -1067,6 +1068,7 @@ def _start_background_initializers() -> None:
     threading.Thread(target=_load_diarizer, daemon=True).start()
     threading.Thread(target=_load_fingerprint_db, daemon=True).start()
     threading.Thread(target=_load_text_embeddings, daemon=True).start()
+    threading.Thread(target=_library_maintenance_loop, daemon=True).start()
     # Warm the AI /models cache so the settings pane opens instantly on first
     # visit. Non-blocking; if the network is slow/unreachable the fallback
     # static lists are used until the fetch completes.
@@ -1341,15 +1343,23 @@ def _me_label_needs_name(session_id: str) -> dict:
 
 # ── Speaker fingerprint helpers ───────────────────────────────────────────────
 
-def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, session_id: str) -> None:
-    """Silently apply a high-confidence fingerprint match: link, rename, push SSEs."""
+def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, session_id: str,
+                            reinforce: bool = True) -> None:
+    """Silently apply a high-confidence fingerprint match: link, rename, push SSEs.
+
+    ``reinforce=False`` links WITHOUT feeding the embedding into the profile
+    centroid; used for margin/streak applies, whose confidence is enough to
+    label the meeting but not enough to teach the library (a borderline link
+    that trains the centroid can gradually drag a profile toward another
+    voice, which is how "magnet" profiles form)."""
     global_id = match["global_id"]
     name  = match["name"]
     color = match.get("color")
     # The Me speaker must never auto-link or accumulate embeddings.
     if speaker_key == ME_KEY or (fingerprint_db._me_id and global_id == fingerprint_db._me_id):
         return
-    fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0)
+    if reinforce:
+        fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0)
     fingerprint_db.link_session_speaker(session_id, speaker_key, global_id)
     storage.save_speaker_label(session_id, speaker_key, name=name, color=color)
     with _state_lock:
@@ -1420,14 +1430,18 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
             log.info("fingerprint", f"{speaker_key}: embedding extraction failed")
             return
 
-        # Profiles already linked to OTHER speaker_keys in this session — never
-        # candidates regardless of whether speaker_key is linked or not.
         session_links = fingerprint_db.get_session_links(sid)
         other_links = {gid for k, gid in session_links.items()
                        if k != speaker_key and gid}
 
         if existing_link:
-            fingerprint_db.add_embedding(existing_link, sid, speaker_key, emb, duration)
+            # Strengthen the linked profile, but only with confidently
+            # matching audio. Feeding every accumulated clip regardless of
+            # similarity is how profiles slowly absorb other voices and turn
+            # into wrong-match magnets (measured offline in speaker_lab).
+            sim = fingerprint_db.similarity_to(existing_link, emb)
+            if sim is None or sim >= fingerprint_db.AUTO_APPLY_THRESHOLD:
+                fingerprint_db.add_embedding(existing_link, sid, speaker_key, emb, duration)
             return
 
         # Persist for the post-meeting cleanup UI — without this, embeddings
@@ -1438,9 +1452,22 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         except Exception as e:
             log.warn("fingerprint", f"add_unlabeled_embedding failed: {e}")
 
+        # "Link v2" (default on): profiles already linked to other speaker_keys
+        # in this session stay eligible. The online diarizer routinely spawns a
+        # fresh "ghost" key for a voice it already labeled once; under the old
+        # exclusion rule every ghost was barred from re-matching its person and
+        # stayed an unassigned "Speaker N" (this was the dominant cause of
+        # late-meeting attribution decay: replaying 10 corrected meetings in
+        # speaker_lab, second-half accuracy was 14% with the exclusion and 64%
+        # without it). Two keys resolving to the same profile is fine; both
+        # simply display that person's name.
+        link_v2 = bool(settings.get("speaker_link_v2", True))
+
         # `rejected` = profiles the user said aren't in this meeting at all, so
         # they're suppressed for every speaker_key (not just the one dismissed).
-        excluded = dismissals.get(speaker_key, set()) | other_links | rejected
+        excluded = dismissals.get(speaker_key, set()) | rejected
+        if not link_v2:
+            excluded = excluded | other_links
         # Never suggest the "You" (Me) profile for a desktop speaker. The purge
         # already drops it from find_matches (NULL centroid); this is an explicit
         # backstop in case it ever holds a centroid.
@@ -1467,25 +1494,71 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         else:
             reason = "library empty" if not fingerprint_db.ready else "all candidates excluded/dismissed"
             log.info("fingerprint", f"{speaker_key}: no candidates ({reason})")
+            return
+
+        # ── Auto-apply decision ─────────────────────────────────────────────
+        # Three routes (margin/streak validated offline in speaker_lab:
+        # measured precision of single-shot similarity is flat ~83% from 0.60
+        # up to 0.82, so the extra routes use different evidence instead of a
+        # lower bar alone):
+        #   hard    top similarity >= AUTO_APPLY_THRESHOLD (legacy rule)
+        #   margin  top >= MARGIN_FLOOR and beats the best *differently
+        #           named* runner-up by MARGIN_GAP (duplicate profiles of the
+        #           same person must not defeat the margin)
+        #   streak  the same profile topped STREAK_N consecutive extractions
+        #           at >= STREAK_FLOOR
+        top = all_candidates[0]
+        top_gid = top["global_id"]
+        top_sim = top["similarity"]
+
+        with _state_lock:
+            streaks = _state["fingerprint_streaks"]
+            prev = streaks.get(speaker_key)
+            if prev and prev[0] == top_gid:
+                prev[1] += 1
+            else:
+                streaks[speaker_key] = prev = [top_gid, 1]
+            streak_n = prev[1]
+
+        top_name = (top.get("name") or "").strip().lower()
+        runner_up_sim = next(
+            (c["similarity"] for c in all_candidates[1:]
+             if (c.get("name") or "").strip().lower() != top_name),
+            -1.0,
+        )
+        margin_ok = (link_v2
+                     and top_sim >= fingerprint_db.MARGIN_FLOOR
+                     and top_sim - runner_up_sim >= fingerprint_db.MARGIN_GAP)
+        streak_ok = (link_v2
+                     and streak_n >= fingerprint_db.STREAK_N
+                     and top_sim >= fingerprint_db.STREAK_FLOOR)
+
+        if top["auto_apply"] or margin_ok or streak_ok:
+            via = ("hard" if top["auto_apply"]
+                   else "margin" if margin_ok else "streak")
+            log.info("fingerprint",
+                     f"{speaker_key}: auto-apply via {via} "
+                     f"(sim={top_sim:.2f}, runner_up={runner_up_sim:.2f}, "
+                     f"streak={streak_n})")
+            # Only hard-confidence matches teach the profile centroid.
+            _auto_apply_fingerprint(speaker_key, top, emb, sid,
+                                    reinforce=top["auto_apply"])
+            return
 
         # Actionable matches: those crossing the suggest threshold.
         matches = [c for c in all_candidates
                    if c["similarity"] >= fingerprint_db.SUGGEST_THRESHOLD]
         if not matches:
             return
-        top = matches[0]
-        if top["auto_apply"]:
-            _auto_apply_fingerprint(speaker_key, top, emb, sid)
-        else:
-            with _state_lock:
-                current_name = _state["speaker_labels"].get(speaker_key, speaker_key)
-                suggestion = {"session_id": sid, "speaker_key": speaker_key,
-                              "current_name": current_name, "matches": matches,
-                              # Fuller ranked list (incl. sub-threshold) for the
-                              # picker dropdown in the suggestion UI.
-                              "candidates": all_candidates}
-                _state["fingerprint_suggestions"][speaker_key] = suggestion
-            _push("fingerprint_match", suggestion)
+        with _state_lock:
+            current_name = _state["speaker_labels"].get(speaker_key, speaker_key)
+            suggestion = {"session_id": sid, "speaker_key": speaker_key,
+                          "current_name": current_name, "matches": matches,
+                          # Fuller ranked list (incl. sub-threshold) for the
+                          # picker dropdown in the suggestion UI.
+                          "candidates": all_candidates}
+            _state["fingerprint_suggestions"][speaker_key] = suggestion
+        _push("fingerprint_match", suggestion)
 
     threading.Thread(target=_extract_and_match, daemon=True).start()
 
@@ -1994,6 +2067,7 @@ def start_recording():
             "fingerprint_dismissals": {},
             "fingerprint_rejected":   set(),
             "fingerprint_suggestions": {},
+            "fingerprint_streaks":    {},
             "_confirmed_speakers":    set(),
             "last_audio_activity_at": now_mono,
             "last_transcript_activity_at": now_mono,
@@ -7884,6 +7958,94 @@ def fp_bulk_optimize():
     for gid in ids:
         fingerprint_db.prune_embeddings(str(gid))
     return jsonify({"ok": True, "optimized": len(ids)})
+
+
+@app.route("/api/fingerprint/library/health", methods=["GET"])
+def fp_library_health():
+    """Read-only library hygiene report: duplicate profiles, embeddings that
+    fit another person's voice, split (polluted) profiles, confusable pairs.
+    Everything run_maintenance would act on, plus review-only findings."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    report = fingerprint_db.library_health()
+    report["auto"] = {
+        "enabled": bool(settings.get("library_maintenance_enabled", True)),
+        "every_days": int(settings.get("library_maintenance_days", 7)),
+        "last_run": settings.get("library_maintenance_last_run", "") or None,
+    }
+    return jsonify(report)
+
+
+@app.route("/api/fingerprint/library/maintenance", methods=["POST"])
+def fp_library_maintenance():
+    """Run the library hygiene pass. Body: {"dry_run": bool} (default true).
+    Apply mode is refused while a recording is live - the fingerprint thread
+    is actively writing embeddings then."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get("dry_run", True))
+    with _state_lock:
+        recording = _state["is_recording"]
+    if recording and not dry_run:
+        return jsonify({"error": "Library cleanup is paused while recording. "
+                                 "Try again after the meeting ends."}), 409
+    result = fingerprint_db.run_maintenance(dry_run=dry_run)
+    if not dry_run:
+        from datetime import datetime as _dt
+        settings.put("library_maintenance_last_run", _dt.utcnow().isoformat())
+        _push("library_maintenance", {
+            "merges": len(result.get("merges", [])),
+            "foreign_removed": result.get("foreign", {}).get("removed_total", 0),
+            "split_purges": len(result.get("split_purges", [])),
+        })
+    return jsonify(result)
+
+
+@app.route("/api/fingerprint/library/auto", methods=["POST"])
+def fp_library_auto():
+    """Toggle the automatic weekly maintenance. Body: {"enabled": bool}."""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    settings.put("library_maintenance_enabled", enabled)
+    return jsonify({"ok": True, "enabled": enabled})
+
+
+def _library_maintenance_loop() -> None:
+    """Background scheduler: run the hygiene pass every
+    library_maintenance_days while the app is idle. First check is delayed so
+    startup (model loads, resume flows) settles first."""
+    from datetime import datetime as _dt
+    time.sleep(300)
+    while True:
+        try:
+            if (bool(settings.get("library_maintenance_enabled", True))
+                    and fingerprint_db.ready):
+                with _state_lock:
+                    recording = _state["is_recording"]
+                last_raw = settings.get("library_maintenance_last_run", "") or ""
+                due = True
+                if last_raw:
+                    try:
+                        last = _dt.fromisoformat(last_raw)
+                        days = int(settings.get("library_maintenance_days", 7))
+                        due = (_dt.utcnow() - last).days >= days
+                    except ValueError:
+                        due = True
+                if due and not recording:
+                    log.info("fingerprint", "Scheduled library maintenance starting…")
+                    result = fingerprint_db.run_maintenance(dry_run=False)
+                    settings.put("library_maintenance_last_run",
+                                 _dt.utcnow().isoformat())
+                    _push("library_maintenance", {
+                        "merges": len(result.get("merges", [])),
+                        "foreign_removed": result.get("foreign", {}).get("removed_total", 0),
+                        "split_purges": len(result.get("split_purges", [])),
+                    })
+        except Exception:
+            log.warn("fingerprint", "Scheduled library maintenance failed:")
+            traceback.print_exc()
+        time.sleep(6 * 3600)
 
 
 @app.route("/api/fingerprint/unlinked-labels", methods=["GET"])

@@ -31,6 +31,19 @@ _AUTO_APPLY_THRESHOLD = 0.82   # cosine sim → apply silently
 _MIN_DURATION_SEC     = 2.5    # minimum audio before extracting embedding
 _EMB_DIM              = 256    # WeSpeaker embedding dimension
 
+# Margin/streak auto-apply (the "link v2" policy, validated offline in
+# speaker_lab against 10 hand-corrected meetings). Single-shot similarity is
+# poorly separable: measured precision is flat (~83%) from 0.60 all the way
+# to 0.82, so a higher bar buys no precision, only lost coverage. These
+# policies use *different* evidence instead:
+#   margin: the best profile clearly beats the best differently-named
+#           runner-up (duplicate profiles of one person must not veto it);
+#   streak: the same profile tops N consecutive embedding extractions.
+_MARGIN_FLOOR = 0.66   # min sim for a margin-based auto-apply
+_MARGIN_GAP   = 0.10   # required (best - runner_up) similarity gap
+_STREAK_N     = 4      # consecutive same-top triggers for a streak apply
+_STREAK_FLOOR = 0.66   # min sim for a streak-based auto-apply
+
 # Reserved per-session speaker key for microphone audio (the app user). Segments
 # tagged with this key are always the "Me" speaker and are never diarized; the
 # key is excluded from all clustering/matching here. app.py re-exports this as
@@ -142,6 +155,10 @@ class SpeakerFingerprintDB:
     SUGGEST_THRESHOLD    = _SUGGEST_THRESHOLD
     AUTO_APPLY_THRESHOLD = _AUTO_APPLY_THRESHOLD
     MIN_DURATION_SEC     = _MIN_DURATION_SEC
+    MARGIN_FLOOR         = _MARGIN_FLOOR
+    MARGIN_GAP           = _MARGIN_GAP
+    STREAK_N             = _STREAK_N
+    STREAK_FLOOR         = _STREAK_FLOOR
 
     def __init__(self, db_path: Path, hf_token: str, device: str = "cpu") -> None:
         self._db_path = db_path
@@ -603,6 +620,20 @@ class SpeakerFingerprintDB:
         results.sort(key=lambda x: x["similarity"], reverse=True)
         return results[:top_k]
 
+    def similarity_to(self, global_id: str, embedding: np.ndarray) -> float | None:
+        """Cosine similarity of an embedding to one profile's centroid, or
+        None when the profile has no centroid. Used to gate profile
+        reinforcement: only confident matches should feed a centroid, so one
+        borderline link can't gradually drag a profile toward another voice."""
+        with _conn(self._db_path) as c:
+            row = c.execute(
+                "SELECT centroid FROM global_speakers WHERE id = ?",
+                (global_id,),
+            ).fetchone()
+        if row is None or row["centroid"] is None:
+            return None
+        return float(np.dot(embedding, _blob_to_emb(row["centroid"])))
+
     # ── Session linking ───────────────────────────────────────────────────────
 
     def link_session_speaker(
@@ -794,6 +825,369 @@ class SpeakerFingerprintDB:
         return {"before": before, "after": after,
                 "outliers_removed": len(outlier_ids),
                 "duplicates_removed": len(dedup_ids)}
+
+    # ── Library maintenance (health report + automated hygiene) ──────────────
+    #
+    # Motivated by the speaker_lab replay study: months of unconditional
+    # reinforcement let a handful of profiles absorb other people's voices
+    # ("magnet" profiles), and duplicate profiles split one person's matching
+    # evidence. Everything below is pure vector math over stored embeddings.
+    # It never needs the embedding model, so it can run on any DB copy and
+    # inside the automated maintenance job.
+    #
+    # All thresholds are deliberately conservative; anything ambiguous is
+    # reported for review instead of acted on. The "Me" profile is never
+    # touched by any of these paths.
+
+    MAINT_DUP_NAME_SIM      = 0.75   # same-name profiles auto-merge at this centroid sim
+    MAINT_FOREIGN_MARGIN    = 0.10   # embedding must fit another profile this much better
+    MAINT_FOREIGN_FLOOR     = 0.72   # ...and at least this well, to count as foreign
+    MAINT_FOREIGN_MAX_FRAC  = 0.40   # flag-not-fix when more than this would be removed
+    MAINT_SPLIT_SIM         = 0.60   # 2-means split below this = two distinct voices
+    MAINT_SPLIT_MINORITY    = 0.15   # ...when the minority mode holds at least this share
+    MAINT_SPLIT_POLLUTION   = 0.75   # minority mode matching another profile = pollution
+    MAINT_CONFUSABLE_SIM    = 0.75   # different-name centroid sim worth warning about
+
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        return " ".join((name or "").casefold().split())
+
+    def _load_profile_pools(self) -> dict[str, dict]:
+        """{gid: {name, norm, embs (np [n,256] | None), count, created_at}} for
+        every profile except the "Me" profile."""
+        pools: dict[str, dict] = {}
+        with _conn(self._db_path) as c:
+            for r in c.execute(
+                    "SELECT id, name, created_at FROM global_speakers"):
+                if self._me_id is not None and r["id"] == self._me_id:
+                    continue
+                # ORDER BY id is load-bearing: sweep_foreign_embeddings maps
+                # pool row indices back to DB rows by the same ordering.
+                erows = c.execute(
+                    "SELECT embedding FROM speaker_embeddings "
+                    "WHERE global_id = ? ORDER BY id",
+                    (r["id"],)).fetchall()
+                embs = (np.stack([_blob_to_emb(e["embedding"]) for e in erows])
+                        if erows else None)
+                pools[r["id"]] = {
+                    "name": r["name"], "norm": self._norm_name(r["name"]),
+                    "embs": embs, "count": len(erows),
+                    "created_at": r["created_at"],
+                }
+        return pools
+
+    @staticmethod
+    def _pool_centroid(embs: np.ndarray | None) -> np.ndarray | None:
+        if embs is None or len(embs) == 0:
+            return None
+        return _normalize(embs.mean(axis=0))
+
+    @staticmethod
+    def _two_means(embs: np.ndarray, iters: int = 12):
+        """Spherical 2-means. Returns (minority_mask, split_sim) where
+        minority_mask selects the smaller mode."""
+        cent = _normalize(embs.mean(axis=0))
+        a = embs[int(np.argmin(embs @ cent))]
+        b = embs[int(np.argmin(embs @ a))]
+        c0, c1 = _normalize(a), _normalize(b)
+        assign = None
+        for _ in range(iters):
+            new_assign = (embs @ c1) > (embs @ c0)
+            if assign is not None and np.array_equal(new_assign, assign):
+                break
+            assign = new_assign
+            if assign.all() or (~assign).all():
+                break
+            c0 = _normalize(embs[~assign].mean(axis=0))
+            c1 = _normalize(embs[assign].mean(axis=0))
+        if assign is None or assign.all() or (~assign).all():
+            return np.zeros(len(embs), dtype=bool), 1.0
+        n1 = int(assign.sum())
+        minority = assign if n1 <= len(embs) - n1 else ~assign
+        return minority, float(np.dot(c0, c1))
+
+    def find_duplicate_profiles(self) -> list[dict]:
+        """Profile pairs that are the same person.
+
+        Auto-mergeable: identical normalized name AND (centroid sim >=
+        MAINT_DUP_NAME_SIM, or one side has no embeddings at all).
+        Review-only: different names but centroid sim >= 0.95 (report, never
+        auto-merge; names carry user intent).
+        """
+        pools = self._load_profile_pools()
+        cents = {g: self._pool_centroid(p["embs"]) for g, p in pools.items()}
+        out: list[dict] = []
+        gids = list(pools)
+        for i in range(len(gids)):
+            for j in range(i + 1, len(gids)):
+                a, b = gids[i], gids[j]
+                pa, pb = pools[a], pools[b]
+                ca, cb = cents[a], cents[b]
+                sim = (float(np.dot(ca, cb))
+                       if ca is not None and cb is not None else None)
+                same_name = pa["norm"] == pb["norm"] and pa["norm"] != ""
+                auto = same_name and (
+                    (sim is not None and sim >= self.MAINT_DUP_NAME_SIM)
+                    or ca is None or cb is None)
+                review = (not same_name and sim is not None and sim >= 0.95)
+                if not auto and not review:
+                    continue
+                # Keep the profile with more evidence; on a tie keep the older.
+                keep, merge = (a, b)
+                b_wins = (pb["count"] > pa["count"]
+                          or (pb["count"] == pa["count"]
+                              and (pb["created_at"] or "") < (pa["created_at"] or "")))
+                if b_wins:
+                    keep, merge = (b, a)
+                out.append({
+                    "keep_id": keep, "keep_name": pools[keep]["name"],
+                    "merge_id": merge, "merge_name": pools[merge]["name"],
+                    "keep_count": pools[keep]["count"],
+                    "merge_count": pools[merge]["count"],
+                    "similarity": None if sim is None else round(sim, 3),
+                    "auto": auto,
+                })
+        return out
+
+    def sweep_foreign_embeddings(self, dry_run: bool = True) -> dict:
+        """Find (and optionally delete) embeddings that fit a DIFFERENT
+        person's profile clearly better than their own.
+
+        For each embedding, "its own" fit is the leave-one-out centroid of its
+        profile; the rival fit is the best centroid among differently-named
+        profiles (snapshotted before any removal, so the pass is
+        order-independent). Foreign = rival >= MAINT_FOREIGN_FLOOR and rival
+        beats own by MAINT_FOREIGN_MARGIN. A profile where more than
+        MAINT_FOREIGN_MAX_FRAC of embeddings look foreign is flagged for
+        review instead of modified; its identity, not its edges, is in doubt.
+        """
+        pools = self._load_profile_pools()
+        cents = {g: self._pool_centroid(p["embs"]) for g, p in pools.items()}
+        report: dict = {"profiles": {}, "removed_total": 0, "flagged": []}
+        removals: dict[str, list[int]] = {}  # gid -> row indices in its pool
+
+        for gid, p in pools.items():
+            embs = p["embs"]
+            if embs is None or len(embs) < 5:
+                continue
+            n = len(embs)
+            total = embs.sum(axis=0)
+            loo = (total[None, :] - embs) / (n - 1)
+            loo /= np.maximum(np.linalg.norm(loo, axis=1, keepdims=True), 1e-8)
+            own_sims = np.einsum("ij,ij->i", embs, loo)
+
+            rival_sims = np.full(n, -1.0, dtype=np.float32)
+            rival_of = [None] * n
+            for og, oc in cents.items():
+                if og == gid or oc is None:
+                    continue
+                if pools[og]["norm"] == p["norm"]:
+                    continue  # duplicates of one person are not "foreign"
+                s = embs @ oc
+                better = s > rival_sims
+                rival_sims = np.where(better, s, rival_sims)
+                for idx in np.where(better)[0]:
+                    rival_of[idx] = og
+            foreign = ((rival_sims >= self.MAINT_FOREIGN_FLOOR)
+                       & (rival_sims - own_sims >= self.MAINT_FOREIGN_MARGIN))
+            n_foreign = int(foreign.sum())
+            if n_foreign == 0:
+                continue
+            if n_foreign / n > self.MAINT_FOREIGN_MAX_FRAC:
+                report["flagged"].append({
+                    "global_id": gid, "name": p["name"], "count": n,
+                    "foreign": n_foreign,
+                    "reason": "over_max_frac; review identity manually",
+                })
+                continue
+            rivals: dict[str, int] = {}
+            for idx in np.where(foreign)[0]:
+                og = rival_of[idx]
+                if og:
+                    rivals[pools[og]["name"]] = rivals.get(pools[og]["name"], 0) + 1
+            report["profiles"][gid] = {
+                "name": p["name"], "count": n, "removed": n_foreign,
+                "absorbed_from": rivals,
+            }
+            report["removed_total"] += n_foreign
+            removals[gid] = list(np.where(foreign)[0])
+
+        if not dry_run and removals:
+            with _conn(self._db_path) as c:
+                for gid, idxs in removals.items():
+                    rows = c.execute(
+                        "SELECT id FROM speaker_embeddings WHERE global_id = ? "
+                        "ORDER BY id", (gid,)).fetchall()
+                    ids = [rows[i]["id"] for i in idxs if i < len(rows)]
+                    c.executemany("DELETE FROM speaker_embeddings WHERE id = ?",
+                                  [(rid,) for rid in ids])
+            for gid in removals:
+                self.recompute_centroid(gid)
+        return report
+
+    def detect_split_profiles(self) -> list[dict]:
+        """Profiles whose embedding pool splits into two dissimilar voices.
+
+        Each finding classifies the minority mode: "pollution" when it
+        matches another profile (>= MAINT_SPLIT_POLLUTION), else "review"
+        (could be a legitimately variable voice: headset vs speakerphone)."""
+        pools = self._load_profile_pools()
+        cents = {g: self._pool_centroid(p["embs"]) for g, p in pools.items()}
+        out = []
+        for gid, p in pools.items():
+            embs = p["embs"]
+            if embs is None or len(embs) < 10:
+                continue
+            minority, split = self._two_means(embs)
+            frac = minority.mean() if len(minority) else 0.0
+            if split >= self.MAINT_SPLIT_SIM or frac < self.MAINT_SPLIT_MINORITY:
+                continue
+            mc = _normalize(embs[minority].mean(axis=0))
+            best_name, best_sim = None, -1.0
+            for og, oc in cents.items():
+                if og == gid or oc is None or pools[og]["norm"] == p["norm"]:
+                    continue
+                s = float(np.dot(mc, oc))
+                if s > best_sim:
+                    best_name, best_sim = pools[og]["name"], s
+            pollution = best_sim >= self.MAINT_SPLIT_POLLUTION
+            out.append({
+                "global_id": gid, "name": p["name"], "count": len(embs),
+                "split_sim": round(split, 3),
+                "minority_frac": round(float(frac), 3),
+                "minority_count": int(minority.sum()),
+                "minority_matches": best_name,
+                "minority_match_sim": round(best_sim, 3),
+                "class": "pollution" if pollution else "review",
+            })
+        out.sort(key=lambda x: x["split_sim"])
+        return out
+
+    def purge_split_minority(self, global_id: str) -> dict:
+        """Remove the minority 2-means mode from one profile and recompute.
+        Caller decides when this is safe (run_maintenance only does it for
+        findings classified as pollution with a minority share <= 45%)."""
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                "SELECT id, embedding FROM speaker_embeddings "
+                "WHERE global_id = ? ORDER BY id", (global_id,)).fetchall()
+        if len(rows) < 10:
+            return {"removed": 0}
+        embs = np.stack([_blob_to_emb(r["embedding"]) for r in rows])
+        minority, split = self._two_means(embs)
+        if split >= self.MAINT_SPLIT_SIM or not minority.any():
+            return {"removed": 0}
+        ids = [rows[i]["id"] for i in np.where(minority)[0]]
+        with _conn(self._db_path) as c:
+            c.executemany("DELETE FROM speaker_embeddings WHERE id = ?",
+                          [(rid,) for rid in ids])
+        self.recompute_centroid(global_id)
+        return {"removed": len(ids), "split_sim": round(split, 3)}
+
+    def library_health(self) -> dict:
+        """Read-only library health report (what run_maintenance would act on,
+        plus review-only findings)."""
+        pools = self._load_profile_pools()
+        cents = {g: self._pool_centroid(p["embs"]) for g, p in pools.items()}
+        confusable = []
+        gids = [g for g in pools if cents[g] is not None]
+        for i in range(len(gids)):
+            for j in range(i + 1, len(gids)):
+                a, b = gids[i], gids[j]
+                if pools[a]["norm"] == pools[b]["norm"]:
+                    continue
+                s = float(np.dot(cents[a], cents[b]))
+                if s >= self.MAINT_CONFUSABLE_SIM:
+                    confusable.append({
+                        "a": pools[a]["name"], "b": pools[b]["name"],
+                        "a_id": a, "b_id": b, "similarity": round(s, 3),
+                    })
+        confusable.sort(key=lambda x: -x["similarity"])
+        return {
+            "profiles": len(pools),
+            "embeddings": int(sum(p["count"] for p in pools.values())),
+            "duplicates": self.find_duplicate_profiles(),
+            "foreign": self.sweep_foreign_embeddings(dry_run=True),
+            "splits": self.detect_split_profiles(),
+            "confusable": confusable,
+        }
+
+    def run_maintenance(self, dry_run: bool = True) -> dict:
+        """The automated hygiene pass, in dependency order:
+
+        1. merge auto-safe duplicate profiles (same name, matching voice or
+           one side embedding-free);
+        2. delete foreign embeddings (clearly another person's voice);
+        3. purge pollution modes from split profiles;
+        4. standard prune (outliers + near-dups) on every touched profile.
+
+        Review-only findings (cross-name duplicates, ambiguous splits,
+        over-threshold foreign fractions, confusable pairs) are returned but
+        never acted on. Safe to run repeatedly; a clean library is a no-op.
+        """
+        log_prefix = "maintenance(dry_run)" if dry_run else "maintenance"
+        result: dict = {"dry_run": dry_run}
+
+        dups = self.find_duplicate_profiles()
+        auto_dups = [d for d in dups if d["auto"]]
+        result["merges"] = auto_dups
+        result["merge_suggestions"] = [d for d in dups if not d["auto"]]
+        touched: set[str] = set()
+        if not dry_run:
+            for d in auto_dups:
+                self.merge_global_speakers(d["keep_id"], d["merge_id"])
+                touched.add(d["keep_id"])
+
+        result["foreign"] = self.sweep_foreign_embeddings(dry_run=dry_run)
+        touched.update(result["foreign"]["profiles"].keys())
+
+        splits = self.detect_split_profiles()
+        result["splits"] = splits
+        result["split_purges"] = []
+        for s in splits:
+            if s["class"] == "pollution" and s["minority_frac"] <= 0.45:
+                if dry_run:
+                    result["split_purges"].append(
+                        {**s, "would_remove": s["minority_count"]})
+                else:
+                    purged = self.purge_split_minority(s["global_id"])
+                    result["split_purges"].append({**s, **purged})
+                    touched.add(s["global_id"])
+
+        result["pruned"] = {}
+        if not dry_run:
+            for gid in touched:
+                try:
+                    result["pruned"][gid] = self.prune_embeddings(gid)
+                except Exception:
+                    log.warn("fingerprint", f"maintenance prune failed for {gid[:8]}")
+
+        # 5. Canonicalize every centroid. The live incremental update
+        # (normalize(old*count + emb)) drifts from the true embedding mean
+        # over months of adds, and historical code paths left occasional
+        # emb_count discrepancies. A full recompute makes stored centroid ==
+        # normalized mean and emb_count == row count for every profile, which
+        # is also what the matcher deserves to score against.
+        result["recentered"] = 0
+        if not dry_run:
+            with _conn(self._db_path) as c:
+                all_ids = [r["id"] for r in
+                           c.execute("SELECT id FROM global_speakers")]
+            for gid in all_ids:
+                try:
+                    self.recompute_centroid(gid)
+                    result["recentered"] += 1
+                except Exception:
+                    log.warn("fingerprint",
+                             f"maintenance recompute failed for {gid[:8]}")
+
+        log.info("fingerprint",
+                 f"{log_prefix}: {len(auto_dups)} merges, "
+                 f"{result['foreign']['removed_total']} foreign embeddings, "
+                 f"{len(result['split_purges'])} pollution purges, "
+                 f"{len(result['foreign']['flagged'])} flagged for review, "
+                 f"{result['recentered']} centroids recomputed")
+        return result
 
     # ── Unlabeled embedding storage (feeds the cleanup UI) ────────────────────
 

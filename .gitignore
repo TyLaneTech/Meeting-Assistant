@@ -22,3 +22,7 @@ __pycache__/
 .venv/
 .model_download.py
 **/update_plans/
+
+# Speaker-attribution experiment sandbox (local-only: replays real meeting
+# audio + user speaker library; never committed)
+/speaker_lab/
