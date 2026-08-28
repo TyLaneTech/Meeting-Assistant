@@ -157,6 +157,7 @@ _state: dict = {
     "fingerprint_suggestions": {},  # speaker_key → {session_id, speaker_key, current_name, matches, candidates}
     "fingerprint_streaks":    {},  # speaker_key → [global_id, consecutive_top_count]
     "speaker_offer_counts":   {},  # speaker_key → int (audio offers for diminishing returns)
+    "source_redirects":       {},  # raw diarizer key → target speaker_key ("sticky" manual reassignment)
     "last_audio_activity_at": 0.0,
     "last_transcript_activity_at": 0.0,
     "quiet_prompt_sent_at": 0.0,
@@ -576,11 +577,24 @@ def _on_segment(
 
         segments = _state["segments"]
 
+        # Sticky manual reassignment: the user relabeled this key's recent
+        # output to another speaker, so new segments follow the same decision.
+        # Recorded as a per-segment source_override (same mechanism as the
+        # manual relabel itself) so the raw diarizer key stays intact.
+        redirect_target = None
+        if source != _NOISE_LABEL:
+            redirect_target = _state["source_redirects"].get(source)
+
         # Merge with previous segment if same speaker, short gap, and
         # previous text didn't end with sentence-ending punctuation.
+        # Compare effective keys too: a segment that arrived before a
+        # reassignment stuck must not absorb text that now belongs to the
+        # redirected-to speaker.
         if segments:
             prev = segments[-1]
-            same_speaker = prev["source"] == source
+            prev_eff = prev.get("source_override") or prev["source"]
+            same_speaker = (prev["source"] == source
+                            and prev_eff == (redirect_target or source))
             gap = (start_time - prev["end_time"]
                    if start_time > 0 and prev.get("end_time", 0) > 0
                    else float("inf"))
@@ -604,6 +618,8 @@ def _on_segment(
             }
             if original_source:
                 seg_entry["_original_source"] = original_source
+            if redirect_target:
+                seg_entry["source_override"] = redirect_target
             segments.append(seg_entry)
 
         # If this speaker was just confirmed (first non-noise segment),
@@ -681,16 +697,21 @@ def _on_segment(
         })
     else:
         seg_id = storage.save_segment(sid, text, source, start_time, end_time)
+        if redirect_target:
+            storage.save_segment_source_override(seg_id, redirect_target)
         if not merged:
             # Store DB id for future merges
             with _state_lock:
                 if segments:
                     segments[-1]["_seg_id"] = seg_id
-        _push("transcript", {
+        payload = {
             "text": text, "source": source, "session_id": sid,
             "start_time": start_time, "end_time": end_time,
             "seg_id": seg_id,
-        })
+        }
+        if redirect_target:
+            payload["source_override"] = redirect_target
+        _push("transcript", payload)
 
     # Reclaim noise segments that now belong to a confirmed speaker
     for seg in reclaim_segs:
@@ -715,6 +736,80 @@ def _on_segment(
             kwargs={"is_auto": True},
             daemon=True,
         ).start()
+
+
+def _maybe_update_live_redirect(seg: dict, target_key: str) -> None:
+    """Make a manual per-segment reassignment "stick" for the rest of a live
+    recording.
+
+    The online diarizer keeps emitting new segments under a key even after the
+    user reassigned that key's recent lines to someone else (its cluster state
+    is untouched), so the mislabeling would just continue. This registers a
+    redirect: every future segment of that raw key arrives with the same
+    source_override the user applied. Reassigning a recent segment back to the
+    key's own speaker clears it.
+
+    Fires only while the segment's session is actively recording, only for
+    diarized keys ("Speaker N"), and only when the reassigned segment is part
+    of the key's most recent output; relabeling older lines is a historical
+    fix, not a statement about who is speaking now. Redirects resolve one hop
+    (no chaining), reset on every recording start, and are deliberately dumb:
+    the user's explicit correction outranks any similarity evidence.
+    """
+    src = seg.get("source") or ""
+    if not src.startswith("Speaker"):
+        return
+    if target_key == _NOISE_LABEL or target_key in ("loopback", "mic", "both"):
+        return
+    with _state_lock:
+        if not _state["is_recording"] or _state["session_id"] != seg["session_id"]:
+            return
+        entries = [s for s in _state["segments"] if s.get("source") == src]
+        if not entries:
+            return
+        # "Recent" = one of the key's last two segments, or within 90 s of its
+        # latest speech. The bulk relabel PATCHes segments one by one, so at
+        # least one request of a fix-the-current-mislabeling gesture lands here.
+        recent_ids = {s.get("_seg_id") for s in entries[-2:]}
+        last_end = entries[-1].get("end_time") or 0.0
+        if seg["id"] not in recent_ids and (seg.get("end_time") or 0.0) < last_end - 90.0:
+            return
+        redirects = _state["source_redirects"]
+        if target_key == src:
+            action = "cleared" if redirects.pop(src, None) is not None else None
+            target_name = None
+        else:
+            action = "set" if redirects.get(src) != target_key else None
+            redirects[src] = target_key
+            # Any queued "who is this?" suggestion for the raw key is moot now.
+            _state["fingerprint_suggestions"].pop(src, None)
+            target_name = _state["speaker_labels"].get(target_key)
+        sid = _state["session_id"]
+        source_name = _state["speaker_labels"].get(src, src)
+    if not action:
+        return
+    if action == "set" and not target_name:
+        # Custom speakers (and freshly created ones) aren't in the live
+        # speaker_labels map; fall back to the stored profile so live
+        # summaries and the notice show a name instead of a raw key.
+        prof = storage.get_speaker_profile(sid, target_key) or {}
+        stored = (prof.get("name") or "").strip()
+        target_name = stored or target_key
+        if stored:
+            with _state_lock:
+                if _state["session_id"] == sid:
+                    _state["speaker_labels"].setdefault(target_key, stored)
+    if action == "set":
+        log.info("speakers", f"Sticky reassignment: new {src} segments -> "
+                             f"{target_name} ({target_key})")
+    else:
+        log.info("speakers", f"Sticky reassignment cleared: {src} segments "
+                             f"use their own speaker again")
+    _push("source_redirect", {
+        "session_id": sid, "source": src, "source_name": source_name,
+        "target": target_key if action == "set" else None,
+        "target_name": target_name, "action": action,
+    })
 
 
 def _run_summary(
@@ -1394,6 +1489,14 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         sid = _state.get("session_id")
         if not sid:
             return
+        # Sticky manual reassignment: the user said this key's current audio
+        # belongs to another speaker, so accumulate it under that key (it can
+        # strengthen the right profile) instead of matching under the raw key.
+        redirected = speaker_key in _state["source_redirects"]
+        if redirected:
+            speaker_key = _state["source_redirects"][speaker_key]
+            if speaker_key == ME_KEY:
+                return
         counts = _state["speaker_emb_counts"]
         count = counts.get(speaker_key, 0)
         if count >= 15:
@@ -1423,6 +1526,11 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
 
     # Check if already linked (strengthen profile)
     existing_link = fingerprint_db.get_link(sid, speaker_key)
+    if redirected and not existing_link:
+        # The redirect target's identity is user-decided but has no linked
+        # profile to strengthen. Running the matcher here could auto-rename
+        # the very speaker the user just chose, so do nothing instead.
+        return
 
     def _extract_and_match() -> None:
         emb = fingerprint_db.extract_embedding(seg_audio)
@@ -2064,10 +2172,12 @@ def start_recording():
             "speaker_labels": existing_labels,
             "speaker_audio_accum":    {},
             "speaker_emb_counts":     {},
+            "speaker_offer_counts":   {},
             "fingerprint_dismissals": {},
             "fingerprint_rejected":   set(),
             "fingerprint_suggestions": {},
             "fingerprint_streaks":    {},
+            "source_redirects":       {},
             "_confirmed_speakers":    set(),
             "last_audio_activity_at": now_mono,
             "last_transcript_activity_at": now_mono,
@@ -6270,6 +6380,13 @@ def update_segment_label(seg_id: int):
     source_override = (data.get("source_override") or "").strip() or None
     storage.save_segment_source_override(seg_id, source_override)
 
+    # A reassignment of a live speaker's recent output sticks: future segments
+    # from the same diarizer key follow the user's correction automatically.
+    if source_override and label != _NOISE_LABEL:
+        seg_now = storage.get_segment(seg_id)
+        if seg_now:
+            _maybe_update_live_redirect(seg_now, source_override)
+
     # Train voice library from this correction (skip for noise labels)
     if fingerprint_db.ready and label != _NOISE_LABEL:
         def _train_from_override():
@@ -6961,6 +7078,8 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 _state["fingerprint_dismissals"] = {}
                 _state["fingerprint_rejected"] = set()
                 _state["fingerprint_suggestions"] = {}
+                _state["fingerprint_streaks"] = {}
+                _state["source_redirects"] = {}
                 _state["_confirmed_speakers"] = set()
 
         _push("reanalysis_start", {"session_id": session_id})
@@ -8043,6 +8162,7 @@ def _library_maintenance_loop() -> None:
                         "split_purges": len(result.get("split_purges", [])),
                     })
         except Exception:
+            import traceback
             log.warn("fingerprint", "Scheduled library maintenance failed:")
             traceback.print_exc()
         time.sleep(6 * 3600)

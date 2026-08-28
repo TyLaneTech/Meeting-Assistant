@@ -46,6 +46,10 @@ order:
   replacing max(centroid, anchor) with a small per-speaker embedding pool.
   Test any of these in speaker_lab before touching the live path (oracle
   accuracy is the metric to move; it is insensitive to the linking layer).
+  Manual mitigation shipped 2026-08-28: reassigning a live speaker's recent
+  lines now sticks (`source_redirects` in app.py), so one correction stops
+  the ongoing mislabeling for the rest of the recording; the clusterer-level
+  fix above remains open.
 - **Settings UI checkbox** for `speaker_link_v2` in the Diarization settings
   section (the backend honors the key today; there is no UI control yet).
 - **Suggestion popup ranking.** With exclusion removed, suggestions can

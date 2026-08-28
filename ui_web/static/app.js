@@ -3490,7 +3490,11 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id && d.session_id !== state.sessionId) return;
     if (d.seg_id) _lastLiveSegId = Math.max(_lastLiveSegId, d.seg_id);
     if (!state.isViewingPast || state.isReanalyzing) {
-      appendTranscript(d.text, d.source || 'loopback', d.start_time, d.end_time, d.seg_id);
+      // source_override arrives when a manual reassignment is sticking to
+      // this diarizer key (see source_redirect); render as the target speaker.
+      appendTranscript(d.text, d.source_override || d.source || 'loopback',
+                       d.start_time, d.end_time, d.seg_id, null,
+                       d.source_override ? d.source : null);
     }
   });
 
@@ -3854,6 +3858,14 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('fingerprint_match', e => {
     const d = JSON.parse(e.data);
     if (d.session_id === state.sessionId) _fpEnqueueToast(d);
+  });
+
+  src.addEventListener('source_redirect', e => {
+    const d = JSON.parse(e.data);
+    if (d.session_id !== state.sessionId) return;
+    // The user just adjudicated this key; drop any pending suggestion for it.
+    if (d.action === 'set') _fpRemoveFromQueue(d.source);
+    _flashLiveRedirect(d);
   });
 
   src.addEventListener('fingerprint_auto_applied', e => {
@@ -7440,6 +7452,25 @@ function _fpUpdateInlineIcons() {
       icon.title = 'Identify speaker';
     }
   });
+}
+
+// ── Sticky reassignment feedback ──────────────────────────────────────────
+// Brief status-bar notice when a manual reassignment starts (or stops)
+// sticking to a live diarizer key (source_redirect SSE; the backend registers
+// one when recent segments of a live speaker get reassigned to someone else).
+function _flashLiveRedirect(d) {
+  const target = d.target ? (_speakerDisplayName(d.target) || d.target_name || d.target) : null;
+  const srcName = d.source_name || d.source;
+  const msg = d.action === 'set'
+    ? `New "${srcName}" lines will be labeled ${target}`
+    : `New lines from that voice return to "${srcName}"`;
+  console.info(`[speakers] ${msg} (${d.source})`);
+  const text = document.getElementById('status-text');
+  const prev = text?.textContent;
+  if (text) {
+    text.textContent = msg;
+    setTimeout(() => { if (text.textContent === msg) text.textContent = prev; }, 4000);
+  }
 }
 
 // ── Auto-apply flash feedback ─────────────────────────────────────────────
