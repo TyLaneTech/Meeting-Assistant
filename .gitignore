@@ -1,7 +1,6 @@
 *.env
 /.claude
 /__pycache__
-AGENT.md
 **/storage/
 
 # Legacy locations from before the storage/ consolidation. These are NORMALLY

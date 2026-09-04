@@ -1,0 +1,55 @@
+# Mirrors this Azure DevOps repo (the source of truth) out to the public GitHub
+# repo, which is what install.sh / install.ps1 clone and what the in-app updater
+# (/api/update/check) pulls from.
+#
+# ONE WAY ONLY. GitHub is a read-only mirror: anything pushed directly to GitHub
+# is erased the next time this runs. All development happens in Azure DevOps.
+#
+# Only `main` and tags are mirrored, so in-progress branches stay internal and
+# the public repo shows exactly what users are meant to install.
+
+name: mirror-to-github-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - '*'
+
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  ADO_REPO: 'dev.azure.com/HiggDAC/Meeting-Assistant/_git/Meeting-Assistant'
+  GH_REPO: 'github.com/TyLaneTech/Meeting-Assistant.git'
+
+steps:
+  - checkout: none
+
+  - script: |
+      set -euo pipefail
+
+      if [ -z "${GH_PAT:-}" ]; then
+        echo "##vso[task.logissue type=error]GH_PAT secret variable is not set on this pipeline."
+        exit 1
+      fi
+
+      git clone --bare "https://ado:${SYSTEM_ACCESSTOKEN}@${ADO_REPO}" repo.git
+      cd repo.git
+
+      # Explicit refspecs rather than --mirror so GitHub-internal refs
+      # (refs/pull/*, etc.) are never touched. --prune keeps GitHub from
+      # accumulating branches that no longer exist here.
+      git push --force --prune "https://x-access-token:${GH_PAT}@${GH_REPO}" \
+        'refs/heads/main:refs/heads/main' \
+        'refs/tags/*:refs/tags/*'
+
+      echo "Mirrored $(git rev-parse --short main) to GitHub."
+    displayName: 'Mirror Azure DevOps -> GitHub'
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      GH_PAT: $(GH_PAT)

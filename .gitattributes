@@ -4,3 +4,7 @@
 # the `curl | bash` one-line installer served from GitHub raw).
 *.sh        text eol=lf
 *.command   text eol=lf
+
+# The mirror pipeline embeds a bash script that runs on a Linux agent. A CRLF
+# checkout committed from Windows would break it with `\r: command not found`.
+*.yml       text eol=lf
