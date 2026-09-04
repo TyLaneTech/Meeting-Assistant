@@ -28,8 +28,11 @@ tries `origin` first and falls back to the GitHub URL, which is why both work.
 
 1. **Never push to the GitHub remote.** The mirror force-pushes, so anything landed
    there directly is erased on the next merge to `main`.
-2. **Never push straight to `main`.** Branch policy rejects it. Branch, push, then
-   open a pull request in Azure DevOps.
+2. **Do not push straight to `main`.** Branch policy requires a pull request and is
+   enforced for every contributor. The repo owner holds the `PolicyExempt` permission
+   ("Bypass policies when pushing") and is the sole exception. Branch, push, then open a
+   pull request in Azure DevOps. Do this even when working as the owner, unless explicitly
+   told to push directly.
 3. **Squash merge only.** Enforced by policy. The Changelog tab is built from
    `git log` on `main`, so one PR must collapse to one commit or the changelog
    fills with WIP noise. See [Commit Messages](#commit-messages) below.
@@ -655,6 +658,101 @@ Sidebar
 ```
 
 The subject names the three headline user-visible features in plain language (`Notes pane`, `Changelog tab`, `folder-aware sidebar filtering`) — descriptive without being marketing-y. Body sub-headings (`Notes pane`, `Settings: Changelog tab`, `Sidebar`) stay neutral so the parser renders them as proper section labels rather than competing with the subject for attention.
+
+---
+
+## Pull Requests
+
+`main` is squash-merge only, so **the squash commit is the changelog entry**. Everything in
+[Commit Messages](#commit-messages) applies to it. The trap is that Azure DevOps does not
+produce that commit correctly on its own.
+
+### What Azure DevOps prefills, and why it is wrong
+
+Completing a pull request prefills the commit as `Merged PR <n>: <PR title>` followed by the
+entire PR description verbatim. Both halves break the Changelog tab:
+
+- **The `Merged PR <n>: ` prefix** defeats `_changelog_category()`, which matches on the first
+  word of the subject. `merged` appears in no category table, so the entry falls back to the
+  neutral "other" dot instead of its real icon, and users see an internal PR number in a
+  user-facing widget.
+- **The PR description is markdown.** `_renderChangelogEntry()` assigns subject and body with
+  `textContent`, so nothing is ever markdown-rendered: `##`, `**bold**`, and backticks all
+  appear literally on screen.
+
+A squash commit has a single parent, so the `--no-merges` flag in `_build_changelog()` does
+**not** filter it out. It always reaches users.
+
+### What to do at completion
+
+Replace both fields in the completion dialog. Never accept the prefill.
+
+**Subject.** Exactly what the commit subject would have been. Delete the `Merged PR <n>: `
+prefix. Past-tense verb first, user-friendly noun phrases, no PR number, no branch name.
+
+**Body.** The changelog format, not the PR description. `_parseChangelogBody()` in `app.js`
+recognises exactly this:
+
+| Input line | Renders as |
+|---|---|
+| Blank line | Ends the current section |
+| First non-blank line of a section | Sub-heading |
+| Line starting `- `, `* `, or `• ` | Bullet |
+| Indented line following a bullet | Folded into that bullet |
+| Non-bullet line after bullets have started | Plain paragraph row |
+| `1. `, `##`, `**bold**`, backticks | Literal text. Never use them. |
+
+Numbered lists are **not** bullets: the matcher is `/^[-*•]\s+/`, so `1.` lines become stray
+sub-headings.
+
+### Direct pushes bypass this entirely
+
+The repo owner can push straight to `main`. That path never opens the completion dialog, so
+there is no `Merged PR <n>: ` prefix to strip and no description to replace: the commit
+message you write **is** the changelog entry, verbatim. It is the cleanest route to a good
+entry, and it is how every commit before PR 904 was made.
+
+The cost is that nothing squashes for you. Push five commits directly and users see five
+changelog entries. Squash locally before pushing, or push one self-contained commit at a
+time.
+
+### Two audiences, two documents
+
+| | PR description | Squash commit body |
+|---|---|---|
+| Read by | Your reviewer | Every end user, in Settings > Changelog |
+| Lives for | The life of the pull request | Forever, on `main` |
+| Style | Markdown, file paths, technical rationale | Plain text sections and bullets, user language |
+
+Write the description for review. At completion, replace it with the user-facing body. Letting
+the description leak into the changelog is the single easiest way to ship a broken entry.
+
+### Worked example
+
+Prefilled by Azure DevOps:
+
+```
+Merged PR 912: Fixed speaker drift
+
+## Problem
+`_assign_speaker()` compared against a stale centroid after long silences.
+
+## Fix
+1. Rebuild the centroid on re-entry
+2. Widen the merge window
+```
+
+Rewritten before completing:
+
+```
+Fixed speakers being renamed part way through long meetings
+
+Speakers
+- Kept a speaker's name attached for the whole meeting instead of letting it
+  drift onto another voice after a long silence
+- Stopped brief crosstalk from creating a duplicate speaker that had to be
+  merged back by hand afterwards
+```
 
 ---
 

@@ -102,16 +102,45 @@ Then open a pull request into `main` in Azure DevOps.
 
 `main` is protected by branch policy. It requires:
 
-- **A pull request.** Direct pushes to `main` are rejected.
+- **A pull request.** Direct pushes to `main` are rejected for everyone except the
+  repo owner, who holds the "Bypass policies when pushing" permission. If you are not
+  sure whether that is you, it is not.
 - **At least one approval.** Your own approval counts, so you are never blocked
   waiting on someone. Get a real review anyway when the change is not trivial.
 - **Squash merge.** Basic merge, rebase, and rebase-with-merge-commit are all
   disabled.
 
 Squash is not cosmetic here. The in-app **Settings → Changelog** tab is built from
-`git log` on `main` (see `_build_changelog` in `app.py`). It already skips merge
-commits, so a non-squashed PR would spill every WIP commit into the changelog as
-separate user-facing entries. One squash per PR gives one clean entry.
+`git log` on `main` (see `_build_changelog` in `app.py`). A non-squashed PR would
+spill every WIP commit into the changelog as separate user-facing entries. One
+squash per PR gives one clean entry.
+
+### Writing the completion message
+
+Because the squash commit is what users read, **the completion dialog is the most
+user-facing thing you will write.** Azure DevOps prefills it badly and you must
+replace both fields:
+
+| Field | Prefilled as | Should be |
+|---|---|---|
+| Subject | `Merged PR 904: Added a contributor guide` | `Added a contributor guide` |
+| Body | Your entire PR description, in markdown | Plain-text sections and bullets |
+
+The `Merged PR <n>: ` prefix costs the entry its icon, because the categoriser
+matches the first word and `merged` is in no category. It also shows an internal
+PR number to end users.
+
+The body is never markdown-rendered. `##`, `**bold**`, backticks, and numbered
+lists all appear on screen exactly as typed. Only `- `, `* `, and `• ` are treated
+as bullets. A blank line ends a section, and a section's first line becomes its
+sub-heading.
+
+Note that a squash commit has a single parent, so it is not filtered out as a
+merge commit. Whatever you leave in that dialog ships to every user.
+
+Your PR description is written for your reviewer and can be as technical as you
+like. The completion message is a different document for a different reader.
+[AGENT.md](AGENT.md) has the full specification and a worked example.
 
 Delete your branch when the PR completes. Azure DevOps offers this in the
 completion dialog and it is pre-ticked on PRs created from the CLI.
@@ -151,7 +180,8 @@ Only `main` and tags are mirrored. Work branches stay internal to Azure DevOps.
 ## Rules that will bite you
 
 1. **Never push to GitHub.** It is a mirror. Your commit will be erased.
-2. **Never push straight to `main`.** Branch policy rejects it. Open a PR.
+2. **Never push straight to `main`.** Branch policy rejects it. Open a PR. (The repo
+   owner holds a bypass permission and is the only exception.)
 3. **Never add branch protection to GitHub's `main`.** The mirror force-pushes and
    protection would block it.
 4. **Never commit `.env`, keys, or anything under `storage/`.** All gitignored.
