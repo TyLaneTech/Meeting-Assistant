@@ -164,6 +164,19 @@ Recording
 Never add `Co-Authored-By:` or generated-with footers. The changelog parser
 strips them defensively, but they should not be written in the first place.
 
+### Internal commits
+
+Every non-merge commit on `main` becomes a Changelog entry that end users read.
+Infrastructure, CI, docs, and tooling work has no meaning for them, so prefix the
+subject with `[internal]` to keep it out:
+
+```
+[internal] Documented pull request and changelog conventions
+```
+
+The marker is matched case-insensitively against the subject. Use it honestly:
+it is for work users cannot see, not for changes you would rather not explain.
+
 ## Releasing
 
 There is no separate release step. Merging to `main` triggers the

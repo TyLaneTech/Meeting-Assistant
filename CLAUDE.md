@@ -72,6 +72,18 @@ in markdown. Both are wrong. Replace both fields in the completion dialog, every
 The PR description is for your reviewer. The squash commit body is for end users. They are
 different documents with different readers. AGENT.md has the full spec and a worked example.
 
+## Keeping internal work out of the changelog
+
+Every non-merge commit on `main` shows up in the user-facing Changelog tab. Prefix the
+subject with `[internal]` when the change is infrastructure, CI, docs, or tooling:
+
+```
+[internal] Documented pull request and changelog conventions
+```
+
+`_build_changelog()` in `app.py` filters those out. Never use the marker to hide a real
+user-facing change.
+
 ## Writing style
 
 No em dashes anywhere: code comments, docs, commit messages, PR descriptions. Use

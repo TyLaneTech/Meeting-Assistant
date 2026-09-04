@@ -661,6 +661,28 @@ The subject names the three headline user-visible features in plain language (`N
 
 ---
 
+### Keeping internal work out of the changelog
+
+Every non-merge commit on `main` becomes a user-facing Changelog entry, infrastructure,
+CI, docs and tooling included. Those mean nothing to an end user.
+
+Prefix the subject with `[internal]` to suppress one:
+
+```
+[internal] Documented pull request and changelog conventions
+```
+
+`_build_changelog()` drops any commit whose subject contains the marker, matched
+case-insensitively, so it never reaches `/api/changelog` or the tab. Use it for anything a
+user cannot see or act on. Do **not** use it to bury a user-facing change you would rather
+not explain.
+
+`_CHANGELOG_EXCLUDE_HASHES` sits next to it and drops specific commits by full hash. That
+is for damage already merged and no longer rewritable, not a routine tool. Anything added
+to it needs a comment saying why the commit is unsalvageable.
+
+---
+
 ## Pull Requests
 
 `main` is squash-merge only, so **the squash commit is the changelog entry**. Everything in

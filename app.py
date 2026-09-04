@@ -8689,6 +8689,22 @@ def restart():
 _CHANGELOG_CACHE_NAME = "changelog.json"
 _CHANGELOG_MAX_COMMITS = 200
 
+# Commits whose subject carries this marker never reach the user-facing Changelog
+# tab. Use it for infrastructure, docs, CI and tooling work, which would otherwise
+# show an end user a line they can neither understand nor act on.
+_CHANGELOG_INTERNAL_MARKER = "[internal]"
+
+# One-off exclusions by full commit hash. Deliberately a hash list rather than a
+# "Merged PR" subject pattern, so a future pull request completed with a properly
+# written message still reaches users instead of being silently swallowed.
+_CHANGELOG_EXCLUDE_HASHES = frozenset({
+    # Azure DevOps prefilled this squash commit as "Merged PR 904: ..." with the
+    # entire PR description as its body. _renderChangelogEntry assigns bodies with
+    # textContent, so it rendered raw "##" headings and numbered lists on screen.
+    # main is publicly mirrored and users pull from it, so it cannot be rewritten.
+    "670cd4e64412a7fdd9dbc8f6e46d29f403fc48cb",
+})
+
 
 def _changelog_category(subject: str) -> str:
     """Crude categorization based on the first word of the commit subject.
@@ -8780,6 +8796,10 @@ def _build_changelog(root: Path) -> dict:
         if len(parts) < 5:
             continue
         h, sh, date, subject, body = parts[0], parts[1], parts[2], parts[3], parts[4]
+        if h in _CHANGELOG_EXCLUDE_HASHES:
+            continue
+        if _CHANGELOG_INTERNAL_MARKER in subject.lower():
+            continue
         body_lines = []
         for line in body.splitlines():
             if any(s in line.lower() for s in skip_substrings):
@@ -8795,7 +8815,16 @@ def _build_changelog(root: Path) -> dict:
             "category": _changelog_category(subject),
         })
 
-    head_hash = commits[0]["hash"] if commits else ""
+    # Key the cache on the real HEAD, not the newest *listed* commit. Filtering
+    # (internal markers, excluded hashes, --no-merges) means commits[0] can lag
+    # HEAD, and api_changelog compares this value against `git rev-parse HEAD`.
+    # If the two can never match, the cache is dead and git runs on every request.
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(root), capture_output=True, text=True, timeout=5,
+        encoding="utf-8",
+    )
+    head_hash = head.stdout.strip() if head.returncode == 0 else ""
     return {
         "head":         head_hash,
         "generated_at": _dt.utcnow().isoformat(),
