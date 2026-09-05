@@ -15,16 +15,6 @@ How an entry is read:
   paragraphs. Plain markdown.
 - Infrastructure, docs, CI and tooling changes get no entry.
 
-## Made the Start Menu shortcut start the app silently in the tray (2026-09-05)
-
-### Launching
-- Opening Meeting Assistant from the Start Menu no longer shows a console window: the app starts in the system tray and its window opens once it is ready
-- The sign-in (start with Windows) shortcut starts the app in the tray the same way, and an existing one is moved over on the next launch
-- A first run still shows the installer in a console so its progress is visible
-- If a hidden start fails, a message points at the launch log instead of waiting forever for a key press
-
-### Changelog
-- Release notes now come from CHANGELOG.md in the project, so they can be written and corrected freely; the notes for the previous update read properly again
 
 ## Added a Home dashboard, a Calendar view, and a redesigned Speakers workflow (2026-09-05)
 
@@ -64,6 +54,15 @@ How an entry is read:
 - Fixed pausing and resuming a recording corrupting the per-speaker audio tracks
 - Fixed a preference saved in one tab being undone by another open tab
 - Fixed restarting or updating from the tray sometimes not bringing the app back
+
+### Launching
+- Opening Meeting Assistant from the Start Menu no longer shows a console window: the app starts in the system tray and its window opens once it is ready
+- The sign-in (start with Windows) shortcut starts the app in the tray the same way, and an existing one is moved over on the next launch
+- A first run still shows the installer in a console so its progress is visible
+- If a hidden start fails, a message points at the launch log instead of waiting forever for a key press
+
+### Changelog
+- Release notes now come from CHANGELOG.md in the project, so they can be written and corrected freely; the notes for the previous update read properly again
 
 ## Improved how quickly recordings stop and sidebar items move (2026-08-28)
 
