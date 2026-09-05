@@ -498,7 +498,8 @@ def test_manifest_starts_at_the_dashboard():
 
 def test_launcher_opens_the_dashboard():
     vbs = _read(ROOT / "app_launcher.vbs")
-    assert 'appUrl    = "http://localhost:6969/"' in vbs
+    assert 'appUrl    = "http://localhost:" & port & "/"' in vbs
+    assert 'EnvPort = "6969"' in vbs
     assert "/session" not in vbs
 
 

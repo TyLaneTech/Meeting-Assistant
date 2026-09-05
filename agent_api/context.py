@@ -60,7 +60,7 @@ class AgentContext:
 
     # System
     changelog: Callable[[int], list]
-    """Most recent parsed changelog commits (newest first)."""
+    """Newest CHANGELOG.md entries first: id, date, title, body (markdown), category."""
 
     stop_recording: Callable[[], Any]
     """The /api/recording/stop view function (called in-request-context)."""

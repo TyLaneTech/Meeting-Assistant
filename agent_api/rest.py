@@ -618,10 +618,10 @@ def system_log_file(name: str):
 def system_changelog():
     limit = max(1, min(100, _as_int(request.args.get("limit"), 15)))
     try:
-        commits = _ctx.changelog(limit)
+        entries = _ctx.changelog(limit)
     except Exception as e:
         return _err(f"Could not read changelog: {e}", 500)
-    return jsonify({"count": len(commits), "commits": commits})
+    return jsonify({"count": len(entries), "entries": entries})
 
 
 # ── Folders ───────────────────────────────────────────────────────────────────

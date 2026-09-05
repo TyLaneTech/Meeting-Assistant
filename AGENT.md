@@ -33,9 +33,9 @@ tries `origin` first and falls back to the GitHub URL, which is why both work.
    ("Bypass policies when pushing") and is the sole exception. Branch, push, then open a
    pull request in Azure DevOps. Do this even when working as the owner, unless explicitly
    told to push directly.
-3. **Squash merge only.** Enforced by policy. The Changelog tab is built from
-   `git log` on `main`, so one PR must collapse to one commit or the changelog
-   fills with WIP noise. See [Commit Messages](#commit-messages) below.
+3. **Squash merge only.** Enforced by policy: one pull request, one commit on `main`.
+   Release notes live in `CHANGELOG.md`, not in commit messages; see
+   [Release Notes and Commit Messages](#release-notes-and-commit-messages) below.
 4. **Never commit `.env`, API keys, or anything under `storage/`.** All gitignored.
 5. **Do not remove the bundled HuggingFace token** from `core/config.py`. It is
    deliberate and the app depends on it.
@@ -89,8 +89,9 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `launch.bat` / `launch.command` | OS-specific shells that invoke `launch.py`. |
 | `mcp_server.py` | Stdio MCP server for external AI agents (Claude Desktop/Code, Codex). Pure stdlib, zero project imports — proxies to the Agent REST API over localhost HTTP, so it works with any Python and never loads app modules. |
 | `watchdog.py` | External freeze watchdog, opt-in via `freeze_watchdog_enabled`. Polls `/api/status` from outside the process and reads `<data>/heartbeat.json` to tell a frozen or crashed app (restart) from a clean quit (leave alone). Started by `launch.py`, never by the app. |
-| `launch_hidden.vbs` | Tray-only Windows start: runs `launch.bat` with no console and sends the startup output to `storage/logs/launch-startup-<stamp>.log`, one file per launch, pruned after a week. `_relaunch_app()` prefers it for restarts and updates. |
-| `app_launcher.vbs` | Click-to-open launcher for pins and shortcuts: opens the app window if the server is already up, otherwise starts it hidden and opens the window once it answers. |
+| `launch_hidden.vbs` | Tray-only Windows start: runs `launch.bat --hidden` with no console and sends the startup output to `storage/logs/launch-startup-<stamp>.log`, one file per launch, pruned after a week. `_relaunch_app()` prefers it for restarts and updates; the sign-in shortcut runs it. |
+| `app_launcher.vbs` | What the Start Menu shortcut runs. Server up: asks it to open the app window (`POST /api/window/open`, so the PWA / app-window / browser choice lives in `core/browser.py`). Server down: starts it through `launch_hidden.vbs` and waits up to three minutes. No `.venv` yet: runs `launch.bat` in a visible console so the first-run install shows its progress. |
+| `CHANGELOG.md` | The release notes users read (Settings → Changelog, What's new card). Parsed by `core/changelog.py`; see Release Notes below. |
 | `tests/` | pytest suite, no hardware needed: unit tests for the pure modules plus static assertions over the templates, scripts and stylesheets. `python -m pytest tests -q` runs in about ten seconds. See CONTRIBUTING.md. |
 
 ### `core/` — foundational utilities
@@ -109,6 +110,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/calendar_feed.py` | Published-calendar (ICS) download, RRULE expansion, time zones, attendee parsing, URL masking |
 | `core/calendar_sync.py` | Matches recordings to calendar instances, stores the match and expected speaker count, feeds attendee candidates to the Speakers Cleanup tab, runs the hourly refresh |
 | `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view |
+| `core/changelog.py` | Parses `CHANGELOG.md` into the entries the Changelog tab and What's new card show |
 | `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries |
 | `core/heartbeat.py` | `<data>/heartbeat.json`, refreshed while alive and removed on a clean quit; read by `watchdog.py` |
 | `core/icons.py`, `core/icons_api.py` | Icon sets (Settings > Icons): per-state slots, tinting, PNG/ICO rendering, custom uploads, the tray and shortcut icons; `/api/icons/*` and the web manifest |
@@ -363,6 +365,8 @@ All API routes follow these conventions:
 | `/api/preferences` | User preferences (JSON settings) |
 | `/api/shutdown` | Graceful exit |
 | `/api/restart` | Graceful stop, then relaunch through the launcher (`_relaunch_app()`) |
+| `/api/window/open` | Open or focus the app window (`core/browser.py`); called by `app_launcher.vbs` |
+| `/api/changelog` | `CHANGELOG.md` parsed into entries (`core/changelog.py`); `?refresh=1` re-reads |
 | `/api/update/check`, `/api/update/apply` | Self-update: fetch `main`, compare, pull, relaunch |
 | `/`, `/session/<id>`, `/calendar`, `/attention`, `/speakers` | The one app shell (`index.html`); the client router picks the view |
 | `/api/dashboard` | Home dashboard data (`core/dashboard_api.py`) |
@@ -455,6 +459,8 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 **WAV append walks the RIFF chunks:** `WavWriter(append=True)` locates the data chunk instead of patching offset 40, and the resume path decodes Opus parts with `-fflags +bitexact`. Pause/resume with per-source tracks corrupted both tracks without this.
 
 **Console logging never raises:** `core/log.py` reconfigures stdout/stderr with `errors="replace"` and echoes through `_echo()`. Under `launch_hidden.vbs` stdout is a cp1252 file, and a `→` in a log line used to raise inside the screen recorder at record start. `launch.py` does the same for its own output.
+
+**Silent shortcuts:** `launch.py` points the Start Menu shortcut at `app_launcher.vbs` and migrates a sign-in shortcut that still runs `cmd /c launch.bat` onto `launch_hidden.vbs`, so neither leaves a console window open. `launch.bat --hidden` shows a message box on failure instead of `pause`, which a hidden console can never answer. A first run (no `.venv`) still gets a visible console for the install.
 
 **Shortcut ownership:** `launch.py` only rewrites a Start Menu shortcut that already launches this checkout (or when none exists), and `core/icons.py` only re-icons shortcuts that do. A second clone or a git worktree must never take over the user's shortcut while the other checkout still exists.
 
@@ -621,220 +627,26 @@ The audio pipeline is designed to avoid progressive slowdown during long session
 
 ---
 
-## Commit Messages
+## Release Notes and Commit Messages
 
-Commits surface to the user via the in-app **Settings → Changelog** tab. The tab parses git history client-side: it splits the body on blank lines into sections, treats the first non-bullet line of each section as a sub-heading, and treats `- ` / `* ` / `• ` lines as bullets (indented continuation lines fold into the preceding bullet). Compose every commit so it reads well there, not just in `git log`.
+**Users read `CHANGELOG.md`, nothing else.** The Settings → Changelog tab and the What's new card after an update come from `core/changelog.py` parsing that file (`GET /api/changelog`, cached in memory on the file's size and mtime). Git history is not consulted, so commit messages and pull request text are for developers.
 
-### Subject — past-tense verb + descriptive user-friendly noun phrases
+### CHANGELOG.md
 
-The first alpha word of the subject drives the icon shown next to the entry. Subjects are written in **past tense** ("Added", "Fixed"), not imperative ("Add", "Fix"):
+- Every `## ` heading (exactly two hashes) opens one entry: `## <Title> (YYYY-MM-DD)`. Newest first. The date may also lead the heading (`## 2026-09-05 Title`).
+- Everything until the next `## ` is the entry's notes, rendered as markdown by `_renderChangelogBody()` in `app.js`: `### ` sub-headings for areas, `- ` bullets, paragraphs, links (opened in a new tab).
+- `changelog.category(title)` picks the icon from the title's first word: Added, Created, Built, New → feature; Fixed, Guarded, Hardened → fix; Updated, Improved, Polished, Reworked, Made, Replaced → improvement; Refactored, Rewrote, Restructured → refactor; Removed, Deleted, Dropped, Retired → removal; anything else → neutral dot.
+- Text before the first entry is a preamble (the file documents its own format there) and is ignored.
+- Entry ids are `<date>-<slug>`; the What's new card shows the newest entry once per browser when the id changes (`localStorage` key `ma:lastSeenChangelogEntry`).
+- Add the entry in the same change that ships the feature. Write for users: what they will notice, in their words, no module names, no emoji, no marketing verbs. Infrastructure, docs, CI and tooling changes get no entry.
 
-| Leading verb(s) — past tense | Category | Icon |
-|---|---|---|
-| `Added`, `Created`, `Built`, `New` | feature | green plus |
-| `Fixed`, `Guarded`, `Hardened`, `Self-healed` | fix | red wrench |
-| `Updated`, `Improved`, `Enhanced`, `Polished`, `Tightened`, `Tuned`, `Reworked`, `Replaced`, `Switched`, `Made` | improvement | blue up-arrow |
-| `Refactored`, `Rewrote`, `Restructured`, `Reorganized`, `Consolidated` | refactor | purple shuffle |
-| `Removed`, `Dropped`, `Killed`, `Stripped` | removal | yellow minus |
-| anything else | other | neutral dot |
+### Commit messages
 
-(The categorizer also accepts the imperative forms — `Add`, `Fix`, etc. — so older commits in git history still get the right icon. New commits use past tense.)
+Past-tense verb first, then what changed and why, for the developer reading `git log`. Body optional. **Never add `Co-Authored-By:`, `Claude-Session:` or generated-with footers** (repo policy, every branch). The `[internal]` subject marker from the git-based changelog is retired: nothing filters on it any more.
 
-The "user-friendly" part comes from the **noun phrases that follow the verb**, not from substituting the verb itself with marketing language. Use phrases the user actually understands — names of features they'll see in the UI, plain descriptors of how the change feels — rather than internal module names or engineering jargon.
+### Pull requests
 
-| ✓ User-friendly noun phrases | ✗ Internal jargon |
-|---|---|
-| Added Notes pane, Changelog tab, and folder-aware sidebar filtering | Added `_notesEditor` module, `/api/changelog` route, and `_renderFolderSubtree` filtering |
-| Fixed Whisper hallucinations during long meetings | Fixed `_collapse_word_periods` regression in transcriber prompt context |
-| Updated OpenAI summaries to use the Responses API | Refactored `_complete_structured` to call `responses.create` |
-
-Multi-feature commits get one subject naming the headline ("Added Notes pane, Changelog tab, and folder-aware sidebar filtering") and split the body into per-area sections.
-
-### Three firm rules
-
-- **Past tense, not imperative.** "Added Notes pane", not "Add Notes pane".
-- **No emoji in commit subjects.** Flair from glyphs is off. The categorizer strips leading non-letter chars defensively, but it's not the convention here.
-- **No marketing-speak verbs.** `Introducing`, `Meet`, `Presenting`, `Ship`, `Level up`, `Sunset`, etc. overshoot — the user has explicitly said they read as too much flair. Stay with the past-tense engineering verb table above.
-
-### Body — sections separated by blank lines
-
-```
-Subject (verb-first, ≤72 chars)
-
-Section heading
-- First user-facing change in this area.
-- Second change. Continuation lines indent two spaces and are
-  folded back into the same bullet by the parser.
-
-Another section heading
-- …
-```
-
-Section headings are 2-4 words naming the user-visible area (e.g. *Notes pane*, *Sidebar*, *Settings: Changelog tab*). Keep ~6 bullets max per section — split if longer.
-
-### Tone — user-facing, not implementation jargon
-
-The audience is the user reading the Changelog tab. Prefer plain wording over internal terminology. Save technical detail for the second clause if it informs behaviour.
-
-| ✗ Avoid | ✓ Prefer |
-|---|---|
-| POST to `/api/sessions/<sid>/notes/attachments` | Drop files into the Notes pane |
-| Refactor `_renderSidebar` to early-return on `filterActive` | Filtering preserves your folder hierarchy |
-| Set `_toolOverrides.summary_provider` from picker click | Pick an AI model per-column from the inline picker |
-
-### Forbidden trailers
-
-**Never** include `Co-Authored-By:` or `🤖 Generated with` lines. This is repo policy on every branch, for every contributor, and it is restated in [CLAUDE.md](CLAUDE.md). The parser strips them defensively, but the rule is: don't write them in the first place.
-
-### Tightening pass
-
-When the user asks for a tighter message, cut in this order:
-1. The catch-all "Other" miscellany section.
-2. Sub-bullets describing internals the user can't action on (e.g. transcriber-internal mechanisms when the user-visible behaviour is captured by the lead bullet).
-3. Wordy clause-chains — split into two short bullets or pick the more important one.
-
-Don't cut: section headings, bullets that describe a *new* user-visible capability, or the verb in the subject line.
-
-### Worked example
-
-```
-Added Notes pane, Changelog tab, and folder-aware sidebar filtering
-
-Notes pane
-- New rich-text Notes column alongside Transcript, Summary, and Chat.
-- Drop or paste images and files anywhere in the pane.
-- Drag any image or file from Notes into the Chat panel to attach it
-  as context for the AI.
-
-Settings: Changelog tab
-- New tab pinned to the bottom of the settings nav. Lists recent
-  updates parsed from git history with date headings.
-- Cached locally; only rebuilt when you click Refresh or after an
-  update is applied.
-
-Sidebar
-- Filtering by date now preserves your folder hierarchy. Folders
-  with no matching sessions are hidden until the filter clears.
-```
-
-The subject names the three headline user-visible features in plain language (`Notes pane`, `Changelog tab`, `folder-aware sidebar filtering`) — descriptive without being marketing-y. Body sub-headings (`Notes pane`, `Settings: Changelog tab`, `Sidebar`) stay neutral so the parser renders them as proper section labels rather than competing with the subject for attention.
-
----
-
-### Keeping internal work out of the changelog
-
-Every non-merge commit on `main` becomes a user-facing Changelog entry, infrastructure,
-CI, docs and tooling included. Those mean nothing to an end user.
-
-Prefix the subject with `[internal]` to suppress one:
-
-```
-[internal] Documented pull request and changelog conventions
-```
-
-`_build_changelog()` drops any commit whose subject contains the marker, matched
-case-insensitively, so it never reaches `/api/changelog` or the tab. Use it for anything a
-user cannot see or act on. Do **not** use it to bury a user-facing change you would rather
-not explain.
-
-`_CHANGELOG_EXCLUDE_HASHES` sits next to it and drops specific commits by full hash. That
-is for damage already merged and no longer rewritable, not a routine tool. Anything added
-to it needs a comment saying why the commit is unsalvageable.
-
----
-
-## Pull Requests
-
-`main` is squash-merge only, so **the squash commit is the changelog entry**. Everything in
-[Commit Messages](#commit-messages) applies to it. The trap is that Azure DevOps does not
-produce that commit correctly on its own.
-
-### What Azure DevOps prefills, and why it is wrong
-
-Completing a pull request prefills the commit as `Merged PR <n>: <PR title>` followed by the
-entire PR description verbatim. Both halves break the Changelog tab:
-
-- **The `Merged PR <n>: ` prefix** defeats `_changelog_category()`, which matches on the first
-  word of the subject. `merged` appears in no category table, so the entry falls back to the
-  neutral "other" dot instead of its real icon, and users see an internal PR number in a
-  user-facing widget.
-- **The PR description is markdown.** `_renderChangelogEntry()` assigns subject and body with
-  `textContent`, so nothing is ever markdown-rendered: `##`, `**bold**`, and backticks all
-  appear literally on screen.
-
-A squash commit has a single parent, so the `--no-merges` flag in `_build_changelog()` does
-**not** filter it out. It always reaches users.
-
-### What to do at completion
-
-Replace both fields in the completion dialog. Never accept the prefill.
-
-**Subject.** Exactly what the commit subject would have been. Delete the `Merged PR <n>: `
-prefix. Past-tense verb first, user-friendly noun phrases, no PR number, no branch name.
-
-**Body.** The changelog format, not the PR description. `_parseChangelogBody()` in `app.js`
-recognises exactly this:
-
-| Input line | Renders as |
-|---|---|
-| Blank line | Ends the current section |
-| First non-blank line of a section | Sub-heading |
-| Line starting `- `, `* `, or `• ` | Bullet |
-| Indented line following a bullet | Folded into that bullet |
-| Non-bullet line after bullets have started | Plain paragraph row |
-| `1. `, `##`, `**bold**`, backticks | Literal text. Never use them. |
-
-Numbered lists are **not** bullets: the matcher is `/^[-*•]\s+/`, so `1.` lines become stray
-sub-headings.
-
-### Direct pushes bypass this entirely
-
-The repo owner can push straight to `main`. That path never opens the completion dialog, so
-there is no `Merged PR <n>: ` prefix to strip and no description to replace: the commit
-message you write **is** the changelog entry, verbatim. It is the cleanest route to a good
-entry, and it is how every commit before PR 904 was made.
-
-The cost is that nothing squashes for you. Push five commits directly and users see five
-changelog entries. Squash locally before pushing, or push one self-contained commit at a
-time.
-
-### Two audiences, two documents
-
-| | PR description | Squash commit body |
-|---|---|---|
-| Read by | Your reviewer | Every end user, in Settings > Changelog |
-| Lives for | The life of the pull request | Forever, on `main` |
-| Style | Markdown, file paths, technical rationale | Plain text sections and bullets, user language |
-
-Write the description for review. At completion, replace it with the user-facing body. Letting
-the description leak into the changelog is the single easiest way to ship a broken entry.
-
-### Worked example
-
-Prefilled by Azure DevOps:
-
-```
-Merged PR 912: Fixed speaker drift
-
-## Problem
-`_assign_speaker()` compared against a stale centroid after long silences.
-
-## Fix
-1. Rebuild the centroid on re-entry
-2. Widen the merge window
-```
-
-Rewritten before completing:
-
-```
-Fixed speakers being renamed part way through long meetings
-
-Speakers
-- Kept a speaker's name attached for the whole meeting instead of letting it
-  drift onto another voice after a long silence
-- Stopped brief crosstalk from creating a duplicate speaker that had to be
-  merged back by hand afterwards
-```
+`main` is squash-merge only (branch policy). The pull request title and description are for the reviewer; Azure DevOps prefills the squash commit from them and that is fine, because users never see the commit. Delete the branch on completion (pre-ticked for PRs created from the CLI).
 
 ---
 

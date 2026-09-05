@@ -175,7 +175,7 @@ The server also exposes this guide as an MCP resource
 | `GET /system/logs` | Ring buffer since app start. Params: `limit`, `level` (info/warn/error), `tag`, `contains`, `after_id` (incremental polling). |
 | `GET /system/logs/files` | Persisted rotating log files under `<data>/logs/`. |
 | `GET /system/logs/files/{name}` | Tail one file (`?lines=500`). |
-| `GET /system/changelog` | Recent app updates parsed from git history (`?limit=15`). |
+| `GET /system/changelog` | Recent app updates from CHANGELOG.md (`?limit=15`): id, date, title, body as markdown, category. |
 
 Log tags you will see: `app`, `recording`, `whisper`, `transcriber`,
 `diarizer`, `ai`, `summary`, `storage`, `audio`, `fingerprint`, `settings`,

@@ -102,8 +102,8 @@ def build_spec(server_url: str) -> dict:
          _q("lines", "Trailing lines to return (default 500).", "integer")],
         tags=["system"]))
     add("/system/changelog", "get", _op(
-        "Recent app updates parsed from git history", "",
-        [_q("limit", "Max commits (default 15).", "integer")], tags=["system"]))
+        "Recent app updates from CHANGELOG.md", "",
+        [_q("limit", "Max entries (default 15).", "integer")], tags=["system"]))
 
     # Folders
     add("/folders", "get", _op("Folder tree with paths and session counts",

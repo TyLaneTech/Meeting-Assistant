@@ -36,6 +36,16 @@ def start_menu_shortcut() -> Path | None:
     return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / SHORTCUT_NAME
 
 
+def startup_shortcut() -> Path | None:
+    """The sign-in autostart shortcut (Startup folder), Windows only."""
+    if sys.platform != "win32":
+        return None
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        return None
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / SHORTCUT_NAME
+
+
 def pinned_taskbar_dir() -> Path | None:
     """Where Windows keeps the shortcuts behind taskbar pins."""
     if sys.platform != "win32":
@@ -127,12 +137,24 @@ def same_path(a: str | Path, b: str | Path) -> bool:
         return str(a).lower() == str(b).lower()
 
 
+LAUNCHER_FILES = ("launch.bat", "app_launcher.vbs", "launch_hidden.vbs")
+
+
 def points_at(info: dict | None, bat_path: Path) -> bool:
-    """True when a shortcut read by read() launches *bat_path*."""
+    """True when a shortcut read by read() launches the checkout that owns
+    *bat_path*: cmd running its launch.bat (the old form) or wscript running one
+    of its .vbs launchers (the Start Menu and sign-in shortcuts since the silent
+    launch)."""
     if not info:
         return False
-    args = info.get("arguments", "") or ""
-    return "cmd.exe" in (info.get("target", "") or "").lower() and str(bat_path).lower() in args.lower()
+    target = (info.get("target", "") or "").lower()
+    args = (info.get("arguments", "") or "").lower()
+    if "cmd.exe" in target and str(bat_path).lower() in args:
+        return True
+    if "wscript" in target:
+        root = str(Path(bat_path).parent).lower()
+        return any((root + os.sep + name) in args for name in LAUNCHER_FILES)
+    return False
 
 
 def our_shortcuts(bat_path: Path) -> list[Path]:

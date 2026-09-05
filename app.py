@@ -45,6 +45,7 @@ from core import browser as browser
 from core import calendar_feed as calendar_feed
 from core import calendar_sync as calendar_sync
 from core import calendar_events_api as calendar_events_api
+from core import changelog as changelog
 from core import dashboard_api as dashboard_api
 from core import heartbeat as heartbeat
 from core import icons as icons
@@ -3001,6 +3002,23 @@ def _startup_lnk_path() -> Path:
     )
 
 
+@app.route("/api/window/open", methods=["POST"])
+def open_window():
+    """Open (or focus) the app window.
+
+    app_launcher.vbs, which the Start Menu shortcut runs, calls this once the
+    server answers, so the window logic (installed PWA, then a chromeless
+    --app window, then the default browser) lives in core/browser.py alone
+    instead of being repeated in VBScript with hardcoded paths and ids.
+    """
+    body = request.get_json(silent=True) or {}
+    path = str(body.get("path") or "/")
+    if not path.startswith("/"):
+        path = "/" + path
+    opened = browser.open_app_window(f"{_server_url}{path}", prefer_pwa=(path == "/"))
+    return jsonify({"ok": True, "app_window": bool(opened)})
+
+
 @app.route("/api/settings/startup")
 def get_startup():
     if sys.platform != "win32":
@@ -3017,23 +3035,19 @@ def set_startup():
     lnk = _startup_lnk_path()
     if enable:
         root = Path(__file__).parent
-        bat  = root / "launch.bat"
-        icon = root / "ui_web" / "static" / "images" / "logo.ico"
-        ps = (
-            f"$ws = New-Object -ComObject WScript.Shell; "
-            f"$s = $ws.CreateShortcut('{lnk}'); "
-            f"$s.TargetPath = 'cmd.exe'; "
-            f"$s.Arguments = '/c \"\"{bat}\"\"'; "
-            f"$s.WorkingDirectory = '{root}'; "
-            f"$s.WindowStyle = 7; "
-            + (f"$s.IconLocation = '{icon}, 0'; " if icon.exists() else "")
-            + "$s.Save()"
+        from core import shortcut as _shortcut
+        try:
+            icon = Path(icons.shortcut_icon_path())
+        except Exception:
+            icon = root / "ui_web" / "static" / "images" / "logo.ico"
+        # Tray-only at sign-in: launch_hidden.vbs starts the app with no console
+        # window. The old cmd /c launch.bat target left a minimised console open
+        # for the whole session.
+        ok = _shortcut.write(
+            lnk, "wscript.exe", f'"{root / "launch_hidden.vbs"}"', str(root),
+            icon if icon.exists() else None,
         )
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
+        if not ok:
             return jsonify({"ok": False, "error": "Failed to create startup shortcut"}), 500
     else:
         try:
@@ -9954,229 +9968,36 @@ def restart():
 
 
 # ── Changelog ────────────────────────────────────────────────────────────────
+# Release notes come from CHANGELOG.md at the project root (core/changelog.py),
+# not from git history. The file is edited freely, in the same change that
+# ships the feature, and commit messages are written for developers again.
 
-_CHANGELOG_CACHE_NAME = "changelog.json"
-_CHANGELOG_MAX_COMMITS = 200
-
-# Commits whose subject carries this marker never reach the user-facing Changelog
-# tab. Use it for infrastructure, docs, CI and tooling work, which would otherwise
-# show an end user a line they can neither understand nor act on.
-_CHANGELOG_INTERNAL_MARKER = "[internal]"
-
-# One-off exclusions by full commit hash. Deliberately a hash list rather than a
-# "Merged PR" subject pattern, so a future pull request completed with a properly
-# written message still reaches users instead of being silently swallowed.
-_CHANGELOG_EXCLUDE_HASHES = frozenset({
-    # Azure DevOps prefilled this squash commit as "Merged PR 904: ..." with the
-    # entire PR description as its body. _renderChangelogEntry assigns bodies with
-    # textContent, so it rendered raw "##" headings and numbered lists on screen.
-    # main is publicly mirrored and users pull from it, so it cannot be rewritten.
-    "670cd4e64412a7fdd9dbc8f6e46d29f403fc48cb",
-})
-
-
-def _changelog_category(subject: str) -> str:
-    """Crude categorization based on the first word of the commit subject.
-    Drives the icon + accent color in the UI; not user-editable.
-
-    Subject convention is past tense ("Added", "Fixed"). Imperative forms
-    ("Add", "Fix") are also accepted so commits from before that
-    convention landed still get their icons. Leading non-letter chars are
-    stripped defensively before matching."""
-    s = subject.strip().lower()
-    s = re.sub(r"^[^\w]+", "", s).lstrip()
-    # Fix
-    if s.startswith((
-        "fixed ", "fix ", "fix:", "bug ", "bug:",
-        "guarded ", "guard ", "hardened ", "harden ",
-    )) or s.startswith(("fix-", "self-heal")):
-        return "fix"
-    # Feature
-    if s.startswith((
-        "added ", "add ", "add:", "new ", "new:",
-        "created ", "create ", "built ", "build ",
-    )):
-        return "feature"
-    # Refactor
-    if s.startswith((
-        "refactored", "refactor",
-        "rewrote", "rewrite",
-        "restructured", "restructure",
-        "reorganized", "reorganize",
-        "consolidated", "consolidate",
-    )):
-        return "refactor"
-    # Improvement
-    if s.startswith((
-        "updated", "update",
-        "improved", "improve",
-        "enhanced", "enhance",
-        "polished", "polish",
-        "tightened", "tighten",
-        "tuned ", "tune ",
-        "reworked", "rework",
-        "replaced", "replace",
-        "switched", "switch",
-        "made ", "make ",
-    )):
-        return "improvement"
-    # Removal
-    if s.startswith((
-        "removed", "remove",
-        "dropped ", "drop ",
-        "killed ", "kill ",
-        "stripped ", "strip ",
-    )):
-        return "removal"
-    return "other"
-
-
-def _build_changelog(root: Path) -> dict:
-    """Run ``git log`` and parse it into a structured payload. Caller is
-    responsible for caching."""
-    from datetime import datetime as _dt
-    SEP = "\x1e"
-    FIELD_SEP = "\x1f"
-    fmt = FIELD_SEP.join(["%H", "%h", "%ad", "%s", "%b"]) + SEP
-    log = subprocess.run(
-        ["git", "log", f"--pretty=format:{fmt}",
-         "--date=short", "--no-merges", "-n", str(_CHANGELOG_MAX_COMMITS)],
-        cwd=str(root), capture_output=True, text=True, timeout=10,
-        encoding="utf-8",
-    )
-    if log.returncode != 0:
-        raise RuntimeError(log.stderr.strip() or "git log failed")
-
-    commits = []
-    # Drop trailers we don't want surfaced (Co-author signatures, generated-with
-    # footers). Defensive — these shouldn't normally land in commits per repo
-    # policy, but old commits may carry them.
-    skip_substrings = (
-        "co-authored-by:",
-        "co-author-by:",
-        "claude-session:",
-        "🤖 generated with",
-        "generated with [claude",
-    )
-    # Orchestration trailers ("Batch: ma-b4  Seat: codex-work") are bookkeeping,
-    # not release notes; they only ever appear at the start of a line.
-    skip_prefixes = ("batch:",)
-    for raw in log.stdout.split(SEP):
-        raw = raw.strip()
-        if not raw:
-            continue
-        parts = raw.split(FIELD_SEP)
-        if len(parts) < 5:
-            continue
-        h, sh, date, subject, body = parts[0], parts[1], parts[2], parts[3], parts[4]
-        if h in _CHANGELOG_EXCLUDE_HASHES:
-            continue
-        if _CHANGELOG_INTERNAL_MARKER in subject.lower():
-            continue
-        body_lines = []
-        for line in body.splitlines():
-            lowered = line.strip().lower()
-            if any(s in lowered for s in skip_substrings):
-                continue
-            if lowered.startswith(skip_prefixes):
-                continue
-            body_lines.append(line)
-        # Commit bodies wrap prose at 72 columns. Fold each wrapped paragraph
-        # back into one line (bullets and their indented continuations keep
-        # their own lines) so the What's new overlay shows sentences, not
-        # fragments.
-        folded: list = []
-        for line in body_lines:
-            stripped = line.rstrip()
-            if not stripped.strip():
-                folded.append("")
-                continue
-            is_bullet = bool(re.match(r"^\s*[-*•]\s+", stripped))
-            is_indented = stripped[:1].isspace()
-            prev = folded[-1] if folded else ""
-            prev_is_bullet = bool(re.match(r"^\s*[-*•]\s+", prev))
-            if folded and prev and not is_bullet and not is_indented and not prev_is_bullet:
-                folded[-1] = prev + " " + stripped.strip()
-            else:
-                folded.append(stripped)
-        body_clean = "\n".join(folded).strip()
-        commits.append({
-            "hash":     h,
-            "short":    sh,
-            "date":     date,
-            "subject":  subject.strip(),
-            "body":     body_clean,
-            "category": _changelog_category(subject),
-        })
-
-    # Key the cache on the real HEAD, not the newest *listed* commit. Filtering
-    # (internal markers, excluded hashes, --no-merges) means commits[0] can lag
-    # HEAD, and api_changelog compares this value against `git rev-parse HEAD`.
-    # If the two can never match, the cache is dead and git runs on every request.
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(root), capture_output=True, text=True, timeout=5,
-        encoding="utf-8",
-    )
-    head_hash = head.stdout.strip() if head.returncode == 0 else ""
-    return {
-        "head":         head_hash,
-        "generated_at": _dt.utcnow().isoformat(),
-        "count":        len(commits),
-        "commits":      commits,
-    }
+_changelog_cache: dict = {"stamp": None, "payload": None}
 
 
 @app.route("/api/changelog")
 def api_changelog():
-    """Return a parsed, locally-cached changelog from git history.
+    """The parsed CHANGELOG.md, re-read whenever the file changes.
 
-    The cache is keyed by HEAD; if HEAD hasn't moved since the last build,
-    git is not invoked and the cached payload is served. Pass ``?refresh=1``
-    to force a rebuild (used by the "Refresh" button on the Changelog tab).
+    ``?refresh=1`` forces a re-read (the Refresh button on the Changelog tab);
+    otherwise the payload is served from memory while the file's size and
+    mtime are unchanged.
     """
     root = Path(__file__).parent
-    cache_path = paths.data_dir() / _CHANGELOG_CACHE_NAME
     refresh = bool(request.args.get("refresh"))
-
-    # Resolve current HEAD cheaply so we can short-circuit when cache is fresh.
+    stamp = changelog.stamp(root)
+    cached = _changelog_cache["payload"]
+    if not refresh and cached is not None and _changelog_cache["stamp"] == stamp:
+        payload = dict(cached)
+        payload["fresh"] = False
+        return jsonify(payload)
     try:
-        rev = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(root), capture_output=True, text=True, timeout=5,
-        )
-        if rev.returncode != 0:
-            return jsonify({"error": "Not a git repository"}), 500
-        head_hash = rev.stdout.strip()
-    except FileNotFoundError:
-        return jsonify({"error": "git not available on this machine"}), 500
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "git rev-parse timed out"}), 504
+        payload = changelog.load(root)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-    if not refresh and cache_path.exists():
-        try:
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("head") == head_hash:
-                cached["fresh"] = False
-                return jsonify(cached)
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    try:
-        payload = _build_changelog(root)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "git log timed out"}), 504
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(payload), encoding="utf-8")
-    except OSError as e:
-        log.warn("changelog", f"Failed to write cache: {e}")
-
+    _changelog_cache["stamp"] = stamp
+    _changelog_cache["payload"] = payload
+    payload = dict(payload)
     payload["fresh"] = True
     return jsonify(payload)
 
@@ -10378,8 +10199,9 @@ def _agent_apply_ai_settings(provider, model) -> dict:
 
 
 def _agent_changelog(limit: int) -> list:
-    payload = _build_changelog(Path(__file__).parent)
-    return (payload.get("commits") or [])[:limit]
+    """Newest CHANGELOG.md entries for the Agent API (id, date, title, body, category)."""
+    payload = changelog.load(Path(__file__).parent)
+    return (payload.get("entries") or [])[:limit]
 
 
 app.register_blueprint(dashboard_api.bp)

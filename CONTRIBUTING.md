@@ -128,72 +128,37 @@ Then open a pull request into `main` in Azure DevOps.
 - **Squash merge.** Basic merge, rebase, and rebase-with-merge-commit are all
   disabled.
 
-Squash is not cosmetic here. The in-app **Settings → Changelog** tab is built from
-`git log` on `main` (see `_build_changelog` in `app.py`). A non-squashed PR would
-spill every WIP commit into the changelog as separate user-facing entries. One
-squash per PR gives one clean entry.
+Write the title and description for your reviewer. Azure DevOps prefills the squash
+commit from them and that is fine: users never see commits (see Release notes).
+Delete your branch when the PR completes; it is pre-ticked on PRs created from the CLI.
 
-### Writing the completion message
+## Release notes
 
-Because the squash commit is what users read, **the completion dialog is the most
-user-facing thing you will write.** Azure DevOps prefills it badly and you must
-replace both fields:
+End users read `CHANGELOG.md` in the app's Settings → Changelog tab and in the What's
+new card after an update. It is the only source of user-facing release notes, and it
+is edited by hand, in the same pull request as the change:
 
-| Field | Prefilled as | Should be |
-|---|---|---|
-| Subject | `Merged PR 904: Added a contributor guide` | `Added a contributor guide` |
-| Body | Your entire PR description, in markdown | Plain-text sections and bullets |
+```
+## Fixed the desktop audio device (2026-09-05)
 
-The `Merged PR <n>: ` prefix costs the entry its icon, because the categoriser
-matches the first word and `merged` is in no category. It also shows an internal
-PR number to end users.
+### Recording
+- The device you select is always the device captured, even when Windows reports a
+  different default output
+```
 
-The body is never markdown-rendered. `##`, `**bold**`, backticks, and numbered
-lists all appear on screen exactly as typed. Only `- `, `* `, and `• ` are treated
-as bullets. A blank line ends a section, and a section's first line becomes its
-sub-heading.
+- One entry per `## ` heading: title, then the date in parentheses. Newest first.
+- The first word of the title picks the icon: Added, Fixed, Improved, Removed, Reworked.
+- Under it, `### ` sub-headings for areas and `- ` bullets in plain user language. No
+  module names, no emoji, no marketing verbs.
+- Infrastructure, CI, docs and tooling work gets no entry.
 
-Note that a squash commit has a single parent, so it is not filtered out as a
-merge commit. Whatever you leave in that dialog ships to every user.
-
-Your PR description is written for your reviewer and can be as technical as you
-like. The completion message is a different document for a different reader.
-[AGENT.md](AGENT.md) has the full specification and a worked example.
-
-Delete your branch when the PR completes. Azure DevOps offers this in the
-completion dialog and it is pre-ticked on PRs created from the CLI.
+The file documents its own format at the top, and `tests/test_changelog.py` fails if it
+stops parsing.
 
 ## Commit messages
 
-End users read these in the Changelog tab, so write for them, not for yourself.
-
-**[AGENT.md](AGENT.md) has the full specification.** In short: past-tense verb,
-user-friendly noun phrases, no emoji, no marketing verbs, body split into
-blank-line-separated sections with a sub-heading and bullets.
-
-```
-Improved how quickly recordings stop and sidebar items move
-
-Recording
-- Stopping a recording now takes effect immediately instead of waiting for
-  the current audio chunk to finish.
-```
-
-Never add `Co-Authored-By:` or generated-with footers. The changelog parser
-strips them defensively, but they should not be written in the first place.
-
-### Internal commits
-
-Every non-merge commit on `main` becomes a Changelog entry that end users read.
-Infrastructure, CI, docs, and tooling work has no meaning for them, so prefix the
-subject with `[internal]` to keep it out:
-
-```
-[internal] Documented pull request and changelog conventions
-```
-
-The marker is matched case-insensitively against the subject. Use it honestly:
-it is for work users cannot see, not for changes you would rather not explain.
+Written for developers: past-tense verb first, what changed and why. Never add
+`Co-Authored-By:` or generated-with footers.
 
 ## Releasing
 

@@ -1047,8 +1047,8 @@ async function openWhatsNew() {
   closeMenu();
   try {
     const data = await fetch('/api/changelog').then(r => r.json());
-    if (data && Array.isArray(data.commits) && data.commits.length) {
-      _showWhatsNewPopup(data.commits[0]);
+    if (data && Array.isArray(data.entries) && data.entries.length) {
+      _showWhatsNewPopup(data.entries[0]);
       return;
     }
   } catch (_) {}
@@ -21415,9 +21415,8 @@ async function applyUpdate() {
       statusEl.textContent = 'Restarting...';
       btn.textContent = 'Restarting...';
       if (tbLabel) tbLabel.textContent = 'Restarting…';
-      // The server-side cache is keyed by HEAD and rebuilds automatically
-      // on next request, but flip the in-memory guard so when the user
-      // returns to the Changelog tab post-restart the new entries fetch.
+      // The server re-reads CHANGELOG.md whenever the file changes; flip
+      // the in-memory guard so the Changelog tab refetches after the restart.
       _changelogLoaded = false;
       _pollUntilBack();
     }
@@ -21714,17 +21713,17 @@ async function loadChangelog(force) {
     _renderChangelog(data);
     if (meta) {
       meta.innerHTML = '';
-      if (data.generated_at) {
+      if (data.modified || data.generated_at) {
         const when = document.createElement('span');
         when.className = 'changelog-meta-when';
-        when.textContent = `Updated ${_formatChangelogDate(data.generated_at)}`;
+        when.textContent = `Updated ${_formatChangelogDate(data.modified || data.generated_at)}`;
         meta.appendChild(when);
       }
-      if (data.head) {
-        const head = document.createElement('span');
-        head.className = 'changelog-meta-hash';
-        head.textContent = data.head.slice(0, 7);
-        meta.appendChild(head);
+      if (typeof data.count === 'number') {
+        const n = document.createElement('span');
+        n.className = 'changelog-meta-hash';
+        n.textContent = `${data.count} ${data.count === 1 ? 'entry' : 'entries'}`;
+        meta.appendChild(n);
       }
       const status = document.createElement('span');
       status.className = 'changelog-meta-status' + (data.fresh ? ' fresh' : '');
@@ -21754,20 +21753,21 @@ const _CHANGELOG_CAT_ICONS = {
 
 function _renderChangelog(data) {
   const body = document.getElementById('changelog-body');
-  const commits = (data && Array.isArray(data.commits)) ? data.commits : [];
-  if (!commits.length) {
-    body.innerHTML = '<div class="changelog-empty">No commits found.</div>';
+  const entries = (data && Array.isArray(data.entries)) ? data.entries : [];
+  if (!entries.length) {
+    const why = data && data.missing ? 'CHANGELOG.md was not found in the app folder.' : 'No release notes yet.';
+    body.innerHTML = `<div class="changelog-empty">${_escHtml(why)}</div>`;
     return;
   }
-  // Group consecutive commits by date so the user gets a date heading per
+  // Group consecutive entries by date so the user gets a date heading per
   // chunk without rendering one per row.
   const frag = document.createDocumentFragment();
   let lastDate = null;
-  for (const c of commits) {
+  for (const c of entries) {
     if (c.date !== lastDate) {
       const h = document.createElement('div');
       h.className = 'changelog-day';
-      h.textContent = _formatChangelogDate(c.date);
+      h.textContent = c.date ? _formatChangelogDate(c.date) : 'Earlier';
       frag.appendChild(h);
       lastDate = c.date;
     }
@@ -21790,7 +21790,7 @@ function _renderChangelogEntry(c) {
 
   const subj = document.createElement('div');
   subj.className = 'changelog-entry-subject';
-  subj.textContent = c.subject || '';
+  subj.textContent = c.title || '';
   content.appendChild(subj);
 
   const bodyText = (c.body || '').trim();
@@ -21809,116 +21809,46 @@ function _renderChangelogEntry(c) {
           const expanded = row.classList.toggle('expanded');
           t.textContent = expanded ? 'Show less' : 'Show more';
         };
-        content.insertBefore(t, content.querySelector('.changelog-entry-foot'));
+        content.appendChild(t);
       }
     });
   }
-
-  const foot = document.createElement('div');
-  foot.className = 'changelog-entry-foot';
-  foot.textContent = c.short || (c.hash || '').slice(0, 7);
-  content.appendChild(foot);
 
   row.appendChild(icon);
   row.appendChild(content);
   return row;
 }
 
-/* Parse a free-form commit body into structured sections so sub-headings
- * (lines that introduce a group of bullet points, like "Summary system
- * prompt") render visually distinct from the bullet items beneath them. */
-function _parseChangelogBody(body) {
-  const lines = body.split('\n');
-  const sections = [];
-  let cur = null;
-  const ensure = () => {
-    if (!cur) cur = { heading: null, paras: [], items: [] };
-    return cur;
-  };
-  const flush = () => {
-    if (cur) sections.push(cur);
-    cur = null;
-  };
-  const isBullet = s => /^[-*•]\s+/.test(s);
-  const isContinuation = s => /^\s+\S/.test(s);
-
-  for (const raw of lines) {
-    const stripped = raw.trimEnd();
-    if (!stripped.trim()) {
-      flush();
-      continue;
-    }
-    if (isBullet(stripped)) {
-      const text = stripped.replace(/^[-*•]\s+/, '').trim();
-      ensure().items.push(text);
-    } else if (isContinuation(stripped) && cur && cur.items.length) {
-      // Indented wrap of the previous bullet - fold it back in.
-      cur.items[cur.items.length - 1] += ' ' + stripped.trim();
-    } else if (cur && (cur.items.length || cur.paras.length)) {
-      // Mid-section non-bullet: treat as a paragraph row.
-      cur.paras.push(stripped.trim());
-    } else if (stripped.trim().length <= 60 && !/[.!?]$/.test(stripped.trim())) {
-      // A short first line without terminal punctuation is a heading.
-      ensure().heading = stripped.trim();
-    } else {
-      // A sentence-length first line is prose, not a heading.
-      ensure().paras.push(stripped.trim());
-    }
-  }
-  flush();
-  return sections;
-}
-
-function _renderChangelogBody(bodyText) {
+/* Render one entry's notes. CHANGELOG.md is the project's own file, written
+ * by the project, so its markdown is rendered as such: "### Area" headings
+ * become the small section headings, "- " lines bullets, the rest paragraphs.
+ * Links open in a new tab so the app window is never navigated away. */
+function _renderChangelogBody(markdown) {
   const wrap = document.createElement('div');
   wrap.className = 'changelog-entry-body';
-  const sections = _parseChangelogBody(bodyText);
-  for (const sec of sections) {
-    const sEl = document.createElement('div');
-    sEl.className = 'changelog-section';
-    if (sec.heading) {
-      const h = document.createElement('div');
-      h.className = 'changelog-section-heading';
-      h.textContent = sec.heading;
-      sEl.appendChild(h);
-    }
-    for (const p of sec.paras) {
-      const pEl = document.createElement('p');
-      pEl.className = 'changelog-para';
-      pEl.textContent = p;
-      sEl.appendChild(pEl);
-    }
-    if (sec.items.length) {
-      const ul = document.createElement('ul');
-      ul.className = 'changelog-bullets';
-      for (const it of sec.items) {
-        const li = document.createElement('li');
-        li.textContent = it;
-        ul.appendChild(li);
-      }
-      sEl.appendChild(ul);
-    }
-    wrap.appendChild(sEl);
-  }
-  // Fall back to the raw text if parsing produced nothing useful.
-  if (!wrap.childElementCount) {
+  let html = '';
+  try { html = renderMd(markdown || ''); } catch (_) { html = ''; }
+  if (!html.trim()) {
     const p = document.createElement('p');
     p.className = 'changelog-para';
-    p.textContent = bodyText;
+    p.textContent = markdown || '';
     wrap.appendChild(p);
+    return wrap;
   }
+  wrap.innerHTML = html;
+  wrap.querySelectorAll('a[href]').forEach(a => { a.target = '_blank'; a.rel = 'noopener'; });
   return wrap;
 }
 
 /* ── What's New popup ─────────────────────────────────────────────────────
- * Shown automatically once when the running HEAD differs from what was
- * last seen in this browser (i.e. the user just updated). On a fresh
- * install the current HEAD is silently anchored so we don't pop up on
- * first launch. The popup body is the latest commit's body parsed by
- * the same _renderChangelogBody() the Changelog tab uses, so styling is
- * shared and stays in sync with future commit-message conventions.
+ * Shown once when CHANGELOG.md has a newer entry than the one last seen in
+ * this browser (the user just updated). On a fresh install the newest entry
+ * is anchored silently so nothing pops up on first launch. The body is the
+ * entry's markdown rendered by the same _renderChangelogBody() the Changelog
+ * tab uses, so styling stays shared.
  */
-const _WHATS_NEW_HEAD_KEY = 'ma:lastSeenChangelogHead';
+const _WHATS_NEW_SEEN_KEY = 'ma:lastSeenChangelogEntry';
+const _WHATS_NEW_LEGACY_KEY = 'ma:lastSeenChangelogHead';   // builds that read git history
 
 async function _checkWhatsNew() {
   // Don't surprise the user mid-recording.
@@ -21927,22 +21857,31 @@ async function _checkWhatsNew() {
   try {
     data = await fetch('/api/changelog').then(r => r.json());
   } catch { return; }
-  if (!data || !Array.isArray(data.commits) || !data.commits.length) return;
-  const head = data.head || data.commits[0].hash || '';
-  if (!head) return;
-  let lastSeen = null;
-  try { lastSeen = localStorage.getItem(_WHATS_NEW_HEAD_KEY); } catch (_) {}
-  if (!lastSeen) {
-    // First load on this browser - anchor silently.
-    try { localStorage.setItem(_WHATS_NEW_HEAD_KEY, head); } catch (_) {}
+  if (!data || !Array.isArray(data.entries) || !data.entries.length) return;
+  const latest = data.latest || data.entries[0].id || '';
+  if (!latest) return;
+  let lastSeen = null, legacy = null;
+  try {
+    lastSeen = localStorage.getItem(_WHATS_NEW_SEEN_KEY);
+    legacy = localStorage.getItem(_WHATS_NEW_LEGACY_KEY);
+  } catch (_) {}
+  if (!lastSeen && !legacy) {
+    // First load on this browser: anchor silently.
+    try { localStorage.setItem(_WHATS_NEW_SEEN_KEY, latest); } catch (_) {}
     return;
   }
-  if (lastSeen === head) return;
-  _showWhatsNewPopup(data.commits[0]);
-  try { localStorage.setItem(_WHATS_NEW_HEAD_KEY, head); } catch (_) {}
+  // A browser that tracked the git-based changelog has just updated to a build
+  // with CHANGELOG.md: it sees the newest entry once, then tracks by entry id.
+  if (lastSeen === latest) return;
+  _showWhatsNewPopup(data.entries[0]);
+  try {
+    localStorage.setItem(_WHATS_NEW_SEEN_KEY, latest);
+    localStorage.removeItem(_WHATS_NEW_LEGACY_KEY);
+  } catch (_) {}
 }
 
-function _showWhatsNewPopup(commit) {
+function _showWhatsNewPopup(entry) {
+  const commit = entry;   // one CHANGELOG.md entry: title, date, body (markdown), category
   if (!commit) return;
   // Tear down any prior instance (e.g. preview button reopened).
   document.querySelectorAll('.whats-new-overlay').forEach(el => el.remove());
@@ -21953,7 +21892,6 @@ function _showWhatsNewPopup(commit) {
 
   const cat = commit.category || 'other';
   const dateLabel = _formatChangelogDate(commit.date);
-  const shortHash = (commit.short || (commit.hash || '').slice(0, 7)) || '';
 
   overlay.innerHTML = `
     <div class="whats-new-dialog" role="dialog" aria-modal="true" aria-labelledby="whats-new-title">
@@ -21965,11 +21903,10 @@ function _showWhatsNewPopup(commit) {
           <img src="/static/images/logo.png" alt="" class="whats-new-logo">
           <div class="whats-new-eyebrow">What's new in this update</div>
         </div>
-        <div class="whats-new-subject" id="whats-new-title">${escapeHtml(commit.subject || '')}</div>
+        <div class="whats-new-subject" id="whats-new-title">${escapeHtml(commit.title || '')}</div>
         <div class="whats-new-meta">
           <span class="whats-new-cat-tag">${escapeHtml(cat)}</span>
           <span>${escapeHtml(dateLabel)}</span>
-          <span class="whats-new-hash">${escapeHtml(shortHash)}</span>
         </div>
       </div>
       <div class="whats-new-body" id="whats-new-body"></div>
@@ -21981,8 +21918,8 @@ function _showWhatsNewPopup(commit) {
       </div>
     </div>`;
 
-  // Render body via the shared parser so heading/bullet styling matches the
-  // Changelog tab. If the commit has no body, show a friendly fallback.
+  // Render the notes through the shared markdown renderer so heading/bullet
+  // styling matches the Changelog tab. An entry with no notes gets a fallback.
   const bodyEl = overlay.querySelector('#whats-new-body');
   const bodyText = (commit.body || '').trim();
   if (bodyText) {
@@ -22027,9 +21964,9 @@ function _showWhatsNewPopup(commit) {
 window.previewWhatsNew = async function previewWhatsNew() {
   try {
     const data = await fetch('/api/changelog').then(r => r.json());
-    const commit = data && data.commits && data.commits[0];
+    const commit = data && data.entries && data.entries[0];
     if (!commit) {
-      flashStatus('No commits to preview');
+      flashStatus('No release notes to preview');
       return;
     }
     _showWhatsNewPopup(commit);
@@ -22042,7 +21979,11 @@ function _formatChangelogDate(s) {
   // Accepts "YYYY-MM-DD" or full ISO. Render as "Mon DD, YYYY" so the
   // listing reads like a human changelog instead of a git log.
   if (!s) return '';
-  const d = new Date(s);
+  // A bare YYYY-MM-DD is a calendar date, not an instant: build it as a local
+  // date, otherwise new Date() reads it as UTC midnight and everyone west of
+  // Greenwich sees the day before.
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s).trim());
+  const d = m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(s);
   if (isNaN(d.getTime())) return s;
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }

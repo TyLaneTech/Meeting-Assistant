@@ -31,58 +31,35 @@ Merging to `main` fires a pipeline that force-pushes `main` and tags to GitHub.
    deliberate and the app depends on it.
 6. **Do not commit unless asked.** Leave changes in the working tree by default.
 
-## Commit messages
+## Release notes
 
-End users read every commit in the app's **Settings → Changelog** tab, which parses
-`git log` directly. Write for them, not for yourself. The full spec is in AGENT.md;
-the rules that matter most:
+End users read `CHANGELOG.md` (repo root) in **Settings → Changelog** and in the What's new
+card after an update. It is the only source of user-facing release notes; commit messages and
+pull request text never reach users.
 
-- **Past-tense verb first.** "Added Notes pane", not "Add Notes pane". The leading
-  verb picks the icon shown next to the entry.
-- **User-friendly noun phrases**, not module names. "Fixed Whisper hallucinations
-  during long meetings", not "Fixed `_collapse_word_periods` regression".
-- **Body is blank-line-separated sections**, each with a sub-heading line then
-  `- ` bullets.
-- **No emoji. No marketing verbs** (`Introducing`, `Meet`, `Ship`, `Level up`).
-- **No `Co-Authored-By:` and no generated-with footers.** Repo policy, every
-  branch, no exceptions. The parser strips them, but do not write them.
+- Every change a user could notice gets an entry, or a bullet under the entry for the release
+  it ships in, in the same pull request. Infrastructure, docs, CI and tooling get no entry.
+- One entry per `## ` heading: the title, then the date in parentheses. Newest first. The first
+  word of the title picks the icon: Added, Fixed, Improved, Removed, Reworked.
+- Under the heading: `### ` sub-headings for areas (Recording, Speakers, Settings), `- `
+  bullets in plain user language. No module names, no emoji, no marketing verbs.
 
 ```
-Improved how quickly recordings stop and sidebar items move
+## Fixed the desktop audio device (2026-09-05)
 
-Recording
-- Stopping a recording now takes effect immediately instead of waiting for
-  the current audio chunk to finish.
+### Recording
+- The device you select is always the device captured, even when Windows reports a
+  different default output
 ```
 
-## Pull requests
+The parser is `core/changelog.py`; `tests/test_changelog.py` fails if the file stops parsing.
 
-`main` is squash-merge only, so the squash commit **is** the changelog entry users read.
-Azure DevOps prefills it as `Merged PR <n>: <title>` followed by your whole PR description
-in markdown. Both are wrong. Replace both fields in the completion dialog, every time:
+## Commit messages and pull requests
 
-- **Delete the `Merged PR <n>: ` prefix.** The first word of the subject picks the icon, and
-  `merged` matches no category, so the entry loses its icon and users see an internal PR
-  number in a user-facing widget.
-- **Replace the description with the changelog body format.** Nothing is markdown-rendered
-  (the widget uses `textContent`), so `##`, `**bold**`, backticks, and numbered lists all
-  appear literally on screen. Only `- `, `* `, and `• ` are bullets. A blank line ends a
-  section; the first line of a section is its sub-heading.
-
-The PR description is for your reviewer. The squash commit body is for end users. They are
-different documents with different readers. AGENT.md has the full spec and a worked example.
-
-## Keeping internal work out of the changelog
-
-Every non-merge commit on `main` shows up in the user-facing Changelog tab. Prefix the
-subject with `[internal]` when the change is infrastructure, CI, docs, or tooling:
-
-```
-[internal] Documented pull request and changelog conventions
-```
-
-`_build_changelog()` in `app.py` filters those out. Never use the marker to hide a real
-user-facing change.
+Written for developers: past-tense verb first, what changed and why. **No `Co-Authored-By:`
+and no generated-with footers**, on any branch. `main` is squash-merge only (branch policy).
+The completion dialog's prefilled title and description can stay as they are; nothing users
+see is built from them.
 
 ## Writing style
 

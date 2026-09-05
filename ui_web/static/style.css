@@ -4563,6 +4563,58 @@ body.video-fullscreen .playback-bar {
   background: color-mix(in srgb, var(--fg-subtle) 80%, transparent);
 }
 
+/* CHANGELOG.md entries render as markdown: map its elements onto the same
+   look the plain-text sections had (small uppercase area headings, dotted
+   bullets). */
+.changelog-entry-body h1, .changelog-entry-body h2, .changelog-entry-body h3,
+.changelog-entry-body h4, .changelog-entry-body h5, .changelog-entry-body h6 {
+  display: block;
+  margin: 12px 0 4px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--fg);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 2px 0 2px 9px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+}
+.changelog-entry-body > :first-child { margin-top: 0; }
+.changelog-entry-body p { margin: 4px 0; text-align: left; }
+.changelog-entry-body ul,
+.changelog-entry-body ol { margin: 2px 0 0 0; padding: 0; list-style: none; text-align: left; }
+.changelog-entry-body li { position: relative; padding-left: 16px; margin: 2px 0; text-align: left; }
+.changelog-entry-body li::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 0.6em;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--fg-subtle) 80%, transparent);
+}
+.changelog-entry-body ol { counter-reset: item; }
+.changelog-entry-body ol > li::before {
+  content: counter(item) '.';
+  counter-increment: item;
+  left: 0;
+  top: 0;
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  background: none;
+  font-variant-numeric: tabular-nums;
+}
+.changelog-entry-body code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--surface2);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.changelog-entry-body strong { color: var(--fg); font-weight: 600; }
+.changelog-entry-body a { color: var(--accent); }
+
 .changelog-entry-toggle {
   margin-top: 8px;
   background: none;

@@ -102,6 +102,8 @@ git pull
 
 Then run `launch.bat`. Dependencies are installed automatically if `requirements.txt` has changed.
 
+After the first run, open Meeting Assistant from the Start Menu: it starts the app silently in the system tray and opens the app window, with no console window.
+
 ---
 
 ## Architecture

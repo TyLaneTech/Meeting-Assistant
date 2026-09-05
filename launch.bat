@@ -54,4 +54,15 @@ if not exist "%VENV%\Scripts\python.exe" (
 )
 
 "%VENV%\Scripts\python.exe" "%ROOT%launch.py"
-if errorlevel 1 pause
+if not errorlevel 1 goto :eof
+
+:: A failure. With a console (double-click, Start Menu first run) keep it open so
+:: the error can be read. Under the hidden launcher (--hidden) there is nobody
+:: to press a key, so a pause would leave a stuck invisible process behind;
+:: show a message box pointing at the log instead.
+if /i "%~1"=="--hidden" goto :failed_hidden
+pause
+goto :eof
+
+:failed_hidden
+powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('Meeting Assistant could not start. The newest launch-startup log in storage\logs has the details.', 'Meeting Assistant') | Out-Null"

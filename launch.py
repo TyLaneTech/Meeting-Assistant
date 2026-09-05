@@ -241,25 +241,55 @@ def _warn_if_cloud_storage_path():
     _warn("Recommended: move this folder to a local path, e.g. ~/meeting-assistant")
 
 
-def _other_launch_bat(arguments: str, ours: Path) -> Path | None:
-    """The launch.bat a shortcut runs when it is a DIFFERENT, still-present
-    checkout than *ours*; None when it is ours, gone, or unreadable."""
-    m = re.search(r'([A-Za-z]:\\[^"]*?launch\.bat)', arguments or "", re.IGNORECASE)
+def _other_checkout(arguments: str, root: Path) -> Path | None:
+    """The checkout a shortcut launches when it is a DIFFERENT, still-present
+    one than *root*; None when it is ours, gone, or unreadable. Recognises every
+    launcher file a shortcut may run: launch.bat (the old form) or the .vbs
+    launchers."""
+    m = re.search(r'([A-Za-z]:\\[^"]*?)\\(?:launch\.bat|app_launcher\.vbs|launch_hidden\.vbs)',
+                  arguments or "", re.IGNORECASE)
     if not m:
         return None
     other = Path(m.group(1))
     try:
-        if other.resolve() == ours.resolve():
+        if other.resolve() == root.resolve():
             return None
     except Exception:
-        if str(other).lower() == str(ours).lower():
+        if str(other).lower() == str(root).lower():
             return None
-    return other if other.exists() else None
+    return other if (other / "launch.bat").exists() else None
+
+
+def _migrate_startup_shortcut():
+    """Move a sign-in (Startup folder) shortcut that still runs cmd /c launch.bat
+    for THIS checkout onto launch_hidden.vbs, so signing in no longer leaves a
+    minimised console window open. Shortcuts of other checkouts are left alone.
+    No-ops silently off Windows and on any error."""
+    if sys.platform != "win32":
+        return
+    try:
+        from core import shortcut as _shortcut
+        lnk = _shortcut.startup_shortcut()
+        if not lnk or not lnk.exists():
+            return
+        root = Path(__file__).parent
+        info = _shortcut.read(lnk)
+        if not info or "cmd.exe" not in (info.get("target") or "").lower():
+            return
+        if str(root / "launch.bat").lower() not in (info.get("arguments") or "").lower():
+            return
+        icon = info.get("icon_file") or ""
+        if _shortcut.write(lnk, "wscript.exe", f'"{root / "launch_hidden.vbs"}"', str(root),
+                           icon if icon and Path(icon).exists() else None):
+            _ok("Startup shortcut now starts the app in the tray")
+    except Exception:
+        pass
 
 
 def _create_start_menu_shortcut():
     """
-    Ensures a Start Menu shortcut exists and points to the current launch.bat
+    Ensures a Start Menu shortcut exists and runs this checkout's
+    app_launcher.vbs (a silent tray start that then opens the app window)
     with the right working directory and icon. Reads the existing shortcut's
     properties via PowerShell and only re-saves when something is missing or
     stale, so we don't churn the .lnk on every launch. Self-heals shortcuts
@@ -272,6 +302,7 @@ def _create_start_menu_shortcut():
 
     root       = Path(__file__).parent
     bat_path   = root / "launch.bat"
+    vbs_path   = root / "app_launcher.vbs"
     icon_path  = root / "ui_web" / "static" / "images" / "logo.ico"
     # The active icon set (Settings > Icons) supplies the shortcut's icon; the
     # default set is the bundled logo.ico above, so a first run never needs
@@ -287,7 +318,7 @@ def _create_start_menu_shortcut():
     )
     lnk_path = start_menu / _SHORTCUT_NAME
 
-    if not bat_path.exists():
+    if not bat_path.exists() or not vbs_path.exists():
         return
 
     def _norm(p: str) -> str:
@@ -319,18 +350,18 @@ def _create_start_menu_shortcut():
                 if len(parts) >= 4:
                     cur_target, cur_args, cur_wd, cur_icon = parts[:4]
                     cur_icon_file = cur_icon.split(",", 1)[0].strip() if cur_icon else ""
-                    target_ok = "cmd.exe" in cur_target.lower()
+                    target_ok = "wscript" in cur_target.lower()
                     # Another checkout owns this shortcut (a second clone, a git
                     # worktree, a colleague's fork run from the same account):
                     # leave it alone while that checkout's launch.bat still
                     # exists. A sandbox launch must not re-point the user's
                     # Start Menu entry at itself (2026-09-05). A moved or
                     # deleted install still hands the entry over.
-                    other = _other_launch_bat(cur_args, bat_path)
+                    other = _other_checkout(cur_args, root)
                     if other is not None:
-                        print(f"{GRY}   Start Menu shortcut belongs to {other.parent}; left unchanged{R}")
+                        print(f"{GRY}   Start Menu shortcut belongs to {other}; left unchanged{R}")
                         return
-                    args_ok   = str(bat_path) in cur_args
+                    args_ok   = str(vbs_path).lower() in cur_args.lower()
                     wd_ok     = _norm(cur_wd) == _norm(str(root))
                     if icon_path.exists():
                         # Icon must point at the right path AND that path must
@@ -366,10 +397,10 @@ def _create_start_menu_shortcut():
     ps_script = (
         f"$ws = New-Object -ComObject WScript.Shell; "
         f"$s  = $ws.CreateShortcut('{lnk_path}'); "
-        f"$s.TargetPath       = 'cmd.exe'; "
-        f"$s.Arguments        = '/c \"\"{bat_path}\"\"'; "
+        f"$s.TargetPath       = 'wscript.exe'; "
+        f"$s.Arguments        = '\"{vbs_path}\"'; "
         f"$s.WorkingDirectory = '{root}'; "
-        f"$s.WindowStyle      = 7; "          # 7 = minimised
+        f"$s.WindowStyle      = 1; "          # wscript has no window of its own
         + (f"$s.IconLocation = '{icon_path}, 0'; " if icon_path.exists() else "")
         + "$s.Save()"
     )
@@ -1107,6 +1138,7 @@ def main():
     # Launcher shortcut (first run / self-heal): Start Menu on Windows, an
     # Applications app bundle on macOS. Each no-ops on the other platform.
     _create_start_menu_shortcut()
+    _migrate_startup_shortcut()
     _create_macos_app_shortcut()
 
     # GPU

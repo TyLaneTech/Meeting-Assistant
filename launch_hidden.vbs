@@ -44,5 +44,7 @@ logFile = logDir & "\launch-startup-" & stamp & ".log"
 ' and the app runs on in the tray).
 q = Chr(34)
 shell.CurrentDirectory = projDir
-cmd = "cmd /c " & q & q & bat & q & " > " & q & logFile & q & " 2>&1" & q
+' --hidden tells launch.bat there is no console: on a failure it shows a message
+' box instead of a pause nobody can answer.
+cmd = "cmd /c " & q & q & bat & q & " --hidden > " & q & logFile & q & " 2>&1" & q
 shell.Run cmd, 0, False
