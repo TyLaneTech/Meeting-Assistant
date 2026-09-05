@@ -426,6 +426,180 @@ _GLOBAL_TOOLS_OAI = [
     for t in _GLOBAL_TOOLS
 ]
 
+# ── Bulk speaker relabel (plan, then confirm, then apply) ─────────────────────
+# The only tools in this file that write. They are deliberately split in two:
+# planning is read-only and mints an opaque token, and applying accepts nothing
+# but that token, so what gets written is always exactly what the user was
+# shown. The backend refuses an apply that happens in the same chat turn as its
+# plan, so the confirmation cannot be skipped by a confident model.
+
+_RELABEL_TOOLS = [
+    {
+        "name": "plan_speaker_relabel",
+        "description": (
+            "READ-ONLY. Work out exactly what would change if every speaker "
+            "named `from_name` were renamed to `to_name`, and return a plan: "
+            "the meetings and speaker labels affected, segment and talk-time "
+            "totals, the strategy that would be used, any warnings, and a "
+            "single-use confirmation token.\n\n"
+            "ALWAYS call this before `apply_speaker_relabel`. Nothing is "
+            "written. Show the user the plan in plain prose - how many "
+            "speakers in how many meetings, which meetings, and every warning "
+            "- and ask them to confirm. If the plan matches nothing, say so "
+            "and offer `list_speakers`; never guess at a different spelling "
+            "on your own."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": _filter_params(
+                from_name={
+                    "type": "string",
+                    "description": (
+                        "The speaker name to replace, exactly as it appears "
+                        "today (e.g. 'Justin' or 'Speaker 3')."
+                    ),
+                },
+                to_name={
+                    "type": "string",
+                    "description": "The name those speakers should carry instead.",
+                },
+                scope={
+                    "type": "string",
+                    "enum": ["session", "library"],
+                    "description": (
+                        "'session' changes one meeting only; 'library' changes "
+                        "every matching speaker across the meeting library "
+                        "(narrowed by the folder and date filters below when "
+                        "you pass them)."
+                    ),
+                },
+                match={
+                    "type": "string",
+                    "enum": ["exact", "contains"],
+                    "description": (
+                        "'exact' (default) matches the whole name, "
+                        "case-insensitively. Use 'contains' ONLY when the user "
+                        "explicitly asks for partial matching, e.g. 'anyone "
+                        "whose label starts with Justin'."
+                    ),
+                    "default": "exact",
+                },
+                session_id={
+                    "type": "string",
+                    "description": (
+                        "The meeting to change when scope is 'session'. In "
+                        "per-meeting chat this defaults to the meeting you are "
+                        "scoped to, so you can omit it."
+                    ),
+                },
+            ),
+            "required": ["from_name", "to_name"],
+        },
+    },
+    {
+        "name": "apply_speaker_relabel",
+        "description": (
+            "WRITES. Carry out a plan returned by `plan_speaker_relabel`, "
+            "using its `token`. Renames speaker labels and can merge voice "
+            "profiles, and is not undoable from the app.\n\n"
+            "Only call this AFTER the user has replied with an explicit "
+            "confirmation ('yes', 'do it', 'go ahead') in a LATER turn than "
+            "the one the plan was made in - the backend rejects a same-turn "
+            "apply. If the user changed anything about the request, call "
+            "`plan_speaker_relabel` again instead and re-confirm the new plan."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": (
+                        "The confirmation token from the plan the user "
+                        "approved. Single use, valid for 10 minutes."
+                    ),
+                },
+                "user_confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the user explicitly approved this exact "
+                        "plan in a previous message. Never set it on their "
+                        "behalf."
+                    ),
+                },
+            },
+            "required": ["token", "user_confirmed"],
+        },
+    },
+    {
+        "name": "cancel_speaker_relabel",
+        "description": (
+            "Retire a plan token from `plan_speaker_relabel` without applying "
+            "it. Call this when the user declines the plan, changes their "
+            "mind, or asks for something different, so the plan can never be "
+            "applied later. Read-only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "The token of the plan the user declined.",
+                },
+            },
+            "required": ["token"],
+        },
+    },
+]
+
+_RELABEL_TOOLS_OAI = [
+    {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+    for t in _RELABEL_TOOLS
+]
+
+# The global chat's full tool set: read-only research plus the relabel pair.
+_GLOBAL_TOOLS_ALL = _GLOBAL_TOOLS + _RELABEL_TOOLS
+_GLOBAL_TOOLS_ALL_OAI = _GLOBAL_TOOLS_OAI + _RELABEL_TOOLS_OAI
+
+_RELABEL_CONTRACT_COMMON = (
+    "## Bulk speaker reassignment (plan, confirm, apply)\n"
+    "You can rename speakers in bulk, but only through a two-step contract:\n"
+    "1. Call `plan_speaker_relabel` FIRST, every time. It writes nothing and "
+    "returns a plan plus a single-use token.\n"
+    "2. Report the plan to the user in plain prose: how many speaker labels, "
+    "in how many meetings, which meetings (name a few), the segment totals, "
+    "and EVERY warning the plan lists. Then ask them to confirm.\n"
+    "3. Only after the user replies with an explicit yes IN A LATER MESSAGE, "
+    "call `apply_speaker_relabel` with that token and user_confirmed=true. If the user declines or changes the request, call `cancel_speaker_relabel` with the token before doing anything else. "
+    "The backend rejects an apply made in the same turn as its plan, so never "
+    "chain the two calls together.\n"
+    "- If the user changes the names, the scope, or the filters, throw the old "
+    "plan away and plan again. Never reuse a token for a different request.\n"
+    "- If the user says no, or says nothing about it, do not apply. Tokens "
+    "expire after 10 minutes; if one has expired, just plan again.\n"
+    "- Never guess a name's spelling. If `plan_speaker_relabel` matches "
+    "nothing, say so and use `list_speakers` to show the real names.\n"
+    "- Use match='contains' only when the user explicitly asks for partial "
+    "matching. Exact matching is the default and is what they almost always "
+    "mean.\n"
+)
+
+_RELABEL_CONTRACT_SESSION = (
+    "\n\n" + _RELABEL_CONTRACT_COMMON
+    + "- In this per-meeting chat, scope defaults to 'session': THIS meeting "
+    "only. Use scope='library' only when the user says every meeting, the "
+    "whole library, everywhere, or names a wider set of meetings.\n"
+)
+
+_RELABEL_CONTRACT_GLOBAL = (
+    "\n\n" + _RELABEL_CONTRACT_COMMON
+    + "- In this library-wide chat, scope defaults to 'library'. Pass "
+    "scope='session' with a session_id when the user is clearly talking about "
+    "one meeting.\n"
+    "- The folder and date filters narrow a library-scope plan the same way "
+    "they narrow a search, so 'fix every Justin in the Backend folder' is one "
+    "plan call with folder='Backend'.\n"
+)
+
 # Models that support Anthropic extended thinking
 _ANTHROPIC_THINKING_MODELS = {
     "claude-opus-4-6",
@@ -537,7 +711,7 @@ class AIAssistant:
         "terminology, looking up a product or company mentioned in the meeting, or "
         "providing context on an external event referenced by a speaker. Your primary "
         "focus should always remain on the meeting transcript itself."
-    )
+    ) + _RELABEL_CONTRACT_SESSION
 
     _SYSTEM_SUMMARY = (
         "You are a meeting summarization assistant. You produce clear, well-structured "
@@ -1085,7 +1259,7 @@ class AIAssistant:
         "uses: clarifying industry terms or acronyms mentioned in meetings, looking "
         "up a company or product referenced by a speaker, providing context on an "
         "external event. Your primary focus should always be the stored meetings."
-    )
+    ) + _RELABEL_CONTRACT_GLOBAL
 
     def ask_global(
         self,
@@ -1106,8 +1280,8 @@ class AIAssistant:
             on_done,
             cancel=cancel,
             on_tool_event=on_tool_event,
-            tools_anthropic=_GLOBAL_TOOLS,
-            tools_openai=_GLOBAL_TOOLS_OAI,
+            tools_anthropic=_GLOBAL_TOOLS_ALL,
+            tools_openai=_GLOBAL_TOOLS_ALL_OAI,
             tool_executor=tool_executor,
             provider=provider, model=model,
         )
@@ -1901,6 +2075,8 @@ class AIAssistant:
                         payload.update(extra)
                     on_tool_event("tool_result", payload)
                 return
+            except KeyError:
+                pass  # not this executor's tool - fall through to built-ins
             except Exception as exec_err:
                 # Don't silently swallow — surface the error to both the
                 # model (so it can correct course) and the server log.

@@ -11,13 +11,16 @@ from __future__ import annotations
 import sys
 import threading
 import urllib.request
-import webbrowser
+import webbrowser  # noqa: F401  (kept for fallback / compatibility)
+
+from core import browser
+from core import recording_request
 from pathlib import Path
 from typing import Callable
 
 try:
     import pystray
-    from PIL import Image, ImageDraw, ImageOps
+    from PIL import Image, ImageDraw
 
     TRAY_AVAILABLE = True
 except ImportError:
@@ -39,39 +42,38 @@ _TRAY_SIZE  = 64
 _icons: dict[str, "Image.Image"] = {}   # populated lazily by _ensure_icons()
 
 
-def _tint(img: "Image.Image", color: tuple[int, int, int]) -> "Image.Image":
-    """Return a tinted copy of *img* using the given RGB colour, preserving alpha."""
-    alpha   = img.split()[3]
-    gray    = ImageOps.grayscale(img)
-    colored = ImageOps.colorize(gray, black=(0, 0, 0), white=color).convert("RGBA")
-    colored.putalpha(alpha)
-    return colored
+# Which icon slot (core/icons.py) backs each tray state. The images default to
+# the owner's logo set and every one is replaceable from Settings > Icons.
+_STATE_SLOT = {
+    "ready":            "tray_ready",
+    "recording_ok":     "tray_recording",
+    "recording_silent": "tray_recording_silent",
+    "loading":          "tray_loading",
+    "setup":            "tray_setup",
+    "reanalyzing":      "tray_reanalyzing",
+}
 
 
 def _ensure_icons() -> None:
-    """Load PNG assets and derive tray variants on first call."""
+    """Resolve every tray state's image through core.icons on first use."""
     if _icons:
         return
     try:
-        def _load(name: str) -> "Image.Image":
-            return (
-                Image.open(_IMAGES_DIR / name)
+        from core import icons as _slots
+        for state, slot in _STATE_SLOT.items():
+            _icons[state] = (
+                _slots.resolve_image(slot)
                 .convert("RGBA")
                 .resize((_TRAY_SIZE, _TRAY_SIZE), Image.LANCZOS)
             )
-
-        idle      = _load("logo.png")
-        recording = _load("logo_recording.png")
-
-        # Same colour scheme on every platform (macOS included, per the note
-        # above): green when ready, red while recording, grey while loading,
-        # amber when setup is required.
-        _icons["ready"]     = idle                               # brand green
-        _icons["recording"] = recording                          # red
-        _icons["loading"]   = _tint(idle, (110, 118, 129))       # gray
-        _icons["setup"]     = _tint(idle, (210, 153, 34))        # amber
     except Exception as e:
-        print(f"[tray] Could not load PNG icons, falling back to drawn icons: {e}")
+        print(f"[tray] Could not load icons, falling back to drawn icons: {e}")
+
+
+def reload_icons() -> None:
+    """Forget the cached images so the next paint re-resolves them. Called by
+    the icons API after an upload or reset; pair it with MeetingTray.refresh()."""
+    _icons.clear()
 
 
 def _create_fallback_icon(color: tuple[int, int, int], size: int = 64) -> "Image.Image":
@@ -257,7 +259,13 @@ class MeetingTray:
         if config.needs_setup(provider):
             return "setup"
         if st.get("is_recording"):
-            return "recording"
+            # Teal when audio is flowing, orange when capturing silence.
+            return "recording_silent" if st.get("capture_silent") else "recording_ok"
+        if st.get("is_reanalyzing"):
+            # A reanalysis blocks recording, so recording_ready is False. That
+            # is not the startup model load, and showing the loading dot for it
+            # reads as "the app is broken".
+            return "reanalyzing"
         if st.get("recording_ready"):
             return "ready"
         return "loading"
@@ -267,23 +275,27 @@ class MeetingTray:
         key = self._get_tray_state()
         if key in _icons:
             return _icons[key]
-        # Fallback: drawn icon if PNG assets were not found
+        # Fallback: a drawn mic in the state's colour if the images failed to load.
         fallbacks = {
-            "setup":     (210, 153, 34),
-            "recording": (248,  81, 73),
-            "ready":     ( 88, 166, 255),
-            "loading":   (110, 118, 129),
+            "setup":            (210, 153,  34),
+            "recording_ok":     (248,  81,  73),
+            "recording_silent": (255, 140,   0),
+            "ready":            ( 63, 185,  80),
+            "reanalyzing":      ( 88, 166, 255),
+            "loading":          (110, 118, 129),
         }
-        return _create_fallback_icon(fallbacks[key])
+        return _create_fallback_icon(fallbacks.get(key, (110, 118, 129)))
 
     def _pick_tooltip(self) -> str:
         """Return a tooltip string reflecting current state."""
         key = self._get_tray_state()
         tooltips = {
-            "setup":     "Meeting Assistant | Setup required",
-            "recording": "Meeting Assistant | Recording",
-            "ready":     "Meeting Assistant | Ready",
-            "loading":   "Meeting Assistant | Loading models…",
+            "setup":            "Meeting Assistant | Setup required",
+            "recording_ok":     "Meeting Assistant | Recording",
+            "recording_silent": "Meeting Assistant | Recording (no audio detected)",
+            "ready":            "Meeting Assistant | Ready",
+            "reanalyzing":      "Meeting Assistant | Reanalyzing a meeting",
+            "loading":          "Meeting Assistant | Loading models…",
         }
         return tooltips.get(key, "Meeting Assistant")
 
@@ -320,6 +332,8 @@ class MeetingTray:
             return "Setup required"
         if st.get("is_recording"):
             return "Recording..."
+        if st.get("is_reanalyzing"):
+            return "Reanalyzing a meeting"
         if st.get("recording_ready"):
             return "Ready"
         return st.get("recording_ready_reason", "Loading models...")
@@ -343,14 +357,18 @@ class MeetingTray:
     # ── Menu callbacks ────────────────────────────────────────────────────────
 
     def _open_browser(self, icon=None, item=None) -> None:
-        webbrowser.open(self._url)
+        # Prefer the installed app: this opens or FOCUSES the window the user
+        # already has pinned instead of adding a second one. The two items
+        # below keep the plain form because an --app-id launch cannot carry a
+        # query string.
+        browser.open_app_window(self._url, prefer_pwa=True)
 
     def _open_settings(self, icon=None, item=None) -> None:
-        webbrowser.open(f"{self._url}/session?settings=1")
+        browser.open_app_window(f"{self._url}/session?settings=1")
 
     def _check_updates(self, icon=None, item=None) -> None:
         """Open the web UI with the settings panel on the System tab to check for updates."""
-        webbrowser.open(f"{self._url}/session?settings=1&section=system")
+        browser.open_app_window(f"{self._url}/session?settings=1&section=system")
 
     def _restart_server(self, icon=None, item=None) -> None:
         """Restart the server via the API.
@@ -392,10 +410,12 @@ class MeetingTray:
                     print(f"[tray] stop recording failed: {e}")
             threading.Thread(target=_do_stop, daemon=True).start()
         else:
-            # Start: open the session page with ?autostart so the recording
-            # goes through the same audio-initialisation path as a normal
-            # session-page start (avoids DirectShow echo issues).
-            webbrowser.open(f"{self._url}/session?autostart=1")
+            # Start: hand it to the start coordinator. The page still performs
+            # the start (that is where device selection and the readiness gate
+            # live), but the window the user already has open takes the command
+            # first, so the tray never spawns a second one.
+            # See core/recording_request.py.
+            recording_request.request_start_async("tray")
 
     def _test_toast(self, icon=None, item=None) -> None:
         """Fire a diagnostic system toast — verifies callbacks + visibility.

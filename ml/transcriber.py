@@ -663,6 +663,34 @@ class Transcriber:
             self._thread = None
         log.info("transcriber", "Stopped.")
 
+    def unload(self) -> None:
+        """Release the Whisper engine and diarizer to reclaim memory.
+
+        The loaded models (plus the CUDA context behind them) hold gigabytes
+        of commit charge for as long as the process lives, even when no
+        meeting has run for hours. Idle unload drops them; `load_model()` /
+        `load_diarizer()` bring them back on the next use. Refuses while a
+        capture is running (a wrong unload destroys a live transcription;
+        a missed one only keeps memory held). Idempotent.
+        """
+        if self.is_running:
+            log.warn("transcriber", "unload() called while running; ignored")
+            return
+        had_models = self.model is not None or self.diarizer is not None
+        self.model = None
+        self.diarizer = None
+        self._contexts.clear()
+        if had_models:
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            log.info("transcriber", "Models unloaded (idle); they reload on next use.")
+
     def process_wav_file(self, wav_path: str) -> None:
         """Transcribe a saved WAV file synchronously (blocking).
 

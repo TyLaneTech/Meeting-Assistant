@@ -1,0 +1,613 @@
+/* Home view layout and charts (dashboard overhaul 2026-09-04).
+ * Home specific layout only: the shell owns tokens, .btn, avatars and badges in
+ * style.css. Colours here come from tokens or a color-mix of tokens; speaker
+ * colours arrive as inline styles on avatars. Loaded after style.css.
+ */
+
+/* Tooltips are body level fixed elements, so the view can overflow freely. */
+.home-content { overflow: visible; }
+
+/* ── Bento shell: bands of cards, a tighter rhythm than the old flat sections ── */
+
+.dash { gap: 20px; }
+
+.dash-band { min-width: 0; }
+
+.dash-cell {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Three bands, each one column on narrow, split at the same breakpoint so the
+ * page reflows as a whole and never half and half. */
+/* Cards in a band share its height: the Meeting load chart runs to the bottom
+ * of the attention list beside it, and the People list runs to the bottom of
+ * the two charts beside it (it takes its height from them, see below). */
+.dash-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  align-items: stretch;
+}
+
+@container view (min-width: 1000px) {
+  .dash-grid { grid-template-columns: 8fr 4fr; }
+  .dash-mid  { grid-template-columns: 7fr 5fr; }
+}
+
+/* The left column of band 2: the two time charts stacked, so their combined
+ * height matches the People list beside them. */
+.dash-col {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+/* ── Band 0: the stat cards ───────────────────────────────────────────────── */
+
+.ov-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+@container view (max-width: 900px) {
+  .ov-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container view (max-width: 520px) {
+  .ov-metrics { grid-template-columns: minmax(0, 1fr); }
+}
+
+.ov-metric {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 13px 15px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 104px;
+}
+
+.ov-metric-link {
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .12s ease, background .12s ease;
+}
+.ov-metric-link:hover {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+.ov-metric-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.ov-metric-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ov-metric-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-muted);
+}
+
+.ov-metric-value {
+  font-size: 25px;
+  font-weight: 600;
+  color: var(--fg);
+  line-height: 1.05;
+  letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ov-metric-unit {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  letter-spacing: 0;
+  margin-left: 6px;
+}
+
+/* Direction only, deliberately not coloured good or bad. */
+.ov-delta {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.ov-delta.flat { color: var(--fg-subtle); }
+.ov-delta.go { color: var(--accent); font-size: 13px; }
+
+.ov-spark {
+  margin-top: auto;
+  height: 30px;
+}
+.ov-spark-svg {
+  display: block;
+  width: 100%;
+  height: 30px;
+}
+.ov-spark-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.ov-spark-area {
+  fill: color-mix(in srgb, var(--accent) 13%, transparent);
+  stroke: none;
+}
+
+.ov-spark-prog {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 6px;
+  height: auto;
+}
+.ov-prog {
+  height: 6px;
+  background: var(--surface3);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.ov-prog-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width .5s cubic-bezier(.4, 0, .2, 1);
+}
+.ov-prog-label {
+  font-size: 10.5px;
+  color: var(--fg-subtle);
+}
+
+/* ── Band 1 (left): cadence, recorded hours per week ──────────────────────── */
+
+.home-cadence-chart {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 200px;
+  margin-top: 4px;
+}
+/* Absolutely positioned so the SVG never sizes the box it is drawn into:
+   home.js measures the box, then paints at exactly that many pixels. */
+.cad-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.cad-vlabel {
+  fill: var(--fg-muted);
+  font-size: 10.5px;
+  font-family: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+}
+.cad-grid {
+  stroke: color-mix(in srgb, var(--border) 75%, transparent);
+  stroke-width: 1;
+}
+.cad-baseline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.cad-ylabel,
+.cad-xlabel {
+  fill: var(--fg-muted);
+  font-size: 11px;
+  font-family: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+}
+.cad-bar {
+  fill: color-mix(in srgb, var(--accent) 60%, transparent);
+  transition: fill .14s ease;
+}
+.cad-bar:hover { fill: var(--accent); }
+.cad-bar.is-current { fill: var(--accent); }
+.cad-bar-empty { fill: color-mix(in srgb, var(--fg-subtle) 38%, transparent); }
+.cad-bar:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.home-cadence-empty {
+  font-size: 13px;
+  color: var(--fg-muted);
+  line-height: 1.5;
+  padding: 8px 0;
+}
+.home-cadence-skel {
+  height: 184px;
+  border-radius: var(--radius-sm);
+}
+
+/* ── C. Next agenda ───────────────────────────────────────────────────────── */
+
+/* Next is a full-width strip: lay the day groups out side by side so the agenda
+ * uses the width instead of hugging the left edge. */
+.dash-next-body {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 10px 44px;
+}
+
+.dash-next-day {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 260px;
+  max-width: 440px;
+}
+
+.dash-next-daylabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  margin-bottom: 4px;
+}
+
+.dash-next-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.dash-next-row.is-link {
+  color: inherit;
+  text-decoration: none;
+}
+.dash-next-row.is-link:hover { background: var(--surface2); }
+.dash-next-row.is-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.next-time {
+  font-size: 13px;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.next-title {
+  font-size: 14px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.next-state {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 9px;
+  white-space: nowrap;
+}
+.next-state-recorded {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+.next-state-live {
+  background: color-mix(in srgb, var(--green) 20%, transparent);
+  color: var(--green);
+}
+.next-state-missed {
+  background: color-mix(in srgb, var(--surface3) 80%, transparent);
+  color: var(--fg-muted);
+}
+
+.dash-next-empty,
+.dash-next-connect {
+  font-size: 13px;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+.dash-next-connect a { color: var(--accent); text-decoration: none; }
+.dash-next-connect a:hover { text-decoration: underline; }
+
+/* ── B. Needs attention rows: speaker avatars ─────────────────────────────── */
+
+.dash-attention-row-text { flex: 1 1 auto; min-width: 0; }
+.dash-attention-row { gap: 12px; }
+.dash-attention-list { flex: 1 1 auto; }
+
+.dash-attention-avatars {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding-left: 6px;
+}
+
+.dash-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--on-accent);
+  text-transform: uppercase;
+  flex-shrink: 0;
+  margin-left: -6px;
+  border: 1.5px solid var(--surface);
+  box-sizing: border-box;
+}
+.dash-attention-avatars .dash-avatar:first-child { margin-left: 0; }
+.dash-avatar-more {
+  background: var(--surface3);
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+
+/* ── D. People refinements ────────────────────────────────────────────────── */
+
+.home-speaker-avatar { width: 22px; height: 22px; font-size: 10px; }
+.home-speaker-stats { color: var(--fg-muted); }
+.home-speaker-bar-wrap { width: clamp(90px, 24%, 220px); }
+
+#home-speakers-widget { min-height: 0; }
+#home-speakers-widget .home-speakers-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+@container view (min-width: 1000px) {
+  /* Size containment: the People card contributes no height of its own, so
+     the band is as tall as the two charts and the list scrolls inside that.
+     The list can be thirty rows long without stretching the charts. */
+  #home-speakers-widget { contain: size; }
+}
+@container view (max-width: 999px) {
+  #home-speakers-widget .home-speakers-list { max-height: 460px; }
+}
+
+/* ── E. Activity histogram (inline SVG) ───────────────────────────────────── */
+
+.home-activity-chart {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 190px;
+  margin-top: 4px;
+}
+
+.act-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.act-vlabel {
+  fill: var(--fg-muted);
+  font-size: 10.5px;
+  font-family: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+}
+
+.act-grid {
+  stroke: color-mix(in srgb, var(--border) 75%, transparent);
+  stroke-width: 1;
+}
+.act-baseline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.act-ylabel,
+.act-xlabel {
+  fill: var(--fg-muted);
+  font-size: 12px;
+  font-family: var(--font-ui);
+  font-variant-numeric: tabular-nums;
+}
+
+.act-bar {
+  fill: color-mix(in srgb, var(--accent) 70%, transparent);
+  transition: fill .14s ease;
+}
+.act-bar:hover { fill: var(--accent); }
+.act-bar.is-today {
+  fill: var(--accent);
+  stroke: color-mix(in srgb, var(--accent) 45%, transparent);
+  stroke-width: 1;
+}
+.act-bar-empty { fill: color-mix(in srgb, var(--fg-subtle) 45%, transparent); }
+.act-bar:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* ── A. When you meet: the weekday by hour heatmap ────────────────────────── */
+
+.ov-heat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.ov-heat-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: auto repeat(var(--ov-cols, 12), minmax(0, 1fr)) auto;
+  grid-template-rows: auto repeat(7, minmax(24px, 1fr));
+  gap: 3px;
+  align-items: stretch;
+}
+.ov-heat-hour,
+.ov-heat-day,
+.ov-heat-total { align-self: center; }
+.ov-heat-total {
+  font-size: 11px;
+  color: var(--fg-muted);
+  padding-left: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-heat-hour {
+  font-size: 11px;
+  color: var(--fg-muted);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-heat-day {
+  font-size: 12px;
+  color: var(--fg-muted);
+  text-align: right;
+  padding-right: 8px;
+  white-space: nowrap;
+}
+
+.ov-heat-day.is-today {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.ov-heat-cell {
+  min-height: 24px;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  transition: transform .12s ease, box-shadow .12s ease;
+}
+
+.ov-heat-cell.has:hover,
+.ov-heat-cell.has:focus-visible {
+  transform: scale(1.16);
+  box-shadow: 0 0 0 1px var(--accent);
+  outline: none;
+  z-index: 2;
+}
+
+.ov-heat-cell.is-peak {
+  box-shadow: 0 0 0 1px var(--accent),
+    0 0 10px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.ov-heat-scale {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  margin-top: 12px;
+}
+
+.ov-heat-scale-label {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.ov-heat-swatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+}
+
+.ov-heat-skeleton {
+  height: 176px;
+  border-radius: var(--radius-sm);
+}
+
+.ov-heat-caption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-sub);
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.ov-heat-caption b {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.ov-empty {
+  font-size: 13px;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+/* ── Shared tooltip ───────────────────────────────────────────────────────── */
+
+.home-tip {
+  position: fixed;
+  z-index: 60;
+  max-width: 320px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--fg);
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .12s ease;
+}
+.home-tip.show {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* ── Loading skeletons (first boot only) ──────────────────────────────────── */
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface2) 25%,
+    var(--surface3) 50%,
+    var(--surface2) 75%
+  );
+  background-size: 200% 100%;
+  animation: dash-shimmer 1.3s ease-in-out infinite;
+  border-radius: var(--radius-sm);
+}
+@keyframes dash-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+}
+
+.dash-skeleton-row { border-top: 1px solid var(--border-sub); }
+.skeleton-line { height: 12px; width: 58%; }
+.skeleton-pill { height: 28px; width: 76px; flex: 0 0 auto; }
+.skeleton-chip { display: inline-block; height: 12px; width: 40px; }
+.skeleton-value { height: 22px; width: 46%; }
+.skeleton-spark { height: 30px; width: 100%; margin-top: auto; }
+.ov-metric-skel { gap: 9px; }

@@ -1,0 +1,84 @@
+{# The global assistant: "Ask your meetings". One rail beside the views,
+   toggled by the header Ask control. Docked when the main column keeps at
+   least 1200 px, otherwise an overlay from the right. Hidden on the session
+   view, which has its own Chat column behind the Layout control.
+
+   Every id home.js binds is load-bearing: #global-chat-*, #home-conv-*. #}
+<aside class="ask-rail" id="ask-rail" aria-label="Ask your meetings" hidden>
+  <div class="ask-rail-panel">
+    <!-- Conversation list -->
+    <div class="home-conv-sidebar" id="home-conv-sidebar">
+      <div class="home-conv-header">
+        <span class="home-conv-title">Chats</span>
+        <button class="icon-btn" onclick="newGlobalConversation()" title="New chat" aria-label="New chat">
+          <i class="fa-solid fa-plus"></i>
+        </button>
+      </div>
+      <div class="home-conv-list" id="home-conv-list">
+        <p class="home-conv-empty">No conversations yet</p>
+      </div>
+    </div>
+
+    <!-- Chat area -->
+    <div class="home-chat-main">
+      <div class="home-chat-header">
+        <button class="icon-btn home-conv-toggle" id="home-conv-toggle"
+                onclick="toggleConvSidebar()" title="Toggle chat list" aria-label="Toggle chat list">
+          <i class="fa-solid fa-list-ul"></i>
+        </button>
+        <div class="col-title-wrap home-chat-title-wrap">
+          <span class="home-chat-title" id="home-chat-title">Ask your meetings</span>
+          <span class="col-subtitle" id="global-chat-model-label"></span>
+        </div>
+        <div class="home-chat-actions">
+          <button class="icon-btn" title="Clear chat" aria-label="Clear chat" onclick="clearGlobalChat()">
+            <i class="fa-solid fa-eraser"></i>
+          </button>
+          <button class="icon-btn" id="ask-close-btn" title="Close Ask" aria-label="Close Ask"
+                  onclick="toggleAskRail(false)">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+      <div id="global-chat-messages" class="col-body chat-body">
+        <div class="home-chat-welcome" id="home-chat-welcome">
+          <p class="home-welcome-subtitle">
+            Search transcripts, pull out decisions, and rename speakers in bulk
+            across every meeting you have recorded.
+          </p>
+          <div class="home-welcome-suggestions" id="home-welcome-suggestions">
+            <button class="home-suggestion-chip" onclick="useSuggestion(this)">What were the key decisions from recent meetings?</button>
+            <button class="home-suggestion-chip" onclick="useSuggestion(this)">Summarize discussions about deadlines</button>
+            <button class="home-suggestion-chip" onclick="useSuggestion(this)">Who are the most active speakers?</button>
+          </div>
+        </div>
+      </div>
+      <div class="chat-input-area">
+        <div class="chat-input-wrap">
+          <div class="model-picker-wrap model-picker-chat-wrap">
+            <button class="chat-model-picker-btn" id="global-chat-model-btn"
+                    title="Global chat model" aria-label="Global chat model"
+                    onclick="toggleModelPicker('global_chat')">
+              <i class="fa-solid fa-microchip"></i>
+            </button>
+            <div class="model-picker-panel model-picker-panel-up hidden" id="global-chat-model-picker"></div>
+          </div>
+          <label class="visually-hidden" for="global-chat-input">Ask about all your meetings</label>
+          <textarea
+            id="global-chat-input"
+            placeholder="Ask about all your meetings…"
+            rows="1"
+            onkeydown="handleGlobalChatKey(event)"
+            oninput="autogrowGlobalInput()"
+          ></textarea>
+          <button id="global-send-btn" class="chat-send-btn" onclick="sendGlobalMessage()" title="Send message" aria-label="Send message">
+            <i class="fa-solid fa-arrow-up"></i>
+          </button>
+          <button id="global-stop-btn" class="chat-stop-btn hidden" onclick="stopGlobalChat()" title="Stop generating" aria-label="Stop generating">
+            <i class="fa-solid fa-stop"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</aside>

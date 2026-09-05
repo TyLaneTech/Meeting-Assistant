@@ -2,7 +2,7 @@
 marked.use({ breaks: true, gfm: true });
 
 // Open every rendered markdown link in a new tab. Skip links that already
-// declare a `target` *or* have an `onclick` handler — the latter is how the
+// declare a `target` *or* have an `onclick` handler - the latter is how the
 // timestamp pills are wired (`href="#" onclick="seekPlayback(…)"`), and
 // adding target="_blank" to them would open a blank tab on middle-click.
 marked.use({
@@ -22,7 +22,7 @@ function renderMd(text) {
 
 /**
  * Typing-cursor manager.
- * One cursor span is created and reused — after each render it's moved to the
+ * One cursor span is created and reused - after each render it's moved to the
  * deepest last inline position. Chunk arrivals add a .streaming class that
  * lights the cursor up; a debounce timer dims it back when chunks stop.
  */
@@ -166,12 +166,12 @@ function _flushSummaryRender() {
 
 /**
  * Post-process rendered summary HTML to make timestamps clickable pills.
- * Matches single timestamps [M:SS] and ranges [M:SS–M:SS] (en-dash, em-dash,
+ * Matches single timestamps [M:SS] and ranges [M:SS-M:SS] (en-dash, em-dash,
  * or plain hyphen as separator). Clicking seeks to the start of the range.
  */
 function linkifyTimestamps(container) {
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  // Group 1: start time. Group 2 (optional): end time after - or –
+  // Group 1: start time. Group 2 (optional): end time after - or -
   const timestampRe = /\[(\d{1,2}:\d{2})(?:[\u2013\u2014\-](\d{1,2}:\d{2}))?\]/g;
   const nodesToReplace = [];
 
@@ -197,10 +197,10 @@ function linkifyTimestamps(container) {
 
       const [startM, startS] = match[1].split(':').map(Number);
       const startSec = startM * 60 + startS;
-      // Use en-dash (–) as canonical separator in the displayed label
+      // Use en-dash (-) as canonical separator in the displayed label
       const label = match[2] ? `${match[1]} - ${match[2]}` : match[1];
       const title = match[2]
-        ? `Jump to ${match[1]} – ${match[2]}`
+        ? `Jump to ${match[1]} to ${match[2]}`
         : `Jump to ${match[1]}`;
 
       const link = document.createElement('a');
@@ -238,12 +238,854 @@ function _saveLayoutCache(updates) {
   } catch (_) {}
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   The app shell: one store, one router, five views
+   ══════════════════════════════════════════════════════════════════════════
+   Every route (/, /calendar, /attention, /speakers, /session) renders the same
+   template. The five view roots are DOM siblings inside <main class="views">;
+   exactly one carries .is-active. The workspace is hidden, never destroyed, so
+   a live recording keeps streaming into it while another view is on screen.
+   See context/ui-overhaul-2026-09.md sections 3.1 and 3.2.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const VIEW_NAMES = ['home', 'calendar', 'attention', 'speakers', 'session'];
+
+/* ── AppData: the store for shared GET reads ──────────────────────────────────
+ * Search, chat, commands and uploads are deliberately NOT cached here.
+ * Each slice: data (last committed payload), lastGood (kept through a failure),
+ * status, error, updatedAt, revision, token. A response commits only while its
+ * token is the slice's current one, so a slow reply can never overwrite a newer
+ * one, and a failure keeps the last good data instead of rendering zeros.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+const _SLICE_ENDPOINTS = {
+  sessions:       '/api/sessions',
+  folders:        '/api/folders',
+  analytics:      '/api/dashboard',
+  attention:      '/api/attention/summary',
+  calendarStatus: '/api/calendar/status',
+};
+
+// Slices the whole shell depends on (the sidebar list, the attention badge).
+// The rest are reloaded lazily, when the view that needs them is active.
+const _EAGER_SLICES = new Set(['sessions', 'folders', 'attention']);
+
+// Which slices each view renders from. Also drives the Refresh control.
+const VIEW_SLICES = {
+  home:      ['analytics', 'sessions', 'attention', 'calendarStatus'],
+  calendar:  ['sessions', 'calendarStatus', 'calendarEvents'],
+  attention: ['sessions', 'attention'],
+  speakers:  [],
+  session:   ['sessions'],
+};
+
+function _newSlice(fallback) {
+  return {
+    data: null, lastGood: fallback, status: 'idle', error: null,
+    updatedAt: 0, revision: 0, token: 0, pending: null,
+  };
+}
+
+/** 'YYYY-MM-DD..YYYY-MM-DD' - the calendarEvents cache key is the range. */
+function calendarRangeKey(start, end) { return `${start}..${end}`; }
+
+const AppData = {
+  slices: {
+    sessions:       _newSlice([]),
+    folders:        _newSlice([]),
+    analytics:      _newSlice(null),
+    attention:      _newSlice(null),
+    calendarStatus: _newSlice(null),
+    calendarEvents: {},          // rangeKey -> slice, lazy, one load per range
+  },
+  _subs: [],
+
+  _slice(name, key) {
+    if (name !== 'calendarEvents') return this.slices[name] || null;
+    if (!key) return null;
+    if (!this.slices.calendarEvents[key]) this.slices.calendarEvents[key] = _newSlice([]);
+    return this.slices.calendarEvents[key];
+  },
+
+  /** The data to render: the committed payload, or the last good one. */
+  get(name, key) {
+    const s = this._slice(name, key);
+    if (!s) return null;
+    return s.data != null ? s.data : s.lastGood;
+  },
+  status(name, key) { const s = this._slice(name, key); return s ? s.status : 'idle'; },
+  error(name, key) { const s = this._slice(name, key); return s ? s.error : null; },
+  lastUpdated(name, key) { const s = this._slice(name, key); return s ? s.updatedAt : 0; },
+  revision(name, key) { const s = this._slice(name, key); return s ? s.revision : 0; },
+
+  /** True while the view is rendering last-good data after a failed reload. */
+  isStale(name, key) {
+    const s = this._slice(name, key);
+    return !!(s && s.status === 'error' && s.data != null);
+  },
+
+  _url(name, key) {
+    if (name !== 'calendarEvents') return _SLICE_ENDPOINTS[name];
+    const [start, end] = String(key).split('..');
+    return `/api/calendar/events?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+  },
+
+  load(name, opts) {
+    const o = opts || {};
+    const s = this._slice(name, o.key);
+    if (!s) return Promise.resolve(null);
+    // Switching views must not fetch unless the slice is idle. Concurrent
+    // requests for one slice coalesce into the one already in flight.
+    if (!o.force && (s.status === 'ready' || s.status === 'loading')) {
+      return s.pending || Promise.resolve(this.get(name, o.key));
+    }
+    const token = ++s.token;         // any older reply can no longer commit
+    s.status = 'loading';
+    this._emit(name, o.key);
+    const settle = () => { if (token === s.token) s.pending = null; };
+    s.pending = fetch(this._url(name, o.key), { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then(payload => {
+        if (token !== s.token) return this.get(name, o.key);
+        s.data = payload;
+        s.lastGood = payload;
+        s.error = null;
+        s.status = 'ready';
+        s.updatedAt = Date.now();
+        s.revision++;
+        settle();
+        this._emit(name, o.key);
+        return payload;
+      })
+      .catch(err => {
+        if (token !== s.token) return this.get(name, o.key);
+        s.error = (err && err.message) || 'request failed';
+        s.status = 'error';
+        settle();
+        this._emit(name, o.key);
+        return this.get(name, o.key);
+      });
+    return s.pending;
+  },
+
+  /** Mark slices out of date. Shell-wide slices reload now; view-only slices
+   *  reload when their view is on screen, and otherwise on next activate. */
+  invalidate(names, reason) {
+    const list = Array.isArray(names) ? names : [names];
+    const active = VIEW_SLICES[Views.current] || [];
+    const jobs = [];
+    for (const name of list) {
+      if (name === 'calendarEvents') {
+        for (const key of Object.keys(this.slices.calendarEvents)) {
+          const s = this.slices.calendarEvents[key];
+          s.status = 'idle';
+          if (active.includes('calendarEvents')) jobs.push(this.load(name, { force: true, key }));
+          else this._emit(name, key);
+        }
+        continue;
+      }
+      const s = this._slice(name);
+      if (!s) continue;
+      s.status = 'idle';
+      if (_EAGER_SLICES.has(name) || active.includes(name)) {
+        jobs.push(this.load(name, { force: true }));
+      } else {
+        this._emit(name);
+      }
+    }
+    return Promise.all(jobs);
+  },
+
+  /** In-place edit for an event that carries enough data to patch (a retitle),
+   *  so the list does not have to be refetched to look right. */
+  patch(name, fn, key) {
+    const s = this._slice(name, key);
+    if (!s) return;
+    const next = fn(s.data != null ? s.data : s.lastGood);
+    if (next !== undefined) { s.data = next; s.lastGood = next; }
+    s.revision++;
+    s.updatedAt = Date.now();
+    this._emit(name, key);
+  },
+
+  subscribe(names, fn) {
+    this._subs.push({ names: Array.isArray(names) ? names : [names], fn });
+    return fn;
+  },
+  unsubscribe(fn) {
+    this._subs = this._subs.filter(sub => sub.fn !== fn);
+  },
+  _emit(name, key) {
+    for (const sub of this._subs.slice()) {
+      if (!sub.names.includes(name)) continue;
+      try { sub.fn(name, key); } catch (e) { console.error('[AppData] subscriber failed', e); }
+    }
+  },
+
+  /** Header Refresh: the active view's dependencies only, never everything. */
+  refreshActiveView() {
+    const names = (VIEW_SLICES[Views.current] || []).slice();
+    if (!names.length) names.push('sessions');
+    const jobs = [];
+    for (const name of names) {
+      if (name === 'calendarEvents') {
+        const keys = Object.keys(this.slices.calendarEvents);
+        keys.forEach(key => jobs.push(this.load(name, { force: true, key })));
+        continue;
+      }
+      jobs.push(this.load(name, { force: true }));
+    }
+    // The sidebar list is on screen in every view, so it refreshes with them.
+    if (!names.includes('sessions')) jobs.push(this.load('sessions', { force: true }));
+    if (!names.includes('folders')) jobs.push(this.load('folders', { force: true }));
+    return Promise.all(jobs).then(() => {
+      const failed = names.filter(n => n !== 'calendarEvents' && this.status(n) === 'error');
+      if (failed.length) {
+        const reason = this.error(failed[0]) || 'request failed';
+        throw new Error(reason);
+      }
+    });
+  },
+};
+
+/** refreshSidebar() is the old name for "the recordings list changed". */
+async function refreshSidebar() {
+  await AppData.invalidate(['sessions', 'folders'], 'sidebar');
+}
+
+/* ── Popovers and menus ──────────────────────────────────────────────────────
+ * Menus are position: fixed so they escape every scroll container, close on
+ * outside click, Escape and navigation, and are arrow-key reachable with focus
+ * returning to the trigger.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+let _openMenuId = null;
+let _openMenuTrigger = null;
+
+function _menuItems(menu) {
+  return [...menu.querySelectorAll('.menu-item')].filter(
+    el => !el.disabled && !el.classList.contains('hidden') && el.offsetParent !== null);
+}
+
+function _positionMenu(menu, trigger) {
+  const r = trigger.getBoundingClientRect();
+  menu.style.position = 'fixed';
+  menu.style.visibility = 'hidden';
+  menu.style.top = '0px';
+  menu.style.left = '0px';
+  const m = menu.getBoundingClientRect();
+  const gap = 6;
+  let top = menu.classList.contains('menu-up') ? r.top - m.height - gap : r.bottom + gap;
+  let left = menu.classList.contains('menu-right') ? r.right - m.width : r.left;
+  top = Math.max(8, Math.min(top, window.innerHeight - m.height - 8));
+  left = Math.max(8, Math.min(left, window.innerWidth - m.width - 8));
+  menu.style.top = top + 'px';
+  menu.style.left = left + 'px';
+  menu.style.visibility = '';
+}
+
+function closeMenu(opts) {
+  if (!_openMenuId) return;
+  const menu = document.getElementById(_openMenuId);
+  const trigger = _openMenuTrigger;
+  _openMenuId = null;
+  _openMenuTrigger = null;
+  if (menu) menu.classList.add('hidden');
+  if (trigger) {
+    trigger.setAttribute('aria-expanded', 'false');
+    if (opts && opts.restoreFocus && trigger.isConnected) trigger.focus();
+  }
+  document.removeEventListener('mousedown', _onMenuOutside, true);
+  document.removeEventListener('keydown', _onMenuKey, true);
+  window.removeEventListener('resize', _onMenuReflow);
+  window.removeEventListener('scroll', _onMenuReflow, true);
+}
+
+function _onMenuOutside(e) {
+  const menu = _openMenuId && document.getElementById(_openMenuId);
+  if (!menu) return;
+  if (menu.contains(e.target) || (_openMenuTrigger && _openMenuTrigger.contains(e.target))) return;
+  closeMenu();
+}
+
+function _onMenuReflow() {
+  const menu = _openMenuId && document.getElementById(_openMenuId);
+  if (menu && _openMenuTrigger) _positionMenu(menu, _openMenuTrigger);
+}
+
+function _onMenuKey(e) {
+  const menu = _openMenuId && document.getElementById(_openMenuId);
+  if (!menu) return;
+  const items = _menuItems(menu);
+  const at = items.indexOf(document.activeElement);
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeMenu({ restoreFocus: true }); return; }
+  if (e.key === 'Tab') { closeMenu(); return; }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!items.length) return;
+    const next = e.key === 'ArrowDown'
+      ? (at < 0 ? 0 : (at + 1) % items.length)
+      : (at <= 0 ? items.length - 1 : at - 1);
+    items[next].focus();
+    return;
+  }
+  if (e.key === 'Home' && items.length) { e.preventDefault(); items[0].focus(); }
+  if (e.key === 'End' && items.length) { e.preventDefault(); items[items.length - 1].focus(); }
+}
+
+function openMenu(menuId, trigger) {
+  const menu = document.getElementById(menuId);
+  if (!menu || !trigger) return;
+  closeMenu();
+  _openMenuId = menuId;
+  _openMenuTrigger = trigger;
+  menu.classList.remove('hidden');
+  _positionMenu(menu, trigger);
+  trigger.setAttribute('aria-expanded', 'true');
+  document.addEventListener('mousedown', _onMenuOutside, true);
+  document.addEventListener('keydown', _onMenuKey, true);
+  window.addEventListener('resize', _onMenuReflow);
+  window.addEventListener('scroll', _onMenuReflow, true);
+  // Keyboard activation lands on the first item; a mouse click does not steal
+  // the pointer's position.
+  if (trigger.dataset.menuKeyboard === '1') {
+    delete trigger.dataset.menuKeyboard;
+    const items = _menuItems(menu);
+    if (items.length) items[0].focus();
+  }
+}
+
+/** Menu triggers call this from onclick. A keyboard-activated click reports
+ *  detail 0, which is how the first item gets focus. */
+function _toggleMenu(menuId, trigger) {
+  if (_openMenuId === menuId) { closeMenu({ restoreFocus: true }); return; }
+  if (window.event && window.event.detail === 0) trigger.dataset.menuKeyboard = '1';
+  openMenu(menuId, trigger);
+}
+
+/* ── Views: the client router ────────────────────────────────────────────── */
+
+const Views = {
+  current: null,
+  _defs: new Map(),
+  _scroll: {},
+  _titles: {},
+
+  register(name, hooks) { this._defs.set(name, hooks || {}); },
+
+  /** name: one of VIEW_NAMES. opts: { url, replace, popstate, focus, state } */
+  show(name, opts) {
+    const o = opts || {};
+    if (!VIEW_NAMES.includes(name)) name = 'home';
+    const repeat = this.current === name;
+    const prev = this.current;
+
+    if (!repeat && prev) {
+      const el = document.getElementById('view-' + prev);
+      if (el) this._scroll[prev] = el.scrollTop;
+      const def = this._defs.get(prev);
+      if (def && def.deactivate) {
+        try { def.deactivate(); } catch (e) { console.error('[Views] deactivate failed', e); }
+      }
+    }
+
+    closeMenu();
+    this.current = name;
+    document.body.dataset.view = name;
+    for (const view of VIEW_NAMES) {
+      const el = document.getElementById('view-' + view);
+      if (el) el.classList.toggle('is-active', view === name);
+    }
+    _syncNavCurrent(name);
+    _syncAskRailForView(name);
+    _syncHeaderForView(name);
+
+    const el = document.getElementById('view-' + name);
+    if (el) {
+      const restore = o.popstate && o.state && typeof o.state.scroll === 'number'
+        ? o.state.scroll
+        : (this._scroll[name] || 0);
+      el.scrollTop = restore;
+      // 90 ms opacity crossfade. Skipped for Back, repeated selection and
+      // reduced motion; nothing translates.
+      const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!repeat && !o.popstate && !o.noFade && !reduce) {
+        el.style.opacity = '0';
+        requestAnimationFrame(() => {
+          el.style.transition = 'opacity 90ms linear';
+          el.style.opacity = '1';
+          setTimeout(() => { el.style.transition = ''; el.style.opacity = ''; }, 160);
+        });
+      }
+    }
+
+    if (o.url) this._writeHistory(name, o.url, !!o.replace || repeat, o.popstate);
+    this.applyTitle(name);
+
+    const def = this._defs.get(name);
+    if (def && def.activate) {
+      try { def.activate({ repeat, popstate: !!o.popstate }); }
+      catch (e) { console.error('[Views] activate failed', e); }
+    }
+
+    if (o.focus && el) {
+      const heading = el.querySelector('.view-heading');
+      if (heading) heading.focus({ preventScroll: true });
+    }
+    _syncRefreshTooltip();
+    return name;
+  },
+
+  _writeHistory(name, url, replace, popstate) {
+    if (popstate) return;                        // the browser already moved
+    const state = { view: name, url, scroll: this._scroll[name] || 0 };
+    if (name === 'calendar' && typeof _calState !== 'undefined') {
+      state.calendarMonth = _calMonthParam();
+      state.calendarDay = _calState.selectedKey ? _calDayParam(_calState.selectedKey) : null;
+    }
+    const here = location.pathname + location.search;
+    if (replace || here === url) history.replaceState(state, '', url);
+    else history.pushState(state, '', url);
+  },
+
+  /** Views own their header title and subtitle; the router sets the default. */
+  setTitle(name, title, subtitle) {
+    this._titles[name] = { title, subtitle };
+    if (this.current === name) this.applyTitle(name);
+  },
+
+  applyTitle(name) {
+    const custom = this._titles[name] || {};
+    const fallback = {
+      home: 'Home', calendar: 'Calendar', attention: 'Needs attention',
+      speakers: 'Speakers', session: 'Meeting Assistant',
+    }[name];
+    const title = custom.title || fallback;
+    if (name === 'session') {
+      const el = document.getElementById('topbar-session-title');
+      if (el) el.textContent = title;
+      document.title = title === 'Meeting Assistant' ? 'Meeting Assistant' : `${title} · Meeting Assistant`;
+    } else {
+      const el = document.getElementById('view-title');
+      if (el) el.textContent = title;
+      document.title = `${fallback} · Meeting Assistant`;
+    }
+    const sub = document.getElementById('view-subtitle');
+    if (sub) {
+      sub.textContent = custom.subtitle || '';
+      sub.classList.toggle('hidden', !custom.subtitle);
+    }
+  },
+};
+
+function _syncNavCurrent(name) {
+  document.querySelectorAll('#sidebar .nav-row[data-nav]').forEach(row => {
+    const target = _routeOf(row.getAttribute('href'));
+    const active = target === name;
+    row.classList.toggle('active', active);
+    if (active) row.setAttribute('aria-current', 'page');
+    else row.removeAttribute('aria-current');
+  });
+}
+
+/** The view a same-origin path belongs to, or null when it is not a route. */
+function _routeOf(href) {
+  if (!href) return null;
+  let path;
+  try { path = new URL(href, location.origin).pathname; } catch (_) { return null; }
+  if (path === '/') return 'home';
+  if (path === '/calendar') return 'calendar';
+  if (path === '/attention') return 'attention';
+  if (path === '/speakers') return 'speakers';
+  if (path === '/session') return 'session';
+  return null;
+}
+
+/* ── navigateTo: one path in and out of every view ───────────────────────── */
+
+function navigateTo(url, opts) {
+  const o = opts || {};
+  let parsed;
+  try { parsed = new URL(url, location.origin); } catch (_) { return false; }
+  if (parsed.origin !== location.origin) return false;
+  const view = _routeOf(parsed.pathname);
+  if (!view) return false;
+
+  const params = new URLSearchParams(parsed.search);
+  // A bare /session with no query is the blank workspace; every other route
+  // keeps its parameters so the actions below can consume them one at a time.
+  Views.show(view, {
+    url: parsed.pathname + (parsed.search || ''),
+    replace: o.replace,
+    popstate: o.popstate,
+    state: o.state,
+    focus: o.focus,
+  });
+  _applyRouteQuery(view, params, o);
+  return true;
+}
+
+/** Strip the parameters we have acted on, keeping the rest of the URL. */
+function _consumeParams(...keys) {
+  const next = new URLSearchParams(location.search);
+  let touched = false;
+  keys.forEach(k => { if (next.has(k)) { next.delete(k); touched = true; } });
+  if (!touched) return;
+  const qs = next.toString();
+  const url = qs ? `${location.pathname}?${qs}` : location.pathname;
+  history.replaceState({ ...(history.state || {}), url }, '', url);
+}
+
+function _applyRouteQuery(view, params, opts) {
+  const o = opts || {};
+
+  if (params.has('workspace')) _consumeParams('workspace');
+
+  // ?attention=needs still filters the recordings list (the criterion lives in
+  // the filter popover); the queue itself is the /attention route.
+  if (params.get('attention') === 'needs') {
+    _setAttentionFilter(true);
+    if (typeof _prefsReady !== 'undefined') _prefsReady.then(() => _setAttentionFilter(true)).catch(() => {});
+    _consumeParams('attention');
+  }
+
+  if (params.has('settings') || params.has('setup')) {
+    openSettings(params.get('section') || null);
+    _consumeParams('settings', 'setup', 'section');
+  }
+
+  if (params.has('fingerprint')) {
+    _consumeParams('fingerprint');
+    if (view !== 'speakers') { navigateTo('/speakers', { replace: true }); return; }
+  }
+
+  if (view === 'calendar') {
+    const month = params.get('month');
+    const day = params.get('day');
+    if (typeof _calApplyRoute === 'function') _calApplyRoute(month, day);
+  }
+
+  if (view !== 'session') return;
+
+  if (params.has('quiet_prompt')) {
+    _quietPromptLanding = params.get('id');
+    _consumeParams('quiet_prompt');
+  }
+
+  // ?speakers=cleanup opens the Speakers dialog on Cleanup once the session
+  // is bound. The older ?speakers=resolve is honoured the same way: Resolve
+  // was folded into Cleanup, and links to it may still be out there.
+  const wantsSpeakers = ['cleanup', 'resolve'].includes(params.get('speakers'));
+  const openSpeakersDialog = () => {
+    if (!wantsSpeakers) return;
+    openSpeakerManager('cleanup');
+    _consumeParams('speakers');
+  };
+
+  if (params.has('autostart')) {
+    _consumeParams('autostart');
+    _waitForRecordReady().then(() => {
+      if (_recordingCommandLost) return;      // another window won this start
+      if (!state.isRecording) startNewRecording();
+    });
+    return;
+  }
+
+  const id = params.get('id');
+  if (id) {
+    // Reconcile against /api/status before binding the workspace: if this is
+    // the live session, SSE status and replay own it and loadSession must not
+    // re-render underneath them.
+    fetch('/api/status').then(r => r.json()).then(st => {
+      if (st.recording && st.session_id === id) {
+        state.sessionId = id;
+        state.isViewingPast = false;
+        if (_quietPromptLanding === id) {
+          setTimeout(() => showQuietStopConfirm(id), 250);
+          _quietPromptLanding = null;
+        }
+        openSpeakersDialog();
+        return;
+      }
+      return loadSession(id).then(openSpeakersDialog);
+    }).catch(() => loadSession(id).then(openSpeakersDialog));
+    return;
+  }
+
+  // /session with nothing to show. Only a Back navigation clears the loaded
+  // session; a live recording is never cleared, replaced or stopped.
+  if (o.popstate && !state.isRecording && state.sessionId) {
+    state.sessionId = null;
+    state.isViewingPast = false;
+    clearAll();
+    updateRecordBtn();
+    _updateActiveFolderHighlights();
+  }
+}
+
+/** Intercept only unmodified primary clicks on same-origin route links. */
+function _initRouteLinks() {
+  document.addEventListener('click', e => {
+    if (e.defaultPrevented || e.button !== 0) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest('a[href]');
+    if (!a || a.target || a.hasAttribute('download') || a.dataset.external !== undefined) return;
+    if (a.getAttribute('href').startsWith('#')) return;
+    const view = _routeOf(a.getAttribute('href'));
+    if (!view) return;
+    e.preventDefault();
+    navigateTo(a.getAttribute('href'), { focus: e.detail === 0 });
+  });
+
+  window.addEventListener('popstate', e => {
+    navigateTo(location.pathname + location.search, { popstate: true, state: e.state });
+  });
+}
+
+/* ── Header: Ask, Layout, Search, Refresh ────────────────────────────────── */
+
+const ASK_DOCK_MIN_PX = 1200;   // main column width the docked rail needs
+
+function _askIsOpen() {
+  const cache = _getLayoutCache();
+  return cache.ask_open === true;
+}
+
+function toggleAskRail(force) {
+  const open = typeof force === 'boolean' ? force : !_askIsOpen();
+  _saveLayoutCache({ ask_open: open });
+  _syncAskRailForView(Views.current);
+  if (open) {
+    const input = document.getElementById('global-chat-input');
+    if (input) input.focus();
+  }
+}
+
+function _syncAskRailForView(view) {
+  const rail = document.getElementById('ask-rail');
+  const toggle = document.getElementById('ask-toggle');
+  if (!rail) return;
+  // The workspace has its own Chat column behind the Layout control, so Ask
+  // (the global library assistant) is not offered there.
+  const allowed = view !== 'session';
+  const open = allowed && _askIsOpen();
+  rail.hidden = !open;
+  document.body.classList.toggle('ask-open', open);
+  if (toggle) {
+    toggle.classList.toggle('hidden', !allowed);
+    toggle.setAttribute('aria-pressed', String(open));
+    toggle.title = open ? 'Hide the assistant' : 'Ask your meetings';
+  }
+  _syncAskRailMode();
+}
+
+/** Docked while the main column keeps ASK_DOCK_MIN_PX, otherwise an overlay. */
+function _syncAskRailMode() {
+  const rail = document.getElementById('ask-rail');
+  const main = document.getElementById('main-area');
+  if (!rail || !main || rail.hidden) return;
+  const railW = rail.offsetWidth || 380;
+  const docked = (main.clientWidth - railW) >= ASK_DOCK_MIN_PX;
+  rail.classList.toggle('ask-overlay', !docked);
+  document.body.classList.toggle('ask-overlaid', !docked);
+}
+
+function _syncHeaderForView(view) {
+  const layout = document.getElementById('layout-control');
+  if (layout) layout.classList.toggle('hidden', view !== 'session');
+}
+
+function _expandHeaderSearch() {
+  const search = document.getElementById('header-search');
+  if (search) search.classList.add('is-expanded');
+  const input = document.getElementById('home-search-input');
+  if (input) input.focus();
+}
+
+function _collapseHeaderSearch() {
+  const search = document.getElementById('header-search');
+  if (search) search.classList.remove('is-expanded');
+}
+
+let _refreshInFlight = false;
+
+function _onRefreshClick() {
+  if (_refreshInFlight) return;
+  _refreshInFlight = true;
+  const btn = document.getElementById('refresh-btn');
+  if (btn) { btn.classList.add('is-spinning'); btn.disabled = true; }
+  AppData.refreshActiveView()
+    .catch(err => uiToast({ message: `Could not refresh: ${(err && err.message) || 'request failed'}`, kind: 'error' }))
+    .then(() => {
+      _refreshInFlight = false;
+      if (btn) { btn.classList.remove('is-spinning'); btn.disabled = false; }
+      _syncRefreshTooltip();
+    });
+}
+
+function _relativeMinutes(ts) {
+  if (!ts) return '';
+  const secs = Math.max(0, (Date.now() - ts) / 1000);
+  if (secs < 45) return 'just now';
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  return hours === 1 ? '1 hour ago' : `${hours} hours ago`;
+}
+
+function _syncRefreshTooltip() {
+  const btn = document.getElementById('refresh-btn');
+  if (!btn) return;
+  const names = (VIEW_SLICES[Views.current] || ['sessions']).filter(n => n !== 'calendarEvents');
+  const newest = names.reduce((acc, n) => Math.max(acc, AppData.lastUpdated(n)), 0);
+  const when = _relativeMinutes(newest);
+  btn.title = when ? `Refresh data · updated ${when}` : 'Refresh data';
+  const stale = names.some(n => AppData.isStale(n));
+  document.getElementById('header-stale')?.classList.toggle('hidden', !stale);
+}
+
+/* ── Capture setup row (the old status pill) ─────────────────────────────── */
+
+function toggleCaptureSetup(force) {
+  const panes = document.getElementById('capture-setup-panes');
+  const row = document.getElementById('status-pill');
+  if (!panes) return;
+  const open = typeof force === 'boolean' ? force : panes.classList.contains('hidden');
+  panes.classList.toggle('hidden', !open);
+  if (row) row.setAttribute('aria-expanded', String(open));
+  _saveLayoutCache({ capture_setup_open: open });
+}
+
+function _restoreCaptureSetup() {
+  toggleCaptureSetup(_getLayoutCache().capture_setup_open === true);
+}
+
+/* ── Capture strip ───────────────────────────────────────────────────────── */
+
+let _captureLastDesktopAudio = 0;
+let _captureWarnTimer = null;
+
+function _syncCaptureStrip() {
+  const strip = document.getElementById('capture-strip');
+  if (!strip) return;
+  const live = !!state.isRecording;
+  strip.hidden = !live;
+  document.body.classList.toggle('is-recording', live);
+  if (!live) {
+    if (_captureWarnTimer) { clearInterval(_captureWarnTimer); _captureWarnTimer = null; }
+    return;
+  }
+  const title = document.getElementById('capture-title');
+  if (title) {
+    const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
+    title.textContent = (entry && entry.title) || 'New recording';
+  }
+  if (!_captureWarnTimer) {
+    _captureLastDesktopAudio = Date.now();
+    _captureWarnTimer = setInterval(_syncCaptureWarning, 1000);
+    _syncCaptureWarning();
+  }
+}
+
+function _syncCaptureWarning() {
+  const el = document.getElementById('capture-warning');
+  if (!el) return;
+  if (!state.isRecording) { el.classList.add('hidden'); return; }
+  const messages = [];
+  if (Date.now() - _captureLastDesktopAudio > 20000) messages.push('No desktop audio for 20 s');
+  const micSel = document.getElementById('viz-mic-sel');
+  if (micSel && String(micSel.value) === '-1') messages.push('Mic muted');
+  el.textContent = messages.join(' · ');
+  el.classList.toggle('hidden', messages.length === 0);
+}
+
+/* ── Record button and its chevron ───────────────────────────────────────── */
+
+/** Record always starts a NEW recording: a workspace showing a past meeting is
+ *  blanked first so the server can never be asked to append to it by accident. */
+async function startNewRecording() {
+  if (state.isRecording) return;
+  if (state.sessionId || state.isViewingPast) {
+    await newSession();
+    if (state.sessionId) return;      // the user cancelled out of newSession()
+  }
+  Views.show('session', { url: '/session' });
+  await toggleRecording({ start: true });
+}
+
+/** The chevron's explicit "append new audio to this recording" action. */
+async function resumeRecording() {
+  if (state.isRecording || !state.isViewingPast || !state.sessionId) return;
+  Views.show('session', { url: '/session?id=' + state.sessionId });
+  await toggleRecording({ start: true, resume: true });
+}
+
+/* ── App menu ────────────────────────────────────────────────────────────── */
+
+async function appUpdateItemClick() {
+  closeMenu();
+  const item = document.getElementById('app-update-item');
+  if (item && item.dataset.available === '1') { confirmUpdateRestart(); return; }
+  uiToast({ message: 'Checking for updates…', id: 'update-check', duration: 2500 });
+  try {
+    const data = await fetch('/api/update/check').then(r => r.json());
+    if (data.error) { uiToast({ message: `Could not check for updates: ${data.error}`, kind: 'error', id: 'update-check' }); return; }
+    if (!data.up_to_date && data.commits_behind > 0) {
+      _showTopbarUpdate(data.commits_behind);
+      uiToast({ message: `${data.commits_behind} update${data.commits_behind === 1 ? '' : 's'} available.`, kind: 'info', id: 'update-check',
+                action: { label: 'Install and restart', onClick: () => confirmUpdateRestart() } });
+    } else {
+      uiToast({ message: 'Meeting Assistant is up to date.', kind: 'success', id: 'update-check' });
+    }
+  } catch (_) {
+    uiToast({ message: 'Could not check for updates. Are you offline?', kind: 'error', id: 'update-check' });
+  }
+}
+
+/** What's new: the same overlay the post-update popup uses, on demand. */
+async function openWhatsNew() {
+  closeMenu();
+  try {
+    const data = await fetch('/api/changelog').then(r => r.json());
+    if (data && Array.isArray(data.commits) && data.commits.length) {
+      _showWhatsNewPopup(data.commits[0]);
+      return;
+    }
+  } catch (_) {}
+  uiToast({ message: 'No release notes available yet.', kind: 'info' });
+}
+
 /* ── Pane toggle & column ordering ────────────────────────────────────────── */
 // Indexed by column: [transcript, summary, chat, notes]. Notes is opt-in
 // (off by default) so existing layouts continue to render three columns.
 const _PANE_COUNT = 4;
-let _paneVisible = [true, true, true, false];
+// [transcript, summary, chat, notes]. Chat and Notes are off by default: chat
+// crowds the workspace and is rarely used (re-enable it per session with the
+// header toggle; the choice persists). Migration below hides chat in any
+// pre-existing saved layout once.
+let _paneVisible = [true, true, false, false];
 const _COL_NAMES = ['Transcript', 'Summary', 'Chat', 'Notes'];
+
+// One-time migration: turn the Chat pane (index 2) off in every saved layout,
+// so the new hidden-by-default applies to existing users too. Runs once; after
+// it, the user's own per-session chat toggles persist normally.
+(function _migrateHideChatDefault() {
+  try {
+    if (localStorage.getItem('ma-hide-chat-v1')) return;
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('ma-panes:')) continue;
+      try {
+        const arr = JSON.parse(localStorage.getItem(k));
+        if (Array.isArray(arr) && arr.length >= 3) {
+          arr[2] = false;
+          localStorage.setItem(k, JSON.stringify(arr));
+        }
+      } catch (_) {}
+    }
+    localStorage.setItem('ma-hide-chat-v1', '1');
+  } catch (_) {}
+})();
 
 // Migrate legacy 3-element arrays from cache/localStorage into the 4-element shape.
 function _normalizePaneArr(arr, fillTail) {
@@ -271,7 +1113,7 @@ let _colOrder = (() => {
 // summary-shaped middle rect, chat-shaped right rect) keep a FIXED visual
 // order. Each one targets whichever non-notes column is currently at the
 // matching relative position (left/middle/right). The Notes button is the
-// only one that floats — it slots in at whatever position the notes column
+// only one that floats - it slots in at whatever position the notes column
 // occupies in _colOrder.
 const _POSITIONAL_TOGGLE_BTN_IDS = [
   'pane-toggle-transcript',  // leftmost non-notes column
@@ -287,27 +1129,24 @@ function _syncToggleButtons() {
   // Slots available to the three positional buttons: all 4 toggle slots
   // minus the one occupied by the notes button.
   const positionalSlots = [0, 1, 2, 3].filter(p => p !== notesPos);
-  // Non-notes columns in their current visual order — drives which actual
+  // Non-notes columns in their current visual order - drives which actual
   // column each positional button controls + the dynamic tooltip.
   const nonNotesOrder = _colOrder.filter(c => c !== _NOTES_COL_IDX);
 
-  _POSITIONAL_TOGGLE_BTN_IDS.forEach((id, i) => {
-    const btn = document.getElementById(id);
+  const applyToggle = (btn, colIdx, slot) => {
     if (!btn) return;
-    const colIdx = nonNotesOrder[i];
-    btn.style.order = String(positionalSlots[i]);
+    btn.style.order = String(slot);
     btn.onclick = () => togglePane(colIdx);
     btn.title = _COL_NAMES[colIdx];
+    btn.setAttribute('aria-label', _COL_NAMES[colIdx]);
     btn.classList.toggle('active', _paneVisible[colIdx]);
-  });
+    btn.setAttribute('aria-pressed', String(!!_paneVisible[colIdx]));
+  };
 
-  const notesBtn = document.getElementById(_NOTES_TOGGLE_BTN_ID);
-  if (notesBtn) {
-    notesBtn.style.order = String(notesPos);
-    notesBtn.onclick = () => togglePane(_NOTES_COL_IDX);
-    notesBtn.title = _COL_NAMES[_NOTES_COL_IDX];
-    notesBtn.classList.toggle('active', _paneVisible[_NOTES_COL_IDX]);
-  }
+  _POSITIONAL_TOGGLE_BTN_IDS.forEach((id, i) => {
+    applyToggle(document.getElementById(id), nonNotesOrder[i], positionalSlots[i]);
+  });
+  applyToggle(document.getElementById(_NOTES_TOGGLE_BTN_ID), _NOTES_COL_IDX, notesPos);
 }
 
 function togglePane(idx) {
@@ -356,14 +1195,13 @@ function _loadPaneVisible(sessionId) {
       }
     }
   } catch (_) {}
-  // Fallback: show transcript+summary+chat, hide notes (legacy default)
-  _paneVisible = [true, true, true, false];
+  // Fallback: show transcript+summary, hide chat + notes (default layout)
+  _paneVisible = [true, true, false, false];
   _syncToggleButtons();
   _applyPaneLayout();
 }
 
 function _applyPaneLayout() {
-  if (window._isHomePage) return;
   const HANDLE_PX = 4;
   const MIN_COL_PX = 160;
   const workspace = document.querySelector('.workspace');
@@ -640,42 +1478,116 @@ function recalcColWidths() {
   _applyPaneLayout();
 })();
 
-/* ── Sidebar resize handle ────────────────────────────────────────────────── */
+/* ── Sidebar resize handle ──────────────────────────────────────────────────
+   The handle is the sidebar's one collapse control. Drag it inward past
+   SIDEBAR_COLLAPSE_AT and the sidebar folds to the 48 px icon rail; drag the
+   rail's edge back out and it expands. Double-click, or Enter / Space with the
+   handle focused, toggles between the two. The open width is remembered across
+   a collapse, so expanding returns to where it was. */
+const SIDEBAR_MIN_W       = 280;
+const SIDEBAR_MAX_W       = 440;
+const SIDEBAR_RAIL_W      = 48;
+const SIDEBAR_COLLAPSE_AT = 240;   // dragged narrower than this = collapse
+
 (function initSidebarResize() {
   const sidebar = document.getElementById('sidebar');
   const handle  = document.getElementById('sidebar-resize-handle');
   if (!sidebar || !handle) return;
 
+  const clampW = w => Math.max(SIDEBAR_MIN_W, Math.min(SIDEBAR_MAX_W, w));
+
   handle.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
     e.preventDefault();
     const startX = e.clientX;
-    const startW = sidebar.offsetWidth;
+    const startOpen = !sidebar.classList.contains('collapsed');
+    // Measure from the rail's edge when it started collapsed, so the first
+    // pixels of an outward drag are not a jump to full width.
+    const startW = startOpen ? sidebar.offsetWidth : SIDEBAR_RAIL_W;
+    let open = startOpen;
+    let moved = false;
 
     handle.classList.add('dragging');
     document.body.style.cursor     = 'col-resize';
     document.body.style.userSelect = 'none';
 
     function onMove(ev) {
-      const newW = Math.max(180, Math.min(520, startW + (ev.clientX - startX)));
-      sidebar.style.width = newW + 'px';
+      const dx = ev.clientX - startX;
+      if (Math.abs(dx) > 2) moved = true;
+      const raw = startW + dx;
+      const wantOpen = raw >= SIDEBAR_COLLAPSE_AT;
+      if (wantOpen !== open) {
+        open = wantOpen;
+        sidebar.classList.toggle('collapsed', !open);
+        if (!open) sidebar.style.width = '';   // the rail rule sizes it now
+      }
+      if (open) sidebar.style.width = clampW(raw) + 'px';
     }
 
     function onUp() {
       handle.classList.remove('dragging');
       document.body.style.cursor     = '';
       document.body.style.userSelect = '';
-      const w = sidebar.offsetWidth;
-      if (typeof savePref === 'function') savePref('sidebar_width', w);
-      _saveLayoutCache({ sidebar_width: w });
-      recalcColWidths();
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup',   onUp);
+      if (!moved) return;   // a plain click, or one half of a double-click
+      setSidebarOpen(open, { width: open ? sidebar.offsetWidth : null });
     }
 
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup',   onUp);
   });
+
+  handle.addEventListener('dblclick', e => { e.preventDefault(); toggleSidebar(); });
+
+  handle.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSidebar(); return; }
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const open = !sidebar.classList.contains('collapsed');
+    if (!open) { if (e.key === 'ArrowRight') setSidebarOpen(true); return; }
+    const next = sidebar.offsetWidth + (e.key === 'ArrowRight' ? 16 : -16);
+    if (next < SIDEBAR_COLLAPSE_AT) setSidebarOpen(false);
+    else setSidebarOpen(true, { width: clampW(next) });
+  });
+
+  // The collapsed rail expands on a click anywhere that is not a control of
+  // its own: the logo, the empty run below the pages, the gaps between rows.
+  // The page icons, the capture row and the footer keep their own jobs.
+  const brandWrap = document.getElementById('brand-icon-wrap');
+  sidebar.addEventListener('click', e => {
+    if (!sidebar.classList.contains('collapsed')) return;
+    if (brandWrap && brandWrap.contains(e.target)) { setSidebarOpen(true); return; }
+    if (e.target.closest('a, button, input, select, textarea, label, [role="menuitem"]')) return;
+    setSidebarOpen(true);
+  });
+  if (brandWrap) {
+    brandWrap.addEventListener('keydown', e => {
+      if (!sidebar.classList.contains('collapsed')) return;
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSidebarOpen(true); }
+    });
+  }
+  _syncBrandExpandAffordance();
 })();
+
+/** In rail mode the logo is a button that expands the sidebar; when open it is
+ *  just the logo again. Keeps the title, role and tab stop in step. */
+function _syncBrandExpandAffordance() {
+  const sidebar = document.getElementById('sidebar');
+  const wrap = document.getElementById('brand-icon-wrap');
+  if (!sidebar || !wrap) return;
+  if (sidebar.classList.contains('collapsed')) {
+    wrap.title = 'Expand sidebar';
+    wrap.setAttribute('role', 'button');
+    wrap.setAttribute('aria-label', 'Expand sidebar');
+    wrap.setAttribute('tabindex', '0');
+  } else {
+    wrap.removeAttribute('title');
+    wrap.removeAttribute('role');
+    wrap.removeAttribute('aria-label');
+    wrap.removeAttribute('tabindex');
+  }
+}
 
 function fmtDuration(secs) {
   secs = Math.floor(secs);
@@ -689,13 +1601,23 @@ function fmtDuration(secs) {
 let _recordingStartTime = null;
 let _durationInterval   = null;
 
+/** One clock, three readouts: the capture setup row, the capture strip and
+ *  the Record button's "Stop · mm:ss". */
+function _writeElapsed(text) {
+  const row = document.getElementById('recording-duration');
+  if (row) row.textContent = text;
+  const strip = document.getElementById('capture-time');
+  if (strip) strip.textContent = text;
+  const btn = document.getElementById('record-elapsed');
+  if (btn) btn.textContent = text;
+}
+
 function startDurationCounter() {
   _recordingStartTime = Date.now();
-  const el = document.getElementById('recording-duration');
-  el.textContent = '0:00';
-  el.classList.remove('hidden');
+  document.getElementById('recording-duration')?.classList.remove('hidden');
+  _writeElapsed('0:00');
   _durationInterval = setInterval(() => {
-    el.textContent = fmtDuration((Date.now() - _recordingStartTime) / 1000);
+    _writeElapsed(fmtDuration((Date.now() - _recordingStartTime) / 1000));
   }, 1000);
 }
 
@@ -703,9 +1625,8 @@ function stopDurationCounter() {
   clearInterval(_durationInterval);
   _durationInterval = null;
   _recordingStartTime = null;
-  const el = document.getElementById('recording-duration');
-  el.classList.add('hidden');
-  el.textContent = '';
+  document.getElementById('recording-duration')?.classList.add('hidden');
+  _writeElapsed('');
 }
 
 function jumpToTimestamp(seconds) {
@@ -764,14 +1685,12 @@ const _summaryStreams = {};
 {
   const _lc = _getLayoutCache();
   const _sb = document.getElementById('sidebar');
-  const _ob = document.getElementById('sidebar-open-btn');
   if (_sb) {
     if (_lc.sidebar_width) _sb.style.width = _lc.sidebar_width + 'px';
     if (_lc.sidebar_open === false) {
       _sb.classList.add('collapsed');
-      _sb.style.width = '';   // let CSS .collapsed { width:0 } take over
+      _sb.style.width = '';   // let the CSS icon-rail width take over
       state.sidebarOpen = false;
-      if (_ob) _ob.style.display = '';
     }
   }
 }
@@ -779,6 +1698,7 @@ const _summaryStreams = {};
 /* ── Preferences (server-persisted) ─────────────────────────────────────── */
 let _prefs = {};   // populated on init from /api/preferences
 let _prefsSaveTimer = null;
+let _prefsPending = {};   // keys changed since the last flush; only these are sent
 
 async function loadPreferences() {
   try {
@@ -826,6 +1746,7 @@ async function loadPreferences() {
     toggleSidebar();
   }
   recalcColWidths();
+  applySidebarNavPrefs();
   // Apply auto-summary toggle
   const autoBtn = document.getElementById('auto-summary-btn');
   if (autoBtn) {
@@ -861,18 +1782,38 @@ async function loadPreferences() {
   if (state.sessionId) refreshSessionChatPromptBadge();
 }
 
+/**
+ * Persist one preference. Only the keys changed since the last flush are sent;
+ * the server merges them into what it has stored. This once sent the whole
+ * _prefs object, and every open page holds its own copy from whenever that page
+ * loaded, so an older tab undid any change made elsewhere the moment it saved
+ * anything: enabling the calendar in Settings and then resizing the sidebar on
+ * another page switched the calendar off again.
+ */
 function savePref(key, value) {
   _prefs[key] = value;
+  _prefsPending[key] = value;
   // Debounce writes so rapid changes don't flood the server
   clearTimeout(_prefsSaveTimer);
-  _prefsSaveTimer = setTimeout(() => {
-    fetch('/api/preferences', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(_prefs),
-    }).catch(() => {});
-  }, 400);
+  _prefsSaveTimer = setTimeout(_flushPrefs, 400);
 }
+
+function _flushPrefs(keepalive = false) {
+  clearTimeout(_prefsSaveTimer);
+  _prefsSaveTimer = null;
+  if (!Object.keys(_prefsPending).length) return;
+  const body = JSON.stringify(_prefsPending);
+  _prefsPending = {};
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: keepalive === true,
+  }).catch(() => {});
+}
+
+// A change made in the last 400 ms before the tab closes still lands.
+window.addEventListener('pagehide', () => _flushPrefs(true));
 
 /* ── Theme (light/dark + accent) ──────────────────────────────────────────── */
 const THEME_MODES   = ['system', 'light', 'dark'];
@@ -905,7 +1846,7 @@ function _effectiveThemeMode(mode) {
   return mode === 'light' ? 'light' : 'dark';
 }
 
-// Small color utils — all work in sRGB space, good enough for UI tinting.
+// Small color utils - all work in sRGB space, good enough for UI tinting.
 function _hexToRgb(hex) {
   hex = (hex || '').trim().replace(/^#/, '');
   if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
@@ -1114,24 +2055,142 @@ if (window.matchMedia) {
 }
 
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
-function toggleSidebar() {
-  state.sidebarOpen = !state.sidebarOpen;
+/** Open or collapse the sidebar, persist it, and re-flow what depends on it.
+ *  opts.width (px) becomes the remembered open width when given. */
+function setSidebarOpen(open, opts) {
   const sidebar = document.getElementById('sidebar');
-  const openBtn  = document.getElementById('sidebar-open-btn');
-  if (state.sidebarOpen) {
+  if (!sidebar) return;
+  const width = opts && opts.width;
+  state.sidebarOpen = !!open;
+  if (open) {
     sidebar.classList.remove('collapsed');
-    // Restore custom width (if set by resize) so it overrides the CSS default
-    if (_prefs.sidebar_width) sidebar.style.width = _prefs.sidebar_width + 'px';
-    openBtn.style.display = 'none';
+    const w = width || _prefs.sidebar_width;
+    if (w) sidebar.style.width = w + 'px';   // the remembered width beats the CSS default
   } else {
     sidebar.classList.add('collapsed');
-    // Clear inline width so CSS .collapsed { width: 0 } can take effect
-    sidebar.style.width = '';
-    openBtn.style.display = '';
+    sidebar.style.width = '';                // the 48 px rail rule takes over
   }
   savePref('sidebar_open', state.sidebarOpen);
-  _saveLayoutCache({ sidebar_open: state.sidebarOpen });
+  const cache = { sidebar_open: state.sidebarOpen };
+  if (open && width) {
+    _prefs.sidebar_width = width;
+    savePref('sidebar_width', width);
+    cache.sidebar_width = width;
+  }
+  _saveLayoutCache(cache);
   recalcColWidths();
+  _syncBrandExpandAffordance();
+  // The rail always shows the pages; the open sidebar honours the fold.
+  if (typeof _prefs !== 'undefined') applySidebarNavPrefs();
+}
+
+function toggleSidebar() { setSidebarOpen(!state.sidebarOpen); }
+
+/* ── Sidebar navigation: which pages show, and whether they fold into the brand
+ *    row. Both are preferences. Needs attention is off by default: the Home
+ *    dashboard already lists what needs speaker work, and the sidebar's height
+ *    is better spent on the recordings list. ───────────────────────────────── */
+const _NAV_KEYS = ['home', 'calendar', 'attention', 'speakers'];
+const _NAV_DEFAULT_ITEMS = { home: true, calendar: true, attention: false, speakers: true };
+
+function _navItems() {
+  const saved = (_prefs.sidebar_nav_items && typeof _prefs.sidebar_nav_items === 'object')
+    ? _prefs.sidebar_nav_items : {};
+  return Object.assign({}, _NAV_DEFAULT_ITEMS, saved);
+}
+
+function applySidebarNavPrefs() {
+  const sidebar = document.getElementById('sidebar');
+  const nav = sidebar && sidebar.querySelector('.sidebar-nav');
+  const brandNav = document.getElementById('brand-nav');
+  if (!sidebar || !nav || !brandNav) return;
+  const items = _navItems();
+  const compact = !!_prefs.sidebar_nav_compact;
+  // Folding is about the open sidebar only: the icon rail always shows the
+  // pages, so a collapsed sidebar keeps them in the nav column.
+  const collapsed = sidebar.classList.contains('collapsed');
+  const rows = [...sidebar.querySelectorAll('.nav-row[data-nav-key]')];
+  const host = (compact && !collapsed) ? brandNav : nav;
+  // The same anchors either way, moved rather than duplicated, so every id
+  // app.js binds (#attention-control, #attention-count) keeps working in both
+  // homes and the router keeps marking the current page.
+  _NAV_KEYS.forEach(key => {
+    const row = rows.find(r => r.dataset.navKey === key);
+    if (!row) return;
+    row.classList.toggle('nav-hidden', items[key] === false);
+    const label = row.querySelector('.nav-label');
+    if ((compact || collapsed) && label) row.title = label.textContent.trim();
+    else row.removeAttribute('title');
+    if (row.parentElement !== host) host.appendChild(row);
+  });
+  // The open sidebar lays the pages out as tiles, two across. An odd last
+  // page stretches across both columns, so four pages make a 2 x 2 block,
+  // three make a row plus a full-width row, and two make one row.
+  const shown = _NAV_KEYS
+    .map(key => rows.find(r => r.dataset.navKey === key))
+    .filter(row => row && items[row.dataset.navKey] !== false);
+  rows.forEach(row => row.classList.remove('nav-span'));
+  if (shown.length % 2 === 1) shown[shown.length - 1].classList.add('nav-span');
+  sidebar.classList.toggle('nav-compact', compact);
+  const handle = document.getElementById('nav-fold-handle');
+  if (handle) {
+    handle.title = compact ? 'Expand the navigation' : 'Fold the navigation into the header';
+    handle.setAttribute('aria-label', handle.title);
+    handle.setAttribute('aria-expanded', compact ? 'false' : 'true');
+    const g = handle.querySelector('.nav-fold-glyph');
+    if (g) g.className = 'nav-fold-glyph fa-solid ' + (compact ? 'fa-chevron-down' : 'fa-chevron-up');
+  }
+  // A narrow sidebar in compact mode keeps the icons and drops the wordmark.
+  const narrow = () => sidebar.classList.toggle('brand-narrow', sidebar.offsetWidth > 0 && sidebar.offsetWidth < 330);
+  if (!applySidebarNavPrefs._obs && typeof ResizeObserver !== 'undefined') {
+    applySidebarNavPrefs._obs = new ResizeObserver(narrow);
+    applySidebarNavPrefs._obs.observe(sidebar);
+  }
+  narrow();
+  _syncNavEditMenu();
+  _syncSettingsNavUI();
+}
+
+/** The page picker's ticks follow the preference. */
+function _syncNavEditMenu() {
+  const items = _navItems();
+  _NAV_KEYS.forEach(key => {
+    const el = document.getElementById('nav-edit-' + key);
+    if (el) el.setAttribute('aria-checked', items[key] !== false ? 'true' : 'false');
+  });
+}
+
+/** A page picker item: flip that page. The menu stays open for the next tick. */
+function toggleNavItem(key) {
+  const items = _navItems();
+  setNavItemVisible(key, items[key] === false);
+}
+
+function toggleNavCompact() { setNavCompact(!_prefs.sidebar_nav_compact); }
+
+function setNavCompact(on) {
+  // The picker's button goes away while folded, so the picker goes with it.
+  if (on && typeof closeMenu === 'function') closeMenu();
+  savePref('sidebar_nav_compact', !!on);
+  applySidebarNavPrefs();
+}
+
+function setNavItemVisible(key, on) {
+  if (!_NAV_KEYS.includes(key)) return;
+  const items = _navItems();
+  items[key] = !!on;
+  savePref('sidebar_nav_items', items);
+  applySidebarNavPrefs();
+}
+
+function _syncSettingsNavUI() {
+  const compact = document.getElementById('nav-compact-toggle');
+  if (compact) compact.checked = !!_prefs.sidebar_nav_compact;
+  const items = _navItems();
+  _NAV_KEYS.forEach(key => {
+    const cb = document.getElementById('nav-item-' + key);
+    if (cb) cb.checked = items[key] !== false;
+  });
 }
 
 // ── Sidebar state ─────────────────────────────────────────────────────────────
@@ -1155,6 +2214,12 @@ let _semanticSearchPending = false;       // true while a semantic request is in
 let _ftsSearchPending = false;            // true while FTS request is in flight
 let _pendingSearchHighlight = null;       // {segmentId, query} - scroll+highlight after session load
 
+// A speaker label that still needs a real identity: a diarizer placeholder
+// ("Speaker 3"), an import stand-in ("Other participant"), or an explicit
+// unknown.
+const _GENERIC_SPEAKER_RE =
+  /^(speaker\s*\d+|other participant(\s*\d+)?|unknown|unidentified|guest|participant\s*\d+)$/i;
+
 // ── Sidebar filter state ──────────────────────────────────────────────────────
 const _SIDEBAR_FILTER_DEFAULTS = Object.freeze({
   datePreset: 'any',          // any | today | yesterday | 7d | 30d | thisMonth | thisYear | custom
@@ -1169,6 +2234,8 @@ const _SIDEBAR_FILTER_DEFAULTS = Object.freeze({
   hasTranscript: 'any',       // any | yes | no
   status: 'any',              // any | done | inprog
   splitGroup: 'any',          // any | yes | no
+  speakersResolved: 'any',    // any | unresolved (has generic labels) | resolved (all named)
+  attention: 'any',           // any | needs
   spkCountMin: '',
   spkCountMax: '',
   sortBy: 'date_desc',        // date_desc | date_asc | title_asc | title_desc | duration_desc | duration_asc | speakers_desc
@@ -1191,19 +2258,29 @@ let _sidebarFilterOpenSections = (() => {
 // ResizeObserver that re-anchors the popover when the sidebar is resized
 let _sidebarFilterResizeObserver = null;
 
-async function refreshSidebar() {
-  const [sessions, folders] = await Promise.all([
-    fetch('/api/sessions').then(r => r.json()),
-    fetch('/api/folders').then(r => r.json()).catch(() => []),
-  ]);
-  _sidebarAllSessions = sessions;
-  _sidebarFolders = folders;
+/** The count beside the "Recordings" header, from the same slice as the list. */
+function _syncRecordingsCount() {
+  const el = document.getElementById('recordings-count');
+  if (!el) return;
+  const n = _sidebarAllSessions.length;
+  el.textContent = n ? String(n) : '';
+}
+
+/** The sessions and folders slices landed: re-read them and repaint. The two
+ *  aliases stay so search, filtering, drag and drop and multiselect are
+ *  untouched by the store. */
+function _onSidebarSlices() {
+  _sidebarAllSessions = AppData.get('sessions') || [];
+  _sidebarFolders = AppData.get('folders') || [];
   _renderSidebar();
-  // Bootstrap race: if a session was opened via URL before this fetch
-  // completed, expand its ancestors now that we know the folder tree.
+  // Bootstrap race: if a session was opened via URL before the list arrived,
+  // expand its ancestors now that we know the folder tree.
   if (typeof state !== 'undefined' && state.sessionId) {
     _revealSessionInSidebar(state.sessionId);
   }
+  // The workspace title comes from this slice, so it lands with it.
+  updateTopbarSessionTitle();
+  _syncCaptureStrip();
 }
 
 /* ── Sidebar search ───────────────────────────────────────────────────────── */
@@ -1346,6 +2423,8 @@ function _activeFilterCount(f) {
   if (f.hasTranscript !== 'any') n++;
   if (f.status !== 'any') n++;
   if (f.splitGroup !== 'any') n++;
+  if (f.speakersResolved !== 'any') n++;
+  if (f.attention !== 'any') n++;
   if (f.spkCountMin !== '' || f.spkCountMax !== '') n++;
   if (f.sortBy !== 'date_desc') n++;
   return n;
@@ -1432,6 +2511,20 @@ function _sessionDurationMatches(s, f) {
   return true;
 }
 
+function _sessionHasUnresolvedSpeakers(s) {
+  if (s.attention && typeof s.attention.unresolved === 'number') return s.attention.unresolved > 0;
+  return (s.speakers || []).some(
+    sp => _GENERIC_SPEAKER_RE.test(String(sp.name || '').trim())
+  );
+}
+
+function _sessionNeedsAttention(s) {
+  if (s.attention && typeof s.attention.needs === 'boolean') return s.attention.needs;
+  return (s.speakers || []).some(
+    sp => _GENERIC_SPEAKER_RE.test(String(sp.name || '').trim())
+  );
+}
+
 function _sessionMatchesFilter(s, f, knownFolderIds) {
   if (!_sessionDateMatchesPreset(s, f)) return false;
   if (!_sessionDurationMatches(s, f)) return false;
@@ -1462,6 +2555,19 @@ function _sessionMatchesFilter(s, f, knownFolderIds) {
 
   if (f.splitGroup === 'yes' && !s.split_group_id) return false;
   if (f.splitGroup === 'no'  &&  s.split_group_id) return false;
+  if (f.attention === 'needs' && !_sessionNeedsAttention(s)) return false;
+
+  if (f.speakersResolved && f.speakersResolved !== 'any') {
+    // Prefer the server definition, which includes material generic speakers
+    // and expected-count mismatches. Older payloads fall back to generic names.
+    // "resolved" also requires at least one speaker.
+    const spk = s.speakers || [];
+    // "Speaker IDs" keeps its original meaning (generic names only); the
+    // broader expected-count mismatch lives under the separate attention key.
+    const hasGeneric = _sessionHasUnresolvedSpeakers(s);
+    if (f.speakersResolved === 'unresolved' && !hasGeneric) return false;
+    if (f.speakersResolved === 'resolved' && (hasGeneric || spk.length === 0)) return false;
+  }
 
   if (f.spkCountMin !== '' || f.spkCountMax !== '') {
     const named = (s.speakers || []).filter(sp => sp.name && !/^Speaker \d+$/i.test(sp.name)).length;
@@ -1478,7 +2584,7 @@ function _applySidebarFilterToSessions(sessions) {
   if (_filterIsActive(f)) {
     out = sessions.filter(s => _sessionMatchesFilter(s, f, folderIds));
   }
-  // Sorting only applies a non-default order when explicitly chosen — the
+  // Sorting only applies a non-default order when explicitly chosen - the
   // normal-mode renderer handles its own folder/date grouping when sortBy is
   // 'date_desc', so we leave the array as-is in that case.
   if (f.sortBy && f.sortBy !== 'date_desc') {
@@ -1492,6 +2598,12 @@ function _applySidebarFilterToSessions(sessions) {
       duration_desc: (a, b) => dur(b) - dur(a),
       duration_asc:  (a, b) => dur(a) - dur(b),
       speakers_desc: (a, b) => spk(b) - spk(a),
+      unresolved_first: (a, b) => {
+        const gen = s => _sessionNeedsAttention(s) ? 0 : 1;
+        const ga = gen(a), gb = gen(b);
+        if (ga !== gb) return ga - gb;                 // needs-IDs sessions first
+        return (b.started_at || '').localeCompare(a.started_at || '');  // newest within group
+      },
     }[f.sortBy];
     if (cmp) out.sort(cmp);
   }
@@ -1503,7 +2615,7 @@ function _updateSidebarFilterBtnState() {
   if (!btn) return;
   btn.classList.toggle('active', _filterIsActive(_sidebarFilter));
   const n = _activeFilterCount(_sidebarFilter);
-  btn.title = n ? `${n} filter${n === 1 ? '' : 's'} applied — click to edit` : 'Filter sessions';
+  btn.title = n ? `${n} filter${n === 1 ? '' : 's'} applied · click to edit` : 'Filter sessions';
 }
 
 function _toggleSidebarFilter(ev) {
@@ -1609,7 +2721,9 @@ function _positionSidebarFilterPopover() {
 }
 
 function _onFilterChange() {
+  if (_sidebarFilter.attention === 'needs') _sidebarFilter.sortBy = 'unresolved_first';
   _updateSidebarFilterBtnState();
+  _syncAttentionControlState();
   _renderSidebarFilterPopover();    // refresh chip states + count
   _renderSidebar();                 // re-render session list with new filter
 }
@@ -1621,7 +2735,7 @@ function _resetSidebarFilter() {
 
 function _setSidebarFilterAsDefault() {
   _sidebarFilterDefault = { ..._sidebarFilter, folders: [...(_sidebarFilter.folders || [])], speakers: [...(_sidebarFilter.speakers || [])] };
-  // Persist via existing prefs API — `null` clears the default when no filters
+  // Persist via existing prefs API - `null` clears the default when no filters
   // are active.
   const payload = _filterIsActive(_sidebarFilterDefault) ? _sidebarFilterDefault : null;
   savePref('sidebar_filter_default', payload);
@@ -1644,7 +2758,9 @@ function _loadSidebarFilterDefault() {
                        folders: [...(_sidebarFilterDefault.folders || [])],
                        speakers: [...(_sidebarFilterDefault.speakers || [])] };
   }
+  if (_sidebarFilter.attention === 'needs') _sidebarFilter.sortBy = 'unresolved_first';
   _updateSidebarFilterBtnState();
+  _syncAttentionControlState();
 }
 
 function _renderSidebarFilterPopover() {
@@ -1679,7 +2795,7 @@ function _renderSidebarFilterPopover() {
     duration: f.durationPreset !== 'any',
     folders:  (f.folders || []).length > 0,
     speakers: (f.speakers || []).length > 0,
-    flags:    f.hasAudio !== 'any' || f.hasTranscript !== 'any' || f.status !== 'any' || f.splitGroup !== 'any',
+    flags:    f.hasAudio !== 'any' || f.hasTranscript !== 'any' || f.status !== 'any' || f.splitGroup !== 'any' || f.speakersResolved !== 'any' || f.attention !== 'any',
     spkCount: f.spkCountMin !== '' || f.spkCountMax !== '',
     sort:     f.sortBy !== 'date_desc',
   };
@@ -1688,7 +2804,7 @@ function _renderSidebarFilterPopover() {
   const tri = (key, val, opts) => `<div class="sf-tri" data-tri="${key}">` +
     opts.map(([v, label]) => `<button type="button" data-tri-val="${v}" class="${val === v ? 'active' : ''}">${label}</button>`).join('') + '</div>';
 
-  // Section header for collapsible sections — clicking the whole row toggles
+  // Section header for collapsible sections - clicking the whole row toggles
   // open/closed. Active filter dot is preserved.
   const collapsibleHeader = (id, iconHtml, title, count) => {
     const isOpen = _sidebarFilterOpenSections.has(id);
@@ -1722,6 +2838,7 @@ function _renderSidebarFilterPopover() {
           <option value="duration_desc"  ${f.sortBy === 'duration_desc' ? 'selected' : ''}>Longest first</option>
           <option value="duration_asc"   ${f.sortBy === 'duration_asc' ? 'selected' : ''}>Shortest first</option>
           <option value="speakers_desc"  ${f.sortBy === 'speakers_desc' ? 'selected' : ''}>Most speakers first</option>
+          <option value="unresolved_first" ${f.sortBy === 'unresolved_first' ? 'selected' : ''}>Needs speaker IDs first</option>
         </select>
       </div>
 
@@ -1752,9 +2869,9 @@ function _renderSidebarFilterPopover() {
         <div class="sf-chip-row">
           ${chip('Any',         f.durationPreset === 'any',    'dur:any')}
           ${chip('< 5 min',     f.durationPreset === 'lt5',    'dur:lt5')}
-          ${chip('5–15 min',    f.durationPreset === '5to15',  'dur:5to15')}
-          ${chip('15–30 min',   f.durationPreset === '15to30', 'dur:15to30')}
-          ${chip('30–60 min',   f.durationPreset === '30to60', 'dur:30to60')}
+          ${chip('5 to 15 min',    f.durationPreset === '5to15',  'dur:5to15')}
+          ${chip('15 to 30 min',   f.durationPreset === '15to30', 'dur:15to30')}
+          ${chip('30 to 60 min',   f.durationPreset === '30to60', 'dur:30to60')}
           ${chip('> 60 min',    f.durationPreset === 'gt60',   'dur:gt60')}
           ${chip('Custom…',     f.durationPreset === 'custom', 'dur:custom')}
         </div>
@@ -1762,7 +2879,7 @@ function _renderSidebarFilterPopover() {
         <div class="sf-range" style="margin-top:8px">
           <div class="sf-range-inputs">
             <input type="number" min="0" step="0.5" id="sf-dur-min" placeholder="min" value="${f.durMin}">
-            <span class="sf-range-sep">–</span>
+            <span class="sf-range-sep">to</span>
             <input type="number" min="0" step="0.5" id="sf-dur-max" placeholder="max" value="${f.durMax}">
             <span class="sf-range-suffix">min</span>
           </div>
@@ -1823,6 +2940,14 @@ function _renderSidebarFilterPopover() {
             <span class="sf-toggle-label"><i class="fa-solid fa-code-branch"></i> Split</span>
             ${tri('splitGroup', f.splitGroup, [['any','Any'],['yes','Yes'],['no','No']])}
           </div>
+          <div class="sf-toggle-row">
+            <span class="sf-toggle-label"><i class="fa-solid fa-user-tag"></i> Speaker IDs</span>
+            ${tri('speakersResolved', f.speakersResolved, [['any','Any'],['unresolved','Needs IDs'],['resolved','All named']])}
+          </div>
+          <div class="sf-toggle-row">
+            <span class="sf-toggle-label"><i class="fa-solid fa-circle-exclamation"></i> Attention</span>
+            ${tri('attention', f.attention, [['any','Any'],['needs','Needs']])}
+          </div>
         </div>
       </div>
 
@@ -1831,7 +2956,7 @@ function _renderSidebarFilterPopover() {
         <div class="sf-range">
           <div class="sf-range-inputs">
             <input type="number" min="0" step="1" id="sf-spk-min" placeholder="min" value="${f.spkCountMin}">
-            <span class="sf-range-sep">–</span>
+            <span class="sf-range-sep">to</span>
             <input type="number" min="0" step="1" id="sf-spk-max" placeholder="max" value="${f.spkCountMax}">
             <span class="sf-range-suffix">named</span>
           </div>
@@ -1875,8 +3000,12 @@ function _renderSidebarFilterPopover() {
     group.querySelectorAll('[data-tri-val]').forEach(b => {
       b.addEventListener('click', e => {
         e.stopPropagation();
-        _sidebarFilter[key] = b.getAttribute('data-tri-val');
-        _onFilterChange();
+        const value = b.getAttribute('data-tri-val');
+        if (key === 'attention') _setAttentionFilter(value === 'needs');
+        else {
+          _sidebarFilter[key] = value;
+          _onFilterChange();
+        }
       });
     });
   });
@@ -2145,6 +3274,7 @@ function _attachFolderDragHandlers(headerEl, folderEl, folder) {
 // ── Render sidebar ────────────────────────────────────────────────────────────
 
 function _renderSidebar() {
+  _syncRecordingsCount();
   // Apply the active filter set first so every code path below operates on the
   // filtered subset. While searching, the rendered set is the matched sessions
   // in relevance order, intersected with any active filter.
@@ -2564,7 +3694,7 @@ function _makeSessionEl(s) {
       return;
     }
     // Snap the active class onto this row immediately so the click feels
-    // responsive — loadSession is async (fetch + render), and waiting for
+    // responsive - loadSession is async (fetch + render), and waiting for
     // it to finish before flipping the highlight makes the click feel
     // dead. The next sidebar render reapplies it idempotently.
     document.querySelectorAll('.session-item.active').forEach(n => n.classList.remove('active'));
@@ -2699,8 +3829,8 @@ function _openSessionMenu(e, s, pos) {
   if (s.has_audio) {
     const rea = document.createElement('div');
     rea.className = 'session-menu-item';
-    rea.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i>  Reanalyze';
-    rea.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); reanalyzeSession(ev, s.id); });
+    rea.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i>  Reanalyze…';
+    rea.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); openReanalyzeDialog(s.id); });
     menu.appendChild(rea);
   }
 
@@ -2730,6 +3860,17 @@ function _openSessionMenu(e, s, pos) {
     retitleSessions([s.id], { label: 'title' });
   });
   menu.appendChild(wand);
+
+  // The id is what the agent API and the MCP tools take, so it is one click
+  // away here rather than something to dig out of the address bar.
+  const copyId = document.createElement('div');
+  copyId.className = 'session-menu-item';
+  copyId.innerHTML = '<i class="fa-solid fa-fingerprint"></i>  Copy ID';
+  copyId.addEventListener('click', ev => {
+    ev.stopPropagation(); _closeSessionMenu();
+    _copySessionId(s.id);
+  });
+  menu.appendChild(copyId);
 
   // Only surface "Undo Split" when this row is part of a split group whose
   // backup is still available. We ask the server on click (cheap) instead of
@@ -2778,6 +3919,19 @@ function _openSessionMenu(e, s, pos) {
 function _closeSessionMenu() {
   const m = document.getElementById('session-menu-popup');
   if (m) m.remove();
+}
+
+/** Put a recording's id on the clipboard and say so. */
+function _copySessionId(id) {
+  const text = String(id || '');
+  if (!text) return;
+  const done = () => uiToast({ message: 'Recording ID copied', kind: 'success', duration: 2500 });
+  const fail = () => uiToast({ message: `Could not copy. The ID is ${text}`, kind: 'warn', duration: 8000 });
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fail);
+  } else {
+    fail();
+  }
 }
 
 // ── Folder context menu ───────────────────────────────────────────────────────
@@ -2887,8 +4041,8 @@ function _revealSessionInSidebar(sessionId) {
 }
 
 async function createFolder() {
-  const name = prompt('Folder name:');
-  if (!name?.trim()) return;
+  const name = await uiPrompt({ title: 'New folder', message: 'Folder name:', validate: v => v.trim() ? null : 'Enter a folder name.' });
+  if (name === null) return;
   await fetch('/api/folders', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -2898,8 +4052,8 @@ async function createFolder() {
 }
 
 async function createSubfolder(parentId) {
-  const name = prompt('Subfolder name:');
-  if (!name?.trim()) return;
+  const name = await uiPrompt({ title: 'New subfolder', message: 'Subfolder name:', validate: v => v.trim() ? null : 'Enter a subfolder name.' });
+  if (name === null) return;
   // Expand the parent folder so the new subfolder is visible
   _sidebarCollapsed.delete(parentId);
   try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
@@ -2940,10 +4094,10 @@ async function deleteFolder(e, folderId) {
       + `This folder contains ${contentsDesc}.\n\n`
       + `• OK = permanently delete the folder and all its contents\n`
       + `• Cancel = keep everything`;
-    if (!confirm(msg)) return;
+    if (!await uiConfirm({ title: `Delete "${folderName}"?`, message: `This folder contains ${contentsDesc}.`, details: ['Permanently delete the folder and all its contents'], confirmLabel: 'Delete', danger: true })) return;
     deleteContents = true;
   } else {
-    if (!confirm(`Delete empty folder "${folderName}"?`)) return;
+    if (!await uiConfirm({ title: `Delete empty folder "${folderName}"?`, confirmLabel: 'Delete', danger: true })) return;
   }
 
   await fetch(`/api/folders/${folderId}`, {
@@ -3188,7 +4342,7 @@ function _dropIntoFolder(folderId) { _handleDropIntoFolder(folderId); }
 async function bulkDelete() {
   const ids = [..._sidebarSelected];
   if (!ids.length) return;
-  if (!confirm(`Delete ${ids.length} session${ids.length === 1 ? '' : 's'} and all their data?`)) return;
+  if (!await uiConfirm({ title: 'Delete sessions?', message: `Delete ${ids.length} session${ids.length === 1 ? '' : 's'} and all their data?`, confirmLabel: 'Delete', danger: true })) return;
   await fetch('/api/sessions/bulk', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3265,7 +4419,7 @@ async function retitleFolder(folderId, folderName) {
     ? `Regenerate AI titles for all sessions in "${fname}" (and any subfolders)?\n\n` +
       `At least ${directCount} session${directCount === 1 ? '' : 's'} in this folder will be re-named.`
     : `Regenerate AI titles for all sessions in "${fname}" and its subfolders?`;
-  if (!confirm(msg)) return;
+  if (!await uiConfirm({ title: 'Regenerate AI titles?', message: msg, confirmLabel: 'Regenerate' })) return;
   // For folder mode the server resolves the IDs (recursive walk); we still
   // pass folderId through to retitleSessions so it bypasses the in-flight
   // visual cache (we don't have the IDs upfront).
@@ -3328,7 +4482,7 @@ function formatSessionMeta(s) {
   const time = `${datePart}, ${timePart}`;
   // Only call a session "In progress" when it actually is the active
   // recording. Stale ended_at=NULL rows from app crashes / aborted splits
-  // would otherwise mislead the sidebar — fall through and compute the
+  // would otherwise mislead the sidebar - fall through and compute the
   // duration from last_segment_time instead.
   const isActiveRecording = state.sessionId === s.id && state.isRecording;
   if (!s.ended_at && isActiveRecording) {
@@ -3342,7 +4496,7 @@ function formatSessionMeta(s) {
       const end = new Date(s.ended_at + 'Z');
       secs = (end - start) / 1000;
     } else {
-      // No ended_at and no segments — show just the date/time.
+      // No ended_at and no segments - show just the date/time.
       return time;
     }
   }
@@ -3359,24 +4513,33 @@ async function deleteSession(e, sessionId) {
   refreshSidebar();
 }
 
-async function reanalyzeSession(e, sessionId) {
-  if (e) e.stopPropagation();
-  if (state.isRecording) { alert('Cannot reanalyze while recording.'); return; }
-  if (state.isReanalyzing) { alert('Reanalysis already in progress.'); return; }
-
-  // Load the session as active so incoming transcript SSE events land on screen
+/**
+ * Make a session the active one before a reanalysis starts on it.
+ *
+ * Every reanalysis_* and transcript_reset handler ignores events whose
+ * session_id is not state.sessionId, so a reanalysis launched from the sidebar
+ * for some other meeting would leave state.isReanalyzing false and the record
+ * button live: the app could then start a recording into a session the batch
+ * pipeline is already writing. Returns false when the session cannot be loaded.
+ */
+async function _adoptSessionForReanalysis(sessionId) {
   if (sessionId !== state.sessionId) {
-    const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json());
-    if (data.error) { alert(data.error); return; }
-    state.sessionId     = sessionId;
+    const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json()).catch(() => ({ error: 'Could not load that meeting.' }));
+    if (!data || data.error) {
+      uiToast({ message: (data && data.error) || 'Could not load that meeting.', kind: 'error' });
+      return false;
+    }
+    state.sessionId = sessionId;
     state.isViewingPast = false;
-    document.getElementById('record-btn').disabled = true;
+    const btn = document.getElementById('record-btn');
+    if (btn) btn.disabled = true;
     if (data.speaker_profiles?.length) {
       data.speaker_profiles.forEach(p => applySpeakerProfileUpdate(p));
     }
   } else {
     state.isViewingPast = false;
-    document.getElementById('record-btn').disabled = true;
+    const btn = document.getElementById('record-btn');
+    if (btn) btn.disabled = true;
   }
 
   // Clear only the transcript display - keep chat and summary intact
@@ -3385,16 +4548,377 @@ async function reanalyzeSession(e, sessionId) {
 
   // Keep playback available during reanalysis - the WAV file still exists
   initPlayback(sessionId);
+  return true;
+}
+
+async function reanalyzeSession(e, sessionId, opts) {
+  if (e) e.stopPropagation();
+  if (state.isRecording) { uiToast({ message: 'Cannot reanalyze while recording.', kind: 'warn' }); return; }
+  if (state.isReanalyzing) { uiToast({ message: 'Reanalysis already in progress.', kind: 'warn' }); return; }
+  opts = opts || {};
+
+  if (!await _adoptSessionForReanalysis(sessionId)) return;
 
   const customPrompt = document.getElementById('summary-custom-prompt')?.value || '';
+  const reqBody = { custom_prompt: customPrompt };
+  // Per-meeting speaker-count dial (from the Reanalyze dialog). Omitted = auto.
+  // "exactly N" forces the count; "up to N" (the default whenever the number
+  // came from the calendar) only caps it, which is what the dialog says.
+  if (opts.numSpeakers) {
+    if (opts.mode === 'exact') reqBody.num_speakers = opts.numSpeakers;
+    else reqBody.max_speakers = opts.numSpeakers;
+  }
   const resp = await fetch(`/api/sessions/${sessionId}/reanalyze`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ custom_prompt: customPrompt }),
+    body: JSON.stringify(reqBody),
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
-    alert(err.error || 'Failed to start reanalysis');
+    uiToast({ message: err.error || 'Failed to start reanalysis', kind: 'error' });
+  }
+}
+
+// Small per-meeting Reanalyze dialog with a speaker-count "dial". Opening this
+// (rather than reanalyzing straight away) lets the user tell the diarizer how
+// many people were in the room, which fixes the common under/over-split problem.
+function openReanalyzeDialog(sessionId) {
+  if (state.isRecording) { uiToast({ message: 'Cannot reanalyze while recording.', kind: 'warn' }); return; }
+  if (state.isReanalyzing) { uiToast({ message: 'Reanalysis already in progress.', kind: 'warn' }); return; }
+  if (!sessionId) return;
+  document.getElementById('reanalyze-dialog')?.remove();
+
+  const ov = document.createElement('div');
+  ov.id = 'reanalyze-dialog';
+  ov.className = 'overlay';
+  ov.innerHTML = `
+    <div class="dialog reanalyze-dialog" role="dialog" aria-modal="true" aria-label="Reanalyze meeting">
+      <h2 class="reanalyze-title">Reanalyze meeting</h2>
+      <p class="reanalyze-sub">Re-transcribes and re-detects speakers from the original audio. If the last pass split speakers wrong, tell it how many people were in the meeting.</p>
+      <p class="reanalyze-hint" id="reanalyze-calendar" style="display:none"></p>
+      <div class="reanalyze-field" id="reanalyze-match-field" style="display:none">
+        <label for="reanalyze-match">Calendar meeting</label>
+        <select id="reanalyze-match"></select>
+        <button type="button" class="reanalyze-btn" id="reanalyze-confirm-match" style="display:none">Confirm</button>
+        <span class="reanalyze-hint" id="reanalyze-match-hint">Wrong meeting? Pick the right one, or say it was not a calendar meeting. Confirming pins it and remembers the attendee count.</span>
+      </div>
+      <div class="reanalyze-field">
+        <label for="reanalyze-speakers">How many people were in this meeting?</label>
+        <select id="reanalyze-mode">
+          <option value="max">Up to</option>
+          <option value="exact">Exactly</option>
+        </select>
+        <select id="reanalyze-speakers"></select>
+        <span class="reanalyze-hint" id="reanalyze-hint">Auto lets the detector decide. Pick a number if it split speakers wrong last time.</span>
+      </div>
+      <div class="reanalyze-actions">
+        <button type="button" class="reanalyze-btn" id="reanalyze-cancel">Cancel</button>
+        <button type="button" class="reanalyze-btn" id="reanalyze-smart" style="display:none"><i class="fa-solid fa-wand-magic-sparkles"></i> Smart cleanup</button>
+        <button type="button" class="reanalyze-btn reanalyze-btn-primary" id="reanalyze-go"><i class="fa-solid fa-arrows-rotate"></i> Reanalyze</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+
+  const sel = ov.querySelector('#reanalyze-speakers');
+  const auto = document.createElement('option');
+  auto.value = ''; auto.textContent = 'Auto (let it decide)';
+  sel.appendChild(auto);
+  for (let n = 1; n <= 12; n++) {
+    const o = document.createElement('option');
+    o.value = String(n);
+    o.textContent = `${n} speaker${n > 1 ? 's' : ''}`;
+    sel.appendChild(o);
+  }
+
+  // Track whether the user has deliberately touched the dropdown, so a late
+  // attendee-count pre-fill never overrides their choice, including an explicit
+  // re-selection of "Auto" (which leaves sel.value === '', indistinguishable
+  // from untouched without this flag).
+  let userTouched = false;
+  const modeSel = ov.querySelector('#reanalyze-mode');
+  sel.addEventListener('change', () => { userTouched = true; });
+  modeSel.addEventListener('change', () => { userTouched = true; });
+
+  const close = () => { ov.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = e => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+  ov.querySelector('#reanalyze-cancel').addEventListener('click', close);
+  ov.querySelector('#reanalyze-go').addEventListener('click', () => {
+    const n = parseInt(sel.value, 10);
+    const mode = modeSel.value === 'exact' ? 'exact' : 'max';
+    close();
+    reanalyzeSession(null, sessionId, {
+      numSpeakers: Number.isFinite(n) ? n : null,
+      mode,
+    });
+  });
+  sel.focus();
+
+  ov.querySelector('#reanalyze-smart').addEventListener('click', () => {
+    close();
+    runSmartCleanup(sessionId);
+  });
+
+  // Show the calendar match, let the user correct it, and pre-fill the count.
+  // The calendar match is authoritative; the resolve-step candidates file is
+  // the fallback for meetings matched before the calendar link existed.
+  // Best-effort and non-blocking: skip silently when there is no data, and
+  // never override the dialog once it is gone or the user has touched the dial.
+  const matchField = ov.querySelector('#reanalyze-match-field');
+  const matchSel   = ov.querySelector('#reanalyze-match');
+  const calLine    = ov.querySelector('#reanalyze-calendar');
+  const hintEl     = ov.querySelector('#reanalyze-hint');
+
+  const confirmBtn = ov.querySelector('#reanalyze-confirm-match');
+
+  function _matchLabel(entry) {
+    const title = entry.title || 'Untitled meeting';
+    const when = entry.start ? _fmtCalendarTime(entry.start) : '';
+    const count = Number(entry.attendee_count);
+    const people = Number.isFinite(count) && count >= 1
+      ? `, ${count} attendee${count > 1 ? 's' : ''}`
+      : '';
+    return when ? `${title} (${when}${people})` : title;
+  }
+
+  // True while the dial holds a number the calendar supplied.
+  let _calendarPrefilled = false;
+
+  // The mode control is meaningless while the dial reads Auto.
+  function _syncModeControl() {
+    modeSel.disabled = !sel.value;
+    modeSel.style.opacity = sel.value ? '' : '0.5';
+  }
+  sel.addEventListener('change', () => {
+    // A hand-picked number is an exact count, the way the dial always behaved.
+    // Only a calendar-supplied number defaults to a ceiling.
+    if (sel.value && !_calendarPrefilled) modeSel.value = 'exact';
+    _syncModeControl();
+  });
+  _syncModeControl();
+
+  async function loadMatch() {
+    let match = null;
+    let alternatives = [];
+    let cleared = false;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/calendar_match`);
+      if (r.ok) {
+        const data = await r.json();
+        match = (data && data.match) || null;
+        alternatives = (data && data.alternatives) || [];
+        cleared = !!(data && data.cleared);
+      }
+    } catch (_) {}
+    if (!ov.isConnected) return;
+
+    let count = null;
+    if (match) {
+      const n = Number(match.attendee_count);
+      if (Number.isFinite(n) && n >= 1) count = n;
+      const title = match.title || 'Untitled meeting';
+      let line = count
+        ? `Calendar: ${title}, ${count} attendee${count > 1 ? 's' : ''}.`
+        : `Calendar: ${title}, attendees not shared by the calendar.`;
+      if (match.confirmed) line += ' Confirmed by you.';
+      else if (match.reason) line += ` Matched by time (${match.reason}).`;
+      calLine.textContent = line;
+      ov.querySelector('#reanalyze-smart').style.display = '';
+    } else {
+      calLine.textContent = cleared
+        ? 'Marked as not a calendar meeting.'
+        : 'No calendar meeting matched this recording.';
+      ov.querySelector('#reanalyze-smart').style.display = 'none';
+    }
+    calLine.style.display = '';
+    if (confirmBtn) {
+      confirmBtn.style.display = (match && !match.confirmed) ? '' : 'none';
+    }
+
+    // The picker only appears when there is something to pick between.
+    matchSel.innerHTML = '';
+    if (match || alternatives.length || cleared) {
+      if (match) {
+        const opt = document.createElement('option');
+        opt.value = 'current';
+        opt.textContent = _matchLabel(match);
+        matchSel.appendChild(opt);
+      }
+      alternatives.forEach((alt, i) => {
+        const opt = document.createElement('option');
+        opt.value = `alt:${i}`;
+        opt.textContent = _matchLabel(alt);
+        matchSel.appendChild(opt);
+      });
+      const none = document.createElement('option');
+      none.value = 'none';
+      none.textContent = 'Not a calendar meeting';
+      matchSel.appendChild(none);
+      matchSel.value = match ? 'current' : 'none';
+      matchField.style.display = '';
+      matchSel.dataset.alts = JSON.stringify(alternatives);
+      matchSel.dataset.current = JSON.stringify(match || null);
+    } else {
+      matchField.style.display = 'none';
+    }
+
+    if (count === null) {
+      try {
+        const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/resolution_candidates`);
+        if (r.ok) {
+          const data = await r.json();
+          const n = data && data.meeting && Number(data.meeting.attendee_count);
+          if (Number.isFinite(n) && n >= 1) count = n;
+        }
+      } catch (_) {}
+    }
+    if (!ov.isConnected || userTouched) return;
+    if (count !== null && count <= 12) {
+      _calendarPrefilled = true;
+      sel.value = String(count);
+      modeSel.value = 'max';
+      hintEl.textContent = `The calendar shows ${count} attendee${count > 1 ? 's' : ''}. "Up to ${count}" lets the detector find fewer; switch to "Exactly" only if you are sure.`;
+    } else {
+      _calendarPrefilled = false;
+      sel.value = '';
+      hintEl.textContent = 'Auto lets the detector decide. Pick a number if it split speakers wrong last time.';
+    }
+    _syncModeControl();
+  }
+
+  async function putMatch(body) {
+    matchSel.disabled = true;
+    if (confirmBtn) confirmBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/calendar_match`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        uiToast({ message: data.error || 'Could not change the calendar match.', kind: 'error' });
+      }
+    } catch (_) {
+      uiToast({ message: 'Could not change the calendar match.', kind: 'error' });
+    } finally {
+      matchSel.disabled = false;
+      if (confirmBtn) confirmBtn.disabled = false;
+    }
+    // The stored count may have changed, so re-read rather than guess. A dial
+    // value the user set by hand is theirs and stays (userTouched is not reset).
+    await loadMatch();
+  }
+
+  matchSel.addEventListener('change', () => {
+    const choice = matchSel.value;
+    let body = null;
+    if (choice === 'none') {
+      body = { clear: true };
+    } else if (choice.startsWith('alt:')) {
+      const alts = JSON.parse(matchSel.dataset.alts || '[]');
+      const alt = alts[parseInt(choice.slice(4), 10)];
+      if (alt) body = { uid: alt.uid, recurrence_id: alt.recurrence_id || null };
+    } else {
+      const current = JSON.parse(matchSel.dataset.current || 'null');
+      if (current) body = { uid: current.uid, recurrence_id: current.recurrence_id || null };
+    }
+    if (body) putMatch(body);
+  });
+
+  // A correct machine match is pre-selected, so the picker never fires a change
+  // event for it. Without this button the common case can never be confirmed,
+  // and the attendee count for a recurring title is never remembered.
+  if (confirmBtn) {
+    confirmBtn.addEventListener('click', () => {
+      const current = JSON.parse(matchSel.dataset.current || 'null');
+      if (!current) return;
+      putMatch({ uid: current.uid, recurrence_id: current.recurrence_id || null });
+    });
+  }
+
+  loadMatch();
+}
+
+/**
+ * Calendar-guided cleanup: show the plan the server computed, then run it only
+ * if the user says so. The server never renames a speaker from the attendee
+ * list; names appear only where the Voice Library recognises the voice during
+ * the reanalysis the plan starts.
+ */
+async function runSmartCleanup(sessionId) {
+  if (!sessionId) return;
+  let result;
+  try {
+    result = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/smart_cleanup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apply: false }),
+    }).then(r => r.json());
+  } catch (_) {
+    uiToast({ message: 'Could not build a cleanup plan.', kind: 'error' });
+    return;
+  }
+  const plan = result && result.plan;
+  if (!plan || result.error) {
+    uiToast({ message: (result && result.error) || 'No cleanup plan available.', kind: 'error' });
+    return;
+  }
+
+  const details = [];
+  if (plan.expected != null) details.push(`Calendar expects ${plan.expected} in the room`);
+  details.push(`Found ${plan.found} speaker${plan.found === 1 ? '' : 's'} with real talk time`);
+  if (plan.unresolved) details.push(`${plan.unresolved} still unnamed`);
+  if (plan.candidates && plan.candidates.length) {
+    details.push(`Resolve candidates: ${plan.candidates.map(c => c.name).join(', ')}`);
+  }
+  details.push('Names are applied only where the Voice Library recognises the voice.');
+
+  if (plan.action !== 'reanalyze') {
+    await uiAlert({
+      title: 'Smart cleanup',
+      message: plan.detail || 'Nothing to clean up.',
+      details,
+    });
+    return;
+  }
+
+  const ok = await uiConfirm({
+    title: 'Run smart cleanup?',
+    message: `${plan.detail} This clears the current transcript and speaker labels for this meeting.`,
+    details,
+    confirmLabel: 'Run cleanup',
+    danger: true,
+  });
+  if (!ok) return;
+
+  // Adopt the session first: the reanalysis SSE handlers only act on the
+  // active meeting, and until they do the record button stays live.
+  if (!await _adoptSessionForReanalysis(sessionId)) return;
+
+  try {
+    const applied = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/smart_cleanup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apply: true }),
+    }).then(r => r.json());
+    if (applied.error) {
+      uiToast({ message: applied.error, kind: 'error' });
+      return;
+    }
+    if (!applied.applied) {
+      uiToast({ message: applied.reason || 'Nothing to clean up.', kind: 'info' });
+      return;
+    }
+    uiToast({
+      message: applied.max_speakers
+        ? `Cleanup started, capped at ${applied.max_speakers} speakers.`
+        : 'Cleanup started.',
+      kind: 'success',
+    });
+  } catch (_) {
+    uiToast({ message: 'Could not start the cleanup.', kind: 'error' });
   }
 }
 
@@ -3403,18 +4927,22 @@ async function reanalyzeCurrentSession() {
   await reanalyzeSession(null, state.sessionId);
 }
 
-function newSession() {
+async function newSession() {
   if (state.isRecording) return;
+  if (_cleanupState && _cleanupState.dirty) {
+    if (!await uiConfirm({ title: 'Discard staged cleanup changes?', message: 'You have unsaved speaker cleanup changes in this meeting. Switching meetings discards them.', confirmLabel: 'Discard and switch', danger: true })) return;
+    _cleanupState.dirty = false;
+  }
   state.sessionId    = null;
   state.isViewingPast = false;
   clearAll();
   _updateActiveFolderHighlights();
-  history.pushState({}, '', '/session');
+  Views.show('session', { url: '/session' });
   // Re-seed the Custom Instructions / per-session system prompt the same way
   // a fresh page load would (localStorage > default-instructions pref > "").
   loadSummaryPrompt();
   updateRecordBtn();
-  refreshSidebar();
+  _renderSidebar();
   _syncUploadBtn();
 }
 
@@ -3444,9 +4972,9 @@ async function handleAudioUpload(input) {
   try {
     const resp = await fetch('/api/sessions/upload', { method: 'POST', body: form });
     const data = await resp.json();
-    if (!resp.ok) { alert(data.error || 'Upload failed'); return; }
+    if (!resp.ok) { uiToast({ message: data.error || 'Upload failed', kind: 'error' }); return; }
 
-    // The backend created a session and started reanalysis – load it
+    // The backend created a session and started reanalysis - load it
     const sessionId = data.session_id;
     state.sessionId     = sessionId;
     state.isViewingPast = false;
@@ -3465,7 +4993,7 @@ async function handleAudioUpload(input) {
     refreshSidebar();
     _syncUploadBtn();
   } catch (e) {
-    alert('Upload failed: ' + e.message);
+    uiToast({ message: 'Upload failed: ' + e.message, kind: 'error' });
   } finally {
     if (btn) { btn.disabled = false; btn.style.opacity = ''; }
   }
@@ -3538,6 +5066,10 @@ function connectSSE(afterSegId = 0) {
   _sseSource = src;
 
   src.addEventListener('status', e => onStatus(JSON.parse(e.data)));
+
+  // Loud, persistent banner when the desktop/call audio is not being captured
+  // (dead loopback). This must never pass unnoticed again (2026-09-01).
+  src.addEventListener('capture_alert', e => { try { _showCaptureAlert(JSON.parse(e.data)); } catch (_) {} });
 
   src.addEventListener('transcript', e => {
     const d = JSON.parse(e.data);
@@ -3767,7 +5299,7 @@ function connectSSE(afterSegId = 0) {
       _renderToolWidget(wrap, state.chatToolCalls);
       _setAssistantProcessing(wrap, true, 'Using ' + _toolDisplayName(d.name) + '…');
     } else if (d.type === 'tool_result') {
-      // Match the result to its call by id — required when tools execute in
+      // Match the result to its call by id - required when tools execute in
       // parallel and results return out of order. Fall back to the first
       // still-pending call if no id is present (backward compat).
       let target = null;
@@ -3777,8 +5309,13 @@ function connectSSE(afterSegId = 0) {
       if (!target) {
         target = state.chatToolCalls.find(tc => !tc.result);
       }
-      if (target) target.result = { success: d.success, summary: d.summary, image: d.image || null };
+      if (target) target.result = {
+        success: d.success, summary: d.summary, image: d.image || null,
+        // Carries the speaker-relabel plan so the widget can offer Confirm/Cancel.
+        relabel: d.relabel_plan || null,
+      };
       _renderToolWidget(wrap, state.chatToolCalls);
+      _syncRelabelCardFromTool(d);
     }
     scrollChatToBottom();
   });
@@ -3841,9 +5378,9 @@ function connectSSE(afterSegId = 0) {
     vizHasMic    = !!d.has_mic;
     if (d.lb_spectrum)  vizLbSpec  = d.lb_spectrum;
     if (d.mic_spectrum) vizMicSpec = d.mic_spectrum;
-    // Fresh levels arrived — wake the (possibly parked) visualizer loops.
+    // Fresh levels arrived - wake the (possibly parked) visualizer loops.
     _startVizLoop();
-    if (!_isHomePage) _startBrandVizLoop();
+    _startBrandVizLoop();
     // Sync gain sliders if server reports different values (e.g. after reconnect)
     if (d.lb_gain  != null) _syncGainSlider('lb',  d.lb_gain);
     if (d.mic_gain != null) _syncGainSlider('mic', d.mic_gain);
@@ -3868,13 +5405,17 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('session_title', e => {
     const d = JSON.parse(e.data);
-    // Update in-memory cache so re-render is instant, then refresh once
-    const entry = _sidebarAllSessions.find(s => s.id === d.session_id);
-    if (entry) { entry.title = d.title; }
     // Worker finished for this session → drop its in-flight badge
     _retitleInFlight.delete(d.session_id);
-    if (entry) _renderSidebar();
-    else refreshSidebar();
+    // The event carries the new title, so patch the slice rather than refetch.
+    let known = false;
+    AppData.patch('sessions', list => {
+      const entry = (list || []).find(s => s.id === d.session_id);
+      if (entry) { entry.title = d.title; known = true; }
+      return list;
+    });
+    if (!known) AppData.invalidate(['sessions'], 'session_title');
+    AppData.invalidate(['analytics'], 'session_title');
     if (d.session_id === state.sessionId) updateTopbarSessionTitle();
   });
 
@@ -3886,12 +5427,13 @@ function connectSSE(afterSegId = 0) {
     _renderSidebar();
   });
   src.addEventListener('retitle_done', e => {
-    // Defensive sweep — clear anything still flagged so a stuck row can't
+    // Defensive sweep - clear anything still flagged so a stuck row can't
     // spin forever if a worker crashed before emitting session_title.
     if (_retitleInFlight.size) {
       _retitleInFlight.clear();
       _renderSidebar();
     }
+    AppData.invalidate(['analytics'], 'retitle_done');
   });
 
   src.addEventListener('speaker_label', e => {
@@ -3907,6 +5449,53 @@ function connectSSE(afterSegId = 0) {
         _renderSidebar();
       }
     }
+    AppData.invalidate(['sessions', 'attention', 'analytics'], 'speaker_label');
+  });
+
+  src.addEventListener('attention_changed', () => {
+    AppData.invalidate(['sessions', 'attention', 'analytics'], 'attention_changed');
+  });
+
+  // A calendar refresh rewrites matches and expected counts across the whole
+  // library, so the sidebar badges and the attention count both go stale.
+  src.addEventListener('calendar_refresh_done', e => {
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) {}
+    if (d.matched || d.cleared || d.updated) {
+      AppData.invalidate(['calendarStatus', 'calendarEvents', 'sessions', 'attention'],
+                         'calendar_refresh_done');
+    } else {
+      AppData.invalidate(['calendarStatus'], 'calendar_refresh_done');
+    }
+    const panel = document.getElementById('section-calendar');
+    if (panel && panel.classList.contains('active')) loadCalendarStatus();
+  });
+
+  src.addEventListener('calendar_match_changed', () => {
+    // A confirmation or a clear moves the expected count, which is what the
+    // attention badge and the sidebar warning triangles are computed from.
+    AppData.invalidate(['calendarStatus', 'calendarEvents', 'sessions', 'attention'],
+                       'calendar_match_changed');
+  });
+
+  src.addEventListener('smart_cleanup_done', e => {
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) {}
+    AppData.invalidate(['sessions', 'attention', 'analytics'], 'smart_cleanup_done');
+    if (d.ok === false) {
+      uiToast({ message: d.error || 'Smart cleanup failed.', kind: 'error' });
+      return;
+    }
+    const found = d.attention && d.attention.found;
+    const unresolved = d.attention && d.attention.unresolved;
+    let message = 'Smart cleanup finished.';
+    if (typeof found === 'number') {
+      message = `Smart cleanup finished: ${found} speaker${found === 1 ? '' : 's'}`;
+      message += unresolved
+        ? `, ${unresolved} still unnamed.`
+        : ', all named.';
+    }
+    uiToast({ message, kind: unresolved ? 'warn' : 'success' });
   });
 
   src.addEventListener('fingerprint_match', e => {
@@ -3930,10 +5519,13 @@ function connectSSE(afterSegId = 0) {
       // Remove from notification queue if it was pending
       _fpRemoveFromQueue(d.speaker_key);
     }
+    _fpLoaded = false;  // the voice library changed; the Speakers view must refetch on its next visit
+    AppData.invalidate(['sessions', 'attention', 'analytics'], 'fingerprint_auto_applied');
   });
 
   src.addEventListener('speaker_linked', e => {
     const d = JSON.parse(e.data);
+    _fpLoaded = false;  // linking can seed a new profile; the Speakers view must refetch
     if (d.session_id === state.sessionId) {
       _sessionLinks[d.speaker_key] = { global_id: d.global_id, name: d.name };
       _updateLinkedBadges();
@@ -3941,6 +5533,7 @@ function connectSSE(afterSegId = 0) {
       _fpRemoveFromQueue(d.speaker_key);
       _fpUpdateInlineIcons();
     }
+    AppData.invalidate(['sessions', 'attention', 'analytics'], 'speaker_linked');
   });
 
   src.addEventListener('transcript_reset', e => {
@@ -3983,7 +5576,7 @@ function connectSSE(afterSegId = 0) {
     if (!_playbackActive && state.sessionId) initPlayback(state.sessionId);
     _syncRecordBtnDisabled();
     _syncUploadBtn();
-    refreshSidebar();
+    AppData.invalidate(['sessions'], 'reanalysis_start');
   });
 
   src.addEventListener('reanalysis_progress', e => {
@@ -4011,7 +5604,7 @@ function connectSSE(afterSegId = 0) {
     }).catch(() => {});
     _syncRecordBtnDisabled();
     _syncUploadBtn();
-    refreshSidebar();
+    AppData.invalidate(['sessions', 'attention', 'analytics'], 'reanalysis_done');
   });
 
   src.addEventListener('reanalysis_error', e => {
@@ -4023,10 +5616,19 @@ function connectSSE(afterSegId = 0) {
     const text = document.getElementById('status-text');
     dot.className    = 'status-dot ready';
     text.textContent = state.modelInfo || 'Ready';
-    alert('Reanalysis failed: ' + (d.error || 'unknown error'));
+    uiToast({ message: 'Reanalysis failed: ' + (d.error || 'unknown error'), kind: 'error' });
     _syncRecordBtnDisabled();
     _syncUploadBtn();
-    refreshSidebar();
+    AppData.invalidate(['sessions'], 'reanalysis_error');
+  });
+
+  _bindRecordingCommand(src);
+
+  src.addEventListener('open', () => {
+    // Reconnect handshake: reconcile status and the shared reads, so a blip
+    // can never leave the shell rendering a world that has moved on.
+    if (_sseEverConnected) _reconcileAfterGap('sse_reconnect');
+    _sseEverConnected = true;
   });
 
   src.onerror = () => {
@@ -4039,15 +5641,312 @@ function connectSSE(afterSegId = 0) {
   };
 }
 
+/* ── Start commands from the server ────────────────────────────────────────── */
+// Nonce of the last start command this page acted on. A reconnect replays a
+// still-pending command over the SSE handshake, so without this a blip could
+// start a second recording.
+let _lastRecordingCommandNonce = null;
+// Set when this page acked a command and LOST the election. The ?autostart
+// handler checks it before starting, so a page opened by the fallback window
+// cannot start a second capture alongside the window that won.
+let _recordingCommandLost = false;
+// Read at parse time, before the ?autostart handler strips the query string. A
+// page loaded with ?autostart starts the recording itself, so on that page this
+// listener only acks and stays out of the way (no double start).
+const _pageLoadedWithAutostart =
+  new URLSearchParams(window.location.search).has('autostart');
+// Identifies this window in the server log ("Start command acked by ..."), so
+// which window took a command is visible after the fact.
+const _windowClientId = 'w-' + Math.random().toString(36).slice(2, 8);
+
+/** Act on a "start recording" command pushed by the server.
+ *
+ *  This is what keeps an auto-detected meeting in the window that is ALREADY
+ *  open: the server offers the command here first and only opens a window if
+ *  nothing acks it. The start still goes through toggleRecording(), the same
+ *  path a click takes. See core/recording_request.py. */
+function _bindRecordingCommand(src) {
+  src.addEventListener('recording_command', e => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    if (!d || d.action !== 'start' || !d.nonce) return;
+    if (d.nonce === _lastRecordingCommandNonce) return;
+    _lastRecordingCommandNonce = d.nonce;
+    if (state.isRecording) return;
+    // Ack first, start second. The ack stops the server escalating to a new
+    // window, and it elects a single starter: every open window gets the
+    // command, but only the first ack of a nonce is accepted. An explicit
+    // {ok:false} means another window has it, so this one stands down. Any
+    // other outcome (network error, unparseable body) starts anyway: a
+    // duplicate start is rejected by the server, a missed one loses a meeting.
+    fetch('/api/recording/ack_command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce: d.nonce, client_id: _windowClientId }),
+    }).then(r => r.json()).then(res => !(res && res.ok === false)).catch(() => true)
+      .then(won => {
+        if (!won) {
+          // Another window took it. Remember that: on a page loaded with
+          // ?autostart this is what stops its own handler from starting a
+          // second capture next to the window that won.
+          _recordingCommandLost = true;
+          return;
+        }
+        if (_pageLoadedWithAutostart) return;  // the ?autostart handler starts it
+        if (state.isRecording) return;
+        // startNewRecording() blanks a workspace showing a past meeting before
+        // it starts, so the server can never be asked to append the new
+        // meeting's audio to an old session. No page load either way.
+        _waitForRecordReady().then(() => {
+          if (!state.isRecording) startNewRecording();
+        });
+      });
+  });
+}
+
 /* ── Branding ────────────────────────────────────────────────────────────── */
+// Bumped whenever an icon slot changes so the tab and sidebar refetch it.
+let _iconVersion = '';
+
 function _updateBrandIcons(recording) {
-  const src = recording
-    ? '/static/images/logo_recording.png'
-    : '/static/images/logo.png';
-  const icon = document.getElementById('brand-icon');
-  if (icon) icon.src = src;
+  // The tab and the sidebar logo follow the "app_idle" / "app_recording"
+  // slots (Settings > Icons), so a recording turns the icon red the way it
+  // always has, and both images are the user's own if they replaced them.
+  const slot = recording ? 'app_recording' : 'app_idle';
   const favicon = document.getElementById('favicon');
-  if (favicon) favicon.href = src;
+  // The first token comes from the server (the link is rendered with it), so
+  // the tab keeps the URL Chrome already fetched; a change in Settings bumps it.
+  if (!_iconVersion && favicon && favicon.dataset.version) _iconVersion = favicon.dataset.version;
+  const q = _iconVersion ? `?v=${encodeURIComponent(_iconVersion)}` : '';
+  const icon = document.getElementById('brand-icon');
+  if (icon) icon.src = `/api/icons/${slot}${q}`;
+  // The tab gets the ICO: exact 16 and 32 px frames rather than a 256 px PNG
+  // the browser scales down, and the same bitmap Chrome hands the taskbar.
+  if (favicon) favicon.href = `/api/icons/${slot}.ico${q}`;
+}
+
+/* ── Settings: Icons tab ────────────────────────────────────────────────── */
+// The last state the server sent: every set, the active one, and its slots.
+let _iconState = null;
+
+function _iconPreviewUrl(slot, setId, size, version) {
+  return `/api/icons/${slot}?set=${encodeURIComponent(setId)}&size=${size}&v=${encodeURIComponent(version || '')}`;
+}
+
+function _iconSetById(id) {
+  return _iconState && _iconState.sets ? _iconState.sets.find(s => s.id === id) : null;
+}
+
+async function loadIconSettings() {
+  const list = document.getElementById('icon-set-list');
+  const grid = document.getElementById('icon-settings-grid');
+  if (!list || !grid) return;
+  let st;
+  try {
+    const r = await fetch('/api/icons');
+    st = await r.json();
+    if (!r.ok) throw new Error(st.error || 'Could not load the icon sets.');
+  } catch (e) {
+    list.innerHTML = `<p class="icon-settings-error">${escapeHtml(e.message || 'Could not load the icon sets.')}</p>`;
+    grid.innerHTML = '';
+    return;
+  }
+  _iconState = st;
+  _renderIconSets(st);
+  _renderIconSlots(st);
+  _renderIconSetPicker(st);
+}
+
+/** The "start from" picker on the New custom set row lists every set. */
+function _renderIconSetPicker(st) {
+  const sel = document.getElementById('icon-set-new-base');
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = st.sets.map(s =>
+    `<option value="${escapeHtml(s.id)}">Start from ${escapeHtml(s.name)}</option>`).join('');
+  sel.value = st.sets.some(s => s.id === keep) ? keep : st.active;
+}
+
+/** The New custom set row: a copy of the picked set under the typed name. */
+async function createIconSet() {
+  const nameEl = document.getElementById('icon-set-new-name');
+  const baseEl = document.getElementById('icon-set-new-base');
+  const name = (nameEl && nameEl.value || '').trim();
+  if (!name) {
+    uiToast({ message: 'Give the new set a name first.', kind: 'warn' });
+    if (nameEl) nameEl.focus();
+    return;
+  }
+  const data = await _iconRequest('/api/icons/sets', {
+    method: 'POST', headers: _JSON_HEADERS,
+    body: JSON.stringify({ name, base: baseEl && baseEl.value || undefined }),
+  }, `${name} is in use. Replace any icon below.`);
+  if (data && nameEl) nameEl.value = '';
+}
+
+/** One row per set: the app icon, three tray states, and what you can do with it. */
+function _renderIconSets(st) {
+  const list = document.getElementById('icon-set-list');
+  if (!list) return;
+  list.innerHTML = st.sets.map(s => {
+    const id = escapeHtml(s.id);
+    const badges = (s.active ? '<span class="icon-set-badge is-active">In use</span>' : '')
+      + `<span class="icon-set-badge">${s.builtin ? 'Built in' : 'Custom'}</span>`;
+    const tray = ['tray_ready', 'tray_recording', 'tray_loading']
+      .map(slot => `<img src="${_iconPreviewUrl(slot, s.id, 40, s.version)}" alt="" width="20" height="20">`)
+      .join('');
+    return `
+      <div class="icon-set-row${s.active ? ' is-active' : ''}" data-set="${id}">
+        <img class="icon-set-preview" src="${_iconPreviewUrl('app_idle', s.id, 96, s.version)}" alt="" width="44" height="44">
+        <div class="icon-set-tray" title="Tray: ready, recording, loading">${tray}</div>
+        <div class="settings-row-info">
+          <div class="settings-row-label">${escapeHtml(s.name)}${badges}</div>
+          <div class="settings-row-desc">${escapeHtml(s.desc)}</div>
+        </div>
+        <div class="icon-set-actions">
+          ${s.active ? '' : `<button type="button" class="btn btn-secondary" onclick="activateIconSet('${id}')">Use</button>`}
+          ${s.builtin
+            ? `<button type="button" class="btn btn-quiet" onclick="copyIconSet('${id}')" title="Make a custom set that starts from this one">Customize…</button>`
+            : `<button type="button" class="btn btn-quiet" onclick="copyIconSet('${id}')" title="Make another custom set that starts from this one">Duplicate…</button>
+          <button type="button" class="btn btn-quiet" onclick="renameIconSet('${id}')">Rename</button>
+          <button type="button" class="btn btn-quiet icon-set-delete" onclick="deleteIconSet('${id}')">Delete</button>`}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+/** The active set's slots. Replace and Reset only exist on a custom set. */
+function _renderIconSlots(st) {
+  const grid = document.getElementById('icon-settings-grid');
+  const title = document.getElementById('icon-slots-title');
+  const intro = document.getElementById('icon-slots-intro');
+  if (!grid) return;
+  const active = _iconSetById(st.active) || { name: st.active };
+  if (title) title.textContent = `Icons in ${active.name}`;
+  if (intro) {
+    intro.textContent = st.editable
+      ? 'Replace any icon with your own image. PNG or ICO works best, square images look right in the tray, and anything large is scaled down.'
+      : 'Built-in sets cannot be changed. Click Customize on a set, or create a custom set above, and every icon in it can be replaced.';
+  }
+  const groups = [];
+  for (const s of st.slots) {
+    let g = groups.find(x => x.name === s.group);
+    if (!g) { g = { name: s.group, slots: [] }; groups.push(g); }
+    g.slots.push(s);
+  }
+  grid.innerHTML = groups.map(g => `
+    <div class="icon-slot-group">${escapeHtml(g.name)}</div>
+    ${g.slots.map(s => `
+      <div class="icon-slot-row" data-slot="${s.slot}">
+        <img class="icon-slot-preview" src="${_iconPreviewUrl(s.slot, st.active, 72, s.version)}" alt="" width="36" height="36">
+        <div class="settings-row-info">
+          <div class="settings-row-label">${escapeHtml(s.label)}${s.replaced ? '<span class="icon-slot-badge">replaced</span>' : ''}</div>
+          <div class="settings-row-desc">${escapeHtml(s.desc)}</div>
+        </div>
+        ${st.editable ? `<div class="icon-slot-actions">
+          <label class="btn btn-secondary icon-slot-upload" title="Choose an image for this state">
+            <i class="fa-solid fa-upload" aria-hidden="true"></i> Replace
+            <input type="file" class="visually-hidden-input"
+                   accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon,.ico"
+                   aria-label="Replace the ${escapeHtml(s.label)} icon"
+                   onchange="uploadIconSlot('${s.slot}', this)">
+          </label>
+          <button type="button" class="btn btn-quiet" ${s.replaced ? '' : 'disabled'}
+                  onclick="resetIconSlot('${s.slot}')" title="Go back to the image this set started with">Reset</button>
+        </div>` : ''}
+      </div>`).join('')}`).join('');
+}
+
+/** Send a change, keep the new state, and refresh every icon on the page. */
+async function _iconRequest(url, opts, okMessage) {
+  try {
+    const r = await fetch(url, opts);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'Something went wrong.');
+    _iconState = data;
+    _iconsChanged();
+    if (okMessage) uiToast({ message: okMessage, kind: 'success' });
+    return data;
+  } catch (e) {
+    uiToast({ message: e.message || 'Something went wrong.', kind: 'error' });
+    return null;
+  }
+}
+
+const _JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+async function activateIconSet(id) {
+  const s = _iconSetById(id);
+  await _iconRequest(`/api/icons/sets/${encodeURIComponent(id)}/activate`, { method: 'POST' },
+                     s ? `Using the ${s.name} icons` : 'Icon set changed');
+}
+
+async function copyIconSet(id) {
+  const base = _iconSetById(id);
+  const name = await uiPrompt({
+    title: 'New custom set',
+    message: `A custom set that starts as a copy of ${base ? base.name : 'this set'}. You can then replace any icon in it. Name it:`,
+    value: base ? `${base.name} (custom)` : 'My icons',
+    placeholder: 'Name',
+    confirmLabel: 'Create',
+  });
+  if (name == null || !name.trim()) return;
+  await _iconRequest('/api/icons/sets', {
+    method: 'POST', headers: _JSON_HEADERS, body: JSON.stringify({ name: name.trim(), base: id }),
+  }, 'Set created and in use. Replace any icon below.');
+}
+
+async function renameIconSet(id) {
+  const s = _iconSetById(id);
+  const name = await uiPrompt({
+    title: 'Rename icon set', value: s ? s.name : '', placeholder: 'Name', confirmLabel: 'Rename',
+  });
+  if (name == null || !name.trim()) return;
+  await _iconRequest(`/api/icons/sets/${encodeURIComponent(id)}`, {
+    method: 'PATCH', headers: _JSON_HEADERS, body: JSON.stringify({ name: name.trim() }),
+  });
+}
+
+async function deleteIconSet(id) {
+  const s = _iconSetById(id);
+  const ok = await uiConfirm({
+    title: 'Delete icon set',
+    message: `Delete ${s ? s.name : 'this set'}? Its images are removed.`
+      + (s && s.active ? ' The Meeting Assistant set takes over.' : ''),
+    confirmLabel: 'Delete',
+    danger: true,
+  });
+  if (!ok) return;
+  await _iconRequest(`/api/icons/sets/${encodeURIComponent(id)}`, { method: 'DELETE' }, 'Icon set deleted');
+}
+
+async function uploadIconSlot(slot, input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  input.value = '';
+  const body = new FormData();
+  body.append('file', file);
+  await _iconRequest(`/api/icons/${slot}`, { method: 'POST', body }, 'Icon replaced');
+}
+
+async function resetIconSlot(slot) {
+  await _iconRequest(`/api/icons/${slot}`, { method: 'DELETE' });
+}
+
+function _iconsChanged() {
+  _iconVersion = String(Date.now());
+  _updateBrandIcons(!!state.isRecording);
+  loadIconSettings();
+}
+
+/* ── Settings: System > Recording reliability ───────────────────────────── */
+
+function _syncReliabilityToggles() {
+  const follow = document.getElementById('loopback-follow-toggle');
+  if (follow) follow.checked = !!_prefs.loopback_follow_output;
+  const watchdog = document.getElementById('freeze-watchdog-toggle');
+  if (watchdog) watchdog.checked = !!_prefs.freeze_watchdog_enabled;
+  _syncSettingsNavUI();
 }
 
 /* ── Status ──────────────────────────────────────────────────────────────── */
@@ -4076,7 +5975,7 @@ let _quietPromptShown = false;
 async function showQuietStopConfirm(sessionId) {
   if (_quietPromptShown || !sessionId) return;
   _quietPromptShown = true;
-  const stop = confirm('Things have gone quiet. Stop this recording?');
+  const stop = await uiConfirm({ title: 'Stop recording?', message: 'Things have gone quiet. Stop this recording?', confirmLabel: 'Stop' });
   if (stop) {
     await fetch('/api/recording/stop', { method: 'POST' }).catch(() => {});
   } else {
@@ -4106,6 +6005,7 @@ function onStatus(d) {
   if (d.me_prompt_pending) _maybeShowMeSpeakerPopup();
 
   if (d.recording !== undefined) {
+    const _wasRecording = state.isRecording;
     state.isRecording = d.recording;
     updateRecordBtn();
 
@@ -4131,13 +6031,17 @@ function onStatus(d) {
           _notesApplyForSession(d.session_id, null);
         }
       }
-      // Update URL to reflect the active session
-      history.replaceState({}, '', '/session?id=' + d.session_id);
+      // Only the workspace shows a session, so the URL is rewritten only when
+      // the workspace is the active view. Recording from Home stays on Home.
+      if (Views.current === 'session') {
+        history.replaceState({ view: 'session', url: '/session?id=' + d.session_id },
+                             '', '/session?id=' + d.session_id);
+      }
       state.sessionId     = d.session_id;
       state.isViewingPast = false;
       _loadChatContextFoldersForSession(d.session_id);
       dot.className       = 'status-dot recording';
-      text.textContent    = 'Recording…';
+      text.textContent    = 'Recording';
       _loadPaneVisible(d.session_id);
       refreshSessionChatPromptBadge();
       destroyPlayback();
@@ -4156,7 +6060,8 @@ function onStatus(d) {
       if (d.me_speaker) {
         _sessionLinks['me'] = { global_id: d.me_speaker.global_id, name: d.me_speaker.name };
       }
-      refreshSidebar();
+      AppData.invalidate(['sessions'], 'recording_start');
+      _syncCaptureStrip();
       if (_quietPromptLanding === d.session_id) {
         setTimeout(() => showQuietStopConfirm(d.session_id), 150);
         _quietPromptLanding = null;
@@ -4172,7 +6077,7 @@ function onStatus(d) {
       vizMicSpec   = [];
       updateLevelMeters(0, 0, false);
       _startVizLoop();
-      if (!_isHomePage) _startBrandVizLoop();
+      _startBrandVizLoop();
       stopDurationCounter();
       _updateBrandIcons(false);
       _updateScreenRecordingStatus(false);
@@ -4182,7 +6087,9 @@ function onStatus(d) {
       // isViewingPast to decide whether to live-append incoming segments.
       if (state.sessionId && !state.isReanalyzing) state.isViewingPast = true;
       updateRecordBtn();
-      refreshSidebar();
+      // A stop finalises in place, from whichever view the user is on.
+      AppData.invalidate(['sessions', 'analytics', 'attention'], 'recording_stop');
+      if (_wasRecording && state.sessionId) _announceRecordingSaved(state.sessionId);
       // The WAV is finalized before this event fires, so playback is available
       // immediately - no need to reload the page or click the session.
       if (state.isViewingPast && state.sessionId) {
@@ -4192,69 +6099,126 @@ function onStatus(d) {
           if (s.has_video) initVideo(state.sessionId, s.video_offset);
         }).catch(() => {});
       }
+      // On the recording→stopped edge, surface speaker resolution while the
+      // meeting is fresh: auto-open the Resolve Speakers panel when generic
+      // speakers remain (was manual-only before 2026-09-01). Claude-fed
+      // candidates, if present, populate the hints; otherwise it shows the
+      // dropdowns for manual assignment.
+      if (_wasRecording && state.sessionId) _maybeAutoOpenResolution(state.sessionId);
+      if (_wasRecording) _clearCaptureAlert();  // recording ended; drop any capture warning
     }
   }
 
-  if (!state.isRecording) {
-    const pill = dot.parentElement;
+  if (!state.isRecording && dot && text) {
+    const row = dot.parentElement;
     if (state.isReanalyzing) {
       dot.className = 'status-dot recording';
-      text.textContent = 'Reanalyzing…';
-      pill.removeAttribute('title');
+      text.textContent = 'Reanalyzing a meeting';
+      row.removeAttribute('title');
     } else if (!state.recordingReady) {
       dot.className = 'status-dot loading';
-      const msg = state.recordingReadyReason || 'Loading transcription model…';
+      const why = state.recordingReadyReason || 'loading model';
+      const msg = `Preparing recorder · ${why}`;
       text.textContent = msg;
-      pill.setAttribute('title', msg);
+      row.setAttribute('title', msg);
     } else {
       dot.className = 'status-dot ready';
-      text.textContent = state.modelInfo || 'Ready';
-      pill.removeAttribute('title');
+      text.textContent = state.modelInfo ? `Ready · ${state.modelInfo}` : 'Ready';
+      row.removeAttribute('title');
     }
   }
 
   _syncRecordBtnDisabled();
 }
 
+/** Stop from any view: the view stays, and the toast is the way in. */
+function _announceRecordingSaved(sessionId) {
+  const onSession = Views.current === 'session' && state.sessionId === sessionId;
+  uiToast({
+    id: 'recording-saved',
+    kind: 'success',
+    message: 'Recording saved.',
+    action: onSession ? null : { label: 'Open recording', onClick: () => loadSession(sessionId) },
+  });
+}
+
+// Auto-open the Cleanup tab once, on the meeting-end edge, when the just-finished
+// session still has generic "Speaker N" labels. Voice-library auto-apply may
+// already have named everyone (then this is a no-op). Cleanup is where fragments
+// get merged and named, with the calendar invite's attendees on offer.
+let _autoResolvedSession = null;
+async function _maybeAutoOpenResolution(sessionId) {
+  if (!sessionId || _autoResolvedSession === sessionId) return;
+  _autoResolvedSession = sessionId;
+  try {
+    const r = await fetch(`/api/agent/v1/meetings/${encodeURIComponent(sessionId)}/speakers`);
+    if (!r.ok) return;
+    const payload = await r.json();
+    const speakers = Array.isArray(payload) ? payload : (payload.speakers || []);
+    // A diarizer placeholder ("Speaker 3"), an import stand-in ("Other
+    // participant"), or an explicit unknown all still need a real identity.
+    const needsResolution = /^(speaker\s*\d+|other participant(\s*\d+)?|unknown|unidentified|guest|participant\s*\d+)$/i;
+    const hasGeneric = speakers.some(s => needsResolution.test(String(s.name || '').trim()));
+    if (!hasGeneric) return;   // everyone already labeled; nothing to do
+    openSpeakerManager('cleanup');
+  } catch (_) { /* non-fatal: the dialog remains reachable manually */ }
+}
+
+/** The workspace's header title and its date-and-duration subtitle. A blank
+ *  workspace is titled "Meeting Assistant", which is what its document title
+ *  says too. */
 function updateTopbarSessionTitle() {
-  const el = document.getElementById('topbar-session-title');
-  if (!el) return;
   if (!state.sessionId) {
-    el.classList.add('hidden');
-    el.textContent = '';
+    Views.setTitle('session', 'Meeting Assistant', '');
     return;
   }
   const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
-  const title = entry?.title || '';
-  if (title) {
-    el.textContent = title;
-    el.classList.remove('hidden');
-  } else {
-    el.classList.add('hidden');
-    el.textContent = '';
+  const title = (entry && entry.title) || 'Untitled recording';
+  const parts = [];
+  if (entry && entry.started_at) {
+    parts.push(new Date(entry.started_at + 'Z').toLocaleDateString(
+      undefined, { month: 'long', day: 'numeric', year: 'numeric' }));
   }
+  if (entry) {
+    const secs = _sessionDurationSec ? _sessionDurationSec(entry) : 0;
+    if (secs > 0) parts.push(fmtDuration(secs));
+  }
+  if (state.isRecording) parts.push('Recording');
+  Views.setTitle('session', title, parts.join(' · '));
 }
 
 function updateRecordBtn() {
   const btn = document.getElementById('record-btn');
-  // Clear any inline "Stopping Recording…" overrides
+  if (!btn) return;
+  // Clear any inline "Stopping…" overrides
   btn.style.background = '';
   btn.style.color = '';
   btn.disabled = false;
   updateTopbarSessionTitle();
+  // Three states, and the button never lies about which one it is in.
+  // "Preparing recorder" is a real disabled button; the reason lives in the
+  // capture setup row, and there is no invented time estimate.
+  const preparing = !state.isRecording && (state.isReanalyzing || !state.recordingReady);
   if (state.isRecording) {
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop';
+    const elapsed = _recordingStartTime ? fmtDuration((Date.now() - _recordingStartTime) / 1000) : '0:00';
+    btn.innerHTML = '<span class="record-pulse" aria-hidden="true"></span> Stop · '
+      + `<span class="record-elapsed" id="record-elapsed">${elapsed}</span>`;
     btn.classList.add('recording');
-    btn.classList.remove('resuming');
-  } else if (state.isViewingPast) {
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Resume';
+  } else if (preparing) {
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-hourglass-half"></i></span> Preparing recorder';
     btn.classList.remove('recording');
-    btn.classList.add('resuming');
   } else {
-    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Start';
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Record';
     btn.classList.remove('recording');
-    btn.classList.remove('resuming');
   }
+  // The chevron only offers "Resume this recording" while a past recording is
+  // on screen, and it says what resuming does.
+  const resumeItem = document.getElementById('record-menu-resume');
+  if (resumeItem) {
+    resumeItem.classList.toggle(
+      'hidden', state.isRecording || !state.isViewingPast || !state.sessionId);
+  }
+  _syncCaptureStrip();
   // Disable device/model selectors while recording
   const lbSel  = document.getElementById('viz-loopback-sel');
   const micSel = document.getElementById('viz-mic-sel');
@@ -4286,27 +6250,58 @@ function updateTestBtn() {
 }
 
 /* ── Recording ───────────────────────────────────────────────────────────── */
-async function toggleRecording() {
+// Reconcile the record button when a Stop can't be confirmed - called when the
+// stop request is rejected (backend gone) or when the SSE stop-confirmation has
+// not arrived within the grace period. Prevents the "Stopping…" spinner from
+// hanging forever against a frozen/dead backend (2026-09-01 freeze incident).
+async function _handleStopUnresponsive() {
+  if (!state.isRecording) return;   // already reconciled by a real status event
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 5000);
+    const r = await fetch('/api/status', { cache: 'no-store', signal: ac.signal });
+    clearTimeout(t);
+    if (r.ok) {
+      const d = await r.json();
+      onStatus(d);                  // if it truly stopped, this clears the button
+      if (!d.recording) return;
+    }
+  } catch (_) { /* backend not answering; fall through to a forced reset */ }
+  state.isRecording = false;
+  const btn = document.getElementById('record-btn');
+  if (btn) { btn.disabled = false; btn.style.background = ''; btn.style.color = ''; }
+  updateRecordBtn();
+  flashStatus('App not responding. The recording may not have stopped; check the Meeting Assistant window.');
+}
+
+/** opts.start skips the "Record starts a new recording" guard (the callers
+ *  that own it, startNewRecording and resumeRecording, have already decided).
+ *  opts.resume appends to the recording currently on screen. */
+async function toggleRecording(opts) {
+  const o = opts || {};
   // Drop keyboard focus from the record button. Browsers activate the focused
   // <button> when Space is pressed, so without this a spacebar tap after a
   // recording starts would "click" the still-focused button and stop it.
   document.getElementById('record-btn')?.blur();
+  if (!state.isRecording && !o.start) {
+    // A bare Record press always starts a NEW recording, from any view.
+    return startNewRecording();
+  }
   if (state.isRecording) {
     // Immediate visual feedback while the server tears down streams
     const btn = document.getElementById('record-btn');
     btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-spinner fa-spin"></i></span> Stopping\u2026';
     btn.style.background = 'var(--yellow)';
-    btn.style.color = '#0d1117';
+    btn.style.color = 'var(--on-accent)';
     btn.disabled = true;
-    await fetch('/api/recording/stop', { method: 'POST' });
+    // Safety net (2026-09-01 freeze): the button only clears when the SSE
+    // 'status' event with recording=false arrives. If the backend is frozen or
+    // dead that confirmation never comes and the spinner hangs on "Stopping…"
+    // forever. Reconcile against /api/status after a grace period, and reset the
+    // UI if the stop can't be confirmed, instead of spinning indefinitely.
+    fetch('/api/recording/stop', { method: 'POST' }).catch(() => _handleStopUnresponsive());
+    setTimeout(() => { if (state.isRecording) _handleStopUnresponsive(); }, 12000);
   } else {
-    // On the home page, redirect to session page and let it handle the recording
-    // start.  This ensures every recording goes through the same audio path.
-    if (window._isHomePage) {
-      window.location.href = '/session?autostart=1';
-      return;
-    }
-
     // Read selected device indices from the dropdowns
     const lbSel  = document.getElementById('viz-loopback-sel');
     const lbVal  = lbSel?.value ?? '';
@@ -4321,8 +6316,8 @@ async function toggleRecording() {
     }
     Object.assign(body, parseMicSelection(micVal));
 
-    if (state.isViewingPast) {
-      // Resume the currently-viewed session instead of starting a new one
+    if (o.resume && state.isViewingPast && state.sessionId) {
+      // Append to the recording on screen. Only resumeRecording() asks for it.
       body.resume_session_id = state.sessionId;
     }
 
@@ -4333,7 +6328,11 @@ async function toggleRecording() {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      alert(err.error || 'Failed to start recording');
+      // A second window that lost the start election can still race the winner
+      // to the server; the reservation rejects it, and that is not an error the
+      // user needs to see.
+      if (err.error === 'Already starting' || err.error === 'Already recording') return;
+      uiToast({ message: err.error || 'Failed to start recording', kind: 'error' });
     }
   }
 }
@@ -5007,43 +7006,50 @@ function _setSpeakerSelection(speakerKey, { toggle = false, range = false } = {}
   renderSpeakerManager();
 }
 
-function openSpeakerManager() {
+/* Deterministic landing. Cleanup is a bulk-repair surface and is never the
+ * surprise destination: open on Resolve when something actually needs a name,
+ * otherwise Manage. An explicit tab argument always wins, and within one
+ * session view we return to whatever tab the user last chose. */
+function _speakerManagerInitialTab(explicitTab) {
+  if (explicitTab) return explicitTab;
+  if (_speakerModalLastTab && _speakerModalStatsSession === state.sessionId) return _speakerModalLastTab;
+  // Cleanup is the landing tab: merging diarizer fragments is the first job
+  // on almost every recording, and Resolve only makes sense once it is done.
+  // A caller that wants another tab passes it explicitly.
+  return 'cleanup';
+}
+
+function openSpeakerManager(tabArg) {
+  // Tolerate being wired straight to an event handler.
+  // 'resolve' is accepted for older callers: that tab was folded into Cleanup.
+  const tab = ['manage', 'cleanup'].includes(tabArg) ? tabArg : (tabArg === 'resolve' ? 'cleanup' : null);
   document.getElementById('speaker-manager-overlay').classList.remove('hidden');
   _syncSpeakerDraftFromSelection();
   renderSpeakerManager();
-  _cleanupPaintQuickBadge();
-  // Default to the Cleanup tab when the session has unlabeled speakers —
-  // that's the most common reason someone opens this dialog with many
-  // diarized speakers, and it saves a click.
-  const initialTab = _hasUnlabeledSpeakers() ? 'cleanup' : 'manage';
-  switchSpeakerManagerTab(initialTab);
+  const landing = _speakerManagerInitialTab(tab);
+  switchSpeakerManagerTab(landing, { remember: !!tab });
+  _speakerModalFocusTab(landing);
+  // Stats arrive after the first paint and feed the tab badges. The landing
+  // tab is never changed underneath the user once it is showing.
+  refreshSpeakerModalHeader();
 }
 
-function _countUnlabeledSpeakers() {
-  try {
-    if (!state.sessionId || typeof _getSortedSpeakerProfiles !== 'function') return 0;
-    return _getSortedSpeakerProfiles().filter(p => {
-      if (_isCustomSpeakerKey(p.speaker_key)) return false;
-      return !_sessionLinks[p.speaker_key];
-    }).length;
-  } catch (_) {
-    return 0;
-  }
-}
-
-function _hasUnlabeledSpeakers() {
-  return _countUnlabeledSpeakers() > 0;
-}
-
+// The badge means ONE thing: how many speaker groups the Cleanup tab holds.
+// Until the clusters load there is no honest number, so the badge stays hidden
+// rather than showing an unlinked-speaker count that changes meaning a moment
+// later. _cleanupUpdateBadge owns it from then on.
 function _cleanupPaintQuickBadge() {
   const badge = document.getElementById('speaker-cleanup-badge');
   if (!badge) return;
-  const n = _countUnlabeledSpeakers();
-  if (n > 0) { badge.hidden = false; badge.textContent = String(n); }
-  else { badge.hidden = true; }
+  if (_cleanupState && _cleanupState.sessionId === state.sessionId) { _cleanupUpdateBadge(); return; }
+  badge.hidden = true;
+  badge.textContent = '';
+  badge.title = '';
 }
 
 function closeSpeakerManager() {
+  stopSpeakerVoice();   // don't leave a voice sample playing after the panel closes
+  _dismissCleanupStagedToast();
   document.getElementById('speaker-manager-overlay').classList.add('hidden');
 }
 
@@ -5074,31 +7080,71 @@ let _cleanupKeyOrder = [];            // visual order of member keys, rebuilt ea
 let _cleanupShowHeatmap = false;      // similarity heatmap view toggle
 let _cleanupPlayQueueState = null;    // sequential audio/video player: { btn, segs, idx, key, timer }
 let _cleanupPicker = null;            // open assignment popover element, or null
+let _cleanupStagedToast = null;       // "changes still staged" reminder, so it can be dismissed
 
-function switchSpeakerManagerTab(tab) {
+// The staged-changes reminder must not outlive the modal: its Apply action
+// would otherwise write edits the user has since discarded.
+function _dismissCleanupStagedToast() {
+  if (_cleanupStagedToast && typeof _cleanupStagedToast.dismiss === 'function') {
+    try { _cleanupStagedToast.dismiss(); } catch (_) {}
+  }
+  _cleanupStagedToast = null;
+}
+
+function switchSpeakerManagerTab(tab, opts) {
+  const remember = !opts || opts.remember !== false;
+  // Leaving Cleanup does NOT discard staged edits (they live in _cleanupState
+  // until Apply), so a blocking confirm here would be a lie. Say plainly that
+  // they are still unwritten and offer the commit.
+  if (_cleanupActiveTab === 'cleanup' && tab !== 'cleanup' && _cleanupState && _cleanupState.dirty) {
+    const pending = Math.max(_cleanupPendingChangeCount(), 1);
+    _cleanupStagedToast = uiToast({
+      message: `${_plural(pending, 'cleanup change is', 'cleanup changes are')} still staged. Nothing is written until you click Apply.`,
+      kind: 'warn',
+      id: 'cleanup-staged-reminder',
+      action: {
+        label: 'Apply now',
+        onClick: () => {
+          // Recheck: "Close and discard" clears the dirty flag but leaves the
+          // staged state in place, and this toast can outlive that click.
+          if (!_cleanupState || !_cleanupState.dirty) {
+            uiToast({ message: 'Those cleanup changes were discarded.', kind: 'info', id: 'cleanup-staged-reminder' });
+            return;
+          }
+          switchSpeakerManagerTab('cleanup');
+          applySpeakerCleanup();
+        },
+      },
+    });
+  }
   _cleanupActiveTab = tab;
+  if (remember) _speakerModalLastTab = tab;
+  // Leaving the current tab: stop any voice sample it was playing.
+  stopSpeakerVoice();
   document.querySelectorAll('.speaker-manager-tab').forEach(b => {
-    b.classList.toggle('active', b.dataset.tab === tab);
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
   });
   document.querySelectorAll('[data-tab-view]').forEach(el => {
     el.hidden = el.dataset.tabView !== tab;
   });
-  // The cleanup tab needs far more room than the compact manage list — widen
-  // the dialog (and let it grow taller) only while cleanup is the active tab.
+  // Cleanup is card-heavy and needs far more room than the compact Manage
+  // list: widen the dialog (and let it grow taller) for it.
   const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
   if (dialog) dialog.classList.toggle('cleanup-active', tab === 'cleanup');
   if (tab === 'cleanup') {
     // Load (or reload) whenever there's no state or it's stale for another session.
     if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();
     _cleanupVideoSyncToggleBtn();
+    _cleanupSyncFooter();
   } else {
     _cleanupClosePicker();
   }
 }
 
 function openSpeakerCleanupTab() {
-  openSpeakerManager();
-  switchSpeakerManagerTab('cleanup');
+  openSpeakerManager('cleanup');
 }
 
 async function loadSpeakerClusters(force = false) {
@@ -5115,7 +7161,12 @@ async function loadSpeakerClusters(force = false) {
   if (grid) grid.innerHTML = '';
   if (noiseSection) noiseSection.hidden = true;
   try {
-    const resp = await fetch(`/api/sessions/${sid}/speaker_clusters`);
+    // The calendar's view of the meeting rides along: it feeds the picker's
+    // attendee list and the invite's attendee count. Never fatal.
+    const [resp, candResp] = await Promise.all([
+      fetch(`/api/sessions/${sid}/speaker_clusters`),
+      fetch(`/api/sessions/${sid}/resolution_candidates`).catch(() => null),
+    ]);
     const data = await resp.json();
     if (!resp.ok) {
       grid.innerHTML = `<div class="cleanup-help">Couldn't load clusters: ${data.error || resp.status}</div>`;
@@ -5123,24 +7174,50 @@ async function loadSpeakerClusters(force = false) {
       return;
     }
     _cleanupState = _cleanupBuildState(data);
+    _cleanupState.calendar = await _cleanupReadCandidates(candResp);
     if (loading) loading.hidden = true;
     renderSpeakerClusters();
     _cleanupUpdateBadge();
+    _cleanupSyncFooter();
   } catch (e) {
     grid.innerHTML = `<div class="cleanup-help">Couldn't load clusters: ${e.message}</div>`;
     if (loading) loading.hidden = true;
   }
 }
 
-function reloadSpeakerClusters() {
+/** The calendar's view of this meeting, for Cleanup: the invite's attendees
+ *  (with job title and line of business when the feed carries them), any agent
+ *  hints keyed by speaker, and the attendee count. Shaped empty when the
+ *  meeting has no calendar match or the calendar is off. */
+async function _cleanupReadCandidates(resp) {
+  const empty = { meeting: {}, candidates: [], hints: [] };
+  if (!resp || !resp.ok) return empty;
+  try {
+    const blob = await resp.json();
+    return {
+      meeting: blob.meeting || {},
+      candidates: (Array.isArray(blob.candidates) ? blob.candidates : []).filter(c => c && c.name),
+      hints: Array.isArray(blob.speaker_hints) ? blob.speaker_hints : [],
+    };
+  } catch (_) {
+    return empty;
+  }
+}
+
+async function reloadSpeakerClusters() {
   if (_cleanupState && _cleanupState.dirty) {
-    if (!confirm('Discard unsaved changes and reload from disk?')) return;
+    const pending = Math.max(_cleanupPendingChangeCount(), 1);
+    if (!await uiConfirm({
+      title: 'Discard staged cleanup changes?',
+      message: `Reloading rereads the groups from disk and throws away ${_plural(pending, 'staged change', 'staged changes')}.`,
+      confirmLabel: 'Discard and reload', danger: true,
+    })) return;
   }
   loadSpeakerClusters(true);
 }
 
 function _cleanupBuildState(payload) {
-  // Fresh load — drop any stale multi-selection / open popover.
+  // Fresh load - drop any stale multi-selection / open popover.
   _cleanupSelectedKeys = new Set();
   _cleanupSelAnchor = null;
   _cleanupClosePicker();
@@ -5206,10 +7283,22 @@ function _cleanupBuildState(payload) {
   });
   noiseKeys.forEach(k => { snapshot[k] = { cluster_id: 'noise', is_noise: true }; });
 
+  // Per-cluster identity snapshot. Membership alone does not capture a staged
+  // link, unlink or rename, so the pending-change count has to diff this too.
+  const clusterSnapshot = {};
+  clusters.forEach(c => {
+    clusterSnapshot[c.cluster_id] = {
+      global_id: c.global_id || null,
+      name:      c.name || '',
+      new_name:  c.new_name || '',
+    };
+  });
+
   return {
     sessionId:  payload.session_id,
     clusters,
     noiseKeys,
+    clusterSnapshot,
     noiseMembers,
     library,
     thresholds: payload.thresholds || { cluster: 0.7, suggest: 0.65, auto: 0.82 },
@@ -5219,27 +7308,20 @@ function _cleanupBuildState(payload) {
   };
 }
 
+// The Cleanup badge counts GROUPS, matching what the tab actually shows.
 function _cleanupUpdateBadge() {
   const badge = document.getElementById('speaker-cleanup-badge');
   if (!badge || !_cleanupState) return;
-  const unlabeledCount = _cleanupState.clusters
-    .filter(c => c.kind === 'unlabeled')
-    .reduce((sum, c) => sum + c.members.length, 0);
-  if (unlabeledCount > 0) {
-    badge.hidden = false;
-    badge.textContent = String(unlabeledCount);
-  } else {
-    badge.hidden = true;
-  }
+  const groups = _cleanupState.clusters.filter(c => c.members.length).length;
+  badge.hidden = groups === 0;
+  badge.textContent = String(groups);
+  badge.title = `${_plural(groups, 'speaker group', 'speaker groups')} in this meeting`;
 }
 
 function _cleanupMarkDirty() {
   if (!_cleanupState) return;
   _cleanupState.dirty = true;
-  ['cleanup-apply-btn', 'cleanup-reset-btn'].forEach(id => {
-    const b = document.getElementById(id);
-    if (b) b.disabled = false;
-  });
+  _cleanupSyncFooter();
 }
 
 function _cleanupRecomputeClusterCentroid(cluster) {
@@ -5286,7 +7368,7 @@ function _cleanupBestLibraryMatch(centroid, excludeGlobalIds) {
 
 function _cleanupUpdateSuggestion(cluster) {
   // Profiles already used by OTHER labeled clusters in this session are not
-  // candidates — Antonio shouldn't be re-suggested for a cluster that's not
+  // candidates - Antonio shouldn't be re-suggested for a cluster that's not
   // already his.
   const taken = new Set();
   for (const c of _cleanupState.clusters) {
@@ -5304,6 +7386,22 @@ function renderSpeakerClusters() {
   const heatWrap = document.getElementById('cleanup-heatmap-wrap');
   if (!grid || !_cleanupState) return;
 
+  // The invite's attendee count is the ceiling the clusters should land under.
+  const calNote = document.getElementById('cleanup-calendar-note');
+  if (calNote) {
+    const cal = _cleanupState.calendar || {};
+    const meeting = cal.meeting || {};
+    const n = Number(meeting.attendee_count) || 0;
+    if (n) {
+      const subject = meeting.calendar_subject && meeting.calendar_subject !== meeting.title
+        ? ` · ${escapeHtml(meeting.calendar_subject)}` : '';
+      calNote.innerHTML = `<i class="fa-solid fa-calendar-days" aria-hidden="true"></i> ${n} on the invite${subject}`;
+      calNote.hidden = false;
+    } else {
+      calNote.hidden = true;
+    }
+  }
+
   // Recompute centroids + suggestions before render so drag reorderings are
   // reflected in similarity suggestions.
   _cleanupState.clusters.forEach(_cleanupUpdateSuggestion);
@@ -5311,7 +7409,7 @@ function renderSpeakerClusters() {
   // ── Heatmap vs cluster-grid view ──
   const heatBtn = document.getElementById('cleanup-heatmap-toggle');
   if (heatBtn) heatBtn.classList.toggle('active', _cleanupShowHeatmap);
-  // Use explicit display values (not '') — the heatmap wrap still carries the
+  // Use explicit display values (not '') - the heatmap wrap still carries the
   // [hidden] attribute, so '' would fall back to the UA display:none rule.
   grid.style.display = _cleanupShowHeatmap ? 'none' : 'grid';
   if (heatWrap) heatWrap.style.display = _cleanupShowHeatmap ? 'flex' : 'none';
@@ -5333,7 +7431,7 @@ function renderSpeakerClusters() {
     // "+ New group" drop zone (always last in the grid).
     const newZone = document.createElement('div');
     newZone.className = 'cleanup-new-cluster';
-    newZone.innerHTML = '<i class="fa-solid fa-plus"></i> Drop here to start a new group';
+    newZone.innerHTML = '<i class="fa-solid fa-plus"></i> Drop here to merge into a new group';
     _cleanupWireDropZone(newZone, () => _cleanupMoveKeysToNewCluster(_cleanupDragKeys));
     grid.appendChild(newZone);
   }
@@ -5350,7 +7448,7 @@ function renderSpeakerClusters() {
     statsEl.innerHTML = `<strong>${labeledCount}</strong> named · <strong>${unlabeledCount}</strong> unnamed · <strong>${total}</strong> voices${noiseCount ? ` · <strong>${noiseCount}</strong> noise` : ''}`;
   }
 
-  // Enable Auto-assign when any unlabeled cluster has a high-confidence match.
+  // Enable Auto-link when any unlabeled cluster has a high-confidence match.
   const confidentBtn = document.getElementById('cleanup-confident-btn');
   if (confidentBtn) {
     const hasConfident = _cleanupState.clusters.some(
@@ -5361,6 +7459,7 @@ function renderSpeakerClusters() {
 
   _cleanupRenderSelectionBar();
   _cleanupUpdateBadge();
+  _cleanupSyncFooter();
   _cleanupWireGridAutoscroll();
 }
 
@@ -5373,7 +7472,7 @@ function _cleanupRenderNoiseSection() {
     .map(k => _cleanupGetMember(k))
     .filter(Boolean);
   // Always a drop target so users can drag speakers here to silence them.
-  // Wire once — this element is persistent (lives in the template), so re-wiring
+  // Wire once - this element is persistent (lives in the template), so re-wiring
   // each render would stack duplicate listeners.
   if (!noiseSection._dropWired) {
     noiseSection._dropWired = true;
@@ -5433,7 +7532,7 @@ function _cleanupSelectPill(key, opts) {
   _cleanupRefreshSelectionUI();
 }
 
-// Cheap UI refresh that doesn't rebuild the whole grid — just toggles the
+// Cheap UI refresh that doesn't rebuild the whole grid - just toggles the
 // `selected` class on pills and re-renders the selection bar.
 function _cleanupRefreshSelectionUI() {
   document.querySelectorAll('#cleanup-grid .cleanup-member, #cleanup-noise-members .cleanup-member')
@@ -5544,13 +7643,15 @@ function _cleanupRenderCluster(cluster) {
   count.textContent = `${segTotal} seg`;
   header.appendChild(count);
 
-  // Assign / change button — opens the voice-library picker popover.
+  // Assign / change button - opens the voice-library picker popover.
   const assignBtn = document.createElement('button');
   assignBtn.className = 'cleanup-assign-btn' + (cluster.kind === 'labeled' ? ' is-set' : '');
   assignBtn.innerHTML = cluster.kind === 'labeled'
     ? '<i class="fa-solid fa-pen"></i>'
-    : '<i class="fa-solid fa-user-tag"></i> Assign';
-  assignBtn.title = cluster.kind === 'labeled' ? 'Change assignment' : 'Assign to a voice profile';
+    : '<i class="fa-solid fa-link"></i> Link';
+  assignBtn.title = cluster.kind === 'labeled'
+    ? 'Change the linked voice-library profile'
+    : 'Link this speaker to a voice-library profile';
   assignBtn.addEventListener('click', e => {
     e.stopPropagation();
     _cleanupOpenPicker(assignBtn, { cluster });
@@ -5564,13 +7665,13 @@ function _cleanupRenderCluster(cluster) {
     row.className = 'cleanup-suggestion-row';
     const sugg = document.createElement('button');
     sugg.className = 'cleanup-suggestion';
-    sugg.title = `Assign ${cluster.suggestion.name}`;
+    sugg.title = `Link to ${cluster.suggestion.name}`;
     const conf = cluster.suggestion.similarity >= _cleanupState.thresholds.auto ? ' high' : '';
     sugg.innerHTML =
       `<span class="cleanup-cluster-swatch sm" style="background:${cluster.suggestion.color || '#58a6ff'}"></span>` +
       `<span class="txt">Sounds like <strong>${escapeHtml(cluster.suggestion.name)}</strong></span>` +
       `<span class="sim${conf}">${Math.round(cluster.suggestion.similarity * 100)}%</span>` +
-      `<span class="cleanup-suggestion-go"><i class="fa-solid fa-check"></i> Assign</span>`;
+      `<span class="cleanup-suggestion-go"><i class="fa-solid fa-check"></i> Link</span>`;
     sugg.addEventListener('click', e => {
       e.stopPropagation();
       _cleanupAssignClusterToProfile(cluster, cluster.suggestion);
@@ -5609,7 +7710,7 @@ function _cleanupTalkTime(member) {
   return (member.segments || []).reduce((s, seg) => s + Math.max(0, seg.end - seg.start), 0);
 }
 
-// Furthest segment end across the whole session — used to scale mini-timelines.
+// Furthest segment end across the whole session - used to scale mini-timelines.
 function _cleanupSessionSpan() {
   if (_cleanupState._span) return _cleanupState._span;
   let max = 0;
@@ -5847,6 +7948,7 @@ function _cleanupPlayQueue(segs, btn, opts) {
     return;
   }
   _cleanupStopPlayback();
+  stopSpeakerVoice();   // only one thing is ever audible in this modal
   const ordered = [...segs].sort((a, b) => a.start - b.start);
   _cleanupPlayQueueState = { btn: btn || null, segs: ordered, idx: 0, key, timer: 0 };
   // Light matching data-seg-key controls first, then the explicit button (which
@@ -5907,7 +8009,7 @@ function _cleanupFindMember(speakerKey) {
 }
 
 function _cleanupGarbageCollectClusters() {
-  // Drop unlabeled clusters that are empty AND weren't originally labeled —
+  // Drop unlabeled clusters that are empty AND weren't originally labeled -
   // labeled clusters with zero members are still meaningful (they signal
   // "no longer assign anyone to this profile in this session").
   _cleanupState.clusters = _cleanupState.clusters.filter(c => {
@@ -6164,7 +8266,10 @@ function _cleanupPickerOutside(e) {
   if (_cleanupPicker && !_cleanupPicker.contains(e.target)) _cleanupClosePicker();
 }
 function _cleanupPickerKey(e) {
-  if (e.key === 'Escape') { e.preventDefault(); _cleanupClosePicker(); }
+  // stopPropagation matters: without it the modal's own Escape handler also
+  // fires and closes the whole dialog behind the picker. Same contract as
+  // ui-combobox.js, where Escape only dismisses the list.
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _cleanupClosePicker(); }
 }
 
 function _cleanupOpenPicker(anchorEl, target) {
@@ -6190,7 +8295,20 @@ function _cleanupOpenPicker(anchorEl, target) {
   if (!centroid) {
     const sub = document.createElement('div');
     sub.className = 'cleanup-picker-subtitle';
-    sub.innerHTML = '<i class="fa-solid fa-circle-info"></i> No voice samples here — profiles aren’t ranked by similarity.';
+    sub.innerHTML = '<i class="fa-solid fa-circle-info"></i> No voice samples here: profiles aren’t ranked by similarity.';
+    pop.appendChild(sub);
+  }
+
+  // What the calendar knows about this meeting: the attendees, and any agent
+  // hint aimed at one of the keys being assigned.
+  const cal = (_cleanupState && _cleanupState.calendar) || { candidates: [], hints: [] };
+  const hint = (cal.hints || []).find(h => h && h.guess && keys.includes(h.speaker_key)) || null;
+  if (hint) {
+    const sub = document.createElement('div');
+    sub.className = 'cleanup-picker-subtitle';
+    const conf = hint.confidence ? ` · ${escapeHtml(String(hint.confidence))} confidence` : '';
+    sub.innerHTML = `<i class="fa-solid fa-wand-magic-sparkles"></i> Suggested from the invite: <b>${escapeHtml(hint.guess)}</b>${conf}`;
+    if (hint.rationale) sub.title = hint.rationale;
     pop.appendChild(sub);
   }
 
@@ -6205,6 +8323,43 @@ function _cleanupOpenPicker(anchorEl, target) {
     listWrap.innerHTML = '';
     const ranked = _cleanupRankLibrary(centroid).filter(p => !ql || p.name.toLowerCase().includes(ql));
     const exact = ranked.find(p => p.name.toLowerCase() === ql);
+
+    // Attendees first: the invite is the strongest evidence of who was in the
+    // room. One that already has a Voice Library profile links to it; one that
+    // does not becomes a new name, exactly as if it had been typed. The hinted
+    // attendee, if any, leads.
+    const matchesQ = c => !ql || c.name.toLowerCase().includes(ql)
+      || String(c.title || c.role || '').toLowerCase().includes(ql)
+      || String(c.lob || '').toLowerCase().includes(ql);
+    const attendees = (cal.candidates || []).filter(matchesQ).sort((x, y) =>
+      (hint && y.name === hint.guess ? 1 : 0) - (hint && x.name === hint.guess ? 1 : 0));
+    const newColor = _cleanupNextColor();
+    const groupHead = (icon, label) => {
+      const head = document.createElement('div');
+      head.className = 'cleanup-picker-group';
+      head.innerHTML = `<i class="fa-solid ${icon}" aria-hidden="true"></i> ${label}`;
+      return head;
+    };
+    if (attendees.length) {
+      listWrap.appendChild(groupHead('fa-calendar-days', 'On the calendar invite'));
+      attendees.forEach(c => {
+        const profile = _cleanupState.library.find(p => p.name.toLowerCase() === c.name.toLowerCase()) || null;
+        const item = document.createElement('button');
+        item.className = 'cleanup-picker-item calendar' + (profile && profile.global_id === currentGid ? ' current' : '');
+        const context = [c.title || c.role, c.lob].filter(Boolean).join(' / ');
+        item.innerHTML =
+          `<span class="cleanup-picker-dot" style="background:${profile ? (profile.color || '#6e7681') : newColor}"></span>` +
+          `<span class="nm">${escapeHtml(c.name)}${context ? `<span class="cleanup-picker-ctx">${escapeHtml(context)}</span>` : ''}</span>` +
+          (profile
+            ? `<span class="cleanup-picker-embs" title="voice samples on file">${profile.emb_count || 0}</span>`
+            : `<span class="cleanup-picker-go"><i class="fa-solid fa-plus"></i> New</span>`);
+        item.addEventListener('click', () => choose(() => profile
+          ? _cleanupPickerChooseProfile(target, profile)
+          : _cleanupPickerChooseNew(target, c.name)));
+        listWrap.appendChild(item);
+      });
+      if (ranked.length || (q && !exact)) listWrap.appendChild(groupHead('fa-waveform-lines', 'Voice Library'));
+    }
     if (q && !exact) {
       const create = document.createElement('button');
       create.className = 'cleanup-picker-item create';
@@ -6218,7 +8373,7 @@ function _cleanupOpenPicker(anchorEl, target) {
     if (!ranked.length && !q) {
       const empty = document.createElement('div');
       empty.className = 'cleanup-picker-empty';
-      empty.textContent = 'No saved voice profiles yet — type a name to create one.';
+      empty.textContent = 'No saved voice profiles yet: type a name to create one.';
       listWrap.appendChild(empty);
     }
     ranked.forEach(p => {
@@ -6242,7 +8397,7 @@ function _cleanupOpenPicker(anchorEl, target) {
     foot.className = 'cleanup-picker-foot';
     const un = document.createElement('button');
     un.className = 'cleanup-picker-unassign';
-    un.innerHTML = '<i class="fa-solid fa-link-slash"></i> Unassign (make unnamed)';
+    un.innerHTML = '<i class="fa-solid fa-link-slash"></i> Unlink from profile';
     un.addEventListener('click', () => _cleanupUnassignCluster(cluster));
     foot.appendChild(un);
     pop.appendChild(foot);
@@ -6325,7 +8480,7 @@ function _cleanupRenderHeatmap(wrap) {
 
   const head = document.createElement('div');
   head.className = 'cleanup-heatmap-head';
-  head.innerHTML = '<i class="fa-solid fa-circle-info"></i> Voice similarity between groups. Hot off-diagonal cells are likely the same person — click one to select both groups and merge them.';
+  head.innerHTML = '<i class="fa-solid fa-circle-info"></i> Voice similarity between groups. Hot off-diagonal cells are likely the same person: click one to select both groups and merge them.';
   wrap.appendChild(head);
 
   if (entities.length < 2) {
@@ -6461,8 +8616,13 @@ function applyConfidentCleanupMatches() {
   }
 }
 
-function resetSpeakerCleanup() {
-  if (!confirm('Discard all unsaved changes?')) return;
+async function resetSpeakerCleanup() {
+  const pending = Math.max(_cleanupPendingChangeCount(), 1);
+  if (!await uiConfirm({
+    title: 'Discard staged cleanup changes?',
+    message: `${_plural(pending, 'staged change', 'staged changes')} in this meeting will be thrown away and the groups reloaded from disk. Nothing that was already applied is affected.`,
+    confirmLabel: 'Discard changes', danger: true,
+  })) return;
   loadSpeakerClusters(true);
 }
 
@@ -6475,28 +8635,28 @@ async function applySpeakerCleanup() {
     .map(m => m.speaker_key);
 
   // Guard: a multi-speaker group with no name (and no library profile) can't be
-  // persisted as a merge — the backend keys identity on a profile, so an unnamed
+  // persisted as a merge - the backend keys identity on a profile, so an unnamed
   // group would be silently split back into individual speakers. Make the user
   // name it (or assign a profile) instead of dropping their grouping.
   const unnamedMerges = _cleanupState.clusters.filter(
     c => !c.global_id && !(c.new_name || '').trim() && visibleKeys(c).length > 1,
   );
   if (unnamedMerges.length) {
-    alert(
-      'Name these grouped speakers before applying — a merged group needs a name ' +
-      '(or an existing voice profile) to be saved:\n\n' +
-      unnamedMerges.map(c => '•  ' + visibleKeys(c).join('  +  ')).join('\n') +
-      '\n\nClick “Assign” on each group to name it.',
-    );
+    await uiAlert({
+      title: 'Name grouped speakers',
+      message: 'A merged group needs a name (or an existing voice profile) to be saved. Use Link on each group to name it.',
+      details: unnamedMerges.map(c => visibleKeys(c).join(' + ')),
+      kind: 'warn',
+    });
     return;
   }
 
   const applyBtn = document.getElementById('cleanup-apply-btn');
-  if (applyBtn) { applyBtn.disabled = true; applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Applying…'; }
+  if (applyBtn) { applyBtn.dataset.busy = '1'; applyBtn.disabled = true; applyBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Applying…'; }
 
   // Only unlabeled/unnamed members that were ORIGINALLY linked to a profile or
   // marked noise need to be sent (so the backend unlinks / un-noises them).
-  // Members that were already plain "Speaker N" are left untouched — sending
+  // Members that were already plain "Speaker N" are left untouched - sending
   // them would reset a manual label and churn the DB for no reason.
   const wasProfileLinked = k => {
     const o = snap[k];
@@ -6531,16 +8691,18 @@ async function applySpeakerCleanup() {
     });
     const data = await resp.json();
     if (!resp.ok) {
-      alert(`Apply failed: ${data.error || resp.status}`);
-      if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply'; }
+      uiToast({ message: `Apply failed: ${data.error || resp.status}`, kind: 'error' });
+      if (applyBtn) { delete applyBtn.dataset.busy; }
+      _cleanupSyncFooter();
       return;
     }
     // Refresh from server to pick up canonical names/links + show the new state.
     _cleanupState = null;
+    if (applyBtn) delete applyBtn.dataset.busy;
     await loadSpeakerClusters(true);
-    if (applyBtn) { applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply'; applyBtn.disabled = true; }
-    const reset = document.getElementById('cleanup-reset-btn');
-    if (reset) reset.disabled = true;
+    _cleanupSyncFooter();
+    onSpeakerDataChanged();
+    uiToast({ message: 'Cleanup applied.', kind: 'success', id: 'cleanup-apply' });
     // Refresh transcript / sidebar speaker pills so they reflect new labels.
     try {
       if (typeof loadSession === 'function' && state.sessionId) await loadSession(state.sessionId);
@@ -6549,8 +8711,9 @@ async function applySpeakerCleanup() {
       if (typeof _tnRefreshSpeakerPills === 'function') _tnRefreshSpeakerPills();
     } catch (_) {}
   } catch (e) {
-    alert(`Apply failed: ${e.message}`);
-    if (applyBtn) { applyBtn.disabled = false; applyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Apply'; }
+    uiToast({ message: `Apply failed: ${e.message}`, kind: 'error' });
+    if (applyBtn) { delete applyBtn.dataset.busy; }
+    _cleanupSyncFooter();
   }
 }
 
@@ -6621,7 +8784,7 @@ function _cleanupVideoApplySavedPosition() {
       && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
     // Clamp the restored geometry into the *current* viewport. A position
     // saved on a larger monitor (or before the window shrank) used to land
-    // off-screen, so the popup "opened" but was never visible — the reported
+    // off-screen, so the popup "opened" but was never visible - the reported
     // bug. Clamp size first, then the top-left, so it's always reachable.
     let w = Math.min(Number.isFinite(pos.width)  ? pos.width  : popupW, window.innerWidth  - 16);
     let h = Math.min(Number.isFinite(pos.height) ? pos.height : popupH, window.innerHeight - 16);
@@ -6634,7 +8797,7 @@ function _cleanupVideoApplySavedPosition() {
     popup.style.right  = 'auto';
     return;
   }
-  // No saved position — anchor to the LEFT of the speaker manager dialog so
+  // No saved position - anchor to the LEFT of the speaker manager dialog so
   // the user can see both panes at once. Fall back to the right side, then to
   // an explicit top-right corner.
   const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
@@ -6656,7 +8819,7 @@ function _cleanupVideoApplySavedPosition() {
       return;
     }
   }
-  // Default: explicit top-right (don't rely on the CSS rule alone — a prior
+  // Default: explicit top-right (don't rely on the CSS rule alone - a prior
   // inline left/top could otherwise leave it parked off-screen).
   popup.style.left  = 'auto';
   popup.style.right = '24px';
@@ -7035,7 +9198,7 @@ function _cleanupVideoEnsureDragWired() {
 // monkey-patch and the switchSpeakerManagerTab wrapper were folded in there and
 // into switchSpeakerManagerTab respectively.)
 
-// Dirty guard — both for page unload and for the modal close handler.
+// Dirty guard - both for page unload and for the modal close handler.
 window.addEventListener('beforeunload', e => {
   if (_cleanupState && _cleanupState.dirty) {
     e.preventDefault();
@@ -7044,15 +9207,35 @@ window.addEventListener('beforeunload', e => {
   }
 });
 
+// Backspace outside an editable field can trigger a browser "back" navigation in
+// the chromeless app window, which then trips the unsaved-changes prompt above
+// ("leave site?"). Never let a stray Backspace navigate: only allow it when the
+// user is actually editing text. Capture phase so it beats the default action.
+window.addEventListener('keydown', e => {
+  if (e.key !== 'Backspace') return;
+  const t = e.target;
+  const tag = t && t.tagName;
+  const editable = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+                   (t && t.isContentEditable);
+  if (!editable) e.preventDefault();
+}, true);
+
 // Wrap existing close handler to prompt on unsaved changes and to close
 // the floating video popup alongside the modal.
 const _origCloseSpeakerManager = closeSpeakerManager;
-closeSpeakerManager = function () {
-  if (_cleanupState && _cleanupState.dirty) {
-    if (!confirm('You have unsaved cleanup changes. Close anyway?')) return;
+closeSpeakerManager = async function (force) {
+  // force: the session is being switched or cleared, so staged cleanup edits
+  // cannot be kept anyway; callers that switch sessions ask BEFORE switching.
+  if (!force && _cleanupState && _cleanupState.dirty) {
+    const pending = Math.max(_cleanupPendingChangeCount(), 1);
+    if (!await uiConfirm({
+      title: 'Close without applying?',
+      message: `${_plural(pending, 'cleanup change is', 'cleanup changes are')} staged and have not been written. Closing discards them.`,
+      confirmLabel: 'Close and discard', cancelLabel: 'Keep editing', danger: true,
+    })) return;
     _cleanupState.dirty = false;
   }
-  // Tear down the floating workspace bits — popup, picker, any preview audio.
+  // Tear down the floating workspace bits: popup, picker, any preview audio.
   try {
     _cleanupClosePicker();
     _cleanupStopPlayback();
@@ -7624,15 +9807,26 @@ async function _fpDismiss(toastData) {
 // ── Voice Library panel ───────────────────────────────────────────────────────
 
 let _fpProfiles     = [];   // global speaker list
+let _fpLoaded       = false; // true once the profiles have been fetched at least once
 let _fpSelectedId   = null; // currently selected global_id
 let _fpDetailColor  = '';
 let _fpSelectMode   = false;
 let _fpSelected     = new Set();  // selected global_ids for bulk ops
 let _fpSearchTerm   = '';
 
-async function openFingerprintPanel() {
-  document.getElementById('fingerprint-panel-overlay').classList.remove('hidden');
-  // Reset search and select state
+/** The Voice Library is the /speakers view now (brief 3.8). Navigating there
+ *  is what "open" means; the view's activate() runs the loader. */
+function openFingerprintPanel() {
+  navigateTo('/speakers');
+}
+
+/** Kept for the call sites that leave the library for a recording: the
+ *  navigation itself is what replaces the panel, so there is nothing to close. */
+function closeFingerprintPanel() {}
+
+/** Reset search and selection, then load. The Speakers view calls this. */
+async function loadFingerprintPanel(opts) {
+  const o = opts || {};
   _fpSearchTerm = '';
   _fpSelectMode = false;
   _fpSelected.clear();
@@ -7641,21 +9835,33 @@ async function openFingerprintPanel() {
   const selectToggle = document.getElementById('fp-select-toggle');
   if (selectToggle) selectToggle.classList.remove('active');
   document.getElementById('fp-select-bar')?.classList.add('hidden');
-  await _fpLoadProfiles();
+  // The Voice Library behaves like a cached slice: fetch once, then reuse on
+  // revisit. Mutations (rename, merge, delete, link) call _fpLoadProfiles()
+  // themselves, so the cache stays fresh, and navigating back to /speakers no
+  // longer refetches every time (the zero-fetch-on-revisit contract).
+  if (o.cached && _fpLoaded) {
+    _fpRenderProfileList();
+    if (_fpSelectedId) {
+      const still = _fpProfiles.find(p => p.id === _fpSelectedId);
+      if (still) _fpSelectProfile(still.id); else _fpClearDetail();
+    }
+  } else {
+    await _fpLoadProfiles();
+  }
+  Views.setTitle('speakers', 'Speakers', _fpSubtitle());
 }
 
-function closeFingerprintPanel() {
-  document.getElementById('fingerprint-panel-overlay').classList.add('hidden');
-}
-
-function closeFingerprintPanelOnOverlay(event) {
-  if (event.target.id === 'fingerprint-panel-overlay') closeFingerprintPanel();
+function _fpSubtitle() {
+  const n = _fpProfiles.length;
+  if (!n) return 'No voice profiles yet';
+  return `${n} voice profile${n === 1 ? '' : 's'}`;
 }
 
 async function _fpLoadProfiles() {
   try {
     const resp = await fetch('/api/fingerprint/speakers');
     _fpProfiles = await resp.json();
+    _fpLoaded = true;
   } catch (e) {
     _fpProfiles = [];
   }
@@ -7683,7 +9889,7 @@ function _fpRenderProfileList() {
     : _fpProfiles;
 
   if (!filtered.length) {
-    scrollEl.innerHTML = `<div class="fp-panel-empty">${_fpProfiles.length ? 'No matching profiles.' : 'No voice profiles yet. Use the "+ New Profile" button to create one.'}</div>`;
+    scrollEl.innerHTML = `<div class="fp-panel-empty">${_fpProfiles.length ? 'No matching profiles.' : 'No voice profiles yet. Use "New profile" to create one.'}</div>`;
     _fpUpdateBulkUI();
     return;
   }
@@ -7841,8 +10047,8 @@ function _fpUpdateBulkUI() {
 async function _fpBulkDelete() {
   const ids = [..._fpSelected];
   if (!ids.length) return;
-  const names = ids.map(id => _fpProfiles.find(p => p.id === id)?.name || id).join(', ');
-  if (!confirm(`Delete ${ids.length} profile${ids.length > 1 ? 's' : ''}?\n\n${names}\n\nThis cannot be undone.`)) return;
+  const names = ids.map(id => _fpProfiles.find(p => p.id === id)?.name || id);
+  if (!await uiConfirm({ title: `Delete ${ids.length} profile${ids.length > 1 ? 's' : ''}?`, message: 'This cannot be undone.', details: names, confirmLabel: 'Delete', danger: true })) return;
   await fetch('/api/fingerprint/speakers/bulk', {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
@@ -7855,10 +10061,10 @@ async function _fpBulkDelete() {
 
 async function _fpBulkMerge() {
   const ids = [..._fpSelected];
-  if (ids.length < 2) { alert('Select at least 2 profiles to merge.'); return; }
+  if (ids.length < 2) { uiToast({ message: 'Select at least 2 profiles to merge.', kind: 'warn' }); return; }
   const names = ids.map(id => _fpProfiles.find(p => p.id === id)?.name || id);
   const keepName = names[0];
-  if (!confirm(`Merge ${ids.length} profiles into "${keepName}"?\n\n${names.join(', ')}\n\nAll voice samples will be combined. This cannot be undone.`)) return;
+  if (!await uiConfirm({ title: `Merge ${ids.length} profiles into "${keepName}"?`, message: 'All voice samples will be combined. This cannot be undone.', details: names, confirmLabel: 'Merge', danger: true })) return;
   const keepId = ids[0];
   for (let i = 1; i < ids.length; i++) {
     await fetch(`/api/fingerprint/speakers/${keepId}/merge`, {
@@ -7875,7 +10081,7 @@ async function _fpBulkMerge() {
 async function _fpBulkOptimize() {
   const ids = [..._fpSelected];
   if (!ids.length) return;
-  if (!confirm(`Optimize ${ids.length} profile${ids.length > 1 ? 's' : ''}? This prunes redundant voice samples.`)) return;
+  if (!await uiConfirm({ title: `Optimize ${ids.length} profile${ids.length > 1 ? 's' : ''}?`, message: 'This prunes redundant voice samples.', confirmLabel: 'Optimize' })) return;
   await fetch('/api/fingerprint/speakers/bulk/optimize', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -7893,7 +10099,7 @@ function _fpClearDetail() {
 async function fpDetailSave() {
   if (!_fpSelectedId) return;
   const name = document.getElementById('fp-detail-name').value.trim();
-  if (!name) { alert('Name is required.'); return; }
+  if (!name) { uiToast({ message: 'Name is required.', kind: 'warn' }); return; }
   await fetch(`/api/fingerprint/speakers/${_fpSelectedId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -7913,7 +10119,7 @@ async function fpDetailMerge() {
   const sel = document.getElementById('fp-detail-merge-sel');
   const targetId = sel.value;
   if (!targetId || !_fpSelectedId) return;
-  if (!confirm(`Merge "${document.getElementById('fp-detail-name').value}" into the selected profile? This cannot be undone.`)) return;
+  if (!await uiConfirm({ title: 'Merge profiles?', message: `Merge "${document.getElementById('fp-detail-name').value}" into the selected profile? This cannot be undone.`, confirmLabel: 'Merge', danger: true })) return;
   await fetch(`/api/fingerprint/speakers/${targetId}/merge`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -7926,7 +10132,7 @@ async function fpDetailMerge() {
 async function fpDetailDelete() {
   if (!_fpSelectedId) return;
   const name = document.getElementById('fp-detail-name').value;
-  if (!confirm(`Delete "${name}" and all its voice samples? This cannot be undone.`)) return;
+  if (!await uiConfirm({ title: `Delete "${name}"?`, message: 'Delete this profile and all its voice samples? This cannot be undone.', confirmLabel: 'Delete', danger: true })) return;
   await fetch(`/api/fingerprint/speakers/${_fpSelectedId}`, { method: 'DELETE' });
   _fpClearDetail();
   await _fpLoadProfiles();
@@ -7947,7 +10153,7 @@ function fpCancelNew() {
 
 async function fpCreateProfile() {
   const name = document.getElementById('fp-new-name').value.trim();
-  if (!name) { alert('Enter a name.'); return; }
+  if (!name) { uiToast({ message: 'Enter a name.', kind: 'warn' }); return; }
   const resp = await fetch('/api/fingerprint/speakers', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -8092,7 +10298,7 @@ function _fpRenderHealth() {
 }
 
 async function fpHealthMerge(keepId, mergeId, mergeName, keepName) {
-  if (!confirm(`Merge "${mergeName}" into "${keepName}"? All voice samples will be combined. This cannot be undone.`)) return;
+  if (!await uiConfirm({ title: 'Merge profiles?', message: `Merge "${mergeName}" into "${keepName}"? All voice samples will be combined. This cannot be undone.`, confirmLabel: 'Merge', danger: true })) return;
   await fetch(`/api/fingerprint/speakers/${keepId}/merge`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -8104,7 +10310,7 @@ async function fpHealthMerge(keepId, mergeId, mergeName, keepName) {
 
 async function fpHealthRun() {
   const btn = document.getElementById('fp-health-run-btn');
-  if (!confirm('Run library cleanup now?\n\nThis merges duplicate profiles, removes voice samples that belong to someone else, and re-tunes every profile. Review items are left alone.')) return;
+  if (!await uiConfirm({ title: 'Run library cleanup now?', message: 'This merges duplicate profiles, removes voice samples that belong to someone else, and re-tunes every profile. Review items are left alone.', confirmLabel: 'Run cleanup', danger: true })) return;
   btn.disabled = true;
   btn.textContent = 'Cleaning…';
   try {
@@ -8255,7 +10461,7 @@ async function fpLinkOne(row) {
   const name = row.dataset.name;
   const sel = row.querySelector('.fp-match-select');
   const value = sel ? sel.value : '';
-  if (!value) { alert('Select a profile or "Create New".'); return; }
+  if (!value) { uiToast({ message: 'Select a profile or "Create New".', kind: 'warn' }); return; }
 
   const body = value === '__new__'
     ? { name, create_new: true }
@@ -8271,6 +10477,7 @@ async function fpLinkOne(row) {
   });
 
   if (resp.ok) {
+    _fpLoaded = false;  // a profile was linked or created; refetch the Speakers view next visit
     row.remove();
     _fpMatchGroups = _fpMatchGroups.filter(g => g.name.toLowerCase() !== name.toLowerCase());
     if (_fpMatchGroups.length === 0) {
@@ -8300,7 +10507,7 @@ async function fpBulkLinkAll() {
   });
 
   if (mappings.length === 0) {
-    alert('Select at least one profile mapping to apply.');
+    uiToast({ message: 'Select at least one profile mapping to apply.', kind: 'warn' });
     return;
   }
 
@@ -8314,6 +10521,7 @@ async function fpBulkLinkAll() {
   });
 
   if (resp.ok) {
+    _fpLoaded = false;  // profiles were linked or created; refetch the Speakers view next visit
     await fpLoadUnlinked();
   }
   if (btn) { btn.disabled = false; btn.textContent = 'Apply All'; }
@@ -8329,14 +10537,14 @@ async function _fpMatchGoToSessions(speakerName, anchorEl) {
   const sessions = data.sessions || [];
   if (!sessions.length) return;
 
-  // Single session — jump directly
+  // Single session - jump directly
   if (sessions.length === 1) {
     closeFingerprintPanel();
     loadSession(sessions[0].session_id);
     return;
   }
 
-  // Multiple sessions — show popup anchored to the name
+  // Multiple sessions - show popup anchored to the name
   const popup = document.createElement('div');
   popup.className = 'fp-match-session-popup';
 
@@ -8767,63 +10975,730 @@ function _bulkReassignSelectedTo(name) {
   _tnRefreshReassignDropdowns();
 }
 
+/* === SPEAKER-MODAL-SHELL START ===========================================
+ * One shell for the Speakers modal: a shared header (meeting + status line +
+ * tab legend), tab badges, deterministic landing, and the single voice-sample
+ * player every tab routes through. Everything below is scoped to the modal.
+ * ========================================================================= */
+
+// ── One voice-sample player for the whole modal ─────────────────────────────
+// Manage, Cleanup and Resolve used to each carry their own <audio> and their
+// own play/stop bookkeeping, so two samples could overlap. playSpeakerVoice is
+// now the single owner: one private <audio>, one cancellation token, one
+// "playing" button at a time.
+let _voiceSampleAudio = null;
+let _voicePlayToken = 0;
+let _voicePlayButton = null;
+let _voicePlayRender = null;
+let _voiceMetaHandler = null;       // pending loadedmetadata listener, so it is never doubled
+
+const _VOICE_CLIP_DEFAULTS = { maxTotalSec: 9, maxClipSec: 6, maxClips: 4 };
+
+function _voiceDefaultRender(btn, playing) {
+  btn.classList.toggle('playing', playing);
+  btn.innerHTML = playing ? '<i class="fa-solid fa-stop"></i>' : '<i class="fa-solid fa-play"></i>';
+}
+
+function _voiceSetButton(btn, playing, render) {
+  if (!btn) return;
+  (render || _voiceDefaultRender)(btn, playing);
+}
+
+/** Stop whatever voice sample is playing, wherever it was started from. */
+function stopSpeakerVoice() {
+  _voicePlayToken += 1;
+  if (_voiceSampleAudio) {
+    try { _voiceSampleAudio.pause(); } catch (_) {}
+    // A cancelled play must not leave its metadata listener attached.
+    if (_voiceMetaHandler) {
+      _voiceSampleAudio.removeEventListener('loadedmetadata', _voiceMetaHandler);
+      _voiceMetaHandler = null;
+    }
+  }
+  if (_voicePlayButton) _voiceSetButton(_voicePlayButton, false, _voicePlayRender);
+  _voicePlayButton = null;
+  _voicePlayRender = null;
+  // Belt and braces: any stale "playing" affordance left by an earlier render.
+  document.querySelectorAll('.speaker-row-play.playing').forEach(b => _voiceDefaultRender(b, false));
+}
+
+// Kept as the historical name used elsewhere in this file.
+function _mgrStopVoice() { stopSpeakerVoice(); }
+
+function _voiceAudioEl(sessionId) {
+  if (!_voiceSampleAudio) {
+    _voiceSampleAudio = new Audio();
+    _voiceSampleAudio.preload = 'auto';
+    // ONE permanent error handler. A per-play {once:true} listener only detaches
+    // when it actually fires, so on a healthy file they piled up one per click.
+    _voiceSampleAudio.addEventListener('error', () => stopSpeakerVoice());
+  }
+  const src = `/api/sessions/${encodeURIComponent(sessionId)}/audio`;
+  if (!_voiceSampleAudio.src || _voiceSampleAudio.src.indexOf(src) === -1) _voiceSampleAudio.src = src;
+  return _voiceSampleAudio;
+}
+
+/** Pick the longest few clips that add up to a short, representative sample. */
+function _pickVoiceClips(segments, opts) {
+  const o = Object.assign({}, _VOICE_CLIP_DEFAULTS, opts || {});
+  const usable = (segments || [])
+    .map(s => ({ start: Number(s.start), end: Number(s.end) }))
+    .filter(s => isFinite(s.start) && isFinite(s.end) && s.end - s.start > 0.15)
+    .sort((a, b) => (b.end - b.start) - (a.end - a.start));
+  const picked = [];
+  let total = 0;
+  for (const s of usable) {
+    const dur = Math.min(s.end - s.start, o.maxClipSec);
+    picked.push({ start: s.start, end: s.start + dur });
+    total += dur;
+    if (total >= o.maxTotalSec || picked.length >= o.maxClips) break;
+  }
+  picked.sort((a, b) => a.start - b.start);
+  return picked;
+}
+
+/* Fetch a speaker's segments by raw diarizer KEY, never by display name: the
+ * agent transcript matcher does a name-substring match, so querying by name
+ * ("Alex") would wrongly pull another speaker's audio ("Alex Chen"). A Manage
+ * row can cover several keys (a name-group), so gather across all of them and
+ * keep only segments whose source really is one of those keys. */
+async function _fetchVoiceSegments(sessionId, speakerKeys) {
+  const wanted = new Set((speakerKeys || []).map(k => String(k).trim().toLowerCase()));
+  const segs = [];
+  for (const key of (speakerKeys || [])) {
+    const url = `/api/agent/v1/meetings/${encodeURIComponent(sessionId)}/transcript` +
+      `?speaker=${encodeURIComponent(key)}&format=json&limit=60`;
+    let data;
+    try { const r = await fetch(url); if (!r.ok) continue; data = await r.json(); }
+    catch (_) { continue; }
+    for (const s of (data.segments || [])) {
+      const src = String(s.source || '').trim().toLowerCase();
+      if (src && !wanted.has(src)) continue;   // matcher can leak on name-substring
+      segs.push(s);
+    }
+  }
+  return segs;
+}
+
+function _voicePlaySeq(audio, clips, idx, token) {
+  if (_voicePlayToken !== token) return;
+  if (idx >= clips.length) { stopSpeakerVoice(); return; }
+  const clip = clips[idx];
+  try { audio.currentTime = clip.start; } catch (_) {}
+  audio.play().catch(() => { if (_voicePlayToken === token) stopSpeakerVoice(); });
+  let timer = 0;
+  const onTU = () => {
+    if (_voicePlayToken !== token) { audio.removeEventListener('timeupdate', onTU); return; }
+    if (audio.currentTime >= clip.end) {
+      audio.removeEventListener('timeupdate', onTU);
+      if (timer) clearTimeout(timer);
+      _voicePlaySeq(audio, clips, idx + 1, token);
+    }
+  };
+  audio.addEventListener('timeupdate', onTU);
+  // Safety net if timeupdate stalls (tab blur / decode hiccup).
+  timer = setTimeout(() => {
+    audio.removeEventListener('timeupdate', onTU);
+    _voicePlaySeq(audio, clips, idx + 1, token);
+  }, (clip.end - clip.start + 0.7) * 1000);
+}
+
+/**
+ * Play a short voice sample for one speaker (or one name-group of keys).
+ *
+ * opts: { sessionId, speakerKeys[], segments?, maxTotalSec, maxClipSec,
+ *         button, render(btn, playing) }
+ * Clicking the same button again stops. Starting a sample stops the Cleanup
+ * segment queue too, so only one thing is ever audible in the modal.
+ */
+async function playSpeakerVoice(opts) {
+  const o = opts || {};
+  const btn = o.button || null;
+  const render = o.render || _voiceDefaultRender;
+  const sessionId = o.sessionId || state.sessionId;
+  const keys = (o.speakerKeys || []).filter(Boolean);
+
+  const alreadyPlaying = btn && btn === _voicePlayButton;
+  stopSpeakerVoice();
+  if (typeof _cleanupStopPlayback === 'function') { try { _cleanupStopPlayback(); } catch (_) {} }
+  if (alreadyPlaying) return;                       // click again to stop
+  if (!sessionId || (!keys.length && !o.segments)) return;
+
+  const token = ++_voicePlayToken;
+  _voicePlayButton = btn;
+  _voicePlayRender = render;
+  _voiceSetButton(btn, true, render);
+
+  let raw = o.segments;
+  if (!raw) {
+    try { raw = await _fetchVoiceSegments(sessionId, keys); }
+    catch (_) { if (_voicePlayToken === token) stopSpeakerVoice(); return; }
+  }
+  if (_voicePlayToken !== token) return;             // toggled/superseded while fetching
+
+  const clips = _pickVoiceClips(raw, { maxTotalSec: o.maxTotalSec, maxClipSec: o.maxClipSec });
+  if (!clips.length) { stopSpeakerVoice(); return; }
+
+  const audio = _voiceAudioEl(sessionId);
+  const begin = () => _voicePlaySeq(audio, clips, 0, token);
+  if (isFinite(audio.duration) && audio.duration > 0) begin();
+  else {
+    // Drop any metadata handler a superseded call left behind before adding ours.
+    if (_voiceMetaHandler) audio.removeEventListener('loadedmetadata', _voiceMetaHandler);
+    _voiceMetaHandler = () => {
+      audio.removeEventListener('loadedmetadata', _voiceMetaHandler);
+      _voiceMetaHandler = null;
+      if (_voicePlayToken === token) begin();
+    };
+    audio.addEventListener('loadedmetadata', _voiceMetaHandler);
+    audio.load();
+  }
+}
+
+// Exposed on window for scripts loaded separately from this file.
+window.playSpeakerVoice = playSpeakerVoice;
+window.stopSpeakerVoice = stopSpeakerVoice;
+
+function playManageSpeakerVoice(keys, btn, ev) {
+  if (ev) ev.stopPropagation();
+  return playSpeakerVoice({ speakerKeys: keys, button: btn });
+}
+
+
+/* ── Shared modal header, status line and tab badges ────────────────────────
+ * All three tabs describe the same set of speakers, so the header states that
+ * set once using the product definition of "needs attention" (core/attention.py):
+ * a non-noise speaker has material content when talk time >= min-seconds OR
+ * word count >= min-words; a material speaker with a generic name is
+ * unresolved; a generic speaker below both thresholds is a diarizer phantom
+ * (a low-content fragment) and never flags the meeting.
+ * ------------------------------------------------------------------------- */
+
+let _speakerModalStats = null;      // { total, named, unresolved, fragments }
+let _speakerModalStatsSession = null;
+let _speakerModalLastTab = null;    // remembered per session view
+let _speakerModalStatsToken = 0;
+
+function _speakerAttentionThresholds() {
+  const prefs = (typeof _prefs === 'object' && _prefs) ? _prefs : {};
+  const seconds = Number(prefs.obsidian_gate_min_seconds);
+  const words = Number(prefs.obsidian_gate_min_words);
+  return {
+    minSeconds: isFinite(seconds) && seconds > 0 ? seconds : 15,
+    minWords:   isFinite(words) && words > 0 ? words : 25,
+  };
+}
+
+/** Same shape core/attention.py computes, from a /speakers payload. */
+function _computeSpeakerAttention(speakers) {
+  const { minSeconds, minWords } = _speakerAttentionThresholds();
+  let named = 0, unresolved = 0, fragments = 0;
+  for (const sp of (speakers || [])) {
+    if (sp.is_noise) continue;
+    const key = String(sp.speaker_key || '');
+    if (key === _NOISE_LABEL || _isNoiseKey(key)) continue;
+    const material = (Number(sp.talk_seconds) || 0) >= minSeconds
+                  || (Number(sp.word_count) || 0) >= minWords;
+    const label = String(sp.name || '').trim();
+    const generic = !label || _GENERIC_SPEAKER_RE.test(label);
+    if (material) {
+      if (generic) unresolved += 1; else named += 1;
+    } else if (generic) {
+      fragments += 1;
+    }
+  }
+  return { total: named + unresolved, named, unresolved, fragments };
+}
+
+function _plural(n, one, many) { return `${n} ${n === 1 ? one : many}`; }
+
+function _speakerStatusText(stats) {
+  if (!stats) return 'Reading speaker stats…';
+  if (!stats.total && !stats.fragments) return 'No diarized speakers in this meeting yet.';
+  const parts = [];
+  if (stats.named) parts.push(`${stats.named} named`);
+  if (stats.unresolved) parts.push(`${_plural(stats.unresolved, 'needs', 'need')} attention`);
+  if (stats.fragments) parts.push(_plural(stats.fragments, 'low-content fragment', 'low-content fragments'));
+  const head = _plural(stats.total, 'speaker', 'speakers');
+  return parts.length ? `${head}: ${parts.join(', ')}` : head;
+}
+
+/** Repaint the meeting title, the status line and both tab badges. */
+function _paintSpeakerModalHeader() {
+  const meetingEl = document.getElementById('speaker-manager-meeting');
+  if (meetingEl) {
+    // The topbar title is only painted for a live recording; a past meeting's
+    // title comes from the session list the sidebar already holds.
+    let title = (document.getElementById('topbar-session-title')?.textContent || '').trim();
+    if (!title && state.sessionId && Array.isArray(_sidebarAllSessions)) {
+      title = ((_sidebarAllSessions.find(s => s.id === state.sessionId) || {}).title || '').trim();
+    }
+    meetingEl.textContent = title;
+    meetingEl.hidden = !title;
+  }
+  const statusEl = document.getElementById('speaker-manager-status');
+  if (statusEl) {
+    statusEl.textContent = _speakerStatusText(_speakerModalStats);
+    statusEl.classList.toggle('has-attention', !!(_speakerModalStats && _speakerModalStats.unresolved));
+  }
+  _paintSpeakerTabBadges();
+}
+
+function _paintSpeakerTabBadges() {
+  _cleanupPaintQuickBadge();
+  const dirtyDot = document.getElementById('speaker-cleanup-dirty');
+  if (dirtyDot) dirtyDot.hidden = !(_cleanupState && _cleanupState.dirty);
+}
+
+/** Reload the shared stats for the current session, then repaint. */
+async function refreshSpeakerModalHeader(force = false) {
+  _paintSpeakerModalHeader();
+  const sid = state.sessionId;
+  if (!sid) { _speakerModalStats = null; _speakerModalStatsSession = null; _paintSpeakerModalHeader(); return; }
+  if (!force && _speakerModalStatsSession === sid && _speakerModalStats) return;
+  const token = ++_speakerModalStatsToken;
+  try {
+    const r = await fetch(`/api/agent/v1/meetings/${encodeURIComponent(sid)}/speakers`);
+    if (!r.ok) return;
+    const payload = await r.json();
+    if (token !== _speakerModalStatsToken) return;
+    const speakers = Array.isArray(payload) ? payload : (payload.speakers || []);
+    _speakerModalStats = _computeSpeakerAttention(speakers);
+    _speakerModalStatsSession = sid;
+  } catch (_) { /* header degrades to the placeholder text */ }
+  _paintSpeakerModalHeader();
+}
+
+/** Any tab that writes a speaker name calls this so the shared header agrees. */
+function onSpeakerDataChanged() {
+  refreshSpeakerModalHeader(true);
+}
+window.onSpeakerDataChanged = onSpeakerDataChanged;
+
+/* ── Cleanup: pending-change count for the sticky footer ─────────────────── */
+
+// Three kinds of staged edit have to be counted, not just one: a member moved
+// between groups or into noise, and a group whose IDENTITY changed (linked to a
+// profile, unlinked, or given a new typed name). Counting membership alone made
+// every rename read as zero pending changes.
+function _cleanupPendingChangeCount() {
+  if (!_cleanupState) return 0;
+  const snap = _cleanupState.originalSnapshot || {};
+  const clusterSnap = _cleanupState.clusterSnapshot || {};
+  let changed = 0;
+  for (const cluster of _cleanupState.clusters) {
+    for (const m of cluster.members) {
+      const before = snap[m.speaker_key];
+      const wasNoise = !!(before && before.is_noise);
+      const nowNoise = _cleanupState.noiseKeys.has(m.speaker_key);
+      if (!before || before.cluster_id !== cluster.cluster_id || wasNoise !== nowNoise) changed += 1;
+    }
+    const identityBefore = clusterSnap[cluster.cluster_id];
+    const identityNow = {
+      global_id: cluster.global_id || null,
+      name:      cluster.name || '',
+      new_name:  cluster.new_name || '',
+    };
+    if (!identityBefore) {
+      // A group created during this edit only counts on its own when it has
+      // been given an identity; otherwise its members already counted above.
+      if (identityNow.global_id || identityNow.new_name) changed += 1;
+    } else if (identityBefore.global_id !== identityNow.global_id
+            || identityBefore.name !== identityNow.name
+            || identityBefore.new_name !== identityNow.new_name) {
+      changed += 1;
+    }
+  }
+  // Keys that live only in the noise bucket now but were not noise before.
+  if (_cleanupState.noiseMembers) {
+    for (const key of _cleanupState.noiseKeys) {
+      if (!_cleanupState.noiseMembers.has(key)) continue;
+      const before = snap[key];
+      if (!before || !before.is_noise) changed += 1;
+    }
+  }
+  return changed;
+}
+
+function _cleanupSyncFooter() {
+  const statusEl = document.getElementById('cleanup-footer-status');
+  const applyBtn = document.getElementById('cleanup-apply-btn');
+  const resetBtn = document.getElementById('cleanup-reset-btn');
+  const dirty = !!(_cleanupState && _cleanupState.dirty);
+  const pending = dirty ? Math.max(_cleanupPendingChangeCount(), 1) : 0;
+  if (statusEl) {
+    statusEl.textContent = dirty
+      ? `${_plural(pending, 'pending change', 'pending changes')}, not written yet`
+      : 'No pending changes';
+    statusEl.classList.toggle('is-dirty', dirty);
+  }
+  if (applyBtn && !applyBtn.dataset.busy) {
+    applyBtn.disabled = !dirty;
+    applyBtn.innerHTML = dirty
+      ? `<i class="fa-solid fa-check"></i> Apply ${_plural(pending, 'change', 'changes')}`
+      : '<i class="fa-solid fa-check"></i> Apply';
+  }
+  if (resetBtn) resetBtn.disabled = !dirty;
+  const dirtyDot = document.getElementById('speaker-cleanup-dirty');
+  if (dirtyDot) dirtyDot.hidden = !dirty;
+}
+
+/* ── Voice Library combobox (Manage tab) ─────────────────────────────────── */
+
+let _voiceProfiles = [];            // [{ id, name, color, emb_count }]
+let _voiceProfilesLoaded = false;
+let _mgrNameCombo = null;           // uiCombobox controller for the Manage editor
+let _mgrCommittedName = '';         // last value written to the server
+
+async function _loadVoiceProfiles(force = false) {
+  if (_voiceProfilesLoaded && !force) return _voiceProfiles;
+  try {
+    const r = await fetch('/api/fingerprint/speakers');
+    const data = await r.json();
+    _voiceProfiles = Array.isArray(data) ? data : [];
+    _voiceProfilesLoaded = true;
+  } catch (_) { _voiceProfiles = []; }
+  if (_mgrNameCombo) _mgrNameCombo.setItems(_voiceComboItems());
+  return _voiceProfiles;
+}
+
+function _voiceComboItems() {
+  // list_global_speakers exposes emb_count (voice samples on file), not a
+  // meeting count, so the row says what the number actually is.
+  return _voiceProfiles
+    .filter(p => p && p.name)
+    .map(p => ({
+      id: p.id,
+      label: p.name,
+      color: p.color || null,
+      sublabel: _plural(Number(p.emb_count) || 0, 'voice sample', 'voice samples'),
+    }));
+}
+
+function _mgrSetUnsaved(dirty) {
+  const el = document.getElementById('speaker-editor-unsaved');
+  if (el) el.hidden = !dirty;
+  const save = document.getElementById('speaker-save-btn');
+  if (save) save.classList.toggle('is-dirty', !!dirty);
+}
+
+function _mgrRefreshUnsaved() {
+  const typed = (_mgrNameCombo ? _mgrNameCombo.getValue() : '').trim();
+  _mgrSetUnsaved(!!_selectedSpeakerKeys.length && typed !== (_mgrCommittedName || '').trim());
+}
+
+// True while the user is actually typing in the Manage name field. Background
+// re-renders (a new transcript segment, a speaker_label or fingerprint event)
+// call renderSpeakerManager, and blindly resyncing the field there would move
+// _mgrCommittedName up to the uncommitted draft, which silently swallows the
+// pending rename on the next change event.
+function _mgrNameFieldIsFocused() {
+  return !!(_mgrNameCombo && document.activeElement === _mgrNameCombo.input);
+}
+
+/** Build (once) the Manage name combobox and keep its value in sync. */
+function _mgrEnsureNameCombo() {
+  const mount = document.getElementById('speaker-name-combo');
+  if (!mount) return null;
+  if (_mgrNameCombo) return _mgrNameCombo;
+  if (typeof window.uiCombobox !== 'function') return null;
+  _mgrNameCombo = uiCombobox({
+    mount,
+    placeholder: 'Speaker name, or pick a Voice Library profile',
+    ariaLabel: 'Speaker name or Voice Library profile',
+    emptyText: 'No Voice Library profiles yet. Type a name to use it.',
+    allowTyped: true,
+    typedLabel: 'Use typed name',
+    items: _voiceComboItems(),
+    onInput: value => { _speakerDraftName = value; _mgrRefreshUnsaved(); },
+    onSelect: (item, meta) => {
+      _speakerDraftName = item.label;
+      if (meta.typed) {
+        // Enter on "Use typed name" is a commit, not a stage. The combobox
+        // preventDefaults that Enter, so the native change event never fires
+        // and a second press would otherwise be needed to save.
+        _mgrCommitTypedName();
+        return;
+      }
+      linkSelectedSpeakersToProfile(item.id, item.label);
+    },
+  });
+  // Enter and blur-after-change both commit, so Manage behaves like Resolve:
+  // an edit you finish is an edit that is saved (with an Undo toast).
+  _mgrNameCombo.input.addEventListener('change', _mgrCommitTypedName);
+  _loadVoiceProfiles();
+  return _mgrNameCombo;
+}
+
+/** Write the typed name through, or just refresh the indicator when there is
+ *  nothing new to save. Shared by Enter, blur-after-change and Save changes. */
+function _mgrCommitTypedName() {
+  const typed = (_mgrNameCombo ? _mgrNameCombo.getValue() : '').trim();
+  if (!typed || !_selectedSpeakerKeys.length || typed === (_mgrCommittedName || '').trim()) {
+    _mgrRefreshUnsaved();
+    return;
+  }
+  applySpeakerEditor();
+}
+
+/** Snapshot the selected rows so an Undo toast can put them back. */
+function _mgrSnapshotSelection() {
+  return _selectedSpeakerKeys.map(key => {
+    const p = _speakerProfiles[key] || {};
+    return { speaker_key: key, name: p.name || '', color: p.color || speakerColor(key) };
+  });
+}
+
+async function _mgrRestoreSnapshot(snapshot) {
+  if (!state.sessionId || !snapshot || !snapshot.length) return;
+  for (const row of snapshot) {
+    try {
+      const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speaker_keys: [row.speaker_key], name: row.name, color: row.color }),
+      });
+      const data = await resp.json();
+      if (resp.ok) (data.speakers || []).forEach(applySpeakerProfileUpdate);
+    } catch (_) { /* best effort */ }
+  }
+  _syncSpeakerDraftFromSelection();
+  renderSpeakerManager();
+  onSpeakerDataChanged();
+}
+
+function _mgrToastSaved(message, snapshot) {
+  uiToast({
+    message,
+    kind: 'success',
+    id: 'speaker-manage-save',
+    action: { label: 'Undo', onClick: () => _mgrRestoreSnapshot(snapshot) },
+  });
+}
+
+/**
+ * Link every selected speaker key to a Voice Library profile, then take the
+ * profile's name. The link endpoint applies the profile name and colour itself
+ * when apply_name is set (app.py fp_link_session_speaker), so no extra PATCH.
+ */
+async function linkSelectedSpeakersToProfile(globalId, profileName) {
+  if (!state.sessionId) { uiToast({ message: 'Load a meeting first.', kind: 'warn' }); return; }
+  if (!_selectedSpeakerKeys.length) {
+    uiToast({ message: 'Select at least one speaker row first.', kind: 'warn' });
+    return;
+  }
+  const snapshot = _mgrSnapshotSelection();
+  const keys = [..._selectedSpeakerKeys];
+  // Full prior binding per key, not just "was it linked": re-linking a speaker
+  // that already pointed at another profile has to be undoable back to THAT
+  // profile, otherwise Undo restores the name but leaves the voice binding on
+  // the new one.
+  const linksBefore = keys.map(k => ({ key: k, link: _sessionLinks[k] || null }));
+  const profileColor = (_voiceProfiles.find(p => p.id === globalId) || {}).color || null;
+  let failed = 0;
+  for (const key of keys) {
+    try {
+      const resp = await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speaker_key: key, global_id: globalId, apply_name: true }),
+      });
+      if (!resp.ok) { failed += 1; continue; }
+      _sessionLinks[key] = { global_id: globalId, name: profileName };
+      // apply_name makes the server write the profile's name AND colour
+      // (app.py fp_link_session_speaker); mirror both locally so the row does
+      // not keep the old swatch until the next reload.
+      const update = { speaker_key: key, name: profileName };
+      if (profileColor) update.color = profileColor;
+      applySpeakerProfileUpdate(update);
+    } catch (_) { failed += 1; }
+  }
+  _updateLinkedBadges();
+  _mgrCommittedName = profileName;
+  _syncSpeakerDraftFromSelection();
+  renderSpeakerManager();
+  onSpeakerDataChanged();
+  if (failed) {
+    uiToast({ message: `Could not link ${_plural(failed, 'speaker', 'speakers')} to ${profileName}.`, kind: 'error' });
+    return;
+  }
+  uiToast({
+    message: `Linked ${_plural(keys.length, 'speaker', 'speakers')} to ${profileName}.`,
+    kind: 'success',
+    id: 'speaker-manage-save',
+    action: {
+      label: 'Undo',
+      onClick: async () => {
+        for (const row of linksBefore) {
+          try {
+            await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link/${encodeURIComponent(row.key)}`, { method: 'DELETE' });
+          } catch (_) {}
+          delete _sessionLinks[row.key];
+          if (!row.link || !row.link.global_id) continue;
+          // Was bound to a different profile before: put that binding back.
+          try {
+            await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ speaker_key: row.key, global_id: row.link.global_id }),
+            });
+            _sessionLinks[row.key] = row.link;
+          } catch (_) {}
+        }
+        _updateLinkedBadges();
+        await _mgrRestoreSnapshot(snapshot);
+      },
+    },
+  });
+}
+
+/** Drop the Voice Library binding for the selected rows (names are kept). */
+async function unlinkSelectedSpeakers() {
+  if (!state.sessionId) return;
+  const keys = _selectedSpeakerKeys.filter(k => _sessionLinks[k]);
+  if (!keys.length) { uiToast({ message: 'No linked speaker selected.', kind: 'warn' }); return; }
+  const ok = await uiConfirm({
+    title: 'Unlink from the Voice Library?',
+    message: `${_plural(keys.length, 'speaker', 'speakers')} will keep the current name but stop being recognised by voice in future meetings.`,
+    details: keys,
+    confirmLabel: 'Unlink',
+  });
+  if (!ok) return;
+  const previous = keys.map(k => ({ key: k, link: _sessionLinks[k] }));
+  for (const key of keys) {
+    try {
+      await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      delete _sessionLinks[key];
+    } catch (_) { /* leave the badge in place if it failed */ }
+  }
+  _updateLinkedBadges();
+  renderSpeakerManager();
+  uiToast({
+    message: `Unlinked ${_plural(keys.length, 'speaker', 'speakers')}.`,
+    kind: 'success',
+    id: 'speaker-manage-save',
+    action: {
+      label: 'Undo',
+      onClick: async () => {
+        for (const row of previous) {
+          if (!row.link || !row.link.global_id) continue;
+          try {
+            await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ speaker_key: row.key, global_id: row.link.global_id }),
+            });
+            _sessionLinks[row.key] = row.link;
+          } catch (_) {}
+        }
+        _updateLinkedBadges();
+        renderSpeakerManager();
+      },
+    },
+  });
+}
+
+/* ── Modal chrome: Escape to close, focus on open ────────────────────────── */
+
+function _speakerModalIsOpen() {
+  const ov = document.getElementById('speaker-manager-overlay');
+  return !!ov && !ov.classList.contains('hidden');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || !_speakerModalIsOpen()) return;
+  // A cleanup picker popover handles its own Escape before this fires.
+  if (_cleanupPicker) return;
+  if (document.querySelector('.ui-dialog-overlay')) return;   // a confirm is up
+  e.preventDefault();
+  closeSpeakerManager();
+});
+
+/** Put the caret somewhere useful the moment the modal lands on a tab. */
+function _speakerModalFocusTab(tab) {
+  window.setTimeout(() => {
+    if (!_speakerModalIsOpen()) return;
+    if (tab === 'manage') {
+      const combo = document.querySelector('#speaker-name-combo .ui-combobox-input');
+      if (combo) { combo.focus(); return; }
+    }
+    document.getElementById(`speaker-tab-${tab}`)?.focus();
+  }, 0);
+}
+
+/* === SPEAKER-MODAL-SHELL END ============================================= */
+
 function renderSpeakerManager() {
   const listEl = document.getElementById('speaker-manager-list');
   const colorGridEl = document.getElementById('speaker-color-grid');
-  const inputEl = document.getElementById('speaker-editor-name');
   const hintEl = document.getElementById('speaker-editor-hint');
-  const subtitleEl = document.getElementById('speaker-manager-subtitle');
-  const datalistEl = document.getElementById('speaker-name-options');
-  if (!listEl || !colorGridEl || !inputEl || !hintEl || !subtitleEl || !datalistEl) return;
+  if (!listEl || !colorGridEl || !hintEl) return;
 
   const profiles = _getSortedSpeakerProfiles().filter(p => p.speaker_key !== _NOISE_LABEL);
   const groups = _groupProfilesByName(profiles);
   const selectedGroupCount = groups.filter(g => g.speakerKeys.some(k => _selectedSpeakerKeys.includes(k))).length;
 
-  inputEl.value = _speakerDraftName;
-  inputEl.oninput = e => { _speakerDraftName = e.target.value; };
-
-  datalistEl.innerHTML = '';
-  _speakerOptionNames().forEach(name => {
-    const opt = document.createElement('option');
-    opt.value = name;
-    datalistEl.appendChild(opt);
-  });
+  // Name field is a combobox over the Voice Library, not a bare datalist: the
+  // first row uses whatever you typed, the rest bind this speaker to a saved
+  // voice profile so it is recognised in future meetings.
+  const combo = _mgrEnsureNameCombo();
+  if (combo) {
+    // Only overwrite the field when the user is NOT mid-edit.
+    // renderSpeakerManager runs on every new transcript segment and on every
+    // speaker_label / fingerprint event while the modal is open; resyncing
+    // there would discard whatever is being typed. The indicator itself is
+    // derived from (typed vs committed), so it is always safe to recompute.
+    if (!_mgrNameFieldIsFocused()) {
+      combo.setValue(_speakerDraftName);
+      _mgrCommittedName = _speakerDraftName;
+    }
+    _mgrRefreshUnsaved();
+  }
 
   colorGridEl.innerHTML = '';
   _SPEAKER_PALETTE.forEach(color => {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'speaker-color-btn' + (_speakerDraftColor === color ? ' active' : '');
-    btn.title = color;
+    btn.title = `Use ${color}`;
+    btn.setAttribute('aria-label', `Use colour ${color}`);
     btn.style.backgroundColor = color;
     btn.addEventListener('click', async () => {
       _speakerDraftColor = color;
-      // Auto-apply color immediately if speakers are selected
+      // Manage is a direct-edit surface: the colour writes straight through,
+      // exactly like the name field, and the toast carries the Undo.
       if (_selectedSpeakerKeys.length && state.sessionId) {
+        const snapshot = _mgrSnapshotSelection();
         const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ speaker_keys: _selectedSpeakerKeys, color }),
         });
         const data = await resp.json();
-        if (resp.ok) (data.speakers || []).forEach(applySpeakerProfileUpdate);
+        if (resp.ok) {
+          (data.speakers || []).forEach(applySpeakerProfileUpdate);
+          _mgrToastSaved(`Colour saved for ${_plural(snapshot.length, 'speaker', 'speakers')}.`, snapshot);
+        } else {
+          uiToast({ message: data.error || 'Could not save the colour.', kind: 'error' });
+        }
       }
       renderSpeakerManager();
     });
     colorGridEl.appendChild(btn);
   });
 
+  const unlinkBtn = document.getElementById('speaker-unlink-btn');
+  if (unlinkBtn) unlinkBtn.hidden = !_selectedSpeakerKeys.some(k => _sessionLinks[k]);
+
   if (selectedGroupCount === 0) {
-    subtitleEl.textContent = 'Manage speaker names, colors, and bulk assignments.';
-    hintEl.textContent = 'Click a speaker row to edit it. Use Ctrl/Cmd-click or Shift-click for multi-select.';
+    hintEl.textContent = 'Click a speaker row to edit it. Ctrl/Cmd-click or Shift-click for multi-select.';
   } else if (selectedGroupCount === 1) {
-    subtitleEl.textContent = 'Editing 1 speaker.';
-    hintEl.textContent = 'Change the name or color, or add a new participant for later assignment.';
+    hintEl.textContent = 'Assign a name, or pick a Voice Library profile to link this speaker to.';
   } else {
-    subtitleEl.textContent = `Editing ${selectedGroupCount} speakers.`;
-    hintEl.textContent = 'Bulk updates apply to every selected speaker row.';
+    hintEl.textContent = `Editing ${selectedGroupCount} speakers. Every change applies to all of them.`;
   }
+
+  _paintSpeakerModalHeader();
 
   listEl.innerHTML = '';
   if (!groups.length) {
@@ -8832,12 +11707,19 @@ function renderSpeakerManager() {
   }
 
   groups.forEach(group => {
-    const row = document.createElement('button');
-    row.type = 'button';
+    // The row is a plain container with real <button> children. It used to be a
+    // <button> with an interactive span inside it, which is invalid HTML and
+    // gives screen readers one unusable control instead of two.
+    const row = document.createElement('div');
     const isSelected = group.speakerKeys.some(k => _selectedSpeakerKeys.includes(k));
     row.className = 'speaker-row' + (isSelected ? ' selected' : '');
     row.dataset.speakerKeys = JSON.stringify(group.speakerKeys);
-    row.addEventListener('click', e => {
+
+    const selectBtn = document.createElement('button');
+    selectBtn.type = 'button';
+    selectBtn.className = 'speaker-row-select';
+    selectBtn.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    selectBtn.addEventListener('click', e => {
       _setGroupSelection(group, {
         toggle: e.ctrlKey || e.metaKey,
         range: e.shiftKey,
@@ -8879,8 +11761,21 @@ function renderSpeakerManager() {
 
     main.appendChild(nameEl);
     main.appendChild(meta);
-    row.appendChild(swatch);
-    row.appendChild(main);
+    selectBtn.appendChild(swatch);
+    selectBtn.appendChild(main);
+    row.appendChild(selectBtn);
+    // Play this speaker's voice (only when there are real segments to hear).
+    // A real sibling button: Enter and Space come free, no nesting.
+    if (count > 0) {
+      const playCtl = document.createElement('button');
+      playCtl.type = 'button';
+      playCtl.className = 'speaker-row-play';
+      playCtl.title = 'Play this speaker’s voice';
+      playCtl.setAttribute('aria-label', `Play ${group.name}`);
+      playCtl.innerHTML = '<i class="fa-solid fa-play"></i>';
+      playCtl.addEventListener('click', ev => playManageSpeakerVoice(group.speakerKeys, playCtl, ev));
+      row.appendChild(playCtl);
+    }
     // Show linked indicator if any key in this group is linked to a global profile
     const isLinked = group.speakerKeys.some(k => _sessionLinks[k]);
     if (isLinked) {
@@ -8896,14 +11791,14 @@ function renderSpeakerManager() {
 }
 
 async function createSpeakerProfile() {
-  const name = (document.getElementById('speaker-editor-name')?.value || '').trim();
+  const name = (_mgrNameCombo ? _mgrNameCombo.getValue() : _speakerDraftName || '').trim();
   if (!name) {
-    alert('Enter a speaker name first.');
+    uiToast({ message: 'Assign a name first.', kind: 'warn' });
     return;
   }
 
   if (!state.sessionId) {
-    // No session yet – store locally and flush when recording starts
+    // No session yet - store locally and flush when recording starts
     const tempKey = `pre:${Date.now()}`;
     const color = _speakerDraftColor || _SPEAKER_PALETTE[_speakerColorIdx % _SPEAKER_PALETTE.length];
     _pendingSpeakerProfiles.push({ tempKey, name, color });
@@ -8926,7 +11821,7 @@ async function createSpeakerProfile() {
   });
   const data = await resp.json();
   if (!resp.ok) {
-    alert(data.error || 'Failed to add speaker');
+    uiToast({ message: data.error || 'Failed to add speaker', kind: 'error' });
     return;
   }
 
@@ -8935,6 +11830,8 @@ async function createSpeakerProfile() {
   _speakerSelectionAnchor = data.speaker.speaker_key;
   _syncSpeakerDraftFromSelection();
   renderSpeakerManager();
+  onSpeakerDataChanged();
+  uiToast({ message: `Added participant "${name}".`, kind: 'success', id: 'speaker-manage-save' });
 }
 
 async function _flushPendingSpeakers(sessionId) {
@@ -8968,19 +11865,20 @@ async function _flushPendingSpeakers(sessionId) {
 async function applySpeakerEditor() {
   if (!state.sessionId) return;
   if (!_selectedSpeakerKeys.length) {
-    alert('Select at least one speaker row first.');
+    uiToast({ message: 'Select at least one speaker row first.', kind: 'warn' });
     return;
   }
 
-  const name = (document.getElementById('speaker-editor-name')?.value || '').trim();
+  const name = (_mgrNameCombo ? _mgrNameCombo.getValue() : _speakerDraftName || '').trim();
   const body = { speaker_keys: _selectedSpeakerKeys };
   if (name) body.name = name;
   if (_speakerDraftColor) body.color = _speakerDraftColor;
   if (!body.name && !body.color) {
-    alert('Enter a name or choose a color first.');
+    uiToast({ message: 'Assign a name or choose a colour first.', kind: 'warn' });
     return;
   }
 
+  const snapshot = _mgrSnapshotSelection();
   const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -8988,13 +11886,20 @@ async function applySpeakerEditor() {
   });
   const data = await resp.json();
   if (!resp.ok) {
-    alert(data.error || 'Failed to update speakers');
+    uiToast({ message: data.error || 'Could not save the speaker.', kind: 'error' });
     return;
   }
 
   (data.speakers || []).forEach(applySpeakerProfileUpdate);
+  _mgrCommittedName = name;
   _syncSpeakerDraftFromSelection();
   renderSpeakerManager();
+  onSpeakerDataChanged();
+  _mgrToastSaved(
+    name ? `Saved "${name}" for ${_plural(snapshot.length, 'speaker', 'speakers')}.`
+         : `Saved ${_plural(snapshot.length, 'speaker', 'speakers')}.`,
+    snapshot,
+  );
 }
 
 function appendTranscript(text, source, startTime, endTime, segId, labelOverride, originalSource) {
@@ -9085,7 +11990,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
 
     if (isMe) {
       // Local-only "(You)" indicator. Never baked into the stored/exported name
-      // — keyed on the local Me id so imported foreign mic segments aren't badged.
+      // - keyed on the local Me id so imported foreign mic segments aren't badged.
       badge.classList.add('src-me');
       const you = document.createElement('span');
       you.className = 'badge-you';
@@ -9095,7 +12000,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
       badge.appendChild(you);
       badge.title = 'Your microphone audio. Click to change your speaker name.';
     } else {
-      // Inline identify icon for unlinked speakers (never for the Me speaker —
+      // Inline identify icon for unlinked speakers (never for the Me speaker -
       // mic audio is always you and is never fingerprinted/identified).
       const idIcon = document.createElement('i');
       idIcon.className = 'fa-solid fa-fingerprint speaker-identify-icon';
@@ -10540,7 +13445,7 @@ async function tnApplyReassign() {
   if (targets.length === 0) return;
 
   const toLabel = toName === _NOISE_LABEL ? 'Noise' : `"${toName}"`;
-  if (!confirm(`Reassign ${targets.length} segment${targets.length !== 1 ? 's' : ''} from "${fromName}" to ${toLabel}?`)) return;
+  if (!await uiConfirm({ title: 'Reassign segments?', message: `Reassign ${targets.length} segment${targets.length !== 1 ? 's' : ''} from "${fromName}" to ${toLabel}?`, confirmLabel: 'Reassign' })) return;
 
   if (toName === _NOISE_LABEL) {
     // Collect unique speaker_keys from target segments and mark them as noise
@@ -10983,8 +13888,8 @@ function tnClearAll() {
   _tnRefreshStats();
 }
 
-function clearTranscript() {
-  if (!confirm('Clear the transcript? The transcript will need to be reanalyzed for speaker labeling.')) return;
+async function clearTranscript() {
+  if (!await uiConfirm({ title: 'Clear transcript?', message: 'The transcript will need to be reanalyzed for speaker labeling.', confirmLabel: 'Clear', danger: true })) return;
   document.getElementById('transcript').innerHTML =
     '<p class="empty-hint">Transcript cleared.</p>';
 }
@@ -11059,7 +13964,7 @@ function _flashSummaryCopied() {
 }
 
 // Popout shown when the summary copy button is clicked, letting the user choose
-// whether to keep the [M:SS] timestamp pills. Reuses the .session-menu styling —
+// whether to keep the [M:SS] timestamp pills. Reuses the .session-menu styling -
 // the app's shared "anchored dropdown" look.
 function openCopySummaryMenu(btn) {
   // Clicking the button again toggles the menu closed.
@@ -11910,7 +14815,7 @@ function sessionEditorUpdateRestoreButton() {
   const btn = document.getElementById('session-editor-restore');
   if (!btn) return;
   // Trim backup only matters in trim mode. Split backup is a session-level
-  // property — offer it in either mode so users can always find the undo.
+  // property - offer it in either mode so users can always find the undo.
   const ed = _sessionEditor;
   if (!ed) { btn.classList.add('hidden'); btn.disabled = true; return; }
   const hasTrim  = ed.mode === 'trim' && ed.hasTrimBackup;
@@ -11918,7 +14823,7 @@ function sessionEditorUpdateRestoreButton() {
   btn.classList.toggle('hidden', !(hasTrim || hasSplit));
   btn.disabled = !(hasTrim || hasSplit);
   // Label reflects which restore will be offered. Split wins if both are
-  // somehow true (shouldn't normally happen — the original session was
+  // somehow true (shouldn't normally happen - the original session was
   // deleted during the split, taking its trim backup with it).
   if (hasSplit) btn.textContent = 'Undo Split…';
   else if (hasTrim) btn.textContent = 'Restore Original';
@@ -12323,7 +15228,7 @@ async function applySessionEditor() {
       if (data.sessions?.[0]?.session_id) await loadSession(data.sessions[0].session_id);
     }
   } catch (e) {
-    alert(e.message || 'Session edit failed');
+    uiToast({ message: e.message || 'Session edit failed', kind: 'error' });
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -12335,7 +15240,7 @@ async function applySessionEditor() {
 async function restoreSessionEditorOriginal() {
   const ed = _sessionEditor;
   if (!ed) return;
-  // Split rollback takes priority — the original session was deleted at split
+  // Split rollback takes priority - the original session was deleted at split
   // time, so the only thing to restore is the pre-split snapshot. The split
   // restore has its own modal (lets the user choose which parts to delete).
   if (ed.hasSplitBackup) {
@@ -12343,7 +15248,7 @@ async function restoreSessionEditorOriginal() {
     return;
   }
   if (!ed.hasTrimBackup) return;
-  if (!confirm('Restore the original audio, video, transcript, and speaker labels for this session?')) return;
+  if (!await uiConfirm({ title: 'Restore original session?', message: 'Restore the original audio, video, transcript, and speaker labels for this session?', confirmLabel: 'Restore', danger: true })) return;
   const btn = document.getElementById('session-editor-restore');
   const applyBtn = document.getElementById('session-editor-apply');
   if (btn) {
@@ -12359,7 +15264,7 @@ async function restoreSessionEditorOriginal() {
     closeSessionEditor();
     await reloadSession(ed.sessionId);
   } catch (e) {
-    alert(e.message || 'Restore failed');
+    uiToast({ message: e.message || 'Restore failed', kind: 'error' });
     sessionEditorUpdateRestoreButton();
   } finally {
     if (btn) {
@@ -12379,11 +15284,11 @@ async function openSplitRestoreDialog(sessionId) {
   try {
     info = await fetch(`/api/sessions/${sid}/split-info`).then(r => r.json());
   } catch (e) {
-    alert('Could not load split info: ' + (e.message || e));
+    uiToast({ message: 'Could not load split info: ' + (e.message || e), kind: 'error' });
     return;
   }
   if (!info.has_backup) {
-    alert('No split backup available for this session.');
+    uiToast({ message: 'No split backup available for this session.', kind: 'warn' });
     return;
   }
 
@@ -12432,7 +15337,7 @@ async function openSplitRestoreDialog(sessionId) {
   list.innerHTML = '';
   const members = info.members || [];
   if (!members.length) {
-    list.innerHTML = '<p class="empty-hint">No split parts remain — restore will simply recreate the original.</p>';
+    list.innerHTML = '<p class="empty-hint">No split parts remain: restore will simply recreate the original.</p>';
   } else {
     members.forEach(m => {
       const row = document.createElement('label');
@@ -12502,7 +15407,7 @@ async function _doSplitRestore(sessionId) {
     }).then(r => r.json());
     if (r.error) throw new Error(r.error);
     closeSplitRestoreDialog();
-    // Close the session editor if open — the session it was editing may no
+    // Close the session editor if open - the session it was editing may no
     // longer exist (e.g. user checked "delete this part")
     const ed = document.getElementById('session-editor-overlay');
     if (ed && !ed.classList.contains('hidden')) closeSessionEditor();
@@ -12510,7 +15415,7 @@ async function _doSplitRestore(sessionId) {
     if (r.restored_session_id) await loadSession(r.restored_session_id);
     flashStatus('Original meeting restored');
   } catch (e) {
-    alert('Restore failed: ' + (e.message || e));
+    uiToast({ message: 'Restore failed: ' + (e.message || e), kind: 'error' });
   } finally {
     if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = 'Restore Original'; }
   }
@@ -13285,7 +16190,7 @@ function _applyCollapse() {
     if (endT > 0) {
       const timeSpan = document.createElement('span');
       timeSpan.className = 'group-time';
-      timeSpan.textContent = `${fmtTime(startT)} – ${fmtTime(endT)}`;
+      timeSpan.textContent = `${fmtTime(startT)} to ${fmtTime(endT)}`;
       summary.appendChild(timeSpan);
     }
 
@@ -13707,12 +16612,15 @@ function _renderToolWidget(msgWrap, toolCalls, isFinal = false) {
   // isFinal=true is used by the hydration path (loading saved messages from
   // the DB). The response has already completed, so any tool entry whose
   // result wasn't persisted (older sessions saved before the parallel-tool
-  // pairing fix) must still render as "completed" — the spinner state would
+  // pairing fix) must still render as "completed" - the spinner state would
   // be permanently stuck otherwise.
   const allDone = isFinal || doneCount === count;
   const isOpen = widget.classList.contains('open');
 
   let itemsHtml = '';
+  // Relabel plan cards live outside the collapsible detail list: they carry
+  // action buttons, so they must stay visible once the widget collapses.
+  let cardsHtml = '';
   for (const tc of toolCalls) {
     const hasResult = !!tc.result;
     let icon, iconCls, detail;
@@ -13744,6 +16652,7 @@ function _renderToolWidget(msgWrap, toolCalls, isFinal = false) {
       </div>
       ${thumb}
     </div>`;
+    cardsHtml += _relabelCardHtml(tc);
   }
 
   const statusIcon = allDone ? '<i class="fa-solid fa-wrench"></i>' : '<span class="chat-tool-spinner"></span>';
@@ -13757,12 +16666,13 @@ function _renderToolWidget(msgWrap, toolCalls, isFinal = false) {
       <span>${statusText}</span>
       <i class="fa-solid fa-chevron-right chat-tool-chevron"></i>
     </button>
-    <div class="chat-tool-details">${itemsHtml}</div>`;
+    <div class="chat-tool-details">${itemsHtml}</div>
+    ${cardsHtml}`;
 
   // Auto-expand while tools are in progress, preserve manual toggle otherwise.
   // Keep 'streaming' even after all tools complete - it's only removed on
   // first chat_chunk so the collapse fires at the right time.
-  // Hydrated (isFinal) widgets skip the streaming class entirely — they're
+  // Hydrated (isFinal) widgets skip the streaming class entirely - they're
   // rendered after the response completed and should stay collapsed unless
   // the user expands them.
   if (isFinal) {
@@ -13791,8 +16701,155 @@ function _toolDisplayName(name) {
     get_context_file_info: 'File Info',
     run_context_shell: 'Shell',
     web_search: 'Web Search',
+    plan_speaker_relabel: 'Planning speaker reassignment',
+    apply_speaker_relabel: 'Applying speaker reassignment',
+    cancel_speaker_relabel: 'Cancelling speaker reassignment',
   };
   return map[name] || name;
+}
+
+/* ── Speaker-reassignment plan card ──────────────────────────────────────────
+   plan_speaker_relabel writes nothing: it returns a plan plus a single-use
+   token. The card below is the user's confirmation step, and posting the token
+   back applies exactly the plan that was shown, never a re-described one. */
+
+function _relabelSummaryLine(card) {
+  const keys = card.key_count || 0;
+  const sessions = card.session_count || 0;
+  return `${keys} speaker${keys === 1 ? '' : 's'} in ${sessions} `
+       + `meeting${sessions === 1 ? '' : 's'}, ${card.segment_total || 0} segments`;
+}
+
+function _relabelCardHtml(tc) {
+  const card = tc.result?.relabel;
+  if (!card || !card.token) return '';
+  const resolved = tc.result.relabelState || '';
+  const sessions = (card.sessions || []).slice(0, 8);
+  const more = (card.sessions || []).length - sessions.length;
+  let list = '';
+  for (const s of sessions) {
+    const when = (s.started_at || '').slice(0, 10);
+    list += `<li>${escapeHtml(s.title || 'Untitled')}`
+          + (when ? ` <span class="relabel-when">${escapeHtml(when)}</span>` : '')
+          + ` <span class="relabel-when">${s.key_count} label${s.key_count === 1 ? '' : 's'}, ${s.segment_count} segments</span></li>`;
+  }
+  if (more > 0) list += `<li class="relabel-when">and ${more} more meeting${more === 1 ? '' : 's'}</li>`;
+
+  let warns = '';
+  for (const w of card.warnings || []) {
+    warns += `<div class="relabel-warn">${escapeHtml(w)}</div>`;
+  }
+
+  const resolvedNote = tc.result.relabelNote
+    ? `<div class="relabel-note">${escapeHtml(tc.result.relabelNote)}</div>`
+    : '';
+  const actions = resolved
+    ? `<div class="relabel-status ${resolved}">${escapeHtml(tc.result.relabelMessage || '')}</div>${resolvedNote}`
+    : `<div class="relabel-actions">
+         <button class="relabel-btn primary" onclick="_relabelConfirm(this)">Confirm</button>
+         <button class="relabel-btn" onclick="_relabelCancel(this)">Cancel</button>
+       </div>
+       <div class="relabel-status"></div>`;
+
+  return `<div class="relabel-card" data-token="${escapeHtml(card.token)}">
+    <div class="relabel-head">Reassign ${escapeHtml(card.from_name)} to ${escapeHtml(card.to_name)}</div>
+    <div class="relabel-sub">${escapeHtml(_relabelSummaryLine(card))}</div>
+    <ul class="relabel-list">${list}</ul>
+    ${warns}
+    ${actions}
+  </div>`;
+}
+
+/* When the model applies or cancels a plan itself (the user confirmed in chat),
+   the earlier plan card must stop offering Confirm/Cancel and show the outcome. */
+function _syncRelabelCardFromTool(d) {
+  const applied = d && d.relabel_applied;
+  if (applied && applied.token) {
+    const keys = applied.key_count || 0, sessions = applied.session_count || 0;
+    const note = (!applied.summaries_queued && sessions > 0)
+      ? 'Summaries were not refreshed (a recording was active or summaries '
+        + 'are disabled); regenerate them from the meeting when convenient.'
+      : '';
+    _relabelResolve(applied.token, 'applied',
+      `Applied from chat: ${keys} speaker${keys === 1 ? '' : 's'} across `
+      + `${sessions} meeting${sessions === 1 ? '' : 's'}`, note);
+  }
+  const cancelled = d && d.relabel_cancelled;
+  if (cancelled && cancelled.token) {
+    _relabelResolve(cancelled.token, 'cancelled', 'Cancelled in chat; nothing was changed');
+  }
+}
+
+function _relabelResolve(token, stateName, message, note) {
+  for (const tc of (state.chatToolCalls || [])) {
+    if (tc.result?.relabel?.token === token) {
+      tc.result.relabelState = stateName;
+      tc.result.relabelMessage = message;
+      tc.result.relabelNote = note || '';
+    }
+  }
+  const card = document.querySelector(`.relabel-card[data-token="${token}"]`);
+  if (!card) return;
+  card.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  card.querySelector('.relabel-actions')?.remove();
+  const status = card.querySelector('.relabel-status');
+  if (status) {
+    status.className = `relabel-status ${stateName}`;
+    status.textContent = message;
+  }
+  card.querySelector('.relabel-note')?.remove();
+  if (note && status) {
+    const el = document.createElement('div');
+    el.className = 'relabel-note';
+    el.textContent = note;
+    status.after(el);
+  }
+}
+
+async function _relabelConfirm(btn) {
+  const card = btn.closest('.relabel-card');
+  const token = card?.dataset.token;
+  if (!token) return;
+  card.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  const status = card.querySelector('.relabel-status');
+  if (status) status.textContent = 'Applying...';
+  try {
+    const res = await fetch('/api/speakers/relabel/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || 'Could not apply the reassignment');
+    const keys = d.key_count || 0;
+    const sessions = d.session_count || 0;
+    // Summaries are skipped while a recording runs or when auto-summary
+    // is off, so say so rather than leaving stale speaker names in them.
+    const note = (!d.summaries_queued && sessions > 0)
+      ? 'Summaries were not refreshed (a recording was active or summaries '
+        + 'are disabled); regenerate them from the meeting when convenient.'
+      : '';
+    _relabelResolve(token, 'applied',
+      `Applied: ${keys} speaker${keys === 1 ? '' : 's'} across `
+      + `${sessions} meeting${sessions === 1 ? '' : 's'}`, note);
+  } catch (e) {
+    _relabelResolve(token, 'failed', e.message || 'Could not apply the reassignment');
+  }
+}
+
+async function _relabelCancel(btn) {
+  const card = btn.closest('.relabel-card');
+  const token = card?.dataset.token;
+  if (!token) return;
+  card.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  try {
+    await fetch('/api/speakers/relabel/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+  } catch {}
+  _relabelResolve(token, 'cancelled', 'Cancelled. Nothing was changed.');
 }
 
 function _toolInputSummary(name, input) {
@@ -13812,6 +16869,12 @@ function _toolInputSummary(name, input) {
   if (name === 'run_context_shell') return input?.command || 'command';
   if (name === 'web_search' && input?.query) return `"${input.query}"`;
   if (name === 'web_search') return 'searching…';
+  if (name === 'plan_speaker_relabel') {
+    const scope = input?.scope === 'library' ? 'whole library' : 'this meeting';
+    return `"${input?.from_name || '?'}" to "${input?.to_name || '?'}" (${scope})`;
+  }
+  if (name === 'apply_speaker_relabel') return 'after your confirmation';
+  if (name === 'cancel_speaker_relabel') return 'plan token';
   return JSON.stringify(input || {});
 }
 
@@ -14933,7 +17996,7 @@ async function pickChatContextFolder() {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      window.alert(data.error || 'Could not add context folder.');
+      uiToast({ message: data.error || 'Could not add context folder.', kind: 'error' });
       return;
     }
     if (!data.selected) return;
@@ -14944,7 +18007,7 @@ async function pickChatContextFolder() {
     }
     _setChatContextFolders([..._chatContextFolders, selected]);
   } catch (e) {
-    window.alert(`Error: ${e.message || e}`);
+    uiToast({ message: `Error: ${e.message || e}`, kind: 'error' });
   } finally {
     btn.disabled = false;
   }
@@ -15270,7 +18333,7 @@ function _renderBubbleAttachments(bodyEl, attachments) {
     });
 
     chatCol.addEventListener('drop', e => {
-      // Notes embed drag takes priority — the dataTransfer carries our
+      // Notes embed drag takes priority - the dataTransfer carries our
       // internal MIME with URL/meta we can re-upload as a chat attachment.
       const notesRaw = (() => {
         try { return e.dataTransfer?.getData(NOTES_MIME) || ''; }
@@ -15389,15 +18452,28 @@ document.getElementById('chat-input')?.addEventListener('paste', e => {
 
 /* ── Past sessions ───────────────────────────────────────────────────────── */
 async function loadSession(sessionId) {
-  // On the home page, navigate to the session page instead of loading inline
-  if (window._isHomePage) {
-    window.location.href = `/session?id=${sessionId}`;
+  // Opening the session already loaded (the live one included) just brings the
+  // workspace forward: it is never re-rendered underneath a live recording.
+  if (sessionId === state.sessionId) {
+    Views.show('session', { url: '/session?id=' + sessionId });
     return;
   }
-  if (sessionId === state.sessionId) return;
+
+  if (_cleanupState && _cleanupState.dirty) {
+    if (!await uiConfirm({ title: 'Discard staged cleanup changes?', message: 'You have unsaved speaker cleanup changes in this meeting. Switching meetings discards them.', confirmLabel: 'Discard and switch', danger: true })) return;
+    _cleanupState.dirty = false;
+  }
 
   if (state.isRecording) {
-    if (!confirm('Stop the current recording and load this session?')) return;
+    const entry = _sidebarAllSessions.find(s => s.id === sessionId);
+    const label = (entry && entry.title) || 'this recording';
+    const go = await uiConfirm({
+      title: 'Stop the current recording?',
+      message: `Stop the current recording and open ${label}?`,
+      confirmLabel: 'Stop and open',
+      danger: true,
+    });
+    if (!go) return;
     await fetch('/api/recording/stop', { method: 'POST' });
   }
 
@@ -15418,7 +18494,7 @@ async function loadSession(sessionId) {
   state.sessionId     = sessionId;
   state.isViewingPast = true;
   _loadChatContextFoldersForSession(sessionId);
-  history.pushState({}, '', '/session?id=' + sessionId);
+  Views.show('session', { url: '/session?id=' + sessionId });
   updateRecordBtn();
   _loadPaneVisible(sessionId);
   refreshSessionChatPromptBadge();
@@ -15452,7 +18528,7 @@ async function loadSession(sessionId) {
   // we kick it off and let the cheap panes paint in this same synchronous tick,
   // so all three come alive together and the transcript fills in progressively.
   // (No `await` runs between the generation check above and the pane renders, so
-  // the cancellation guard still holds — a newer load can't interleave here.)
+  // the cancellation guard still holds - a newer load can't interleave here.)
   const segments = data.segments || [];
   const CHUNK = 150;  // segments per animation frame
 
@@ -15512,7 +18588,7 @@ async function loadSession(sessionId) {
   // video availability (e.g. switching to a no-video session with the speaker
   // manager left open).
   if (typeof _cleanupVideoSyncToggleBtn === 'function') _cleanupVideoSyncToggleBtn();
-  // Invalidate any cached cleanup clusters from the previous session — otherwise
+  // Invalidate any cached cleanup clusters from the previous session - otherwise
   // reopening the Cleanup tab would show the old session's speakers.
   if (_cleanupState && _cleanupState.sessionId !== sessionId) {
     _cleanupState = null;
@@ -15523,7 +18599,7 @@ async function loadSession(sessionId) {
     _cleanupShowHeatmap = false;
     const overlay = document.getElementById('speaker-manager-overlay');
     if (_cleanupActiveTab === 'cleanup' && overlay && !overlay.classList.contains('hidden')) {
-      loadSpeakerClusters();  // manager is open on Cleanup — refetch for the new session now
+      loadSpeakerClusters();  // manager is open on Cleanup - refetch for the new session now
     }
   }
 
@@ -15633,7 +18709,7 @@ function _finishBulkLoad() {
   // On a fresh load nothing is selected (clearAll cleared it), so this whole
   // O(N) per-segment querySelector pass would just toggle a class off on every
   // badge that never had it. Skip it when the selection is empty. (Keep the
-  // unconditional calls on the real select/deselect paths — they must run with
+  // unconditional calls on the real select/deselect paths - they must run with
   // an empty set to clear stale highlights.)
   if (_selectedSpeakerKeys.length) _highlightSelectedSpeakerBadges();
   if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
@@ -15644,91 +18720,37 @@ function _finishBulkLoad() {
   _refreshMinimap(true);
 }
 
-/* ── Shutdown ────────────────────────────────────────────────────────────── */
-/* ── Power menu ────────────────────────────────────────────────────────── */
+/* ── App lifecycle (the sidebar footer App menu) ─────────────────────────── */
 
-function togglePowerMenu() {
-  const menu = document.getElementById('power-menu');
-  menu.classList.toggle('hidden');
-  if (!menu.classList.contains('hidden')) {
-    // Close on outside click
-    setTimeout(() => {
-      document.addEventListener('click', _closePowerMenuOutside, { once: true });
-    }, 0);
-  }
-}
-function closePowerMenu() {
-  document.getElementById('power-menu')?.classList.add('hidden');
-}
-function _closePowerMenuOutside(e) {
-  const wrap = document.querySelector('.power-menu-wrap');
-  if (wrap && !wrap.contains(e.target)) closePowerMenu();
-  else if (!document.getElementById('power-menu')?.classList.contains('hidden')) {
-    document.addEventListener('click', _closePowerMenuOutside, { once: true });
-  }
-}
-
-function confirmShutdown() {
+async function confirmShutdown() {
+  closeMenu();
   if (!state.isRecording) { doShutdown(); return; }
-  const overlay = document.createElement('div');
-  overlay.className = 'overlay';
-  overlay.innerHTML = `
-    <div class="dialog">
-      <h3>Shut down server?</h3>
-      <p>A recording is in progress. This will stop it and close the Meeting Assistant server.</p>
-      <div class="dialog-btns">
-        <button class="btn btn-danger" onclick="doShutdown()">Shut Down</button>
-        <button class="btn" style="background:var(--surface2);color:var(--fg)"
-                onclick="this.closest('.overlay').remove()">Cancel</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
+  const confirmed = await uiConfirm({ title: 'Quit Meeting Assistant?', message: 'A recording is in progress. Quitting stops it and closes Meeting Assistant.', confirmLabel: 'Stop and quit', danger: true });
+  if (confirmed) doShutdown();
 }
 
 async function doShutdown() {
-  document.querySelector('.overlay')?.remove();
   await fetch('/api/shutdown', { method: 'POST' }).catch(() => {});
-  const screen = _showTransitionScreen('Shut Down', 'You can close this tab.');
+  const screen = _showTransitionScreen('Meeting Assistant has quit', 'You can close this tab.');
   // Freeze the animation after a moment for a calm stopped state
   setTimeout(() => screen.stop(), 3000);
 }
 
-function confirmRestart() {
+async function confirmRestart() {
+  closeMenu();
   if (!state.isRecording) { doRestart(); return; }
-  const overlay = document.createElement('div');
-  overlay.className = 'overlay';
-  overlay.innerHTML = `
-    <div class="dialog">
-      <h3>Restart server?</h3>
-      <p>A recording is in progress. This will stop it and restart the Meeting Assistant.</p>
-      <div class="dialog-btns">
-        <button class="btn" style="background:var(--accent);color:#fff" onclick="doRestart()">Restart</button>
-        <button class="btn" style="background:var(--surface2);color:var(--fg)"
-                onclick="this.closest('.overlay').remove()">Cancel</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
+  const confirmed = await uiConfirm({ title: 'Restart Meeting Assistant?', message: 'A recording is in progress. Restarting stops it first.', confirmLabel: 'Stop and restart' });
+  if (confirmed) doRestart();
 }
 
-function confirmUpdateRestart() {
+async function confirmUpdateRestart() {
+  closeMenu();
   if (!state.isRecording) { doUpdateRestart(); return; }
-  const overlay = document.createElement('div');
-  overlay.className = 'overlay';
-  overlay.innerHTML = `
-    <div class="dialog">
-      <h3>Update &amp; Restart?</h3>
-      <p>A recording is in progress. This will stop it, pull the latest update, and restart.</p>
-      <div class="dialog-btns">
-        <button class="btn" style="background:var(--accent);color:#fff" onclick="doUpdateRestart()">Update &amp; Restart</button>
-        <button class="btn" style="background:var(--surface2);color:var(--fg)"
-                onclick="this.closest('.overlay').remove()">Cancel</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
+  const confirmed = await uiConfirm({ title: 'Install the update and restart?', message: 'A recording is in progress. This stops it, pulls the latest update, and restarts.', confirmLabel: 'Stop and update' });
+  if (confirmed) doUpdateRestart();
 }
 
 async function doUpdateRestart() {
-  document.querySelector('.overlay')?.remove();
   const screen = _showTransitionScreen('Updating & Restarting\u2026', 'The page will reload when the server is back.');
   try {
     const res = await fetch('/api/update/apply', { method: 'POST' });
@@ -15853,7 +18875,6 @@ function _showTransitionScreen(title, subtitle) {
 }
 
 async function doRestart() {
-  document.querySelector('.overlay')?.remove();
   await fetch('/api/restart', { method: 'POST' }).catch(() => {});
   const screen = _showTransitionScreen('Restarting\u2026', 'The page will reload when the server is back.');
   let attempts = 0;
@@ -15872,6 +18893,7 @@ async function doRestart() {
 
 /* ── Misc helpers ────────────────────────────────────────────────────────── */
 function clearAll() {
+  _mgrStopVoice();   // stop any speaker voice sample when switching/clearing sessions
   _lastLiveSegId = 0;
   _speakerLabels = {};
   _speakerProfiles = {};
@@ -15889,6 +18911,12 @@ function clearAll() {
   _fpRejected = new Set();
   _pendingSpeakerProfiles = [];
   _sessionLinks = {};
+  // The Speakers modal is per-meeting: drop the remembered tab and the shared
+  // status line so the next open lands deterministically for the new session.
+  _speakerModalLastTab = null;
+  _speakerModalStats = null;
+  _speakerModalStatsSession = null;
+  _mgrCommittedName = '';
   _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
   _showNoise = false;
   _noiseSolo = false;
@@ -15908,7 +18936,7 @@ function clearAll() {
   document.getElementById('analytics-panel')?.classList.add('collapsed');
   document.getElementById('analytics-btn')?.classList.remove('active');
   _updateFilterBtnState();
-  closeSpeakerManager();
+  closeSpeakerManager(true);
   closeChaptersManager();
   _chapters = [];
   renderChapterTicks();
@@ -15924,7 +18952,7 @@ function clearAll() {
     '<p class="empty-hint">An auto-updating summary will appear here as the meeting progresses.</p>';
   document.getElementById('chat-messages').innerHTML =
     '<p class="empty-hint">Ask questions about the meeting here.</p>';
-  // Reset the Notes editor (no save — clearAll is for navigating away from a session)
+  // Reset the Notes editor (no save - clearAll is for navigating away from a session)
   if (typeof _notesResetForSessionChange === 'function') _notesResetForSessionChange();
   state.aiChatBusy = false;
   _setChatBusy(false);
@@ -16108,7 +19136,7 @@ function _onNotesResizeMove(e) {
   const newWidth = Math.max(40, Math.round(s.startWidth + dx));
   const newHeight = Math.max(20, Math.round(newWidth / s.aspect));
   // Quill's image format whitelists width/height attributes, so setting them
-  // directly persists in getContents() — no formatText call needed.
+  // directly persists in getContents() - no formatText call needed.
   s.img.setAttribute('width', String(newWidth));
   s.img.setAttribute('height', String(newHeight));
   const lbl = document.getElementById('notes-img-size-label');
@@ -16139,7 +19167,7 @@ document.addEventListener('keydown', e => {
 
 /* Quill's default Image blot sanitizes URLs to one of {http, https, data,
  * blob}, but in practice blob: URLs get rejected and replaced with the
- * "no-op" `//:0` placeholder — which renders as the browser's broken-image
+ * "no-op" `//:0` placeholder - which renders as the browser's broken-image
  * icon. We use blob URLs as the temporary src while an upload is in flight,
  * so we override sanitize to pass them through. (data: and the server's
  * /api/... paths still work as before.) */
@@ -16156,7 +19184,7 @@ function _allowBlobImageUrls() {
     };
     window._noteImageSanitizePatched = true;
   } catch (_) {
-    // CDN load failed or API changed — fall through; worst case is a
+    // CDN load failed or API changed - fall through; worst case is a
     // momentary broken-image icon, which we already had.
   }
 }
@@ -16368,7 +19396,7 @@ function _scheduleNotesSave() {
 
 async function _notesFlushSave(showImmediate) {
   if (!_quill || !state.sessionId) return;
-  // Saving for the wrong session would clobber its data — bail.
+  // Saving for the wrong session would clobber its data - bail.
   if (_notesSessionBound && _notesSessionBound !== state.sessionId) return;
   _notesSaveTimer = null;
   const delta = _quill.getContents();
@@ -16469,7 +19497,7 @@ function _wireNotesDropAndPaste(editorEl) {
 
   // Stop propagation on every drag event so the document-level session-import
   // overlay doesn't pop up over the notes column and steal the drop. Treat
-  // internal embed drags (image/file rearrange) the same way — same overlay
+  // internal embed drags (image/file rearrange) the same way - same overlay
   // is fine, but no need for the file-types check since dataTransfer.types
   // won't carry "Files" for an internal drag.
   col.addEventListener('dragenter', e => {
@@ -16514,7 +19542,7 @@ function _wireNotesDropAndPaste(editorEl) {
     if (!blot || typeof _quill.getIndex !== 'function') return;
     const idx = _quill.getIndex(blot);
     if (idx < 0) return;
-    // Pull the embed payload too — when the drop lands in the chat panel
+    // Pull the embed payload too - when the drop lands in the chat panel
     // we need the URL/metadata to re-upload the file as a chat attachment.
     const ops = _quill.getContents(idx, 1).ops || [];
     const op = ops[0];
@@ -16623,7 +19651,7 @@ function _quillIndexFromPoint(x, y) {
   const editorRoot = _quill.root;
   if (!editorRoot.contains(range.startContainer)) {
     // Drop happened over the editor pane but outside the actual ql-editor
-    // (e.g. the empty area below the last paragraph) — append at the end.
+    // (e.g. the empty area below the last paragraph) - append at the end.
     return _quill.getLength();
   }
   const sel = window.getSelection();
@@ -16642,7 +19670,7 @@ function _dtHasFiles(e) {
   return Array.from(types).includes('Files');
 }
 
-/* File-selection entry point — used by drop, paste, and the toolbar button. */
+/* File-selection entry point - used by drop, paste, and the toolbar button. */
 async function _notesHandleFileSelect(files, originalEvent) {
   if (!files || !files.length) return;
   if (!state.sessionId) {
@@ -16674,7 +19702,7 @@ async function _notesHandleFileSelect(files, originalEvent) {
       // Show the image immediately via a blob URL, then swap to the server
       // URL once the upload completes. We track the embed by *index* (not by
       // URL string), because Quill's image blot round-trips src through
-      // getAttribute() which may normalize the URL — leaving a Delta-side
+      // getAttribute() which may normalize the URL - leaving a Delta-side
       // string match unable to find the embed.
       const tempUrl = URL.createObjectURL(file);
       const imageIndex = insertIndex;
@@ -16772,7 +19800,7 @@ function _notesSwapImageAt(index, oldBlobUrl, newSrc) {
     }
   }
   if (foundIndex < 0) {
-    // Index drifted — fall back to URL match (best-effort).
+    // Index drifted - fall back to URL match (best-effort).
     foundIndex = _findEmbedIndex(op => op?.insert?.image === oldBlobUrl);
   }
   if (foundIndex < 0) return;
@@ -16780,7 +19808,7 @@ function _notesSwapImageAt(index, oldBlobUrl, newSrc) {
   _quill.deleteText(foundIndex, 1, 'silent');
   _quill.insertEmbed(foundIndex, 'image', newSrc, 'silent');
   _notesSuppressChange = false;
-  // Now safe to release the blob — the DOM no longer references it.
+  // Now safe to release the blob - the DOM no longer references it.
   try { URL.revokeObjectURL(oldBlobUrl); } catch (_) {}
 }
 
@@ -16858,11 +19886,11 @@ code{background:#f1f3f5;border:1px solid #dee2e6;border-radius:3px;padding:0 4px
   flashStatus('Notes exported');
 }
 
-function clearNotes() {
+async function clearNotes() {
   if (!_quill) return;
   if (_quill.getText().trim().length === 0 &&
       !_quill.root.querySelector('.note-file, img')) return;
-  if (!confirm('Clear all notes for this session? This cannot be undone.')) return;
+  if (!await uiConfirm({ title: 'Clear all notes?', message: 'This cannot be undone.', confirmLabel: 'Clear', danger: true })) return;
   _quill.setContents({ ops: [] }, 'user');
   _quill.history.clear();
   _refreshNotesEmptyHint();
@@ -16877,8 +19905,12 @@ function highlightCode(sel) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  // Strings land in title="..." and data-tooltip="..." attributes all over the
+  // app, so quotes have to be escaped too. Null-safe: a missing title is '',
+  // never a thrown TypeError halfway through a render.
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function flashStatus(msg) {
@@ -16898,6 +19930,43 @@ function flashStatus(msg) {
   const prev = el.textContent;
   el.textContent = msg;
   setTimeout(() => { el.textContent = prev; }, 1800);
+}
+
+// Persistent top banner warning that call/desktop audio is not being captured.
+// Driven by the server's capture_alert SSE event; dismissable, and cleared when
+// a recording stops (see onStatus).
+function _showCaptureAlert(d) {
+  const msg = (d && d.message) || 'Call/desktop audio is not being captured.';
+  let bar = document.getElementById('capture-alert-bar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'capture-alert-bar';
+    bar.style.cssText = [
+      'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:99999',
+      'background:var(--red,#b62324)', 'color:#fff', 'padding:11px 16px',
+      'font:600 14px/1.45 system-ui,-apple-system,sans-serif', 'display:flex',
+      'align-items:center', 'gap:12px', 'box-shadow:0 2px 12px rgba(0,0,0,.45)',
+    ].join(';');
+    const icon = document.createElement('span');
+    icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i>';
+    const txt = document.createElement('span');
+    txt.id = 'capture-alert-text';
+    txt.style.flex = '1';
+    const x = document.createElement('button');
+    x.textContent = '×';
+    x.setAttribute('aria-label', 'Dismiss');
+    x.style.cssText = 'background:transparent;border:0;color:#fff;font-size:22px;cursor:pointer;line-height:1;padding:0 4px';
+    x.addEventListener('click', _clearCaptureAlert);
+    bar.append(icon, txt, x);
+    document.body.appendChild(bar);
+  }
+  document.getElementById('capture-alert-text').textContent = msg;
+  bar.style.display = 'flex';
+}
+
+function _clearCaptureAlert() {
+  const bar = document.getElementById('capture-alert-bar');
+  if (bar) bar.style.display = 'none';
 }
 
 /* ── Audio device selection ──────────────────────────────────────────────── */
@@ -16987,13 +20056,13 @@ async function loadAudioDevices() {
   if (savedMic && [...micSel.options].some(o => o.value === String(savedMic))) {
     micSel.value = savedMic;
   } else if (savedMic && savedMic !== '-1' && !String(savedMic).startsWith('ffmpeg:')) {
-    // Legacy saved value (WASAPI index or browser mic "-2") — try to match by
+    // Legacy saved value (WASAPI index or browser mic "-2") - try to match by
     // device name.  WASAPI and dshow names for the same physical mic are usually
     // identical, so find the WASAPI name from data.input and look for a matching
     // ffmpeg option.
     let legacyName = null;
     if (savedMic === '-2') {
-      // Browser mic has no name to match — just fall through to first dshow device
+      // Browser mic has no name to match - just fall through to first dshow device
     } else {
       const idx = parseInt(savedMic, 10);
       const wasapiDev = (data.input || []).find(d => d.index === idx);
@@ -17073,7 +20142,7 @@ async function toggleAudioTest() {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      alert(err.error || 'Failed to start audio test');
+      uiToast({ message: err.error || 'Failed to start audio test', kind: 'error' });
     }
   }
 }
@@ -17105,7 +20174,7 @@ async function autoDetectDevices() {
     if (micSel) micSel.innerHTML = micOpts;
 
     if (!resp.ok) {
-      alert(data.error || 'Auto-detect failed');
+      uiToast({ message: data.error || 'Auto-detect failed', kind: 'error' });
       return;
     }
 
@@ -17131,7 +20200,7 @@ async function autoDetectDevices() {
     // Restore options on error too
     if (lbSel)  lbSel.innerHTML  = lbOpts;
     if (micSel) micSel.innerHTML = micOpts;
-    alert('Auto-detect failed: ' + e.message);
+    uiToast({ message: 'Auto-detect failed: ' + e.message, kind: 'error' });
   } finally {
     btn.disabled = false;
     btn.classList.remove('detecting');
@@ -17185,7 +20254,7 @@ const N_BARS = 32;
 let vizLbTarget = 0, vizMicTarget = 0;
 let vizLb = 0,       vizMic = 0;
 let vizHasMic  = false;
-let vizLbSpec  = [];   // frequency spectrum from server (N_BARS values, 0–1)
+let vizLbSpec  = [];   // frequency spectrum from server (N_BARS values, 0-1)
 let vizMicSpec = [];
 // Smoothed per-band values for animation (fast attack, slow decay)
 const vizLbBars  = new Float32Array(N_BARS);
@@ -17211,6 +20280,19 @@ function updateLevelMeters(lb, mic, hasMic) {
     micEl.style.height = hasMic ? toH(mic) + '%' : '0%';
     micEl.classList.toggle('peak', hasMic && mic > 0.55);
   }
+  // The capture strip runs on the same numbers, so proof that audio is
+  // arriving is on screen in every view, not only in the input pane.
+  const stripLb  = document.getElementById('capture-meter-desktop');
+  const stripMic = document.getElementById('capture-meter-mic');
+  if (stripLb) {
+    stripLb.style.width = toH(lb) + '%';
+    stripLb.classList.toggle('peak', lb > 0.55);
+  }
+  if (stripMic) {
+    stripMic.style.width = hasMic ? toH(mic) + '%' : '0%';
+    stripMic.classList.toggle('peak', hasMic && mic > 0.55);
+  }
+  if (lb > 0.01) _captureLastDesktopAudio = Date.now();
 }
 
 function startVizLoop() {
@@ -17263,7 +20345,7 @@ function startVizLoop() {
       const lbAlpha = lbActive ? 0.25 + 0.75 * lbV : 0.12;
       const lbGrad = ctx.createLinearGradient(0, midY, 0, midY - lbH);
       lbGrad.addColorStop(0, `rgba(88,166,255,${lbAlpha.toFixed(2)})`);
-      // Subtle lighten toward tip — ~25% shift, not full white
+      // Subtle lighten toward tip - ~25% shift, not full white
       const lbT = Math.min(1, lbV * 1.2) * 0.25;
       const lbR = Math.round(88  + (255 - 88)  * lbT);
       const lbG = Math.round(166 + (255 - 166) * lbT);
@@ -17547,11 +20629,11 @@ async function changeWhisperPreset(presetId) {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      alert(err.error || 'Failed to change model');
+      uiToast({ message: err.error || 'Failed to change model', kind: 'error' });
       loadModelConfig();  // revert selection
     }
   } catch (e) {
-    alert('Failed to change model');
+    uiToast({ message: 'Failed to change model', kind: 'error' });
     loadModelConfig();
   } finally {
     sel.disabled = false;
@@ -17569,11 +20651,11 @@ async function changeDiarizerDevice(device) {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      alert(err.error || 'Failed to change diarizer');
+      uiToast({ message: err.error || 'Failed to change diarizer', kind: 'error' });
       loadModelConfig();
     }
   } catch (e) {
-    alert('Failed to change diarizer');
+    uiToast({ message: 'Failed to change diarizer', kind: 'error' });
     loadModelConfig();
   } finally {
     sel.disabled = false;
@@ -17592,7 +20674,7 @@ async function toggleDiarizationEnabled() {
     btn.textContent = newEnabled ? 'On' : 'Off';
     btn.classList.toggle('active', newEnabled);
   } catch (_) {
-    alert('Failed to toggle diarization');
+    uiToast({ message: 'Failed to toggle diarization', kind: 'error' });
   }
 }
 
@@ -17623,7 +20705,7 @@ function toggleAutoScroll() {
 
 /* ── Settings modal ──────────────────────────────────────────────────────── */
 
-// Fallback model lists — used only if the backend hasn't returned its live
+// Fallback model lists - used only if the backend hasn't returned its live
 // /models fetch yet (first paint before /api/ai_settings resolves). The
 // authoritative list lives on the server and auto-updates as providers ship
 // new versions; new Claude / GPT releases appear here without any code change.
@@ -17664,9 +20746,14 @@ function updateChatModelLabel(provider, model, modelsByProvider = currentAiModel
     : _providerLabel(provider);
 }
 
-async function openSettings() {
+async function openSettings(section) {
+  closeMenu();
   const overlay = document.getElementById('settings-overlay');
   overlay.classList.remove('hidden');
+  if (section) {
+    const navBtn = document.querySelector(`.settings-nav-item[data-target="section-${section}"]`);
+    if (navBtn) switchSettingsSection(navBtn);
+  }
 
   try {
     const [status, aiCfg] = await Promise.all([
@@ -17734,6 +20821,7 @@ async function openSettings() {
   loadScreenPresets();
   loadScreenDisplays();
   loadDataFolder();
+  loadObsidianSettings();
 }
 
 function _renderQuietReminderSettings() {
@@ -17817,7 +20905,7 @@ function _renderMicIsMeSettings() {
   if (cur) {
     cur.textContent = window._meSpeakerName
       ? `You: ${window._meSpeakerName}`
-      : 'Not set yet — your mic uses a default "You" label until you choose.';
+      : 'Not set yet: your mic uses a default "You" label until you choose.';
   }
 }
 
@@ -18087,7 +21175,7 @@ function toggleModelPicker(tool) {
     // Reparent to <body> so ``position: fixed`` always resolves against the
     // viewport. Some ancestors (e.g. ``.home-chat-panel``) use ``transform``
     // for animations, which promotes them to the containing block for fixed
-    // descendants — that shifts our coordinates and the panel lands in the
+    // descendants - that shifts our coordinates and the panel lands in the
     // wrong place.
     if (panel.parentElement !== document.body) {
       document.body.appendChild(panel);
@@ -18125,7 +21213,7 @@ function _positionModelPicker(tool, panel) {
 
   // Horizontal: prefer right-aligning the panel with the button, then clamp
   // so it can't escape the viewport. Clamping matters when the button sits
-  // near the left edge — e.g. Global Chat on the home page — where naive
+  // near the left edge - e.g. Global Chat on the home page - where naive
   // right-anchoring would push the panel far off-screen.
   let left = r.right - pw;
 
@@ -18279,8 +21367,8 @@ async function checkForUpdates() {
       statusEl.className = 'settings-info-val val-ok';
       btn.disabled = false;
       btn.textContent = 'Check for Updates';
-      // Hide topbar update button if it was showing
-      document.getElementById('topbar-update-btn')?.classList.add('hidden');
+      // Clear the update-available state in the App menu
+      _clearAppMenuUpdate();
     } else {
       statusEl.textContent = `${data.commits_behind} update${data.commits_behind !== 1 ? 's' : ''} available`;
       statusEl.className = 'settings-info-val val-warn';
@@ -18306,9 +21394,11 @@ async function applyUpdate() {
   statusEl.textContent = 'Pulling latest changes...';
   statusEl.className = 'settings-info-val';
 
-  // Also disable topbar button if visible
-  const tbBtn = document.getElementById('topbar-update-btn');
-  if (tbBtn) { tbBtn.disabled = true; tbBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Updating...'; }
+  // The App menu item is the same action; keep the two in step
+  const tbBtn = document.getElementById('app-update-item');
+  const tbLabel = tbBtn && tbBtn.querySelector('.menu-item-label');
+  if (tbBtn) tbBtn.disabled = true;
+  if (tbLabel) tbLabel.textContent = 'Installing the update…';
 
   try {
     const res = await fetch('/api/update/apply', { method: 'POST' });
@@ -18319,11 +21409,12 @@ async function applyUpdate() {
       statusEl.className = 'settings-info-val val-warn';
       btn.disabled = false;
       btn.textContent = 'Retry Update';
-      if (tbBtn) { tbBtn.disabled = false; tbBtn.innerHTML = '<i class="fa-solid fa-download"></i> Retry'; }
+      if (tbBtn) tbBtn.disabled = false;
+      if (tbLabel) tbLabel.textContent = 'Retry the update';
     } else {
       statusEl.textContent = 'Restarting...';
       btn.textContent = 'Restarting...';
-      if (tbBtn) { tbBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restarting...'; }
+      if (tbLabel) tbLabel.textContent = 'Restarting…';
       // The server-side cache is keyed by HEAD and rebuilds automatically
       // on next request, but flip the in-memory guard so when the user
       // returns to the Changelog tab post-restart the new entries fetch.
@@ -18358,41 +21449,53 @@ function _pollUntilBack() {
 
 // ── Topbar update indicator ──────────────────────────────────────────────
 
+/** Back to "Check for updates" once there is nothing to install. */
+function _clearAppMenuUpdate() {
+  const item = document.getElementById('app-update-item');
+  if (!item) return;
+  delete item.dataset.available;
+  item.removeAttribute('title');
+  const label = item.querySelector('.menu-item-label');
+  if (label) label.textContent = 'Check for updates';
+  document.getElementById('app-menu-dot')?.classList.add('hidden');
+}
+
+/** The App menu item carries the update-available state, and the footer button
+ *  carries a dot so the news is visible without opening the menu. */
 function _showTopbarUpdate(commitsBehind) {
-  const btn = document.getElementById('topbar-update-btn');
-  if (!btn) return;
-  btn.classList.remove('hidden');
-  btn.disabled = false;
+  const item = document.getElementById('app-update-item');
+  if (!item) return;
   const s = commitsBehind !== 1 ? 's' : '';
-  btn.title = `${commitsBehind} update${s} available`;
-  btn.innerHTML = `<i class="fa-solid fa-download"></i> Update`;
-  // Show the "Update & Restart" option in the power menu
-  const pmUpdate = document.getElementById('power-menu-update');
-  if (pmUpdate) pmUpdate.classList.remove('hidden');
+  item.dataset.available = '1';
+  item.title = `${commitsBehind} update${s} available`;
+  const label = item.querySelector('.menu-item-label');
+  if (label) label.textContent = `Install ${commitsBehind} update${s} and restart`;
+  document.getElementById('app-menu-dot')?.classList.remove('hidden');
 }
 
 async function topbarApplyUpdate() {
-  const btn = document.getElementById('topbar-update-btn');
-  btn.disabled = true;
-  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Updating...';
+  const item = document.getElementById('app-update-item');
+  const label = item && item.querySelector('.menu-item-label');
+  if (item) item.disabled = true;
+  if (label) label.textContent = 'Installing the update…';
 
   try {
     const res = await fetch('/api/update/apply', { method: 'POST' });
     const data = await res.json();
 
     if (data.error) {
-      btn.disabled = false;
-      btn.innerHTML = '<i class="fa-solid fa-download"></i> Retry';
-      btn.title = `Update failed: ${data.error}`;
+      if (item) { item.disabled = false; item.title = `Update failed: ${data.error}`; }
+      if (label) label.textContent = 'Retry the update';
+      uiToast({ message: `Update failed: ${data.error}`, kind: 'error' });
     } else {
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restarting...';
+      if (label) label.textContent = 'Restarting…';
       _changelogLoaded = false;
       _pollUntilBack();
     }
   } catch (_) {
-    btn.disabled = false;
-    btn.innerHTML = '<i class="fa-solid fa-download"></i> Retry';
-    btn.title = 'Update failed - click to retry';
+    if (item) { item.disabled = false; item.title = 'Update failed. Try again.'; }
+    if (label) label.textContent = 'Retry the update';
+    uiToast({ message: 'Update failed. Try again.', kind: 'error' });
   }
 }
 
@@ -18416,8 +21519,8 @@ function _startPeriodicUpdateCheck() {
   _silentUpdateCheck();
   // Then every 15 minutes while idle
   _updateCheckInterval = setInterval(() => {
-    // Skip if already showing update button or recording is active
-    if (!document.getElementById('topbar-update-btn')?.classList.contains('hidden')) return;
+    // Skip once an update is already announced, or while recording
+    if (document.getElementById('app-update-item')?.dataset.available === '1') return;
     if (state.isRecording) return;
     _silentUpdateCheck();
   }, 15 * 60 * 1000);
@@ -18436,6 +21539,16 @@ function switchSettingsSection(btn) {
   // Lazy-load the Agent API tab (fetches connection info + config snippets)
   if (btn.dataset.target === 'section-agent-api') {
     loadAgentApiPanel();
+  }
+  // Lazy-load the Calendar tab (feed status; the link itself stays masked)
+  if (btn.dataset.target === 'section-calendar') {
+    loadCalendarStatus();
+  }
+  if (btn.dataset.target === 'section-icons') {
+    loadIconSettings();
+  }
+  if (btn.dataset.target === 'section-system') {
+    _syncReliabilityToggles();
   }
 }
 
@@ -18739,14 +21852,17 @@ function _parseChangelogBody(body) {
       const text = stripped.replace(/^[-*•]\s+/, '').trim();
       ensure().items.push(text);
     } else if (isContinuation(stripped) && cur && cur.items.length) {
-      // Indented wrap of the previous bullet — fold it back in.
+      // Indented wrap of the previous bullet - fold it back in.
       cur.items[cur.items.length - 1] += ' ' + stripped.trim();
     } else if (cur && (cur.items.length || cur.paras.length)) {
       // Mid-section non-bullet: treat as a paragraph row.
       cur.paras.push(stripped.trim());
-    } else {
-      // First non-blank line of a new section becomes its heading.
+    } else if (stripped.trim().length <= 60 && !/[.!?]$/.test(stripped.trim())) {
+      // A short first line without terminal punctuation is a heading.
       ensure().heading = stripped.trim();
+    } else {
+      // A sentence-length first line is prose, not a heading.
+      ensure().paras.push(stripped.trim());
     }
   }
   flush();
@@ -18817,7 +21933,7 @@ async function _checkWhatsNew() {
   let lastSeen = null;
   try { lastSeen = localStorage.getItem(_WHATS_NEW_HEAD_KEY); } catch (_) {}
   if (!lastSeen) {
-    // First load on this browser — anchor silently.
+    // First load on this browser - anchor silently.
     try { localStorage.setItem(_WHATS_NEW_HEAD_KEY, head); } catch (_) {}
     return;
   }
@@ -18874,7 +21990,7 @@ function _showWhatsNewPopup(commit) {
   } else {
     const p = document.createElement('p');
     p.className = 'whats-new-empty';
-    p.textContent = 'Small under-the-hood changes — no detailed notes for this update.';
+    p.textContent = 'Small under-the-hood changes: no detailed notes for this update.';
     bodyEl.appendChild(p);
   }
 
@@ -18949,6 +22065,259 @@ async function setStartupLaunch(enabled) {
   }
 }
 
+// ── Obsidian export ──────────────────────────────────────────────────────
+
+async function loadObsidianSettings() {
+  try {
+    const st = await fetch('/api/obsidian/status').then(r => r.json());
+    document.getElementById('obsidian-toggle').checked = !!st.enabled;
+    document.getElementById('obsidian-dir').value = st.dir || '';
+  } catch (_) {}
+}
+
+function saveObsidianSettings() {
+  const updates = {
+    obsidian_export_enabled: document.getElementById('obsidian-toggle')?.checked === true,
+    obsidian_export_dir: document.getElementById('obsidian-dir')?.value || '',
+  };
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
+}
+
+// ── Calendar (published ICS feed) ────────────────────────────────────────
+
+/**
+ * Render the Calendar tab from /api/calendar/status. The stored ICS link is a
+ * credential and only ever arrives masked, so the input starts empty: typing a
+ * value is the only way to replace the saved link.
+ */
+async function loadCalendarStatus() {
+  const stateEl  = document.getElementById('calendar-link-state');
+  const lineEl   = document.getElementById('calendar-status-line');
+  const detailEl = document.getElementById('calendar-status-detail');
+  if (!stateEl) return;
+  let st;
+  try {
+    st = await fetch('/api/calendar/status').then(r => r.json());
+  } catch (_) {
+    lineEl.textContent = 'Could not read the calendar status.';
+    return;
+  }
+  const toggle = document.getElementById('calendar-enabled');
+  if (toggle) toggle.checked = !!st.enabled;
+  const interval = document.getElementById('calendar-refresh-minutes');
+  if (interval) interval.value = String(st.refresh_minutes || 60);
+  const input = document.getElementById('calendar-ics-url');
+  if (input) input.placeholder = st.has_url ? st.url_masked : 'Paste the ICS link';
+
+  stateEl.textContent = st.has_url ? `Saved link: ${st.url_masked}` : 'No link saved yet.';
+  const forgetBtn = document.getElementById('calendar-forget-btn');
+  if (forgetBtn) forgetBtn.hidden = !st.has_url;
+
+  if (st.last_error) {
+    lineEl.textContent = st.last_error;
+  } else if (st.last_refresh) {
+    const pct = Math.round((st.has_attendees_ratio || 0) * 100);
+    lineEl.textContent =
+      `${st.instance_count} meeting${st.instance_count === 1 ? '' : 's'} in the window, ` +
+      `${st.matched_sessions} recording${st.matched_sessions === 1 ? '' : 's'} matched, ` +
+      `${pct}% carry attendees.`;
+  } else {
+    lineEl.textContent = st.has_url ? 'Not refreshed yet.' : 'Paste your ICS link to get started.';
+  }
+  detailEl.textContent = st.last_refresh
+    ? `Last refresh ${_fmtCalendarTime(st.last_refresh)}` +
+      (st.next_refresh_due ? `, next due ${_fmtCalendarTime(st.next_refresh_due)}` : '')
+    : '';
+}
+
+function _fmtCalendarTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function toggleCalendarLinkReveal() {
+  const input = document.getElementById('calendar-ics-url');
+  const btn = document.getElementById('calendar-reveal-btn');
+  if (!input) return;
+  const hidden = input.type === 'password';
+  input.type = hidden ? 'text' : 'password';
+  if (btn) btn.innerHTML = `<i class="fa-solid fa-eye${hidden ? '-slash' : ''}"></i>`;
+}
+
+/** Toggle + interval only. The link has its own explicit Save. */
+function saveCalendarSettings() {
+  const updates = {
+    calendar_enabled: document.getElementById('calendar-enabled')?.checked === true,
+    calendar_refresh_minutes: parseInt(document.getElementById('calendar-refresh-minutes')?.value || '60', 10),
+  };
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).then(() => loadCalendarStatus()).catch(() => {});
+}
+
+/** Save a newly typed ICS link, then refresh once so matches appear straight away. */
+async function saveCalendarLink() {
+  const input = document.getElementById('calendar-ics-url');
+  const btn = document.getElementById('calendar-save-btn');
+  if (!input || !btn || btn.disabled) return;
+  const url = (input.value || '').trim();
+  if (!url) {
+    uiToast({ message: 'Paste the ICS link first.', kind: 'warn' });
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    // A dedicated route, not /api/preferences: that one round-trips a masked
+    // copy of every setting from every open tab and must never write this key.
+    const res = await fetch('/api/calendar/link', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      uiToast({ message: data.error || 'Could not save the calendar link.', kind: 'error' });
+      return;
+    }
+    // The masked value must never round-trip back as the stored link.
+    input.value = '';
+    input.type = 'password';
+    delete _prefs.calendar_ics_url;
+    const toggle = document.getElementById('calendar-enabled');
+    if (toggle && !toggle.checked) {
+      toggle.checked = true;
+      saveCalendarSettings();
+    }
+    _prefs.calendar_enabled = true;
+    await refreshCalendarNow();
+  } catch (_) {
+    uiToast({ message: 'Could not save the calendar link.', kind: 'error' });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save link';
+    loadCalendarStatus();
+  }
+}
+
+/** Remove the stored link entirely and switch the feature off. */
+async function forgetCalendarLink() {
+  const ok = await uiConfirm({
+    title: 'Forget the calendar link?',
+    message: 'The app stops matching recordings to meetings until you paste a link again. Matches already stored are kept.',
+    confirmLabel: 'Forget link',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await fetch('/api/calendar/link', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clear: true }),
+    });
+    delete _prefs.calendar_ics_url;
+    _prefs.calendar_enabled = false;
+    uiToast({ message: 'Calendar link removed.', kind: 'success' });
+  } catch (_) {
+    uiToast({ message: 'Could not remove the calendar link.', kind: 'error' });
+  }
+  loadCalendarStatus();
+}
+
+async function testCalendarLink() {
+  const btn = document.getElementById('calendar-test-btn');
+  const out = document.getElementById('calendar-test-result');
+  if (!btn || btn.disabled) return;
+  const typed = (document.getElementById('calendar-ics-url')?.value || '').trim();
+  btn.disabled = true;
+  btn.textContent = 'Testing…';
+  out.textContent = '';
+  try {
+    const res = await fetch('/api/calendar/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: typed }),
+    }).then(r => r.json());
+    if (!res.ok) {
+      out.textContent = res.error || 'The calendar could not be read.';
+    } else {
+      const pct = Math.round((res.has_attendees_ratio || 0) * 100);
+      const parts = [
+        `${res.event_count} event${res.event_count === 1 ? '' : 's'}, ` +
+        `${res.instance_count} in the window`,
+      ];
+      if (res.first_start && res.last_start) {
+        parts.push(`${_fmtCalendarTime(res.first_start)} to ${_fmtCalendarTime(res.last_start)}`);
+      }
+      parts.push(`${pct}% carry attendees`);
+      if (res.sample_titles && res.sample_titles.length) {
+        parts.push(`e.g. ${res.sample_titles.join(', ')}`);
+      }
+      if (res.timezone_notes && res.timezone_notes.length) {
+        parts.push(res.timezone_notes.join('; '));
+      }
+      out.textContent = parts.join(' | ');
+    }
+  } catch (_) {
+    out.textContent = 'The calendar could not be read.';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Test link';
+  }
+}
+
+async function refreshCalendarNow() {
+  const btn = document.getElementById('calendar-refresh-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Refreshing…'; }
+  try {
+    const res = await fetch('/api/calendar/refresh', { method: 'POST' }).then(r => r.json());
+    if (res.error) {
+      uiToast({ message: res.error, kind: 'error' });
+    } else {
+      uiToast({
+        message: `Calendar refreshed: ${res.matched} recording${res.matched === 1 ? '' : 's'} matched.`,
+        kind: 'success',
+      });
+    }
+  } catch (_) {
+    uiToast({ message: 'Calendar refresh failed.', kind: 'error' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Refresh now'; }
+    loadCalendarStatus();
+  }
+}
+
+async function obsidianExportAll() {
+  const btn = document.getElementById('obsidian-export-all-btn');
+  const status = document.getElementById('obsidian-export-status');
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = 'Exporting…';
+  try {
+    const res = await fetch('/api/obsidian/export-all', { method: 'POST' }).then(r => r.json());
+    if (res.error) {
+      status.textContent = res.error;
+    } else {
+      status.textContent = `Exported ${res.exported} session${res.exported === 1 ? '' : 's'} (${res.skipped} empty skipped)`;
+    }
+  } catch (_) {
+    status.textContent = 'Export failed - is the vault folder reachable?';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Export all now';
+  }
+}
+
 // ── Data folder ──────────────────────────────────────────────────────────
 
 async function loadDataFolder() {
@@ -18959,7 +22328,7 @@ async function loadDataFolder() {
     const info = await fetch('/api/data_folder').then(r => r.json());
     pathEl.textContent = info.current;
     pathEl.title = info.overridden
-      ? `Overridden — default is ${info.default}`
+      ? `Overridden · default is ${info.default}`
       : 'Default location';
     if (resetBtn) resetBtn.style.display = info.overridden ? '' : 'none';
   } catch (_) {
@@ -18984,13 +22353,13 @@ async function pickDataFolder() {
       // user cancelled
       return;
     }
-    const ok = window.confirm(
-      `Move data folder to:\n\n${res.selected}\n\n` +
-      `This will copy every recording, database, and setting to the new ` +
-      `location and switch over. The original folder is kept as a backup ` +
-      `until you delete it manually.\n\n` +
-      `The app will need a restart afterwards. Continue?`
-    );
+    const ok = await uiConfirm({
+      title: 'Move data folder?',
+      message: 'This will copy every recording, database, and setting to the new location and switch over. The original folder is kept as a backup until you delete it manually. The app will need a restart afterwards.',
+      details: [res.selected],
+      confirmLabel: 'Move data',
+      danger: true,
+    });
     if (!ok) return;
     btn.textContent = 'Migrating…';
     const out = await fetch('/api/data_folder/migrate', {
@@ -18999,19 +22368,19 @@ async function pickDataFolder() {
       body: JSON.stringify({ destination: res.selected }),
     }).then(r => r.json());
     if (out.error) {
-      window.alert(`Migration failed:\n\n${out.error}`);
+      await uiAlert({ title: 'Migration failed', message: out.error, kind: 'error' });
       return;
     }
     const mb = (out.bytes_copied / 1024 / 1024).toFixed(1);
-    window.alert(
-      `Data folder migrated.\n\n` +
-      `${out.files_copied} files + ${out.dbs_copied} databases (${mb} MB)\n\n` +
-      `Please close and reopen the app for the change to take full effect. ` +
-      `The original folder is preserved at:\n${out.src}`
-    );
+    await uiAlert({
+      title: 'Data folder migrated',
+      message: `${out.files_copied} files + ${out.dbs_copied} databases (${mb} MB). Please close and reopen the app for the change to take full effect.`,
+      details: [`The original folder is preserved at: ${out.src}`],
+      kind: 'success',
+    });
     loadDataFolder();
   } catch (e) {
-    window.alert(`Error: ${e.message || e}`);
+    uiToast({ message: `Error: ${e.message || e}`, kind: 'error' });
   } finally {
     btn.disabled = false;
     btn.textContent = original;
@@ -19019,20 +22388,19 @@ async function pickDataFolder() {
 }
 
 async function resetDataFolder() {
-  const ok = window.confirm(
-    `Revert to the default data folder?\n\n` +
-    `This only changes which folder the app reads from on next startup — ` +
-    `it does NOT move files. If you want your current data at the default ` +
-    `location, copy it there manually first.\n\n` +
-    `The app will need a restart afterwards. Continue?`
-  );
+  const ok = await uiConfirm({
+    title: 'Revert to the default data folder?',
+    message: 'This only changes which folder the app reads from on next startup. It does not move files. If you want your current data at the default location, copy it there manually first. The app will need a restart afterwards.',
+    confirmLabel: 'Revert',
+    danger: true,
+  });
   if (!ok) return;
   try {
     await fetch('/api/data_folder/reset', { method: 'POST' }).then(r => r.json());
-    window.alert('Reverted to default data folder. Please close and reopen the app.');
+    await uiAlert({ title: 'Data folder reverted', message: 'Reverted to default data folder. Please close and reopen the app.', kind: 'success' });
     loadDataFolder();
   } catch (e) {
-    window.alert(`Error: ${e.message || e}`);
+    uiToast({ message: `Error: ${e.message || e}`, kind: 'error' });
   }
 }
 
@@ -19802,12 +23170,12 @@ async function saveApiKeys() {
       btn.textContent = 'Saved!';
       setTimeout(() => { btn.textContent = 'Save Keys'; btn.disabled = false; }, 1500);
     } else {
-      alert(data.error || 'Failed to save keys');
+      uiToast({ message: data.error || 'Failed to save keys', kind: 'error' });
       btn.textContent = 'Save Keys';
       btn.disabled = false;
     }
   } catch (e) {
-    alert('Failed to save keys');
+    uiToast({ message: 'Failed to save keys', kind: 'error' });
     btn.textContent = 'Save Keys';
     btn.disabled = false;
   }
@@ -19968,7 +23336,7 @@ async function startExport() {
 
     // Show size
     const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
-    statusEl.textContent = `Complete — ${sizeMB} MB`;
+    statusEl.textContent = `Complete · ${sizeMB} MB`;
     document.getElementById('export-subtitle').textContent = 'Export complete';
 
     // Trigger download
@@ -20169,12 +23537,7 @@ async function _doImport(file) {
         if (name) await _applyMeName(data.session_id, name);
       }
 
-      if (_isHomePage) {
-        window.location.href = '/session?id=' + data.session_id;
-      } else {
-        history.pushState({}, '', '/session?id=' + data.session_id);
-        loadSession(data.session_id);
-      }
+      loadSession(data.session_id);
     }
 
     setTimeout(() => toast.classList.add('hidden'), 3000);
@@ -20197,10 +23560,75 @@ function openImportPicker() {
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 
-const _isHomePage = !!window._isHomePage;
+let _attentionPreviousSort = null;
 
-// Session-page-specific init (transcript scroll, panels, etc.)
-if (!_isHomePage) {
+/** The filter popover owns the Needs attention criterion; the nav row is a
+ *  plain link to /attention, so its state is aria-current, set by the router. */
+function _syncAttentionControlState() {
+  const btn = document.getElementById('sidebar-filter-btn');
+  if (!btn) return;
+  btn.classList.toggle('attention-on', _sidebarFilter.attention === 'needs');
+}
+
+function _setAttentionFilter(active) {
+  if (active) {
+    if (_sidebarFilter.attention !== 'needs') _attentionPreviousSort = _sidebarFilter.sortBy;
+    _sidebarFilter.attention = 'needs';
+    _sidebarFilter.sortBy = 'unresolved_first';
+  } else {
+    _sidebarFilter.attention = 'any';
+    if (_sidebarFilter.sortBy === 'unresolved_first') {
+      _sidebarFilter.sortBy = _attentionPreviousSort || 'date_desc';
+    }
+    _attentionPreviousSort = null;
+  }
+  _onFilterChange();
+}
+
+/** The badge and the queue's row count come from the same store slice. */
+function attentionCount() {
+  // The sidebar badge and the Needs attention queue count the same thing from
+  // the same slice: sessions rows flagged as needing work. The attention
+  // summary is only a fallback before sessions loads, so the badge and the
+  // queue subtitle never disagree.
+  const sessions = AppData.get('sessions');
+  // Once sessions has loaded (even to an empty list) it is authoritative; the
+  // attention summary is only a fallback so the badge can show before that load.
+  if (AppData.status('sessions') === 'ready' && Array.isArray(sessions)) {
+    return sessions.filter(s => s.attention && s.attention.needs).length;
+  }
+  const summary = AppData.get('attention');
+  return summary && summary.needs_attention != null
+    ? Math.max(0, Number(summary.needs_attention) || 0)
+    : 0;
+}
+
+function _renderAttentionBadge() {
+  const badge = document.getElementById('attention-count');
+  if (!badge) return;
+  const count = attentionCount();
+  badge.textContent = String(count);
+  badge.classList.toggle('hidden', count === 0);
+  const row = document.getElementById('attention-control');
+  if (row) {
+    row.title = count === 0
+      ? 'Every recording has its speakers named'
+      : `${count} recording${count === 1 ? '' : 's'} need speaker work`;
+  }
+}
+
+function _initAttentionControl() {
+  AppData.subscribe(['attention', 'sessions'], _renderAttentionBadge);
+  _syncAttentionControlState();
+  _renderAttentionBadge();
+}
+
+/* ── Boot ─────────────────────────────────────────────────────────────────
+ * The workspace DOM is always present, so init-time wiring runs
+ * unconditionally: there is no "this is not the workspace page" any more.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+{
   // Auto-scroll behavior:
   // - Live recording: disable when user scrolls up, re-enable at bottom
   // - Playback: disable on user-initiated scroll only, re-enable via button click
@@ -20229,6 +23657,7 @@ if (!_isHomePage) {
 // Import drag-and-drop init
 _initImportDragDrop();
 _initSidebarDragAutoScroll();
+_initAttentionControl();
 
 // Shared init (sidebar, SSE, status, devices, models)
 connectSSE();
@@ -20238,7 +23667,10 @@ window.addEventListener('beforeunload', () => {
   if (_sseSource) { _sseSource.close(); _sseSource = null; }
 });
 
-refreshSidebar();
+AppData.subscribe(['sessions', 'folders'], _onSidebarSlices);
+AppData.load('sessions');
+AppData.load('folders');
+AppData.load('attention');
 _checkSemanticSearchReady();
 fetch('/api/status').then(r => r.json()).then(d => {
   // Stop any orphaned audio test left over from a previous page session
@@ -20266,27 +23698,29 @@ fetch('/api/ai_settings')
   .catch(() => {});
 
 startVizLoop();
-if (!_isHomePage) startBrandVizLoop();
+startBrandVizLoop();
 // Returning to a foreground tab re-kicks the parked loops; they re-evaluate the
 // settled state on the first frame and immediately re-park if levels are zero.
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
     _startVizLoop();
-    if (!_isHomePage) _startBrandVizLoop();
+    _startBrandVizLoop();
   }
 });
 initGainSliders();
 _restoreSidebarPanes();
 
-if (!_isHomePage) {
-  _tnInitSearch();
-  _tsbInitAutocomplete();
-  _syncPanelBottomRadius();
-  _syncSummaryBottomRadius();
-}
+_tnInitSearch();
+_tsbInitAutocomplete();
+_syncPanelBottomRadius();
+_syncSummaryBottomRadius();
 
-// Load preferences first, then init components that depend on saved values
-let _devicesReady = loadPreferences().then(() => {
+// Load preferences first, then init components that depend on saved values.
+// _prefsReady is kept separate from _devicesReady: preferences restore the saved
+// sidebar filter, so anything that has to win over that default (a ?attention=
+// link, for one) has to wait for preferences alone, not for device enumeration.
+const _prefsReady = loadPreferences();
+let _devicesReady = _prefsReady.then(() => {
   loadModelConfig();
   return loadAudioDevices();
 });
@@ -20300,66 +23734,96 @@ _startPeriodicUpdateCheck();
 // What's New popup. Defer slightly so the page lands and renders first.
 setTimeout(() => { _checkWhatsNew().catch(() => {}); }, 800);
 
-if (!_isHomePage) {
-  loadSummaryPrompt();
+loadSummaryPrompt();
+_syncUploadBtn();
 
-  // Auto-open settings if ?settings=1 or ?setup=1 is in the URL
-  // Auto-load session if ?session=<id> is in the URL
-  {
-    const params = new URLSearchParams(location.search);
-    if (params.has('quiet_prompt')) _quietPromptLanding = params.get('id');
-    if (params.has('settings') || params.has('setup')) {
-      openSettings();
-      const section = params.get('section');
-      if (section) {
-        const navBtn = document.querySelector(`.settings-nav-item[data-target="section-${section}"]`);
-        if (navBtn) switchSettingsSection(navBtn);
-      }
-      history.replaceState(null, '', location.pathname);
-    } else if (params.has('fingerprint')) {
-      openFingerprintPanel();
-      history.replaceState(null, '', location.pathname);
-    } else if (params.has('autostart')) {
-      // Auto-start recording once the model is ready.  Used by the home page
-      // and system tray so every recording goes through the session page's
-      // proven audio path.
-      history.replaceState(null, '', '/session');
-      _waitForRecordReady().then(() => {
-        if (!state.isRecording) toggleRecording();
-      });
-    } else if (params.has('id')) {
-      // Defer until status has loaded - if the session is actively recording,
-      // the SSE status+replay events handle everything; only call loadSession
-      // for past (non-recording) sessions.
-      const _pendingSessionId = params.get('id');
-      fetch('/api/status').then(r => r.json()).then(st => {
-        if (st.recording && st.session_id === _pendingSessionId) {
-          // Active recording - SSE status event will set state; don't call loadSession
-          if (_quietPromptLanding === _pendingSessionId) {
-            setTimeout(() => showQuietStopConfirm(_pendingSessionId), 250);
-            _quietPromptLanding = null;
-          }
-          return;
-        }
-        loadSession(_pendingSessionId);
-      }).catch(() => loadSession(_pendingSessionId));
-    }
+/* ── The views register their lifecycle, then the route is applied ────────── */
+
+Views.register('speakers', {
+  activate() { loadFingerprintPanel({ cached: true }); },
+});
+
+Views.register('session', {
+  activate() { updateTopbarSessionTitle(); recalcColWidths(); },
+});
+
+_initRouteLinks();
+
+// Ctrl+N: a new workspace from anywhere. Ctrl+K: the global search.
+document.addEventListener('keydown', e => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+  const key = (e.key || '').toLowerCase();
+  if (key === 'n' && !e.shiftKey) {
+    e.preventDefault();
+    newSession();
+  } else if (key === 'k') {
+    e.preventDefault();
+    _expandHeaderSearch();
   }
+});
 
-  window.addEventListener('popstate', () => {
-    const params = new URLSearchParams(location.search);
-    const sid = params.get('id');
-    if (sid) {
-      loadSession(sid);
-    } else if (!state.isRecording) {
-      state.sessionId    = null;
-      state.isViewingPast = false;
-      clearAll();
-      updateRecordBtn();
-      _updateActiveFolderHighlights();
-    }
-  });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  const search = document.getElementById('header-search');
+  if (search && search.classList.contains('is-expanded')) _collapseHeaderSearch();
+});
 
-  // Initial sync of upload button visibility
-  _syncUploadBtn();
+// The Ask rail docks or overlays on the width actually left for the view.
+if (window.ResizeObserver) {
+  const mainArea = document.getElementById('main-area');
+  if (mainArea) new ResizeObserver(() => _syncAskRailMode()).observe(mainArea);
+}
+
+// "updated 2 min ago" has to keep being true while the window sits open, and
+// it has to be right the moment a slice lands.
+setInterval(_syncRefreshTooltip, 30000);
+AppData.subscribe(['sessions', 'folders', 'analytics', 'attention', 'calendarStatus', 'calendarEvents'],
+                  _syncRefreshTooltip);
+
+/* ── Reconciling after a gap ──────────────────────────────────────────────── */
+
+let _sseEverConnected = false;
+let _lastFocusAt = Date.now();
+
+/** After an SSE reconnect, or a window that was away for more than a minute,
+ *  re-read status and the shared slices instead of trusting what is on screen. */
+function _reconcileAfterGap(reason) {
+  fetch('/api/status', { cache: 'no-store' })
+    .then(r => r.json())
+    .then(onStatus)
+    .catch(() => {});
+  AppData.invalidate(['sessions', 'folders', 'attention'], reason);
+  const active = VIEW_SLICES[Views.current] || [];
+  if (active.includes('analytics')) AppData.invalidate(['analytics'], reason);
+  if (active.includes('calendarStatus')) AppData.invalidate(['calendarStatus'], reason);
+}
+
+window.addEventListener('blur', () => { _lastFocusAt = Date.now(); });
+window.addEventListener('focus', () => {
+  if (Date.now() - _lastFocusAt > 60000) _reconcileAfterGap('window_focus');
+  _lastFocusAt = Date.now();
+});
+
+/* ── The first route ──────────────────────────────────────────────────────── */
+
+// Deferred to DOMContentLoaded so home.js, calendar.js and attention.js have
+// registered their views (they are parsed after this file).
+function _bootRoute() {
+  _restoreCaptureSetup();
+  _syncAskRailForView(window.MA_INITIAL_VIEW || 'home');
+  const url = location.pathname + location.search;
+  const initial = window.MA_INITIAL_VIEW || 'home';
+  const parsed = _routeOf(location.pathname);
+  // The server told us which view it rendered; the URL is the source of the
+  // query actions. They only disagree if someone hand-edited the address. The
+  // server already marked this view active, so skip the entry crossfade to
+  // avoid a flash on the first paint.
+  Views.show(parsed || initial, { url, replace: true, noFade: true });
+  _applyRouteQuery(parsed || initial, new URLSearchParams(location.search), {});
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _bootRoute, { once: true });
+} else {
+  _bootRoute();
 }

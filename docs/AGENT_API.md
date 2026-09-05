@@ -280,7 +280,7 @@ Notes:
 | Endpoint | Notes |
 |---|---|
 | `GET /live` | If recording: session id/title, `elapsed_sec`, transcript tail (`after_segment_id` cursor + `limit`), `last_segment_id`, chapters, current summary, audio levels. If idle: `latest_session_id`. |
-| `POST /recording/start` | Opt-in (section 8). Body `{"confirm": true}`. Opens the app's session page with autostart (the microphone flows through the browser, so a headless start would silently lose it). |
+| `POST /recording/start` | Opt-in (section 8). Body `{"confirm": true}`. Sends a start command to the app window (the page performs the start, so a headless start would silently lose the device selection); a window is opened only if none takes the command. |
 | `POST /recording/stop` | Opt-in. Body `{"confirm": true}`. Finalization (cleanup, auto-title) continues asynchronously. |
 
 ---
@@ -397,9 +397,12 @@ Agents must not be able to silently record people. Therefore:
   **Allow recording control** in Settings > Agent API
   (`agent_api_allow_recording_control`).
 - Both require `{"confirm": true}`.
-- Start opens the app's session page with autostart rather than starting
-  headlessly: the default microphone path flows through the browser, so this
-  is the only start mode that captures everything.
+- Start asks an app window to begin rather than starting headlessly: device
+  selection and the readiness gate live on the page, so this is the only start
+  mode that captures everything. The request goes to the start coordinator
+  (core/recording_request.py), which offers it to the window that is already
+  open, then opens the app window, and only then falls back to a fresh
+  autostart window. Poll `GET /live` for the outcome.
 
 Agent etiquette: only call these when the user explicitly asks, and say out
 loud that recording is starting/stopping.

@@ -32,7 +32,6 @@ import shutil
 import subprocess
 import sys
 import time
-import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -43,7 +42,7 @@ from agent_api import helpers
 from agent_api.context import AgentContext
 from capture_video import capture_live_frame, extract_frame, find_ffmpeg
 from capture_video.ffmpeg_util import subprocess_no_window_flag
-from core import config, log, paths, settings, storage
+from core import calendar_feed, config, log, paths, recording_request, settings, storage
 from ml import text_embeddings
 
 bp = Blueprint("agent_api", __name__, url_prefix="/api/agent/v1")
@@ -837,9 +836,18 @@ def meeting_transcript(session_id: str):
         segs = [s for s in segs if (s.get("id") or 0) > after_id]
     want_speaker = (args.get("speaker") or "").strip().lower()
     if want_speaker:
-        segs = [s for s in segs
-                if want_speaker in helpers.resolve_speaker(
-                    s, labels, _ctx.source_labels).lower()]
+        # Match EITHER the resolved display name ("Alex Chen") OR the raw
+        # diarizer key stored on each segment ("Speaker 5"). A caller checking
+        # one diarizer cluster asks for a transcript sample by speaker_key,
+        # but several keys often share one resolved name (e.g. keys 4/5/8 all
+        # became "Other participant"), so a resolved-name-only filter returned
+        # nothing and the panel showed "No transcript sample available".
+        def _speaker_match(s):
+            resolved = helpers.resolve_speaker(
+                s, labels, _ctx.source_labels).lower()
+            src = str(s.get("source") or "").strip().lower()
+            return want_speaker in resolved or want_speaker == src
+        segs = [s for s in segs if _speaker_match(s)]
 
     offset = max(0, _as_int(args.get("offset"), 0))
     limit = _as_int(args.get("limit"), 0)
@@ -1650,6 +1658,10 @@ def _masked_settings_values() -> dict:
     values = settings.load()
     if values.get("agent_api_token"):
         values["agent_api_token"] = "********"
+    # The published-calendar link is a credential: anyone holding it can read
+    # the owner's calendar. Only the masked form ever leaves the process.
+    if values.get("calendar_ics_url"):
+        values["calendar_ics_url"] = calendar_feed.mask_url(values["calendar_ics_url"])
     # video_offsets is a per-session bookkeeping map (one entry per recording).
     # It is read-only here and dwarfs every other setting once the library
     # grows, so summarise it instead of dumping thousands of tokens of UUIDs.
@@ -1808,18 +1820,22 @@ def recording_start():
                     "audio (and screen, if configured) on this machine.", 400)
     if _ctx.status_payload().get("recording"):
         return _err("A recording is already running.", 409)
-    # Recordings must start through the session page (?autostart=1): the
-    # default microphone source is the browser mic, which only flows while a
-    # session tab is pumping chunks. This mirrors the tray and meeting-detect
-    # flows exactly.
-    webbrowser.open(f"{_ctx.server_url}/session?autostart=1")
+    # The session page performs the start (that is where device selection and
+    # the readiness gate live). The coordinator offers the command to the app
+    # window that is already open before opening one, and falls back to the old
+    # autostart window if nothing takes it. This mirrors the tray and
+    # meeting-detect flows exactly. See core/recording_request.py.
+    if recording_request.get_default() is None:
+        return _err("The app is not ready to start recordings.", 503)
+    recording_request.request_start_async("agent_api", "requested via Agent API")
     log.info("agent", "Recording start requested via Agent API "
-                      "(opened session page with autostart).")
+                      "(handed to the start coordinator).")
     return jsonify({
         "ok": True,
-        "initiated": "browser_autostart",
-        "note": "The session page was opened with autostart. Poll GET /live "
-                "to confirm the recording is running.",
+        "initiated": "start_request",
+        "note": "A start command was sent to the app window (a window is "
+                "opened only if none takes it). Poll GET /live to confirm the "
+                "recording is running.",
     })
 
 

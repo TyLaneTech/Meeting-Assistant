@@ -88,6 +88,10 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `launch.py` | Setup automation — venv creation, GPU/Metal probe, dependency install (picks `requirements-macos.txt` on darwin), model predownload, app launch. |
 | `launch.bat` / `launch.command` | OS-specific shells that invoke `launch.py`. |
 | `mcp_server.py` | Stdio MCP server for external AI agents (Claude Desktop/Code, Codex). Pure stdlib, zero project imports — proxies to the Agent REST API over localhost HTTP, so it works with any Python and never loads app modules. |
+| `watchdog.py` | External freeze watchdog, opt-in via `freeze_watchdog_enabled`. Polls `/api/status` from outside the process and reads `<data>/heartbeat.json` to tell a frozen or crashed app (restart) from a clean quit (leave alone). Started by `launch.py`, never by the app. |
+| `launch_hidden.vbs` | Tray-only Windows start: runs `launch.bat` with no console and sends the startup output to `storage/logs/launch-startup-<stamp>.log`, one file per launch, pruned after a week. `_relaunch_app()` prefers it for restarts and updates. |
+| `app_launcher.vbs` | Click-to-open launcher for pins and shortcuts: opens the app window if the server is already up, otherwise starts it hidden and opens the window once it answers. |
+| `tests/` | pytest suite, no hardware needed: unit tests for the pure modules plus static assertions over the templates, scripts and stylesheets. `python -m pytest tests -q` runs in about ten seconds. See CONTRIBUTING.md. |
 
 ### `core/` — foundational utilities
 
@@ -99,7 +103,18 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/settings.py` | JSON user preferences (device selections, model choices, UI prefs) |
 | `core/network.py` | HuggingFace token + pipeline download helpers |
 | `core/compute_device.py` | `best_torch_device()` — single source of truth for CUDA/MPS/CPU choice |
-| `core/storage.py` | SQLite CRUD — sessions, segments, summaries, chat, speaker labels |
+| `core/storage.py` | SQLite CRUD — sessions, segments, summaries, chat, speaker labels, calendar matches, expected speaker counts |
+| `core/attention.py` | The Needs attention queue: recordings whose speakers are still unnamed, against the calendar's expected count |
+| `core/browser.py` | Opens the UI as an app window (Chrome/Edge `--app=` or the installed PWA) instead of a browser tab |
+| `core/calendar_feed.py` | Published-calendar (ICS) download, RRULE expansion, time zones, attendee parsing, URL masking |
+| `core/calendar_sync.py` | Matches recordings to calendar instances, stores the match and expected speaker count, feeds attendee candidates to the Speakers Cleanup tab, runs the hourly refresh |
+| `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view |
+| `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries |
+| `core/heartbeat.py` | `<data>/heartbeat.json`, refreshed while alive and removed on a clean quit; read by `watchdog.py` |
+| `core/icons.py`, `core/icons_api.py` | Icon sets (Settings > Icons): per-state slots, tinting, PNG/ICO rendering, custom uploads, the tray and shortcut icons; `/api/icons/*` and the web manifest |
+| `core/obsidian_export.py` | Optional Markdown export of finished meetings into an Obsidian vault |
+| `core/recording_request.py` | Start-recording coordinator: offers the start to an already-open window over SSE, then the installed PWA, then a fresh `?autostart=1` window |
+| `core/shortcut.py` | Windows `.lnk` helpers shared by the launcher and the icon sync; only ever touches shortcuts that launch this checkout |
 
 ### `capture_audio/` — audio input
 
@@ -109,7 +124,8 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `capture_audio/windows.py` | WASAPI loopback + microphone capture, mixer, RMS levels, AGC, FFmpeg mic ingestion. |
 | `capture_audio/mac.py` | ScreenCaptureKit loopback (system audio) + CoreAudio mic capture via sounddevice. |
 | `capture_audio/mac_bootstrap.py` | Retired no-op shim. ScreenCaptureKit needs no virtual driver, aggregate device, or output reroute, so the BlackHole machinery this held is gone. Kept only so a stale import gets no-ops instead of an `ImportError`. |
-| `capture_audio/wav_writer.py` | Minimal WAV file writer with sample-offset tracking |
+| `capture_audio/wav_writer.py` | Minimal WAV file writer with sample-offset tracking; append mode walks the RIFF chunks so an ffmpeg-written header survives |
+| `capture_audio/render_probe.py` | Out-of-process Core Audio probe (pycaw/comtypes, run only as a subprocess) reporting which output endpoint is actually playing; used by the opt-in follow-output watchdog |
 | `capture_audio/params.py` | Default audio parameters, AGC settings, recording presets |
 | `capture_audio/audio/test_sample.mp3` | Tone played during input-device auto-detection (read directly off disk by `windows.py`/`mac.py`) |
 | `capture_audio/audio/complete.mp3` | Recording-complete chime |
@@ -142,6 +158,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | File | Responsibility |
 |---|---|
 | `ai/assistant.py` | Anthropic/OpenAI integration — streaming summary, incremental patch, Q&A, title generation. Per-tool model selection and prompt caching. |
+| `ai/speaker_relabel.py` | Bulk speaker relabel agent for the global chat: plans, confirms and applies speaker reassignments (`plan_speaker_relabel`, `apply_speaker_relabel`, `cancel_speaker_relabel`). The only chat tools that write. |
 
 ### `agent_api/` — external agent interface (REST)
 
@@ -164,12 +181,14 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 
 | File | Responsibility |
 |---|---|
-| `ui_web/templates/index.html` | Session SPA shell |
-| `ui_web/templates/home.html` | Home page (recent meetings, global chat) |
-| `ui_web/static/app.js` | Session-page frontend logic — SSE handling, UI, state, preferences |
-| `ui_web/static/home.js` | Home-page frontend logic |
-| `ui_web/static/style.css` | Dark-theme CSS, all component styles |
-| `ui_web/static/images/` | Logo, tray icons, fontAwesome assets |
+| `ui_web/templates/index.html` | The one app shell: header, sidebar, the view containers and every dialog. Served for `/`, `/session/<id>`, `/calendar`, `/attention` and `/speakers`; the client router picks the view. |
+| `ui_web/templates/_header.html`, `_sidebar.html`, `_settings.html`, `_ask_rail.html` | Shell partials: header controls, the sidebar (page links, recordings, footer), the Settings dialog, the global "Ask your meetings" rail |
+| `ui_web/templates/_view_home.html`, `_view_calendar.html`, `_view_attention.html`, `_view_speakers.html` | The view bodies the router swaps between without a reload |
+| `ui_web/static/app.js` | Router (`Views`, `navigateTo`), the `AppData` cache, SSE handling, the session view, Settings, preferences |
+| `ui_web/static/home.js`, `calendar.js`, `attention.js` | Renderers for the Home dashboard, the Calendar view and the Needs attention view |
+| `ui_web/static/ui-dialog.js`, `ui-combobox.js` | `uiToast`, `uiConfirm`, `uiAlert`, `uiPrompt` (native dialogs are not used anywhere) and the combobox widget |
+| `ui_web/static/style.css`, `home.css`, `calendar.css` | Styles; the two view sheets belong to their views |
+| `ui_web/static/images/` | Logo, the bundled icon set under `sets/wave/`, fontAwesome assets. Custom sets live under `<data>/icons/`. |
 
 ### `storage/` — runtime data and bundled binaries (not a Python package)
 
@@ -259,7 +278,7 @@ const state = {
 
 ### User preferences (`_prefs` in app.js, `data/settings.json` on server)
 
-Loaded from `GET /api/preferences` on page load. Writes are debounced 400ms via `savePref(key, value)`. The server-side module is `core/settings.py`.
+Loaded from `GET /api/preferences` on page load. Writes are debounced 400ms via `savePref(key, value)`, which sends only the keys changed since the last flush and flushes on `pagehide`. It must never send the whole `_prefs` object: every open page holds the copy it loaded, and an older copy written back undoes changes made elsewhere (enabling the calendar in one tab and resizing the sidebar in another switched the calendar off again, 2026-09-05). The server-side module is `core/settings.py`; `PUT /api/preferences` merges. `calendar_ics_url` is a credential with its own route (`POST /api/calendar/link`) and is stripped from every preferences write.
 
 ---
 
@@ -299,6 +318,12 @@ es.addEventListener("event_name", e => {
 | `speaker_label` | `session_id`, `speaker_key`, `name` | Speaker rename broadcast |
 | `chapters_updated` | `session_id`, `chapters` | Chapter list changed (generated, edited, added, or deleted) |
 | `chapters_busy` | `busy`, `session_id` | Chapter generation started/finished |
+| `calendar_refresh_done` | refresh summary (`matched`, `cleared`, `updated`, ...) | The published calendar was re-read and recordings re-matched |
+| `calendar_match_changed` | `session_id`, `confirmed` | A recording's calendar match was confirmed or cleared |
+| `attention_changed` | `session_id` | The Needs attention queue changed for a recording |
+| `capture_alert` | `kind`, `message`, ... | The desktop capture has produced no signal (loopback silence watchdog) |
+| `smart_cleanup_done` | `session_id`, ... | A smart cleanup reanalysis finished |
+| `recording_command` | `nonce`, `source`, `reason` | A start-recording request offered to open windows; one acks it via `/api/recording/ack_command` (`core/recording_request.py`) |
 
 **Adding a new event:** Call `_push("new_event", {...})` anywhere in app.py. Add an `es.addEventListener("new_event", ...)` in app.js.
 
@@ -337,6 +362,17 @@ All API routes follow these conventions:
 | `/api/settings/status` | Combined setup status |
 | `/api/preferences` | User preferences (JSON settings) |
 | `/api/shutdown` | Graceful exit |
+| `/api/restart` | Graceful stop, then relaunch through the launcher (`_relaunch_app()`) |
+| `/api/update/check`, `/api/update/apply` | Self-update: fetch `main`, compare, pull, relaunch |
+| `/`, `/session/<id>`, `/calendar`, `/attention`, `/speakers` | The one app shell (`index.html`); the client router picks the view |
+| `/api/dashboard` | Home dashboard data (`core/dashboard_api.py`) |
+| `/api/calendar/*`, `/api/sessions/<id>/calendar_match` | Published-calendar status, link, test, refresh, events; the per-recording match |
+| `/api/attention/summary`, `/api/sessions/<id>/expected_speakers` | Needs attention queue; the expected speaker count |
+| `/api/sessions/<id>/resolution_candidates`, `/api/sessions/<id>/smart_cleanup` | Calendar attendees offered in the Cleanup picker; the smart cleanup reanalysis |
+| `/api/speakers/relabel/*`, `PATCH /api/sessions/<id>/speakers` | Bulk relabel agent confirm/cancel; speaker reassignment |
+| `/api/recording/request_start`, `/api/recording/ack_command` | Start coordinator (`core/recording_request.py`) |
+| `/api/icons/*`, `/manifest.webmanifest` | Icon sets (`core/icons_api.py`) |
+| `/api/obsidian/*` | Optional Obsidian export |
 | `/api/agent/v1/*` | Agent API blueprint (`agent_api/rest.py`) — REST interface for external AI agents; self-documenting via `/docs` + `/openapi.json` |
 
 ---
@@ -409,6 +445,24 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 **CUDA DLL registration:** `ml/transcriber.py` registers nvidia pip-package DLL directories at import time (before ctranslate2 loads). This must happen before any CUDA library is imported. Do not move this code.
 
 **macOS loopback watchdog:** `_sck_watchdog_loop()` supervises the ScreenCaptureKit stream and restarts it through `_restart_sck_loopback()` if it dies mid-recording. SCK delivers sample buffers continuously even during silence, so a gap longer than `_SCK_WATCHDOG_TIMEOUT` (5 s) means a dead stream (TCC permission revoked, display reconfigured), not a quiet room. Do not "optimize" that check away by treating silence as normal. Restart backoff is `_SCK_RESTART_BACKOFF` = (0.5, 1.0, 2.0) seconds; if all three attempts fail, `loopback_error` is set and the recording continues mic-only rather than dying.
+
+**Desktop device choice (Windows):** `_resolve_loopback()` uses the device the user selected: the saved index when it still carries the saved name, otherwise the live device with that name, and the default output only when the saved device is gone. Following the default output, at start and mid-recording through `render_probe.py`, is behind `loopback_follow_output` (default off). Windows keeps two output roles and PortAudio reports only one, so "the default output" is routinely not the device the user hears; following it captured an idle endpoint for a whole call (2026-09-05). The word-level name tier ignores the `[Loopback]` suffix, which every loopback device carries.
+
+**Loopback silence watchdog:** `_loopback_silence_watchdog()` raises `capture_alert` when the desktop capture never produces signal or drops out. It only ever switches devices when following is on and the probe shows a different endpoint actually playing; silence alone never moves the capture.
+
+**Preference writes are partial:** `savePref()` sends only the changed keys (see User preferences). Do not reintroduce a whole-object `PUT`.
+
+**WAV append walks the RIFF chunks:** `WavWriter(append=True)` locates the data chunk instead of patching offset 40, and the resume path decodes Opus parts with `-fflags +bitexact`. Pause/resume with per-source tracks corrupted both tracks without this.
+
+**Console logging never raises:** `core/log.py` reconfigures stdout/stderr with `errors="replace"` and echoes through `_echo()`. Under `launch_hidden.vbs` stdout is a cp1252 file, and a `→` in a log line used to raise inside the screen recorder at record start. `launch.py` does the same for its own output.
+
+**Shortcut ownership:** `launch.py` only rewrites a Start Menu shortcut that already launches this checkout (or when none exists), and `core/icons.py` only re-icons shortcuts that do. A second clone or a git worktree must never take over the user's shortcut while the other checkout still exists.
+
+**One launcher log per launch:** `launch_hidden.vbs` names its redirect target with a timestamp. `cmd` opens a redirect target without write sharing, so a fixed name could not be reopened while the chain being replaced (an in-app restart or update) still held it, and the second launcher died before running anything: every restart from a hidden-launched app silently never came back (2026-09-05). `launch.py` always prints how the app exited so a quiet exit leaves a trace.
+
+**Speakers dialog lands on Cleanup:** the Resolve tab was folded into Cleanup, whose picker lists the calendar invite's attendees ahead of the Voice Library. Every entry point (post-recording auto-open, `?speakers=cleanup`, the Home, Needs attention and Calendar buttons) opens Cleanup.
+
+**Sidebar page links are preferences:** `sidebar_nav_items` and `sidebar_nav_compact` drive `applySidebarNavPrefs()`, which moves the nav anchors (not copies) into the brand row when folded, so ids and the router's current-page marking keep working. The collapsed rail always shows the icons and pins Settings and the status dot to its bottom.
 
 ---
 
@@ -523,7 +577,13 @@ loadPreferences().then(() => {
 });
 ```
 
-**Debounced saves:** Use the 400ms debounce in `savePref()` for any preference that changes frequently (device selection, playback speed). Do not call `PUT /api/preferences` directly from event handlers.
+**Debounced saves:** Use the 400ms debounce in `savePref()` for any preference that changes frequently (device selection, playback speed). Do not call `PUT /api/preferences` directly from event handlers. A handler that saves several related keys at once (`saveCalendarSettings()`, `saveObsidianSettings()`) sends exactly those keys.
+
+**Dialogs and toasts:** use `uiToast({ message, kind })`, `uiConfirm({...})`, `uiAlert`, `uiPrompt` from `ui-dialog.js`. The static tests fail on any native `alert`, `confirm` or `prompt`.
+
+**Views:** each view has a renderer (`home.js`, `calendar.js`, `attention.js`) that reads through `AppData` (a cache invalidated by the SSE events above) and sizes its layout with container queries (`@container view (...)`), never viewport media queries, because the view can be narrower than the window when the Ask rail is docked. Charts are painted at pixel size from the box they sit in and repainted by a `ResizeObserver`.
+
+**Opacity:** the static tests forbid `opacity` outside `:disabled` rules and keyframes. Hide with `hidden`, `visibility`, or `.visually-hidden-input`.
 
 ---
 

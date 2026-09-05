@@ -25,7 +25,10 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
-import webbrowser
+import webbrowser  # noqa: F401  (kept for fallback / compatibility)
+
+from core import browser
+from core import recording_request
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -106,9 +109,11 @@ def _get_windows_toaster():
     global _live_toaster
     if _live_toaster is not None:
         return _live_toaster
-    from windows_toasts import InteractableWindowsToaster  # type: ignore[import-not-found]
-    _register_windows_aumid()
-    _live_toaster = InteractableWindowsToaster(APP_DISPLAY_NAME, notifierAUMID=AUMID)
+    with _live_lock:
+        if _live_toaster is None:
+            from windows_toasts import InteractableWindowsToaster  # type: ignore[import-not-found]
+            _register_windows_aumid()
+            _live_toaster = InteractableWindowsToaster(APP_DISPLAY_NAME, notifierAUMID=AUMID)
     return _live_toaster
 
 
@@ -188,7 +193,7 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
     stop_url = f"{base}/api/recording/stop"
 
     def _open_session(_arg: str) -> None:
-        webbrowser.open(session_url)
+        browser.open_app_window(session_url)
 
     def _stop_recording(_arg: str) -> None:
         try:
@@ -200,7 +205,7 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
             urllib.request.urlopen(req, timeout=5).read()
         except Exception as e:
             log.warn("notify", f"Stop-from-toast failed: {e}")
-        webbrowser.open(session_url)
+        browser.open_app_window(session_url)
 
     return notify(
         "Still in the meeting?",
@@ -218,17 +223,21 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
 def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
     """Offer to record a just-detected Zoom/Teams meeting.
 
-    The "Start recording" action opens the session page with ``autostart=1``
-    rather than POSTing /api/recording/start directly. All recordings must be
-    kicked off from the session page (the autostart path) to avoid the
-    DirectShow echo issue, so we route through the browser the same way the
-    home-page record button does.
+    "Start recording" hands the request to the start coordinator rather than
+    POSTing /api/recording/start. Every recording is still kicked off by the
+    session page (that is where device selection and the readiness gate live),
+    but the coordinator offers it to the window that is already open first and
+    only opens a new one if nothing takes it. See core/recording_request.py.
     """
     base = server_url.rstrip("/")
+    # macOS has no toast buttons: clicking the notification just opens a URL,
+    # so the autostart page stays the only affordance there. On Windows the
+    # coordinator handles it and no second window is opened.
     start_url = f"{base}/session?autostart=1"
 
     def _start(_arg: str) -> None:
-        webbrowser.open(start_url)
+        recording_request.request_start_async(
+            "toast:detected", f"{app_name} meeting detected")
 
     return notify(
         f"{app_name} meeting detected",
@@ -247,26 +256,36 @@ def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
 def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
     """Auto-start recording a just-detected meeting and confirm with a toast.
 
-    Mirrors ``send_meeting_detected_toast`` but, instead of asking, it starts the
-    recording immediately and then shows a confirmation. Starting goes through
-    the session page's ``autostart=1`` path (the only safe way to begin a
-    recording, to avoid the DirectShow echo issue): exactly what the manual
-    "Start recording" action does, just without waiting for a click. Opening that
-    URL again while already recording is a no-op on the page side, so the toast's
-    own "Open" click can reuse it safely.
+    Mirrors ``send_meeting_detected_toast`` but, instead of asking, it requests
+    the start immediately and then shows a confirmation. The request goes to the
+    start coordinator, which offers it to the app window that is already open
+    before opening anything (core/recording_request.py); the page still performs
+    the start, exactly as a manual click would.
 
     Uses the sticky "reminder" scenario so the user reliably sees that recording
     began even while Focus Assist / Do Not Disturb is on during the meeting.
+
+    Returns True once the start request has been dispatched, EVEN IF the toast
+    itself failed. The caller (the meeting-detect loop) uses the return value to
+    mark the meeting as handled and to arm auto-stop, so tying it to the toast
+    would leave a recording running forever and re-fire the detection every two
+    seconds. A failed toast is logged, not escalated.
     """
     base = server_url.rstrip("/")
-    start_url = f"{base}/session?autostart=1"
+    session_url = f"{base}/session"
     stop_url = f"{base}/api/recording/stop"
 
-    # Kick off the recording the same way the "Start recording" action does.
-    webbrowser.open(start_url)
+    # Kick off the recording. Async: the coordinator escalates over tens of
+    # seconds and this runs on the meeting-detect loop.
+    recording_request.request_start_async(
+        "toast:autostart", f"{app_name} meeting detected")
 
     def _open(_arg: str) -> None:
-        webbrowser.open(start_url)
+        # Focus the app window the user already has (the installed PWA) rather
+        # than opening a second one. No autostart: the recording is already
+        # being requested, and a still-pending command reaches this window over
+        # SSE the moment it connects.
+        browser.open_app_window(session_url, prefer_pwa=True)
 
     def _stop(_arg: str) -> None:
         try:
@@ -279,7 +298,7 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
         except Exception as e:
             log.warn("notify", f"Stop-from-toast failed: {e}")
 
-    return notify(
+    shown = notify(
         f"Recording {app_name} meeting",
         "Auto-started recording and transcription. Click to open.",
         on_click=_open,
@@ -289,8 +308,12 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
         ],
         duration="long",
         scenario="reminder",
-        mac_url=start_url,
+        mac_url=session_url,
     )
+    if not shown:
+        log.warn("notify", f"Recording {app_name} meeting: start requested but the "
+                           f"confirmation toast did not display")
+    return True
 
 
 def send_test_toast() -> bool:

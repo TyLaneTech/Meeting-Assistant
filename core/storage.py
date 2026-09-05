@@ -5,8 +5,10 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from core import paths as paths
+from core.attention import compute_attention, get_attention_thresholds
 
 
 def __getattr__(name):
@@ -193,6 +195,10 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_chapters_session ON chapters(session_id)",
             # Per-session chapters system prompt override (NULL = use global/default)
             "ALTER TABLE sessions ADD COLUMN chapters_system_prompt TEXT DEFAULT NULL",
+            # Canonical expected-speaker and calendar metadata for attention signals
+            "ALTER TABLE sessions ADD COLUMN expected_speaker_count INTEGER DEFAULT NULL",
+            "ALTER TABLE sessions ADD COLUMN expected_speaker_source TEXT DEFAULT NULL",
+            "ALTER TABLE sessions ADD COLUMN calendar_match TEXT DEFAULT NULL",
             # Composite index for transcript lookups. Session loads filter on
             # session_id and the speaker-history/talk-time paths additionally
             # group on source; without this every lookup scanned the whole
@@ -667,6 +673,110 @@ def create_session(
              actual_started, ended_at, split_group_id),
         )
     return sid
+
+
+def set_expected_speaker_count(
+    session_id: str,
+    count: int | None,
+    source: str,
+) -> None:
+    """Set or clear the expected speaker count and its provenance."""
+    if source not in ("calendar", "user", "candidates"):
+        raise ValueError("Invalid expected speaker source")
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET expected_speaker_count = ?, expected_speaker_source = ?"
+            " WHERE id = ?",
+            (count, source, session_id),
+        )
+
+
+def set_calendar_match(session_id: str, match_dict: dict | None) -> None:
+    """Store a calendar match and adopt its attendee count unless user-set."""
+    payload = json.dumps(match_dict, separators=(",", ":")) if match_dict is not None else None
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE sessions SET calendar_match = ? WHERE id = ?",
+            (payload, session_id),
+        )
+        attendee_count = match_dict.get("attendee_count") if isinstance(match_dict, dict) else None
+        current = conn.execute(
+            "SELECT expected_speaker_source FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            current
+            and current["expected_speaker_source"] != "user"
+            and isinstance(attendee_count, int)
+            and not isinstance(attendee_count, bool)
+        ):
+            conn.execute(
+                "UPDATE sessions SET expected_speaker_count = ?, expected_speaker_source = 'calendar'"
+                " WHERE id = ?",
+                (attendee_count, session_id),
+            )
+
+
+def get_calendar_match(session_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT calendar_match FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    if not row or not row["calendar_match"]:
+        return None
+    try:
+        value = json.loads(row["calendar_match"])
+        return value if isinstance(value, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_session_times(session_id: str) -> dict | None:
+    """Return one session's timing and expected-count row, nothing heavier.
+
+    ``get_session`` pulls the whole meeting (segments, chat, chapters); calendar
+    matching only needs the span and the expected-count provenance.
+    """
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT s.id, s.title, s.started_at, s.ended_at,"
+            "       s.expected_speaker_count, s.expected_speaker_source,"
+            "       (SELECT MAX(ts.end_time) FROM transcript_segments ts"
+            "        WHERE ts.session_id = s.id) AS last_segment_time"
+            " FROM sessions s WHERE s.id = ?",
+            (session_id,),
+        ).fetchone()
+    return {k: row[k] for k in row.keys()} if row else None
+
+
+def backfill_expected_counts(candidates_dir) -> int:
+    """Populate missing expected counts from saved resolution candidates."""
+    candidates_dir = Path(candidates_dir)
+    updated = 0
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id FROM sessions WHERE expected_speaker_count IS NULL"
+            " AND expected_speaker_source IS NULL"
+        ).fetchall()
+        for row in rows:
+            candidate_path = candidates_dir / f"{row['id']}.json"
+            try:
+                payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            meeting = payload.get("meeting") if isinstance(payload, dict) else None
+            count = meeting.get("attendee_count") if isinstance(meeting, dict) else None
+            if not isinstance(count, int) or isinstance(count, bool):
+                continue
+            conn.execute(
+                "UPDATE sessions SET expected_speaker_count = ?,"
+                " expected_speaker_source = 'candidates' WHERE id = ?"
+                " AND expected_speaker_count IS NULL",
+                (count, row["id"]),
+            )
+            updated += 1
+    return updated
 
 
 def get_session_split_group_id(session_id: str) -> str | None:
@@ -1231,12 +1341,88 @@ def delete_session(session_id: str) -> None:
             pass
 
 
+def _calendar_match_summary(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        match = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(match, dict):
+        return None
+    return {
+        key: match.get(key)
+        for key in ("uid", "title", "start", "end", "attendee_count", "confirmed",
+                    "cleared")
+    }
+
+
+def _attention_by_session(conn) -> dict[str, dict]:
+    session_rows = conn.execute(
+        "SELECT id, expected_speaker_count FROM sessions"
+    ).fetchall()
+    stats = conn.execute(
+        "SELECT ts.session_id,"
+        " COALESCE(NULLIF(ts.source_override, ''), ts.source) AS speaker_key,"
+        " COALESCE(sl.name, COALESCE(NULLIF(ts.source_override, ''), ts.source)) AS name,"
+        " COALESCE(sl.is_noise, 0) AS is_noise,"
+        " COALESCE(SUM(MAX(ts.end_time - ts.start_time, 0)), 0) AS talk_seconds,"
+        " COALESCE(SUM(CASE WHEN TRIM(ts.text) = '' THEN 0 ELSE"
+        " LENGTH(TRIM(ts.text)) - LENGTH(REPLACE(TRIM(ts.text), ' ', '')) + 1 END), 0)"
+        " AS word_count"
+        " FROM transcript_segments ts"
+        " LEFT JOIN speaker_labels sl ON sl.session_id = ts.session_id"
+        " AND sl.speaker_key = COALESCE(NULLIF(ts.source_override, ''), ts.source)"
+        " GROUP BY ts.session_id, COALESCE(NULLIF(ts.source_override, ''), ts.source)"
+    ).fetchall()
+    speakers_by_session: dict[str, list[dict]] = {}
+    for row in stats:
+        speakers_by_session.setdefault(row["session_id"], []).append({
+            "name": row["name"],
+            "is_noise": bool(row["is_noise"]),
+            "talk_seconds": row["talk_seconds"],
+            "word_count": row["word_count"],
+        })
+    thresholds = get_attention_thresholds()
+    return {
+        row["id"]: compute_attention(
+            speakers_by_session.get(row["id"], []),
+            row["expected_speaker_count"],
+            thresholds=thresholds,
+        )
+        for row in session_rows
+    }
+
+
+def get_session_attention(session_id: str) -> dict | None:
+    with _conn() as conn:
+        exists = conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if not exists:
+            return None
+        return _attention_by_session(conn)[session_id]
+
+
+def attention_summary() -> dict:
+    with _conn() as conn:
+        attention = _attention_by_session(conn).values()
+    values = list(attention)
+    return {
+        "needs_attention": sum(1 for item in values if item["needs"]),
+        "unresolved_speakers": sum(item["unresolved"] for item in values),
+        "mismatched": sum(
+            1 for item in values if "speaker_count_mismatch" in item["reasons"]
+        ),
+    }
+
+
 def list_sessions() -> list[dict]:
     audio_dir = paths.audio_dir()
     with _conn() as conn:
         rows = conn.execute(
             "SELECT s.id, s.title, s.started_at, s.ended_at,"
             "       s.folder_id, s.sort_order, s.split_group_id,"
+            "       s.expected_speaker_count, s.expected_speaker_source,"
+            "       s.calendar_match,"
             "       (SELECT MAX(ts.end_time) FROM transcript_segments ts"
             "        WHERE ts.session_id = s.id) AS last_segment_time"
             " FROM sessions s ORDER BY s.started_at DESC"
@@ -1250,6 +1436,7 @@ def list_sessions() -> list[dict]:
             " GROUP BY sl.session_id, lower(sl.name)"
             " ORDER BY sl.session_id, lower(sl.name)"
         ).fetchall()
+        attention_by_session = _attention_by_session(conn)
     # Group speakers by session_id
     speakers_by_session: dict[str, list[dict]] = {}
     for sr in speaker_rows:
@@ -1258,9 +1445,11 @@ def list_sessions() -> list[dict]:
             {"name": sr["name"], "color": sr["color"]}
         )
     return [
-        {**dict(r),
+        {**{k: r[k] for k in r.keys() if k != "calendar_match"},
          "has_audio": (audio_dir / f"{r['id']}.wav").exists(),
-         "speakers": speakers_by_session.get(r["id"], [])}
+         "speakers": speakers_by_session.get(r["id"], []),
+         "attention": attention_by_session[r["id"]],
+         "calendar_match": _calendar_match_summary(r["calendar_match"])}
         for r in rows
     ]
 
@@ -2077,6 +2266,7 @@ def get_dashboard_analytics() -> dict:
         day = (datetime.utcnow() - timedelta(days=13 - i)).strftime("%Y-%m-%d")
         activity_data.append({"day": day, "count": activity_map.get(day, 0)})
 
+    attention = attention_summary()
     return {
         "total_sessions": total_sessions,
         "total_seconds": total_seconds,
@@ -2088,6 +2278,8 @@ def get_dashboard_analytics() -> dict:
         "activity": activity_data,
         "top_speakers": [dict(r) for r in top_speakers],
         "recent_sessions": [dict(r) for r in recent_sessions],
+        "needs_attention_count": attention["needs_attention"],
+        "unresolved_speaker_total": attention["unresolved_speakers"],
     }
 
 
@@ -2329,6 +2521,106 @@ def speaker_time_stats(session_id: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def _name_predicate(match: str) -> str:
+    """SQL fragment comparing a name column to a bound parameter."""
+    if match == "contains":
+        return "lower({col}) LIKE '%' || lower(?) || '%' ESCAPE '\\'"
+    return "lower({col}) = lower(?)"
+
+
+def _like_literal(text: str) -> str:
+    """Escape a user string so LIKE treats its wildcards as ordinary text.
+
+    A speaker named "J_hn" or "100%" must match itself, not act as a pattern.
+    Pairs with the ESCAPE clause in ``_name_predicate``.
+    """
+    return (text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_"))
+
+
+def _name_param(name: str, match: str) -> str:
+    """The bound value for ``_name_predicate``, escaped when it is a pattern."""
+    return _like_literal(name) if match == "contains" else name
+
+
+def find_speaker_labels_by_name(
+    name: str,
+    *,
+    match: str = "exact",
+    session_ids: "list[str] | None" = None,
+) -> list[dict]:
+    """Speaker-label rows carrying a display name, across sessions.
+
+    ``match`` is "exact" (case-insensitive equality, the default) or
+    "contains". ``session_ids`` of None searches the whole library; an empty
+    list matches nothing. Rows come back newest session first with the
+    session's title and start time attached, which is what the bulk-relabel
+    planner needs to describe what it would change.
+    """
+    name = (name or "").strip()
+    if not name:
+        return []
+    if session_ids is not None and not session_ids:
+        return []
+
+    where = [_name_predicate(match).format(col="sl.name")]
+    params: list = [_name_param(name, match)]
+    if session_ids is not None:
+        where.append(f"sl.session_id IN ({','.join('?' * len(session_ids))})")
+        params.extend(session_ids)
+
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT sl.session_id, sl.speaker_key, sl.name, sl.color,"
+            " sl.global_id, sl.is_noise, s.title, s.started_at"
+            " FROM speaker_labels sl"
+            " JOIN sessions s ON s.id = sl.session_id"
+            f" WHERE {' AND '.join(where)}"
+            " ORDER BY s.started_at DESC, sl.speaker_key",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_label_overrides_by_name(
+    name: str,
+    *,
+    match: str = "exact",
+    session_ids: "list[str] | None" = None,
+) -> dict[str, int]:
+    """Per-session count of transcript lines pinned to a name by hand.
+
+    ``label_override`` wins over the speaker_labels display name for a single
+    line, so renaming a speaker leaves these lines showing the old name. The
+    planner reports them as a warning instead of silently under-delivering.
+    """
+    name = (name or "").strip()
+    if not name:
+        return {}
+    if session_ids is not None and not session_ids:
+        return {}
+
+    where = [
+        "ts.label_override IS NOT NULL",
+        "ts.label_override != ''",
+        _name_predicate(match).format(col="ts.label_override"),
+    ]
+    params: list = [_name_param(name, match)]
+    if session_ids is not None:
+        where.append(f"ts.session_id IN ({','.join('?' * len(session_ids))})")
+        params.extend(session_ids)
+
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT ts.session_id, COUNT(*) AS n FROM transcript_segments ts"
+            f" WHERE {' AND '.join(where)}"
+            " GROUP BY ts.session_id",
+            params,
+        ).fetchall()
+    return {r["session_id"]: r["n"] for r in rows}
 
 
 def get_summary_history(session_id: str) -> list[dict]:

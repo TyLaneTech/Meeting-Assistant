@@ -198,16 +198,52 @@ def read_log_file(name: str, lines: int = 500) -> str | None:
 
 # ── Public logging API (console behaviour unchanged) ─────────────────────────
 
+def _make_console_safe() -> None:
+    """Never let a console echo raise.
+
+    Under the tray launcher (launch_hidden.vbs) stdout is a file in the console
+    code page, cp1252 on most Windows machines, which cannot encode the arrows
+    and check marks some log lines carry. Left alone, print() raises
+    UnicodeEncodeError inside whatever called log.info(), and the screen
+    recorder's start-up line is one of those callers (2026-09-05). Replacing
+    the odd character with '?' in the console is the right trade; the log file
+    is UTF-8 and keeps the original.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_make_console_safe()
+
+
+def _echo(line: str) -> None:
+    """print() that survives a closed or unencodable console."""
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        try:
+            print(line.encode(enc, errors="replace").decode(enc, errors="replace"))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def info(tag: str, msg: str) -> None:
-    print(f"  {_fmt_tag(tag)}  {msg}")
+    _echo(f"  {_fmt_tag(tag)}  {msg}")
     _capture("info", tag, msg)
 
 
 def warn(tag: str, msg: str) -> None:
-    print(f"  {_YLW}[{tag}]{_R}  {_YLW}{msg}{_R}")
+    _echo(f"  {_YLW}[{tag}]{_R}  {_YLW}{msg}{_R}")
     _capture("warn", tag, msg)
 
 
 def error(tag: str, msg: str) -> None:
-    print(f"  {_RED}[{tag}]{_R}  {_RED}{msg}{_R}")
+    _echo(f"  {_RED}[{tag}]{_R}  {_RED}{msg}{_R}")
     _capture("error", tag, msg)

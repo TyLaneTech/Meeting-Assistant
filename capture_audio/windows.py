@@ -4,10 +4,12 @@ Captures system audio output (loopback) AND the default microphone input,
 mixing both streams into a single mono feed for transcription.
 """
 import collections
+import json
 import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -72,10 +74,62 @@ _N_BARS   = 32   # number of log-spaced frequency bands sent to the frontend
 # all open streams/handles when the process exits normally.
 _stream_graveyard: list = []
 
+
+def _terminate_quietly(pa) -> None:
+    """Terminate a PyAudio instance that never opened a loopback stream. Safe
+    because only closing a WASAPI *loopback* stream calls ExitProcess; a PyAudio
+    that only enumerated devices terminates normally. No-op on None or error."""
+    if pa is None:
+        return
+    try:
+        pa.terminate()
+    except Exception:
+        pass
+
+
+def probe_render_endpoints(duration: float = 1.2) -> dict | None:
+    """Ask Windows where audio is ACTUALLY playing right now.
+
+    Runs capture_audio/render_probe.py as a subprocess (COM must never run
+    in-process here; see render_probe.py) and returns its parsed JSON:
+    active render endpoints with name, max peak over the sampling window,
+    and default-Multimedia / default-Communications flags. Returns None on
+    any failure - callers treat that as "no information".
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "render_probe.py")
+    try:
+        r = subprocess.run(
+            [sys.executable, script, "--duration", str(duration)],
+            capture_output=True, timeout=duration + 15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        out = (r.stdout or b"").decode("utf-8", errors="replace").strip()
+        data = json.loads(out) if out else None
+        if not data or not data.get("ok"):
+            log.warn("audio", f"Render probe returned no data"
+                              f"{': ' + str(data.get('error')) if data else ''}")
+            return None
+        return data
+    except Exception as e:
+        log.warn("audio", f"Render probe failed: {e}")
+        return None
+
 # Guards the per-source Opus encode, which now runs after a recording has
 # already been reported as stopped. Module level (not per instance) because the
 # capture object that produced the temp WAVs is not the one that resumes them.
 _PER_SOURCE_ENCODE_LOCK = threading.Lock()
+
+
+
+def _follow_output_enabled() -> bool:
+    """The loopback_follow_output preference. Imported lazily so this module
+    keeps loading in the audio self-test, which runs without the app's settings."""
+    try:
+        from core import settings as _settings
+        return bool(_settings.get("loopback_follow_output", False))
+    except Exception:
+        return False
 
 
 class AudioCapture:
@@ -138,6 +192,33 @@ class AudioCapture:
         self._mic_device_name: str = ""
         self._loopback_verified: bool = False
         self._mic_verified: bool = False
+
+        # Real-signal tracking for the loopback silence watchdog. `_verified`
+        # flips on a single non-zero byte (unreliable), so `loopback_had_signal`
+        # tracks whether the loopback ever produced ACTUAL audio above the noise
+        # floor. If it stays dead, the watchdog fires on_loopback_silent so a call
+        # whose audio plays to a device we are not capturing never fails silently.
+        self.loopback_had_signal: bool = False
+        self.on_loopback_silent = None       # optional callback(dev_name, kind)
+        self._silence_watchdog: threading.Thread | None = None
+        # Live device following: which PyAudio owns the loopback stream (starts as
+        # self._pa, becomes a fresh instance after a mid-recording switch), and a
+        # lock serialising switches. A WASAPI loopback stream can NEVER be closed
+        # while running (it calls ExitProcess), so a switch parks the old stream +
+        # PyAudio in _stream_graveyard and opens a new one.
+        self._loopback_pa = None
+        self._loopback_restart_lock = threading.Lock()
+        # When a mid-recording switch lands on a device whose native mix format
+        # differs from the one bound at start (e.g. a Bluetooth/USB call endpoint
+        # is mono, or 16 kHz HFP), the mixer must resample the switched loopback
+        # back to the pipeline rate (self.sample_rate, fixed at start for the WAV
+        # + transcriber). 1/1 means no resampling (the common 48 kHz case).
+        self._loopback_resample_up: int = 1
+        self._loopback_resample_down: int = 1
+        # Communications-role default endpoint name from the most recent render
+        # probe (or None). Used to keep the loopback "sticky" on the call device
+        # through a far-end pause, rather than chasing an unrelated sound.
+        self._last_probe_comms: str | None = None
 
         # User-controlled gain multipliers (1.0 = no change, persisted via localStorage)
         self.loopback_gain: float = 1.0
@@ -214,16 +295,22 @@ class AudioCapture:
             power <<= 1
         return power
 
-    def _find_loopback_device(self) -> dict:
+    def _find_loopback_device(self, pa=None) -> dict:
         """
         Find the WASAPI loopback device for the current default audio output.
         Falls back gracefully when device names are truncated or don't match exactly.
+
+        ``pa`` lets a caller pass a FRESH PyAudio instance: PortAudio caches the
+        device list at init, so self._pa cannot see a device connected after the
+        recording started. A live switch passes a new instance to see the current
+        default output.
         """
-        wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-        default_output = self._pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+        pa = pa or self._pa
+        wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_output = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
         default_name: str = default_output["name"]
 
-        all_loopbacks = list(self._pa.get_loopback_device_info_generator())
+        all_loopbacks = list(pa.get_loopback_device_info_generator())
         if not all_loopbacks:
             raise RuntimeError(
                 "No WASAPI loopback devices found. "
@@ -253,7 +340,8 @@ class AudioCapture:
                           f"Using '{all_loopbacks[0]['name']}' as fallback.")
         return all_loopbacks[0]
 
-    def _match_loopback_by_name(self, wanted: str) -> dict | None:
+    def _match_loopback_by_name(self, wanted: str, pa=None,
+                                strict: bool = False) -> dict | None:
         """Find a loopback device whose name matches ``wanted``.
 
         Uses the same tiered matching as _find_loopback_device (exact,
@@ -262,9 +350,19 @@ class AudioCapture:
         instead of falling back to the first device: a wrong first-device is
         exactly the bug we are guarding against, so the caller picks the
         fallback (system default) itself.
+
+        ``pa`` lets a caller pass a FRESH PyAudio instance (PortAudio caches
+        the device list at init), e.g. a live switch targeting an endpoint
+        connected after the recording started.
+
+        ``strict`` stops after the exact + substring tiers. Probe-sourced
+        targets use it so a render name never maps onto a *sibling* endpoint of
+        the same hardware via the loose word/prefix tiers (e.g. "Headset
+        Earphone (Jabra)" vs "Speakers (Jabra)" both contain "Jabra"), which
+        would bind the wrong, idle endpoint.
         """
         try:
-            all_lb = list(self._pa.get_loopback_device_info_generator())
+            all_lb = list((pa or self._pa).get_loopback_device_info_generator())
         except Exception:
             return None
         if not all_lb:
@@ -273,18 +371,23 @@ class AudioCapture:
         for lb in all_lb:
             if lb["name"] == wanted:
                 return lb
-        # 2. Substring either direction (added/removed suffixes)
+        # 2. Substring either direction (added/removed suffixes, e.g. the
+        #    " [Loopback]" the loopback name carries but the render name does not)
         for lb in all_lb:
             if wanted in lb["name"] or lb["name"] in wanted:
                 return lb
+        if strict:
+            return None
         # 3. Truncated prefix (Windows truncates long output vs loopback names
         #    differently)
         prefix = wanted[:20]
         for lb in all_lb:
             if prefix and prefix in lb["name"]:
                 return lb
-        # 4. Word level (e.g. "USB Audio" shared between both names)
-        words = [w for w in wanted.split() if len(w) >= 4]
+        # 4. Word level (e.g. "USB Audio" shared between both names). Every
+        #    loopback name ends in "[Loopback]", so that token would match any
+        #    device at all and turn a missing headset into random speakers.
+        words = [w for w in wanted.split() if len(w) >= 4 and w != "[Loopback]"]
         for lb in all_lb:
             if any(w in lb["name"] for w in words):
                 return lb
@@ -307,7 +410,69 @@ class AudioCapture:
         if index is None and not name:
             return self._find_loopback_device()
 
-        # Fast path: the saved index still points at the saved device.
+        saved = self._resolve_saved_loopback(index, name)
+
+        # The default: the device chosen in the recorder is the device captured.
+        # Windows keeps two output roles (the Default Device and the Default
+        # Communications Device) and PortAudio only ever reports the first, so
+        # "the default output" is routinely not the device the user is
+        # listening on. Following it would swap a deliberately chosen headset
+        # for idle speakers and record silence for the whole call (2026-09-05:
+        # a saved Arctis headset was replaced by an idle Bose endpoint). The
+        # saved device is authoritative; the default is only the fallback when
+        # the saved device has gone.
+        if not _follow_output_enabled():
+            if saved is not None:
+                return saved
+            if name:
+                log.warn("audio", f"Loopback device '{name}' not found; "
+                                  f"using system default")
+            return self._find_loopback_device()
+
+        # Follow mode (Settings > System > "Follow call audio"): call/system
+        # audio plays to the CURRENT default output, so bind to it. A saved
+        # device is only a hint: when the default has since moved (headphones
+        # plugged in, a Bluetooth dongle, a call app's own endpoint), a stale
+        # saved device captures an idle endpoint and records pure silence (the
+        # 2026-09-01 dead-loopback failure: a call on the headphones was missed
+        # because the loopback stayed pinned to idle Realtek speakers). Use the
+        # saved device only when the default cannot be resolved.
+        default_lb = None
+        try:
+            default_lb = self._find_loopback_device()
+        except Exception as e:
+            log.warn("audio", f"Could not resolve the default-output loopback: {e}")
+
+        # NOTE: we deliberately do NOT run the render probe here. It costs a
+        # subprocess (~1-3s) and would delay every recording start, and at
+        # start-time nothing may be playing yet, so we cannot tell a browser
+        # call (renders to the Console default we already resolve below) from a
+        # native call (renders to the Communications default). We bind the
+        # Console default now (instant, correct for browser + single-device)
+        # and let the silence watchdog FOLLOW the audio to wherever it is
+        # actually playing within a few seconds - it only ever switches to an
+        # endpoint that is demonstrably producing sound, so it can never bind
+        # an idle device or flip-flop. See _loopback_silence_watchdog.
+        if default_lb is not None:
+            if saved is not None and saved.get("index") != default_lb.get("index"):
+                log.info("audio",
+                         f"Loopback: following current default output "
+                         f"'{default_lb['name']}' instead of the saved "
+                         f"'{saved['name']}' (system audio plays to the default output)")
+            else:
+                log.info("audio", f"Loopback: default output '{default_lb['name']}'")
+            return default_lb
+
+        if saved is not None:
+            log.info("audio", f"Loopback: default output not resolvable; using saved '{saved['name']}'")
+            return saved
+
+        return self._find_loopback_device()  # raises the clear "no loopback devices" error
+
+    def _resolve_saved_loopback(self, index: int | None, name: str | None) -> dict | None:
+        """The device the user chose: the saved index when it still carries the
+        saved name, otherwise the live device with that name. None when neither
+        resolves, so the caller decides the fallback."""
         if index is not None:
             try:
                 info = self._pa.get_device_info_by_index(index)
@@ -322,8 +487,6 @@ class AudioCapture:
                 if name:
                     log.info("audio", f"Loopback index {index} no longer valid; "
                              f"re-resolving by name")
-
-        # Name-based re-resolution against the live loopback list.
         if name:
             match = self._match_loopback_by_name(name)
             if match is not None:
@@ -331,10 +494,7 @@ class AudioCapture:
                     log.info("audio", f"Loopback '{name}' re-resolved to index "
                              f"{match.get('index')}")
                 return match
-            log.warn("audio", f"Loopback device '{name}' not found; "
-                     f"using system default")
-
-        return self._find_loopback_device()
+        return None
 
     def _find_mic_device(self) -> dict | None:
         """Find the system default microphone input device (WASAPI only)."""
@@ -451,6 +611,8 @@ class AudioCapture:
         try:
             subprocess.run(
                 [ffmpeg, "-y", "-i", opus_path,
+                 # A plain 44-byte header: no LIST/INFO chunk for the appender to trip on.
+                 "-fflags", "+bitexact",
                  "-acodec", "pcm_s16le", "-ar", str(self.sample_rate or 48000),
                  "-ac", "1", wav_path],
                 capture_output=True, timeout=300,
@@ -597,6 +759,7 @@ class AudioCapture:
             input_device_index=lb_info["index"],
             frames_per_buffer=self.CHUNK_SIZE,
         )
+        self._loopback_pa = self._pa   # the loopback starts on the main PyAudio
 
         # --- Microphone stream (best-effort) ---
         if mic_index == -3:
@@ -619,9 +782,24 @@ class AudioCapture:
                 # or an automatic retarget onto the same physical device.
                 resolved, reason = resolve_dshow_mic_name(ffmpeg_mic_name)
                 if resolved is None:
-                    log.warn("audio", f"Mic '{ffmpeg_mic_name}' not found in dshow "
-                                      f"device list ({reason}) - capturing loopback only")
-                    mic_info = None
+                    # The saved DirectShow mic is gone (dead/disabled device, USB
+                    # unplugged - e.g. the retired "USB PnP Audio Device"). Do NOT
+                    # fall through to loopback-only: that silently drops the user's
+                    # OWN voice (the inverse of the dead-loopback failure). Retarget
+                    # to the live WASAPI default input so the user is always
+                    # captured; only if that is also unavailable do we go
+                    # loopback-only.
+                    fallback = self._find_mic_device()
+                    if fallback is not None:
+                        log.warn("audio", f"Mic '{ffmpeg_mic_name}' not found in dshow "
+                                          f"device list ({reason}); falling back to the "
+                                          f"default microphone '{fallback['name']}'")
+                        mic_info = fallback
+                    else:
+                        log.warn("audio", f"Mic '{ffmpeg_mic_name}' not found in dshow "
+                                          f"device list ({reason}) and no fallback mic "
+                                          f"available - capturing loopback only")
+                        mic_info = None
                 else:
                     if resolved != ffmpeg_mic_name:
                         log.info("audio", f"Mic name re-resolved: '{ffmpeg_mic_name}' "
@@ -754,6 +932,7 @@ class AudioCapture:
         self._loopback_thread = threading.Thread(
             target=self._capture_loop,
             args=(self._loopback_stream, self._loopback_q),
+            kwargs={"is_loopback": True},
             daemon=True,
         )
         self._loopback_thread.start()
@@ -782,6 +961,336 @@ class AudioCapture:
         self._mixer_thread = threading.Thread(target=self._mixer_loop, daemon=True)
         self._mixer_thread.start()
 
+        self._silence_watchdog = threading.Thread(
+            target=self._loopback_silence_watchdog, daemon=True)
+        self._silence_watchdog.start()
+
+    def restart_loopback(self, target_name: str | None = None) -> bool:
+        """Switch the loopback to a live output device without stopping the
+        recording, so a live device change (headphones plugged in mid-call, a new
+        default output, a Bluetooth dongle) is followed automatically.
+
+        ``target_name``, when given, names the render endpoint that is ACTUALLY
+        playing audio (from the render probe - typically the default
+        Communications device a call app renders to, which PortAudio cannot
+        see). Without it, falls back to the current default output.
+
+        A WASAPI loopback stream can NEVER be closed while running (it calls
+        ExitProcess), so the old stream and its PyAudio are parked in the graveyard
+        and never closed. A FRESH PyAudio is used because PortAudio caches the
+        device list at init, so self._pa cannot see a device connected after the
+        recording started. Returns True only when it actually switched to a
+        different, live device. Never raises; any failure leaves the current
+        stream untouched (the silence watchdog then alarms)."""
+        if not self.is_running:
+            return False
+        if not self._loopback_restart_lock.acquire(blocking=False):
+            return False  # a switch is already in progress
+        pa2 = None
+        try:
+            try:
+                pa2 = pyaudio.PyAudio()
+                if target_name:
+                    new_info = self._match_loopback_by_name(target_name, pa=pa2, strict=True)
+                    if new_info is None:
+                        # The probe named an endpoint with no matching loopback
+                        # device. Do NOT fall back to the console default and
+                        # switch to it - that fallback is the flip-flop that
+                        # moved a live call onto an idle device. Stay put; the
+                        # watchdog tries again next tick.
+                        log.warn("audio", f"Loopback switch: no loopback device matches "
+                                          f"'{target_name}'; staying on the current device")
+                        _terminate_quietly(pa2)
+                        return False
+                else:
+                    new_info = self._find_loopback_device(pa=pa2)
+            except Exception as e:
+                log.warn("audio", f"Loopback switch: could not resolve a target device ({e})")
+                _terminate_quietly(pa2)
+                return False
+
+            # Same device as now? Then the silence is not a device move (the call
+            # is muted, or its app is pinned to a non-default output); don't churn.
+            if new_info["name"] == self._loopback_device_name:
+                _terminate_quietly(pa2)
+                return False
+
+            # Open the new loopback at ITS OWN native mix format, not the start
+            # device's. A call endpoint (Bluetooth HFP, many USB headsets) is
+            # often MONO and sometimes 16 kHz; forcing the start device's 48 kHz
+            # stereo made the open fail and the call was lost with only an alarm
+            # (the real gap behind the 2026-09-01 failure on headset hardware).
+            # We take the device's channels/rate and reconcile downstream: the
+            # mixer already downmixes with self._loopback_channels, and we set a
+            # resample ratio so a different rate is converted back to the
+            # pipeline rate (self.sample_rate, fixed at start for WAV/transcriber).
+            new_ch = max(1, int(new_info.get("maxInputChannels") or self._loopback_channels))
+            new_rate = int(new_info.get("defaultSampleRate") or self.sample_rate)
+            try:
+                new_stream = pa2.open(
+                    format=self.FORMAT,
+                    channels=new_ch,
+                    rate=new_rate,
+                    input=True,
+                    input_device_index=new_info["index"],
+                    frames_per_buffer=self.CHUNK_SIZE,
+                )
+            except Exception as e:
+                log.warn("audio", f"Loopback switch: could not open '{new_info['name']}' "
+                                  f"at {new_rate}Hz/{new_ch}ch ({e})")
+                _terminate_quietly(pa2)
+                return False
+
+            old_stream = self._loopback_stream
+            old_thread = self._loopback_thread
+            old_pa = self._loopback_pa
+
+            # Reconcile the new device's format with the fixed pipeline BEFORE the
+            # new capture thread starts queueing data, so the mixer reads the
+            # right channel count and resample ratio for the very first chunk.
+            if new_rate != self.sample_rate:
+                g = gcd(self.sample_rate, new_rate)
+                self._loopback_resample_up = self.sample_rate // g
+                self._loopback_resample_down = new_rate // g
+                log.info("audio", f"Loopback resampling {new_rate}->{self.sample_rate} Hz "
+                                  f"on the switched device")
+            else:
+                self._loopback_resample_up = self._loopback_resample_down = 1
+            self._loopback_channels = new_ch
+
+            # Publish the new stream: the old loopback thread's while-condition
+            # (self._loopback_stream is stream) goes False and it exits.
+            self._loopback_stream = new_stream
+            self._loopback_pa = pa2
+            self._loopback_device_name = new_info["name"]
+            self._loopback_verified = False
+            self.loopback_had_signal = False
+            self.loopback_level = 0.0
+            self._loopback_thread = threading.Thread(
+                target=self._capture_loop,
+                args=(new_stream, self._loopback_q),
+                kwargs={"is_loopback": True},
+                daemon=True,
+            )
+            self._loopback_thread.start()
+
+            if old_thread is not None:
+                old_thread.join(timeout=2)
+            # NEVER close a WASAPI loopback stream (ExitProcess). Park it, and its
+            # PyAudio unless that is the main one (still owns the mic + WAV).
+            _stream_graveyard.append(old_stream)
+            if old_pa is not None and old_pa is not self._pa:
+                _stream_graveyard.append(old_pa)
+            src = ("the live endpoint (render probe)" if target_name
+                   else "the current default output")
+            log.info("audio", f"Loopback switched to {src}: '{new_info['name']}'")
+            return True
+        finally:
+            self._loopback_restart_lock.release()
+
+    def _probe_live_output(self, require_playing: bool = True,
+                           duration: float = 1.2) -> str | None:
+        """Name of the render endpoint the loopback SHOULD capture, per the
+        render probe, or None when the probe fails / has nothing to offer.
+
+        Preference order: the endpoint that is ACTUALLY playing and is the
+        default Communications device (call apps render there, and a call is
+        the thing we must never lose), then a playing default-output endpoint,
+        then the loudest playing endpoint (a call app pinned to a non-default
+        device).
+
+        ``require_playing=True`` (the watchdog's use) returns None when nothing
+        is audible, so a silent moment cannot move the device. With
+        ``require_playing=False`` a role-flagged default is returned even while
+        silent, but an arbitrary idle endpoint never is (only a genuinely
+        playing endpoint is used as the loudest-fallback). Recording start does
+        NOT probe (it would delay capture and cannot yet tell a browser call
+        from a native one); the watchdog follows the audio a few seconds in.
+
+        Probing runs in a subprocess (~duration plus interpreter start); only
+        call it from the watchdog thread, never on the recording-start path.
+        """
+        PLAYING = 0.01   # meter peak: 0.0 dead silence; quiet speech > 0.03
+        probe = probe_render_endpoints(duration)
+        if not probe:
+            return None
+        eps = probe.get("endpoints") or []
+        if not eps:
+            return None
+        summary = ", ".join(
+            f"'{e['name']}' peak={e['peak']}"
+            + ("[comm]" if e.get("is_default_communications") else "")
+            + ("[default]" if e.get("is_default") else "")
+            for e in eps)
+        log.info("audio", f"Render probe: {summary}")
+        # Remember the Communications-role default (the device a call app renders
+        # to) so the watchdog can stay sticky on it through a far-end pause.
+        self._last_probe_comms = next(
+            (e["name"] for e in eps if e.get("is_default_communications")), None)
+        playing = [e for e in eps if e.get("peak", 0.0) >= PLAYING]
+        pool = playing if playing else ([] if require_playing else eps)
+        if not pool:
+            return None
+        for e in pool:
+            if e.get("is_default_communications"):
+                return e["name"]
+        for e in pool:
+            if e.get("is_default"):
+                return e["name"]
+        # Only fall back to "loudest" among endpoints that are ACTUALLY
+        # playing; never pick an arbitrary idle endpoint (e.g. an HDMI output
+        # that happens to enumerate first) when nothing is audible.
+        if playing:
+            return max(playing, key=lambda e: e.get("peak", 0.0))["name"]
+        return None
+
+    def _loopback_silence_watchdog(self) -> None:
+        """Keep the loopback bound to wherever the call/desktop audio is ACTUALLY
+        playing, and alarm if it is genuinely not being captured.
+
+        PortAudio only ever hands us the Console/Multimedia default output, but a
+        call app can render to the Communications-role default (Teams, Zoom) or
+        to a device the user picked inside it, and the user may switch output
+        devices mid-call. So while the loopback is silent, we ask the
+        out-of-process render probe which endpoint is producing sound RIGHT NOW
+        and, only when that is a DIFFERENT endpoint than the one we hold, switch
+        to it. We never switch to an idle device and never switch on mere
+        silence, so a healthy recording cannot churn or flip-flop between two
+        endpoints (the 2026-09-01 one-sided-call failure was the loopback pinned
+        to an idle device while the call played elsewhere; following the audio
+        recovers it as soon as the far end makes a sound).
+
+        A proactive first check shortly after start catches a call already in
+        progress; after that we only probe while silent, backing off the more
+        consecutive quiet probes find nothing, so a legitimately silent
+        recording (mic-only, muted call) does not spawn a COM subprocess every
+        few seconds for the whole meeting.
+        """
+        INITIAL_CHECK = 1.5        # first proactive device check after start
+        RECOVER_AFTER = 10.0       # silent this long (had signal) -> probe
+        RECOVER_AFTER_NEVER = 4.0  # faster when there was never ANY signal
+        RECOVER_COOLDOWN = 15.0    # base gap between probe attempts
+        MAX_COOLDOWN = 30.0        # backoff ceiling: cap the follow delay at ~30s
+        GRACE = 40.0               # alarm if the CURRENT device never produced signal
+        DROP_AFTER = 25.0          # alarm if a live loopback dropped
+        ALARM_COOLDOWN = 120.0
+        started = time.monotonic()
+        last_signal_ts = started
+        last_recover_ts = started - RECOVER_COOLDOWN
+        last_alarm_ts = started - ALARM_COOLDOWN
+        # grace_base resets on every switch so each newly-bound device gets its
+        # own GRACE window before the "never captured" alarm can fire - a
+        # successful switch to a device that is momentarily silent must not be
+        # reported as a capture failure.
+        grace_base = started
+        fired_start = False
+        did_initial = False
+        quiet_probe_streak = 0
+
+        # Following the audio to another output device is opt-in (Settings >
+        # System > "Follow call audio"). Off keeps the classic behaviour: the
+        # loopback stays on the device chosen at start and only the silence
+        # alarm below runs. Read once per recording so a mid-recording toggle
+        # applies to the next one, not this one.
+        follow_output = _follow_output_enabled()
+
+        def _try_follow_audio() -> bool:
+            """Probe for a live endpoint and switch ONLY to a different,
+            actually-playing device. Returns True if it switched. Never raises."""
+            if not follow_output:
+                return False
+            try:
+                target = self._probe_live_output(require_playing=True)
+            except Exception as e:
+                log.warn("audio", f"loopback probe failed: {e}")
+                return False
+            if not target:
+                return False
+            # Sticky comms: if we are already on the call device (the
+            # Communications-role default) and the only thing playing is a
+            # DIFFERENT endpoint (music / a notification / a video on the
+            # speakers during a far-end pause), do not abandon the call for it.
+            comms = self._last_probe_comms
+            if comms and comms in (self._loopback_device_name or "") and target != comms:
+                return False
+            # Cheap same-device check against the CACHED device list so we skip a
+            # full fresh-PyAudio switch when already on the playing device (the
+            # probe's render name lacks the ' [Loopback]' suffix, so a plain
+            # compare to _loopback_device_name never matches). A target absent
+            # from the cached list may be newly connected - fall through to
+            # restart_loopback, which re-enumerates with a fresh PyAudio.
+            cached = self._match_loopback_by_name(target, strict=True)
+            if cached is not None and cached.get("name") == self._loopback_device_name:
+                return False
+            try:
+                return self.restart_loopback(target_name=target)
+            except Exception as e:
+                log.warn("audio", f"loopback switch failed: {e}")
+                return False
+
+        while self.is_running:
+            # Proactive first check: a call already audible at record-start (e.g.
+            # auto-record joined a call in progress) is followed within a couple
+            # of seconds instead of waiting out the full silence timer.
+            if not did_initial:
+                time.sleep(INITIAL_CHECK)
+                did_initial = True
+                if not self.is_running:
+                    break
+                if _try_follow_audio():
+                    last_signal_ts = last_recover_ts = grace_base = time.monotonic()
+                    fired_start = False
+                continue
+
+            time.sleep(2)
+            now = time.monotonic()
+            if self.loopback_level > 0.003:
+                last_signal_ts = now
+                quiet_probe_streak = 0
+            silent_for = now - last_signal_ts
+
+            recover_after = (RECOVER_AFTER if self.loopback_had_signal
+                             else RECOVER_AFTER_NEVER)
+            # Back off: each consecutive quiet probe that finds nothing new
+            # widens the gap up to MAX_COOLDOWN, so a silent recording is not
+            # probed every 15s for the whole meeting.
+            cooldown = min(RECOVER_COOLDOWN * (2 ** min(quiet_probe_streak, 3)),
+                           MAX_COOLDOWN)
+            if silent_for > recover_after and now - last_recover_ts > cooldown:
+                switched = _try_follow_audio()
+                now = time.monotonic()   # the probe + any switch took real time
+                last_recover_ts = now
+                if switched:
+                    quiet_probe_streak = 0
+                    # New device: give it its own signal + alarm grace so a
+                    # momentary silence right after the switch is not reported
+                    # as a capture failure.
+                    last_signal_ts = grace_base = now
+                    fired_start = False
+                    continue
+                quiet_probe_streak += 1
+
+            if not self.loopback_had_signal:
+                if not fired_start and now - grace_base > GRACE:
+                    fired_start = True
+                    last_alarm_ts = now
+                    self._emit_loopback_silent("never")
+            elif (self._has_mic and self.mic_level > 0.003
+                    and silent_for > DROP_AFTER
+                    and now - last_alarm_ts > ALARM_COOLDOWN):
+                last_alarm_ts = now
+                self._emit_loopback_silent("dropped")
+
+    def _emit_loopback_silent(self, kind: str) -> None:
+        log.warn("audio", f"Loopback has no signal ({kind}); desktop/call audio "
+                          f"may not be captured (device '{self._loopback_device_name}')")
+        cb = self.on_loopback_silent
+        if cb:
+            try:
+                cb(self._loopback_device_name, kind)
+            except Exception as e:
+                log.warn("audio", f"on_loopback_silent callback failed: {e}")
+
     def stop(self, encode_per_source: bool = True) -> None:
         """Stop capture and finalize the mixed WAV.
 
@@ -798,12 +1307,14 @@ class AudioCapture:
         # Wait for the capture and mixer threads to finish their current iteration
         # and exit naturally (they check is_running at the top of every loop).
         # Loopback/mic streams always have data so stream.read() returns quickly.
-        for t in (self._loopback_thread, self._mic_thread, self._mixer_thread):
+        for t in (self._loopback_thread, self._mic_thread, self._mixer_thread,
+                  self._silence_watchdog):
             if t:
                 t.join(timeout=3)
         self._loopback_thread = None
         self._mic_thread = None
         self._mixer_thread = None
+        self._silence_watchdog = None
         # Finalize WAV *after* the mixer thread has stopped - calling stop_wav()
         # while the mixer is still running is a race condition that can corrupt
         # the file or crash on a write to a closed handle.
@@ -935,14 +1446,14 @@ class AudioCapture:
         return arr.size, peak, rms
 
     def _capture_loop(self, stream, out_queue: queue.Queue,
-                      buf_size: int = 0) -> None:
+                      buf_size: int = 0, is_loopback: bool = False) -> None:
         chunk = buf_size or self.CHUNK_SIZE
-        # Identify which stream this thread is servicing so the one-shot
-        # "Verified audio device" log line can name the right device. We
-        # compare object identity rather than passing a label arg to keep
-        # the existing call sites unchanged.
-        is_loopback = stream is self._loopback_stream
-        while self.is_running:
+        # A loopback thread services one stream. On a live device switch the
+        # loopback stream is swapped (self._loopback_stream points at the new
+        # one), so this thread's `self._loopback_stream is stream` goes False and
+        # it exits, handing off to the new thread. The mic thread only tracks
+        # is_running.
+        while self.is_running and (not is_loopback or self._loopback_stream is stream):
             try:
                 # Read however many frames WASAPI has ready, clamped to a
                 # reasonable range.  This adapts to the device's actual
@@ -1168,6 +1679,13 @@ class AudioCapture:
                     while True:
                         data = self._loopback_q.get_nowait()
                         chunk = self._to_mono_float(data, self._loopback_channels)
+                        # A mid-recording switch may have landed on a device at a
+                        # different native rate; resample it back to the pipeline
+                        # rate so the mix / WAV / transcriber stay consistent.
+                        # 1/1 (the common case) is a no-op.
+                        if self._loopback_resample_up != self._loopback_resample_down:
+                            chunk = resample_poly(chunk, self._loopback_resample_up,
+                                                  self._loopback_resample_down)
                         lb_parts.append(chunk)
                         lb_len += len(chunk)
                         got_data = True
@@ -1299,6 +1817,8 @@ class AudioCapture:
                             self.agc_lb_gated = True
                         lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
                         self.loopback_level = lb_rms
+                        if not self.loopback_had_signal and lb_rms > 0.003:
+                            self.loopback_had_signal = True
                         self._lb_fft_buf.extend(lb_chunk.tolist())
                     else:
                         lb_rms = 0.0

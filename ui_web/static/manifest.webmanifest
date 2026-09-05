@@ -1,0 +1,21 @@
+{
+  "name": "Meeting Assistant",
+  "short_name": "Meetings",
+  "description": "Real-time meeting transcription, speaker ID, and AI summaries. Local and private.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    { "src": "/api/icons/app_idle?size=192", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/api/icons/app_idle?size=512", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/api/icons/app_idle?size=512", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Start a recording", "short_name": "Record", "url": "/session?autostart=1" },
+    { "name": "Calendar", "short_name": "Calendar", "url": "/calendar" },
+    { "name": "Needs attention", "short_name": "Attention", "url": "/session?attention=needs" }
+  ]
+}

@@ -82,6 +82,24 @@ run is slow. Later ones are not.
 reference for the architecture, threading model, SSE event system, state
 management, and the behaviors that must not regress.
 
+## Tests
+
+`tests/` holds fast, hardware-free checks: unit tests for the pure modules
+(calendar feed parsing and matching, the dashboard queries, WAV handling, device
+resolution) and static assertions that read the templates, scripts and
+stylesheets and fail when a convention regresses (no native `alert`, `confirm`
+or `prompt`; no `opacity` outside disabled states and keyframes; the ids the
+scripts bind to; the Speakers dialog landing on Cleanup). Run them before
+opening a pull request:
+
+```bash
+uv pip install pytest --python .venv/Scripts/python.exe
+.venv/Scripts/python.exe -m pytest tests -q
+```
+
+They finish in about ten seconds. The Windows-only capture tests skip themselves
+on macOS.
+
 ## Branching
 
 One long-lived branch, `main`, always releasable. Everything else is short-lived

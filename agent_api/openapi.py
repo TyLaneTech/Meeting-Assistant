@@ -319,8 +319,9 @@ def build_spec(server_url: str) -> dict:
         tags=["live"]))
     add("/recording/start", "post", _op(
         "Start a recording (opt-in)",
-        "Requires the 'Allow recording control' setting. Opens the app's "
-        "session page with autostart, mirroring the tray flow.",
+        "Requires the 'Allow recording control' setting. Sends a start "
+        "command to the app window (opening one only if none takes it), "
+        "mirroring the tray flow.",
         body={"type": "object", "required": ["confirm"],
               "properties": {"confirm": {"type": "boolean"}}},
         tags=["recording"]))

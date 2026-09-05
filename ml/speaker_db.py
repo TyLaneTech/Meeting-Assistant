@@ -240,6 +240,16 @@ class SpeakerFingerprintDB:
     def ready(self) -> bool:
         return self._ready
 
+    def unload(self) -> None:
+        """Release the embedding Inference model to reclaim memory.
+
+        Every consumer already guards on `self._ready`, so an unloaded DB
+        degrades to a no-op rather than an error; `__init__` (re-run by the
+        app's wake path) brings it back. Idempotent.
+        """
+        self._inference = None
+        self._ready = False
+
     # ── Profile CRUD ──────────────────────────────────────────────────────────
 
     def create_global_speaker(self, name: str, color: str | None = None) -> str:

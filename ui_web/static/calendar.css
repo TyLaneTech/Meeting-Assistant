@@ -1,0 +1,320 @@
+/* ══════════════════════════════════════════════════════════════════════════
+   Calendar view: the chip vocabulary and the day agenda
+   Layout scaffolding (.cal-page, .cal-main, .cal-grid, .cal-day, .cal-detail)
+   lives in style.css; this file owns the schedule-and-recording vocabulary that
+   the redesign added. Loaded after style.css and home.css, so its rules win at
+   equal specificity. Tokens only: every colour is a token or a color-mix of
+   tokens, no raw hex, no text opacity.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Legend ───────────────────────────────────────────────────────────────── */
+
+.cal-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.cal-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.cal-legend-swatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 15px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  font-size: 8px;
+  color: var(--fg-muted);
+}
+
+/* ── Grid cell: fill the window, never spill ──────────────────────────────── */
+
+/* Rows share the grid's height equally and never drop below three chips'
+   worth. calendar.js measures the painted cell and shows as many chips as
+   fit, so a taller window means more of the day visible, not more air. */
+.cal-grid { grid-auto-rows: minmax(104px, 1fr); }
+
+/* Cells never spill past their row, and the day items pack tight so three
+   two-line chips clear a 1440 x 900 grid without clipping. */
+.cal-day { overflow: hidden; padding: 4px 6px 4px; gap: 3px; }
+.cal-day-items { gap: 2px; }
+
+.cal-day-allday {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  margin-bottom: 1px;
+}
+
+.cal-allday-chip {
+  min-width: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface2);
+  border: 1px solid var(--border-sub);
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Chips ────────────────────────────────────────────────────────────────── */
+
+.cal-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  padding: 0 6px 1px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg);
+  text-decoration: none;
+  transition: background 120ms var(--dash-ease), border-color 120ms var(--dash-ease);
+}
+
+/* Future scheduled: outlined, no fill. */
+.cal-chip--scheduled {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+}
+
+/* Recorded and matched, and a recording with no meeting: filled, neutral. */
+.cal-chip--recorded,
+.cal-chip--recording {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+}
+
+/* Live: a green wash, plus the word Live and the waveform glyph. */
+.cal-chip--live {
+  background: color-mix(in srgb, var(--green) 20%, transparent);
+  border: 1px solid color-mix(in srgb, var(--green) 45%, var(--border));
+  color: var(--fg);
+}
+
+/* Past, not recorded: muted, dashed. */
+.cal-chip--missed {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--fg-muted);
+}
+
+a.cal-chip:hover {
+  background: var(--surface3);
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+}
+a.cal-chip--live:hover {
+  background: color-mix(in srgb, var(--green) 28%, transparent);
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border));
+}
+.cal-chip:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* Keep the needs-attention marker a dot, not a thick edge, even in the narrow
+   container query that style.css applies below 120px. */
+.cal-chip.needs-attention { border-left-width: 1px; }
+
+.cal-chip-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.cal-chip-time {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cal-chip-tag {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+/* Live is the one state that earns a filled pill: it is happening now. */
+.cal-chip--live .cal-chip-tag {
+  padding: 0 6px 1px;
+  border-radius: 999px;
+  background: var(--green);
+  color: var(--on-green);
+  font-weight: 600;
+}
+
+.cal-chip-dot {
+  width: 6px;
+  height: 6px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--yellow);
+  flex-shrink: 0;
+}
+
+.cal-chip-title {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.cal-chip-glyph {
+  font-size: 10px;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  width: 11px;
+  text-align: center;
+}
+
+.cal-chip-titletext {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.08;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cal-more {
+  display: inline-block;
+  margin-top: 1px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.cal-day.has-items:hover .cal-more { color: var(--fg); }
+
+/* A seventh of the grid is tight. Below two words of title, shed the glyph and
+   step the type down a notch rather than clip. */
+@container cal-day (max-width: 132px) {
+  .cal-chip-titletext { font-size: 11.5px; }
+  .cal-chip-glyph { display: none; }
+}
+
+/* ── Day panel: a chronological agenda over recordings and events ─────────── */
+
+.cal-agenda-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border-sub);
+}
+.cal-agenda-row:last-child { border-bottom: 0; }
+
+.cal-agenda-time {
+  width: 62px;
+  flex-shrink: 0;
+  padding-top: 1px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cal-agenda-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.cal-agenda-title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--fg);
+}
+
+.cal-agenda-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.cal-agenda-sep { color: var(--fg-subtle); }
+.cal-agenda-dur { font-variant-numeric: tabular-nums; }
+
+.cal-agenda-state {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 8px 2px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  background: transparent;
+}
+.cal-agenda-state--recorded,
+.cal-agenda-state--recording {
+  color: var(--fg);
+  background: var(--surface2);
+  border-color: var(--border);
+}
+.cal-agenda-state--live {
+  color: var(--on-green);
+  background: var(--green);
+  border-color: transparent;
+}
+.cal-agenda-state--missed {
+  color: var(--fg-muted);
+  border: 1px dashed var(--border);
+}
+.cal-agenda-state--allday { border-color: var(--border-sub); }
+
+.cal-agenda-attn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.cal-agenda-act { flex-shrink: 0; }
+
+.cal-agenda-action {
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cal-chip { transition: none; }
+}
+
+/* ── Day panel width follows the window ───────────────────────────────────── */
+
+.cal-detail { width: clamp(300px, 24vw, 440px); }
+
+/* "+N more" is a real affordance: it opens the day, so it should look like it. */
+.cal-more { transition: color 120ms var(--dash-ease); }
+.cal-day.has-items:hover .cal-more { color: var(--accent); }

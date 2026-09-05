@@ -1,0 +1,114 @@
+{# Home: an analytical dashboard on a bento grid (dashboard overhaul 2026-09-04).
+   Every figure is derived client side from the sessions slice home.js already
+   holds, so switching views and back never touches the network. The header
+   subtitle still carries the one line library summary; the cards below carry
+   the trend. Ids home.js writes to are load-bearing, keep them. #}
+<h1 class="view-heading visually-hidden" id="view-home-heading" tabindex="-1">Home</h1>
+
+<div class="home-content">
+  <div class="dash" id="dash">
+
+    <!-- First run: no recordings yet. One direct sequence, no cards. -->
+    <section class="dash-firstrun hidden" id="dash-firstrun">
+      <h2 class="dash-firstrun-title">Record your first meeting</h2>
+      <p class="dash-firstrun-body">
+        Meeting Assistant captures the call, writes the transcript, and works out
+        who said what. Everything stays on this machine.
+      </p>
+      <div class="dash-firstrun-actions">
+        <button type="button" class="btn btn-secondary" onclick="toggleCaptureSetup(true)">
+          <i class="fa-solid fa-sliders"></i> Prepare your inputs
+        </button>
+        <button type="button" class="btn btn-record" onclick="document.getElementById('record-btn')?.focus()">
+          <i class="fa-solid fa-play"></i> Record
+        </button>
+        <button type="button" class="btn btn-secondary" onclick="openSettings('calendar')">
+          <i class="fa-solid fa-calendar-days"></i> Connect your calendar
+        </button>
+      </div>
+    </section>
+
+    <!-- Band 0. The stat cards: value, trend sparkline, change on the prior
+         week. The backlog card is a route link to the attention queue. -->
+    <section class="dash-band" id="dash-overview" aria-label="Key figures">
+      <div class="ov-metrics" id="dash-overview-metrics"></div>
+    </section>
+
+    <p class="dash-hint hidden" id="dash-library-hint">
+      Name a speaker once in the Speakers view and Meeting Assistant recognises
+      that voice in every later meeting.
+    </p>
+
+    <!-- Band 1. The hero row: meeting load over 12 weeks on the left, the
+         needs-attention queue on the right, its height tied to the chart. -->
+    <div class="dash-grid" id="dash-grid">
+
+      <section class="dash-cell dash-cadence" aria-labelledby="home-cadence-title">
+        <div class="dash-section-head">
+          <h2 class="dash-section-title" id="home-cadence-title">Meeting load</h2>
+          <span class="dash-section-note" id="home-cadence-note"></span>
+        </div>
+        <div class="home-cadence-chart" id="home-cadence-chart"></div>
+        <p class="visually-hidden" id="home-cadence-desc"></p>
+      </section>
+
+      <section class="dash-cell dash-attention" id="dash-attention" aria-labelledby="dash-attention-headline">
+        <div class="dash-section-head">
+          <h2 class="dash-section-title dash-attention-headline" id="dash-attention-headline">Checking your recordings…</h2>
+          <a class="dash-section-link hidden" id="dash-attention-all" data-nav href="/attention">See all</a>
+        </div>
+        <ol class="dash-attention-list" id="dash-attention-list"></ol>
+      </section>
+
+    </div>
+
+    <!-- Band 2. Your patterns on the left (when you meet, then recent activity),
+         the people you meet with on the right. The two stacked charts on the
+         left run to about the height of the People list, so the columns balance
+         instead of one card stretching past its content. -->
+    <div class="dash-grid dash-mid" id="dash-mid">
+
+      <div class="dash-col">
+        <section class="dash-cell dash-overview-cell" aria-labelledby="dash-overview-title">
+          <div class="dash-section-head">
+            <h2 class="dash-section-title" id="dash-overview-title">When you meet</h2>
+            <span class="dash-section-note" id="dash-overview-note"></span>
+          </div>
+          <div class="ov-heat" id="dash-overview-heat"></div>
+          <p class="visually-hidden" id="dash-overview-desc"></p>
+        </section>
+
+        <section class="dash-cell" aria-labelledby="home-activity-title">
+          <div class="dash-section-head">
+            <h2 class="dash-section-title" id="home-activity-title">Activity</h2>
+            <span class="dash-section-note" id="home-activity-summary"></span>
+          </div>
+          <div class="home-activity-chart" id="home-activity-chart"></div>
+          <p class="visually-hidden" id="home-activity-desc"></p>
+        </section>
+      </div>
+
+      <section class="dash-cell" id="home-speakers-widget" aria-labelledby="home-speakers-title">
+        <div class="dash-section-head">
+          <h2 class="dash-section-title" id="home-speakers-title">People</h2>
+          <span class="dash-section-note" id="home-speakers-note"></span>
+        </div>
+        <div class="home-speakers-list" id="home-speakers-list">
+          <p class="home-speakers-empty">Name a speaker once and they appear here.</p>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- Band 3. What is next, full width. -->
+    <div class="dash-grid dash-low" id="dash-low">
+      <section class="dash-cell dash-next" id="dash-next" aria-labelledby="dash-next-title">
+        <div class="dash-section-head">
+          <h2 class="dash-section-title" id="dash-next-title">Next</h2>
+        </div>
+        <div class="dash-next-body" id="dash-next-body"></div>
+      </section>
+    </div>
+
+  </div>
+</div>

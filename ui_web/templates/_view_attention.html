@@ -1,0 +1,16 @@
+{# Needs attention: a work queue, newest first (brief section 3.7). Rows come
+   from the sessions slice; the count and the sidebar badge share one source.
+   attention.js owns everything inside #attn-list. #}
+<h1 class="view-heading visually-hidden" id="view-attention-heading" tabindex="-1">Needs attention</h1>
+
+<div class="attn-page">
+  <ol class="attn-list" id="attn-list"></ol>
+
+  <div class="attn-empty hidden" id="attn-empty">
+    <p class="attn-empty-line">Every recording has its speakers named.</p>
+    <p class="attn-empty-rule">
+      A recording lands here while it still has unnamed speakers, or while the
+      number of speakers found does not match the number the calendar expected.
+    </p>
+  </div>
+</div>

@@ -1,0 +1,69 @@
+{# Calendar: month grid of recordings and scheduled meetings (brief section 3.6).
+   The grid and the day panel are built by calendar.js from the shared store.
+   Every id it writes to is load-bearing. The chip vocabulary redesign belongs
+   to the calendar worker; this file carries the containers. #}
+<h1 class="view-heading visually-hidden" id="view-calendar-heading" tabindex="-1">Calendar</h1>
+
+<div class="cal-page">
+
+  <div class="cal-main">
+    {# The month and the count line are the shell header's title and subtitle
+       (brief 3.4), so this row is only the controls. #}
+    <div class="cal-head">
+      <div class="cal-controls">
+        <button type="button" class="btn btn-secondary cal-step" id="cal-prev"
+                aria-label="Previous month"><i class="fa-solid fa-chevron-left"></i></button>
+        <button type="button" class="btn btn-secondary cal-today" id="cal-today">Today</button>
+        <button type="button" class="btn btn-secondary cal-step" id="cal-next"
+                aria-label="Next month"><i class="fa-solid fa-chevron-right"></i></button>
+        <button type="button" class="btn btn-secondary cal-sync" id="cal-sync">
+          <i class="fa-solid fa-rotate" aria-hidden="true"></i> Sync calendar
+        </button>
+      </div>
+      <p class="cal-sync-note" id="cal-sync-note"></p>
+    </div>
+
+    <p class="cal-banner hidden" id="cal-banner" role="status"></p>
+
+    {# The chip vocabulary, spelled out once. Each swatch carries the real chip
+       style so the grid reads without a key, and this is the key when it does
+       not. Recorded and Live are filled; Scheduled is outlined; Not recorded is
+       muted and dashed. #}
+    <ul class="cal-legend" aria-label="Legend">
+      <li class="cal-legend-item">
+        <span class="cal-legend-swatch cal-chip--scheduled"></span>Scheduled
+      </li>
+      <li class="cal-legend-item">
+        <span class="cal-legend-swatch cal-chip--recorded"><i class="fa-solid fa-waveform-lines" aria-hidden="true"></i></span>Recorded
+      </li>
+      <li class="cal-legend-item">
+        <span class="cal-legend-swatch cal-chip--live"></span>Live
+      </li>
+      <li class="cal-legend-item">
+        <span class="cal-legend-swatch cal-chip--missed"></span>Not recorded
+      </li>
+    </ul>
+
+    <div class="cal-weekdays" aria-hidden="true">
+      <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span>
+      <span>Thu</span><span>Fri</span><span>Sat</span>
+    </div>
+
+    <!-- No ARIA grid role here: that contract needs row wrappers around the
+         cells, which would fight the CSS grid. Each day names itself with
+         an aria-label instead (see _calRender in calendar.js). -->
+    <div class="cal-grid" id="cal-grid" aria-label="Recordings by day"></div>
+
+    <p class="cal-hint">Left and right arrow keys change month. Escape closes the day panel.</p>
+  </div>
+
+  <aside class="cal-detail hidden" id="cal-detail" aria-label="Day detail">
+    <div class="cal-detail-head">
+      <h3 class="cal-detail-title" id="cal-detail-title"></h3>
+      <button type="button" class="icon-btn" id="cal-detail-close"
+              aria-label="Close day detail"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="cal-detail-body" id="cal-detail-body"></div>
+  </aside>
+
+</div>

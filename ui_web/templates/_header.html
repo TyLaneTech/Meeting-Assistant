@@ -1,0 +1,146 @@
+{# The header owns what you can do here (brief section 3.4). 56 px. The view
+   title is on the left, the actions on the right in one priority order:
+   Ask, the column toggles (session only), Search, Refresh, Record. Record
+   never collapses.
+
+   Load-bearing ids: #record-btn #topbar-session-title #home-search-input
+   #home-search-clear #home-search-results #home-search-ai #pane-toggle-*
+   #refresh-btn #}
+<header class="app-header" id="app-header">
+
+  <div class="app-header-title">
+    <div class="app-header-title-row">
+      <h2 class="view-title" id="view-title">Home</h2>
+      <h2 class="view-title" id="topbar-session-title">Meeting Assistant</h2>
+    </div>
+    <p class="view-subtitle" id="view-subtitle"></p>
+  </div>
+
+  <div class="app-header-actions">
+
+    <button type="button" class="btn btn-quiet header-ask-btn" id="ask-toggle"
+            aria-pressed="false" title="Ask your meetings"
+            onclick="toggleAskRail()">
+      <i class="fa-solid fa-comments" aria-hidden="true"></i>
+      <span class="btn-label">Ask</span>
+    </button>
+
+    {# Layout: one toggle per workspace column, drawn as the column it shows.
+       app.js keeps the three positional buttons in the columns' visual order
+       and floats Notes with its column, and togglePane() refuses to hide the
+       last one. The pane-toggle-* ids are load-bearing. Session view only. #}
+    <div class="pane-toggle-group" id="layout-control" role="group" aria-label="Columns shown in the workspace">
+      <button type="button" class="pane-toggle-btn active" id="pane-toggle-transcript" onclick="togglePane(0)"
+              title="Transcript" aria-label="Transcript" aria-pressed="true">
+        <svg viewBox="0 0 24 20" width="22" height="16" aria-hidden="true">
+          <rect x="1" y="1" width="22" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <rect x="4" y="5" width="5" height="10" rx="1" fill="currentColor" opacity=".7"/>
+        </svg>
+      </button>
+      <button type="button" class="pane-toggle-btn active" id="pane-toggle-summary" onclick="togglePane(1)"
+              title="Summary" aria-label="Summary" aria-pressed="true">
+        <svg viewBox="0 0 24 20" width="22" height="16" aria-hidden="true">
+          <rect x="1" y="1" width="22" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <rect x="7" y="5" width="10" height="10" rx="1" fill="currentColor" opacity=".7"/>
+        </svg>
+      </button>
+      <button type="button" class="pane-toggle-btn" id="pane-toggle-chat" onclick="togglePane(2)"
+              title="Chat" aria-label="Chat" aria-pressed="false">
+        <svg viewBox="0 0 24 20" width="22" height="16" aria-hidden="true">
+          <rect x="1" y="1" width="22" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <rect x="15" y="5" width="5" height="10" rx="1" fill="currentColor" opacity=".7"/>
+        </svg>
+      </button>
+      <button type="button" class="pane-toggle-btn" id="pane-toggle-notes" onclick="togglePane(3)"
+              title="Notes" aria-label="Notes" aria-pressed="false">
+        <svg viewBox="0 0 24 20" width="22" height="16" aria-hidden="true">
+          <rect x="1" y="1" width="22" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          <line x1="5" y1="6"  x2="14" y2="6"  stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".85"/>
+          <line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".7"/>
+          <line x1="5" y1="14" x2="11" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".55"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="header-search" id="header-search">
+      <button type="button" class="icon-btn header-search-open" id="search-open-btn"
+              title="Search recordings and transcripts (Ctrl+K)"
+              aria-label="Search recordings and transcripts"
+              onclick="_expandHeaderSearch()"><i class="fa-solid fa-magnifying-glass"></i></button>
+      <div class="home-search-wrap">
+        <i class="fa-solid fa-magnifying-glass home-search-icon" aria-hidden="true"></i>
+        <label class="visually-hidden" for="home-search-input">Search recordings and transcripts</label>
+        <input type="text" id="home-search-input" class="home-search-input"
+               title="Search recordings and transcripts (Ctrl+K)"
+               placeholder="Search recordings…" autocomplete="off" spellcheck="false">
+        <button class="home-search-clear hidden" id="home-search-clear"
+                aria-label="Clear the search"
+                onclick="clearHomeSearch()"><i class="fa-solid fa-xmark"></i></button>
+        <span class="home-search-ai" id="home-search-ai" title="Includes AI-powered semantic search when available"><i class="fa-solid fa-brain"></i></span>
+      </div>
+      <div id="home-search-results" class="home-search-results hidden"></div>
+    </div>
+
+    <button type="button" class="icon-btn header-refresh-btn" id="refresh-btn"
+            title="Refresh data" aria-label="Refresh data" onclick="_onRefreshClick()">
+      <i class="fa-solid fa-rotate" aria-hidden="true"></i>
+    </button>
+    <span class="header-stale hidden" id="header-stale" title="Showing the last data that loaded">Stale</span>
+
+    <div class="record-group" id="record-group">
+      <button id="record-btn" class="btn btn-record" onclick="toggleRecording()" disabled>
+        <span class="btn-icon"><i class="fa-solid fa-play"></i></span> Preparing recorder
+      </button>
+      <button type="button" class="btn btn-record record-chevron" id="record-chevron"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="record-menu"
+              title="More recording actions" aria-label="More recording actions"
+              onclick="_toggleMenu('record-menu', this)">
+        <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+      </button>
+      <div class="menu menu-right hidden" id="record-menu" role="menu" aria-labelledby="record-chevron">
+        <button type="button" class="menu-item hidden" role="menuitem" id="record-menu-resume"
+                onclick="resumeRecording()">
+          <i class="fa-solid fa-play" aria-hidden="true"></i>
+          <span class="menu-item-label">Resume this recording</span>
+          <span class="menu-item-note">Appends new audio to it</span>
+        </button>
+        <button type="button" class="menu-item" role="menuitem" onclick="newSession()">
+          <i class="fa-solid fa-plus" aria-hidden="true"></i>
+          <span class="menu-item-label">New workspace</span>
+          <kbd class="menu-item-key">Ctrl+N</kbd>
+        </button>
+        <button type="button" class="menu-item" role="menuitem" onclick="openImportPicker()">
+          <i class="fa-solid fa-file-import" aria-hidden="true"></i>
+          <span class="menu-item-label">Import recording</span>
+        </button>
+      </div>
+    </div>
+
+  </div>
+</header>
+
+{# Capture strip: while a recording is live, every view shows it. It never
+   depends on the workspace being visible (review finding 1). #}
+<div class="capture-strip" id="capture-strip" hidden>
+  <span class="capture-live">
+    <span class="capture-dot" aria-hidden="true"></span>
+    <span class="capture-live-label">Recording</span>
+  </span>
+  <span class="capture-title" id="capture-title"></span>
+  <span class="capture-time" id="capture-time">0:00</span>
+  <div class="capture-meters">
+    <div class="capture-meter">
+      <span class="capture-meter-label">Desktop</span>
+      <span class="capture-meter-track"><span class="capture-meter-fill" id="capture-meter-desktop"></span></span>
+    </div>
+    <div class="capture-meter">
+      <span class="capture-meter-label">Mic</span>
+      <span class="capture-meter-track"><span class="capture-meter-fill" id="capture-meter-mic"></span></span>
+    </div>
+  </div>
+  <span class="capture-warning hidden" id="capture-warning" role="status"></span>
+  <button type="button" class="btn btn-record recording capture-stop-btn" id="capture-stop-btn"
+          onclick="toggleRecording()">
+    <span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop
+  </button>
+</div>

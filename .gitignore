@@ -25,3 +25,10 @@ __pycache__/
 # Speaker-attribution experiment sandbox (local-only: replays real meeting
 # audio + user speaker library; never committed)
 /speaker_lab/
+
+# Session handoff notes (local only)
+.claude/handoffs/
+
+# Local tooling scratch dirs (design/browser-automation working dirs, never shipped)
+/.impeccable/
+/.playwright-mcp/

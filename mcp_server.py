@@ -491,10 +491,10 @@ TOOLS: list[dict] = [
     _tool(
         "start_recording",
         "Start recording a meeting (OPT-IN: fails unless the user enabled "
-        "'Allow recording control' in Settings > Agent API). Opens the "
-        "app's session page with autostart, which begins capturing system "
-        "audio, microphone, and (if configured) the screen. Only call when "
-        "the user explicitly asks to record.",
+        "'Allow recording control' in Settings > Agent API). Sends a start "
+        "command to the app window, which begins capturing system audio, "
+        "microphone, and (if configured) the screen. Only call when the user "
+        "explicitly asks to record.",
         {"confirm": {"type": "boolean", "description":
                      "Must be true; acknowledges a recording will start."}},
         ["confirm"],

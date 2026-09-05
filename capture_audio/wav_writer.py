@@ -72,6 +72,13 @@ class WavWriter:
             else:
                 self._input_samples_written = self._total_samples
 
+            # Where the data chunk's size field lives: 40 in the canonical
+            # 44-byte header this class writes, but a WAV decoded by ffmpeg (the
+            # resume path rebuilds the per-source temp WAV that way) carries a
+            # LIST chunk before "data". Patching offset 40 there corrupted the
+            # file, ffmpeg refused it, and the whole track stayed as a broken
+            # WAV (2026-09-05).
+            self._data_size_pos = self._find_data_size_pos(path)
             # Open for raw binary append - write PCM after existing data
             self._raw = open(path, "r+b")
             self._raw.seek(0, 2)  # seek to end
@@ -125,6 +132,26 @@ class WavWriter:
         self._input_samples_written += input_sample_count
         return offset
 
+    @staticmethod
+    def _find_data_size_pos(path: str) -> int:
+        """Byte offset of the data chunk's size field, found by walking the
+        RIFF chunks. 40 (the canonical header) when the file cannot be read."""
+        try:
+            with open(path, "rb") as f:
+                if f.read(4) != b"RIFF":
+                    return 40
+                f.seek(12)
+                while True:
+                    head = f.read(8)
+                    if len(head) < 8:
+                        return 40
+                    chunk_id, size = head[:4], struct.unpack("<I", head[4:])[0]
+                    if chunk_id == b"data":
+                        return f.tell() - 4
+                    f.seek(size + (size & 1), 1)   # chunks are word-aligned
+        except Exception:
+            return 40
+
     def close(self) -> None:
         """Finalize and close the WAV file.  Safe to call multiple times."""
         if self._closed:
@@ -135,13 +162,15 @@ class WavWriter:
             self._wf.close()
             self._wf = None
         if self._raw is not None:
-            # Patch RIFF and data chunk sizes so the WAV is valid
+            # Patch the RIFF and data chunk sizes from what is actually on disk
+            # so the WAV is valid whatever header layout it started with.
             self._raw.flush()
-            data_size = self._total_samples * 2  # 16-bit mono = 2 bytes/sample
-            riff_size = data_size + 36  # 36 = header bytes after RIFF size field
+            self._raw.seek(0, 2)
+            end = self._raw.tell()
+            data_pos = getattr(self, "_data_size_pos", 40)
             self._raw.seek(4)
-            self._raw.write(struct.pack("<I", riff_size))
-            self._raw.seek(40)
-            self._raw.write(struct.pack("<I", data_size))
+            self._raw.write(struct.pack("<I", max(0, end - 8)))
+            self._raw.seek(data_pos)
+            self._raw.write(struct.pack("<I", max(0, end - (data_pos + 4))))
             self._raw.close()
             self._raw = None

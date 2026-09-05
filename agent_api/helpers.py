@@ -501,9 +501,17 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "quiet_prompt_enabled": "Remind the user when a recording has captured near-silence for a while.",
     "meeting_detect_enabled": "Watch for Zoom/Teams meetings and offer to record (opt-in).",
     "meeting_detect_autostart": "Auto-start recording on meeting detection instead of prompting.",
+    "pwa_app_id": "Chrome app id of the installed Meeting Assistant PWA, so a start request focuses that window instead of opening a second one.",
     "warp_toggle_enabled": "Briefly disconnect Cloudflare WARP around network-heavy operations (rarely needed).",
     "sidebar_open": "UI: whether the session sidebar is expanded.",
     "playback_speed": "UI: default playback speed for recordings.",
+    "calendar_enabled": "Match recordings against the published Outlook calendar feed.",
+    "calendar_ics_url": "Published-calendar ICS link. Masked here: it is a credential and is never exposed or writable through this API.",
+    "calendar_timezone": "IANA zone used for floating and unknown-zone calendar times (e.g. America/Chicago).",
+    "calendar_refresh_minutes": "Minutes between background calendar refreshes (the feed itself can lag up to 24 hours).",
+    "calendar_match_window_minutes": "How far a calendar event's start may sit from a recording's start and still match.",
+    "calendar_last_refresh": "Machine-managed: UTC timestamp of the last successful calendar refresh.",
+    "calendar_last_error": "Machine-managed: message from the last failed calendar refresh.",
     "agent_api_enabled": "Master switch for this Agent API. When false every /api/agent/v1 endpoint returns 503.",
     "agent_api_token": "Optional bearer token required on Agent API requests when non-empty.",
     "agent_api_allow_recording_control": "Allow agents to start/stop recordings (off by default).",
@@ -525,8 +533,8 @@ RESTART_REQUIRED_KEYS = {
     "loopback_device_name", "mic_device",
 }
 
-# Internal bookkeeping keys the agent should not write directly.
-SETTINGS_WRITE_DENYLIST = {"video_offsets"}
+# Internal bookkeeping and credentials the agent may not write directly.
+SETTINGS_WRITE_DENYLIST = {"video_offsets", "calendar_ics_url"}
 
 
 def settings_schema() -> list[dict]:

@@ -27,6 +27,7 @@ import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, stream_with_context
 import flask.cli
@@ -40,15 +41,27 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 import numpy as np
 
 from core import log as log
+from core import browser as browser
+from core import calendar_feed as calendar_feed
+from core import calendar_sync as calendar_sync
+from core import calendar_events_api as calendar_events_api
+from core import dashboard_api as dashboard_api
+from core import heartbeat as heartbeat
+from core import icons as icons
+from core import icons_api as icons_api
 
 from core import config as config
 from capture_video import media_edit as media_edit
 from ui_desktop import notifications as notifications
 from core import meeting_detect as meeting_detect
+from core import obsidian_export as obsidian
 from core import paths as paths
+from core import recording_request as recording_request
 from core import settings as settings
 from core import storage as storage
 from ai.assistant import AIAssistant
+from ai import assistant as ai_assistant
+from ai import speaker_relabel as speaker_relabel
 from capture_audio import (
     AudioCapture, enumerate_audio_devices, enumerate_dshow_audio_devices,
     auto_detect_devices,
@@ -72,6 +85,7 @@ from agent_api import AgentContext, register_agent_api
 
 config.ensure_env()
 storage.init_db()
+storage.backfill_expected_counts(paths.data_dir() / "resolution_candidates")
 # Heal sessions left "in progress" by a previous crash, killed split, etc.
 # No active recording can exist this early in startup, so we don't need to
 # pass an active_session_id.
@@ -163,9 +177,21 @@ _state: dict = {
     "quiet_prompt_sent_at": 0.0,
     "quiet_prompt_armed": True,
     "recording_started_at_monotonic": 0.0,
+    "capture_silent": False,   # True while recording but no audio for a grace period (tray dot -> orange)
+    # Reservation held from the moment a start passes its guard until the
+    # capture is running (or the attempt fails). is_recording is only set at the
+    # very end of start_recording, so without this two concurrent starts both
+    # pass the guard and open two captures.
+    "is_starting": False,
 }
 _state_lock = threading.Lock()
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
+# Heavy summary regen/export of OTHER sessions requested while a recording is
+# active is deferred here and drained when the recording stops. Running a bulk
+# force_full+export sweep concurrently with the live recording pipeline
+# deadlocked the app on 2026-09-01.
+_deferred_summaries: list[dict] = []
+_deferred_summaries_lock = threading.Lock()
 _chapters_lock = threading.Lock()  # serializes chapter runs; prevents auto/manual overlap
 _recording_cleanup_done = threading.Event()   # signalled when stop_recording cleanup finishes
 _recording_cleanup_done.set()                 # initially "done" (no cleanup pending)
@@ -179,6 +205,10 @@ _tray = None  # MeetingTray instance (set in main(), None if no tray)
 _server_url = f"http://localhost:{int(os.getenv('PORT', 6969))}"
 _APP_STARTED_AT = time.time()   # wall-clock start, surfaced via the Agent API
 _quiet_audio_rms_threshold = float(settings.get("quiet_prompt_audio_rms_threshold", 0.006))
+# Seconds of continuous silence while recording before the tray dot turns orange
+# ("recording but capturing silence"). Long enough to ride out natural pauses,
+# short enough to flag a dead capture reasonably quickly.
+_TRAY_SILENCE_GRACE_SEC = 15.0
 _startup_init_lock = threading.Lock()
 _startup_init_started = False
 
@@ -256,8 +286,94 @@ def _push(event: str, data: dict) -> None:
         _refresh_tray()
 
 
+def _connected_client_count() -> int:
+    """How many browser windows are listening on /api/events right now."""
+    with _cq_lock:
+        return len(_client_queues)
+
+
+def _recording_ready_now() -> bool:
+    """The recording_ready status field, for callers outside the status path."""
+    with _state_lock:
+        return _recording_prereqs_locked()[0]
+
+
+def _notify_start_failed(source: str, reason: str) -> None:
+    """Tell the user, out loud, that an automatic start did not happen.
+
+    Silence here is the worst outcome: the user believes the meeting is being
+    recorded because the app said it would be. Runs on the coordinator's
+    background thread, so it uses the public notify() helper (never the Windows
+    backend directly) and swallows its own errors.
+    """
+    log.error("record", f"Start ({source}) could not be completed: {reason}")
+
+    def _open(_arg: str) -> None:
+        try:
+            browser.open_app_window(f"{_server_url}/session", prefer_pwa=True)
+        except Exception as e:
+            log.warn("record", f"Opening the app window from the toast failed: {e}")
+
+    try:
+        notifications.notify(
+            "Meeting Assistant is NOT recording",
+            "Automatic start did not go through. Open the app and press Record.",
+            on_click=_open,
+            actions=[{"label": "Open the app", "arg": "open", "on_click": _open}],
+            duration="long",
+            scenario="reminder",   # sticky, and survives Focus Assist
+            mac_url=f"{_server_url}/session",
+        )
+    except Exception as e:
+        log.warn("record", f"Start-failure toast failed: {e}")
+
+
+# One app window, not two: a "start recording" request (meeting auto-detect,
+# the tray, an agent) is offered to the window that is ALREADY open before any
+# new window is opened. See core/recording_request.py for the three tiers; the
+# last one is the old ?autostart=1 window, so a meeting is never lost.
+_start_coordinator = recording_request.StartRequestCoordinator(
+    push=_push,
+    open_window=browser.open_app_window,
+    is_recording=lambda: bool(_state.get("is_recording")),
+    base_url=lambda: _server_url,
+    client_count=_connected_client_count,
+    is_ready=_recording_ready_now,
+    on_failure=_notify_start_failed,
+)
+recording_request.set_default(_start_coordinator)
+
+
+def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
+    """Surface a loopback-silence alarm to the UI (a persistent banner) and a
+    system toast, so a call whose audio is not being captured never passes
+    unnoticed (the 2026-09-01 dead-loopback failure). Ignored if this session is
+    no longer the active recording, so a late alarm cannot fire on a new one."""
+    with _state_lock:
+        if not _state.get("is_recording") or _state.get("session_id") != session_id:
+            return
+    if kind == "dropped":
+        msg = ("Call/desktop audio went silent. Your output device may have changed; "
+               "check that the call still plays to your current output device.")
+    else:
+        msg = ("Call/desktop audio is NOT being captured. Check that the call is "
+               "playing to your current Windows output device (the one you hear it on).")
+    log.warn("audio", f"CAPTURE ALERT ({kind}): {msg}")
+    _push("capture_alert", {"level": "error", "kind": kind, "message": msg, "device": dev_name})
+    try:
+        notifications.notify("Meeting Assistant: call audio not captured", msg, duration="long")
+    except Exception as e:
+        log.warn("audio", f"capture-alert toast failed: {e}")
+
+
 def _recording_prereqs_locked() -> tuple[bool, str]:
     """Return whether recording can start and, if not, why not."""
+    if _state.get("is_reanalyzing"):
+        # A reanalysis owns _state["session_id"] and feeds segments through the
+        # same _on_segment path a live recording uses. Starting a recording now
+        # interleaves two meetings into one transcript, so the record button and
+        # the auto-start coordinator both wait for the reanalysis to finish.
+        return False, "Reanalysis in progress; recording can start when it finishes"
     if not _state["model_ready"]:
         info = (_state.get("model_info") or "").strip()
         return False, info or "Loading transcription model..."
@@ -276,11 +392,15 @@ def _status_payload(extra: dict | None = None) -> dict:
             "model_ready": _state["model_ready"],
             "model_info": _state["model_info"],
             "diarizer_ready": _state["diarizer_ready"],
+            "is_reanalyzing": bool(_state.get("is_reanalyzing")),
             "screen_recording": _screen_recorder.is_recording,
         }
         recording_ready, recording_ready_reason = _recording_prereqs_locked()
     payload["recording_ready"] = recording_ready
     payload["recording_ready_reason"] = recording_ready_reason
+    # True while a start command is waiting for a window to take it. Read
+    # outside _state_lock: the coordinator has its own lock.
+    payload["pending_start"] = _start_coordinator.pending_command() is not None
 
     # "Me" speaker (microphone = app user). me_speaker is null until chosen; the
     # client uses me_prompt_pending to decide whether to show the first-run popup.
@@ -312,6 +432,11 @@ _SOURCE_LABELS = {
     # the linked "Me" profile name wins via the speaker_labels lookup above.
     ME_KEY:     "Me",
 }
+
+# Hand the labels to the Obsidian exporter, which renders segments the same way
+# _fmt_segment does but keeps itself out of app.py so upstream syncs stay clean.
+obsidian.configure(_SOURCE_LABELS)
+
 
 def _fmt_time(seconds: float) -> str:
     """Format seconds as MM:SS."""
@@ -822,8 +947,15 @@ def _run_summary(
     update_context: str = "",
     is_auto: bool = True,
     clears_pending: bool = False,
+    force_full: bool = False,
+    export_after: bool = False,
 ) -> None:
     """Run a summary update and broadcast the result via SSE.
+
+    force_full=True: ignore any prior summary and regenerate from scratch (the
+                  correct path after a reanalysis/rename, where an incremental
+                  patch cannot repair stale pre-reanalysis speaker labels).
+    export_after=True: queue an Obsidian re-export once the new summary is saved.
 
     Serialized via _summary_lock so auto and manual runs never overlap.
 
@@ -853,11 +985,17 @@ def _run_summary(
             if is_active:
                 _state["summary_generating"] = True
 
+        # force_full wins over any prior summary: regenerate from scratch.
+        if force_full:
+            existing_summary = ""
+
         # Feed the current chapter outline into the summary's context so it is
         # aware of the meeting's high-level structure.
         meta = {**(meta or {}), "chapters": _chapters_for_meta(session_id)}
 
         mode = "generating" if not existing_summary else "updating"
+        log.info("summary", f"regenerate session={session_id[:8]} mode={mode} "
+                 f"force_full={force_full} export_after={export_after} is_auto={is_auto}")
         _push("summary_busy", {"busy": True, "mode": mode, "session_id": session_id})
 
         try:
@@ -891,6 +1029,9 @@ def _run_summary(
                         return
                 _persist(content)
                 _push("summary_replace", {"content": content, "session_id": session_id})
+                if export_after:
+                    obsidian.queue_export(session_id)
+                    log.info("summary", f"queued obsidian export after regen {session_id[:8]}")
             else:
                 # ── First summary - stream it so the user sees it appear ──────
                 _push("summary_start", {"session_id": session_id})
@@ -903,6 +1044,9 @@ def _run_summary(
                 def on_done() -> None:
                     _persist("".join(chunks))
                     _push("summary_done", {"session_id": session_id})
+                    if export_after:
+                        obsidian.queue_export(session_id)
+                        log.info("summary", f"queued obsidian export after regen {session_id[:8]}")
 
                 sp, sm = _resolve_tool_ai("summary")
                 # Resolve effective system prompt: session override > global > built-in
@@ -912,6 +1056,9 @@ def _run_summary(
                 ai.summarize(transcript, on_token, on_done, custom_prompt=custom_prompt, meta=meta,
                              provider=sp, model=sm,
                              system_prompt=effective_sp)
+        except Exception as e:
+            log.error("summary", f"regenerate failed for {session_id[:8]}: {e}")
+            import traceback; traceback.print_exc()
         finally:
             with _state_lock:
                 if _state["session_id"] == session_id:
@@ -980,8 +1127,52 @@ def _run_chapters(
             _push("chapters_busy", {"busy": False, "session_id": session_id})
 
 
-def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None:
-    """Patch the current summary after speaker-label changes."""
+def _defer_summary_during_recording(session_id, transcript, seg_count,
+                                    custom_prompt, meta, force_full, export_after) -> None:
+    """Queue a heavy summary regen/export to run once the current recording stops.
+
+    Bulk force_full+export of OTHER sessions while a meeting records is what
+    deadlocked the app on 2026-09-01, so those are deferred rather than run live.
+    Deduped by session_id (the latest request for a session wins)."""
+    with _deferred_summaries_lock:
+        _deferred_summaries[:] = [r for r in _deferred_summaries if r["session_id"] != session_id]
+        _deferred_summaries.append({
+            "session_id": session_id, "transcript": transcript, "seg_count": seg_count,
+            "custom_prompt": custom_prompt, "meta": meta,
+            "force_full": force_full, "export_after": export_after,
+        })
+        depth = len(_deferred_summaries)
+    log.info("summary", f"Deferred summary regen for {session_id} until recording stops ({depth} queued)")
+
+
+def _drain_deferred_summaries() -> None:
+    """Run summaries deferred during a recording, serially (each still takes
+    _summary_lock). Called once the recording has stopped."""
+    with _deferred_summaries_lock:
+        pending = _deferred_summaries[:]
+        _deferred_summaries.clear()
+    if not pending:
+        return
+    log.info("summary", f"Recording stopped; running {len(pending)} deferred summary regen(s)")
+    for req in pending:
+        try:
+            _run_summary(
+                req["session_id"], "", req["transcript"], req["seg_count"],
+                req["custom_prompt"], req["meta"],
+                is_auto=False, clears_pending=False,
+                force_full=req["force_full"], export_after=req["export_after"],
+            )
+        except Exception as e:
+            log.warn("summary", f"Deferred summary for {req['session_id']} failed: {e}")
+
+
+def _speaker_summary_args(session_id: str, update_context: str) -> "tuple | None":
+    """Build the _run_summary arguments for a speaker-label change.
+
+    Split out of _queue_speaker_summary_refresh so a bulk relabel can run the
+    same refresh serially through one worker instead of spawning a thread per
+    session. Returns None when there is nothing to refresh.
+    """
     if not update_context.strip():
         return
     if not settings.get("auto_summary", True):
@@ -1033,12 +1224,55 @@ def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None
             custom_prompt=custom_prompt,
         )
 
+    return (session_id, existing_summary, transcript, seg_count,
+            custom_prompt, meta, update_context)
+
+
+def _queue_speaker_summary_refresh(session_id: str, update_context: str) -> None:
+    """Patch the current summary after speaker-label changes."""
+    args = _speaker_summary_args(session_id, update_context)
+    if args is None:
+        return
     threading.Thread(
         target=_run_summary,
-        args=(session_id, existing_summary, transcript, seg_count, custom_prompt, meta, update_context),
+        args=args,
         kwargs={"is_auto": False},
         daemon=True,
     ).start()
+
+
+# Bulk speaker relabels can touch dozens of sessions at once. Fanning out one
+# summary thread per session would pile them all onto the single _summary_lock
+# and, during a live recording, is exactly the shape that froze the app on
+# 2026-09-01. They go through this one bounded worker instead, which runs them
+# strictly one at a time.
+_relabel_summary_queue: "queue.Queue[tuple]" = queue.Queue()
+
+
+def _relabel_summary_worker() -> None:
+    while True:
+        session_id, update_context = _relabel_summary_queue.get()
+        try:
+            # A long queue can still be draining when the next meeting
+            # starts, so the recording check is re-run per item, not
+            # only at enqueue time.
+            with _state_lock:
+                recording = bool(_state.get("is_recording"))
+            if recording:
+                log.info("summary",
+                         f"Recording active - skipping queued summary refresh "
+                         f"for {session_id} (it will refresh lazily)")
+                continue
+            args = _speaker_summary_args(session_id, update_context)
+            if args is not None:
+                _run_summary(*args, is_auto=False)
+        except Exception as e:
+            log.warn("summary", f"Relabel summary refresh for {session_id} failed: {e}")
+        finally:
+            _relabel_summary_queue.task_done()
+
+
+threading.Thread(target=_relabel_summary_worker, daemon=True).start()
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -1184,6 +1418,20 @@ def _level_push_loop() -> None:
                 with _state_lock:
                     _state["last_audio_activity_at"] = time.monotonic()
                     _state["quiet_prompt_armed"] = True
+            # Tray dot health: teal while audio is flowing, orange after a grace
+            # period of silence while recording. Refresh the tray only on a
+            # transition so we are not rebuilding the icon ~12x/second.
+            if is_rec:
+                now_mono = time.monotonic()
+                with _state_lock:
+                    last = (_state.get("last_audio_activity_at")
+                            or _state.get("recording_started_at_monotonic") or 0.0)
+                    was_silent = bool(_state.get("capture_silent"))
+                silent = last > 0 and (now_mono - last) > _TRAY_SILENCE_GRACE_SEC
+                if silent != was_silent:
+                    with _state_lock:
+                        _state["capture_silent"] = silent
+                    _refresh_tray()
             payload = {
                 "loopback":    round(capture.loopback_level, 4),
                 "mic":         round(capture.mic_level, 4),
@@ -1260,6 +1508,26 @@ def _quiet_prompt_loop() -> None:
 threading.Thread(target=_quiet_prompt_loop, daemon=True).start()
 
 
+def _stop_recording_locally(reason: str) -> None:
+    """POST the local stop endpoint from a background thread.
+
+    stop_recording() cannot be called directly from here: it returns jsonify(),
+    which needs a Flask app context. Going over HTTP reuses the exact path the
+    toast's Stop button already uses, including the async cleanup that finalizes
+    the WAV, generates the title, and triggers the Obsidian export.
+    """
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{_server_url}/api/recording/stop", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+        log.info("meetdetect", f"Auto-stopped recording ({reason})")
+    except Exception as e:
+        log.warn("meetdetect", f"Auto-stop failed ({reason}): {e}")
+
+
 def _meeting_detect_loop() -> None:
     """Offer to record when a Zoom/Teams meeting starts and nothing is recording.
 
@@ -1274,6 +1542,10 @@ def _meeting_detect_loop() -> None:
     clear_since: float | None = None
     last_prompt_at = 0.0
     REARM_AFTER_CLEAR_SEC = 45.0
+    # True only while a recording that THIS loop auto-started is still running.
+    # Gates auto-stop so a recording the user started by hand is never stopped
+    # out from under them.
+    autostarted = False
 
     while True:
         time.sleep(2.0)
@@ -1282,6 +1554,7 @@ def _meeting_detect_loop() -> None:
             consecutive = 0
             prompted = False
             clear_since = None
+            autostarted = False  # don't carry an armed auto-stop across a disable
             continue
 
         debounce = max(1, int(cfg.get("meeting_detect_debounce", 2)))
@@ -1299,8 +1572,22 @@ def _meeting_detect_loop() -> None:
             consecutive = 0
             if clear_since is None:
                 clear_since = now
-            elif prompted and now - clear_since >= REARM_AFTER_CLEAR_SEC:
-                prompted = False  # meeting ended; re-arm for the next one
+            elif now - clear_since >= REARM_AFTER_CLEAR_SEC:
+                # The meeting has been gone for the grace period. Stop a
+                # recording we auto-started, otherwise it runs forever, the
+                # session never finalizes, and nothing reaches the vault.
+                if autostarted and cfg.get("meeting_detect_autostop", True):
+                    with _state_lock:
+                        still_recording = _state["is_recording"]
+                        started_at = _state.get("recording_started_at_monotonic", 0.0)
+                    # Only stop the recording this meeting produced. If the user
+                    # started a fresh one after the meeting dropped, it began
+                    # after clear_since and is left alone.
+                    if still_recording and started_at <= clear_since:
+                        _stop_recording_locally("meeting ended")
+                    autostarted = False
+                if prompted:
+                    prompted = False  # meeting ended; re-arm for the next one
             continue
 
         # A meeting looks active.
@@ -1326,6 +1613,8 @@ def _meeting_detect_loop() -> None:
         if sent:
             prompted = True
             last_prompt_at = now
+            if autostart:
+                autostarted = True  # arm auto-stop for when this meeting ends
             log.info(
                 "meetdetect",
                 f"{'Auto-started recording' if autostart else 'Meeting-detected toast sent'} "
@@ -1334,6 +1623,27 @@ def _meeting_detect_loop() -> None:
 
 
 threading.Thread(target=_meeting_detect_loop, daemon=True).start()
+
+
+def _heartbeat_loop() -> None:
+    """Refresh the liveness heartbeat every few seconds so the external watchdog
+    (watchdog.py) can tell a frozen app apart from one that was quit on purpose.
+    See core/heartbeat.py. If this loop stops advancing the heartbeat's timestamp
+    while the process is still alive, that IS the freeze signal the watchdog acts
+    on (2026-09-01: the app wedged and nothing noticed)."""
+    port = int(os.getenv("PORT", 6969))
+    while True:
+        try:
+            with _state_lock:
+                rec = bool(_state.get("is_recording"))
+                sid = _state.get("session_id")
+            heartbeat.write(recording=rec, session_id=sid, port=port)
+        except Exception:
+            pass
+        time.sleep(8)
+
+
+threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
 
 # ── "Me" speaker (microphone = app user) ──────────────────────────────────────
@@ -1679,15 +1989,49 @@ def home():
     session_param = request.args.get("session")
     if session_param:
         return redirect(f"/session?id={session_param}")
-    # Redirect settings/setup to session page (which has the settings dialog)
+    # Redirect settings/setup to session page (which has the settings dialog).
+    # Carry ?section= through: the dashboard deep-links to Settings > Calendar,
+    # and dropping it would land the user on the default tab.
     if request.args.get("settings") or request.args.get("setup"):
+        section = request.args.get("section")
+        if section:
+            return redirect(f"/session?settings=1&section={quote(section)}")
         return redirect("/session?settings=1")
-    return render_template("home.html")
+    return render_template("index.html", initial_view="home")
 
 
 @app.route("/session")
 def session_view():
-    return render_template("index.html")
+    # The installed app window keeps the start page it was installed with
+    # (/session) until Chrome refreshes its manifest, so a bare /session with
+    # nothing to show lands on the dashboard instead. The workspace is still
+    # reachable with any parameter (the nav uses ?workspace=1), and a live
+    # recording always stays on the workspace.
+    if not request.args:
+        with _state_lock:
+            recording = bool(_state.get("is_recording"))
+        if not recording:
+            return redirect("/")
+    return render_template("index.html", initial_view="session")
+
+
+@app.route("/calendar")
+def calendar_view():
+    """Month view of recordings and scheduled meetings. The grid is built in
+    the browser from the shared data store, so this route only serves the shell."""
+    return render_template("index.html", initial_view="calendar")
+
+
+@app.route("/attention")
+def attention_view():
+    """The speaker work queue: every recording that still needs a person."""
+    return render_template("index.html", initial_view="attention")
+
+
+@app.route("/speakers")
+def speakers_view():
+    """The voice library as a routed view: profiles, matching and library health."""
+    return render_template("index.html", initial_view="speakers")
 
 
 @app.route("/api/events")
@@ -1703,6 +2047,14 @@ def events():
         active_sid = _state["session_id"] if _state["is_recording"] else None
     init = _status_payload()
     q.put(f"event: status\ndata: {json.dumps(init)}\n\n")
+
+    # A start command minted while no window was listening rides the handshake
+    # into this freshly-loaded page. That is what lets an auto-detected meeting
+    # start in the window we just opened without an ?autostart=1 URL (Chrome
+    # cannot pass one to an --app-id PWA launch). Only this client gets it.
+    pending_cmd = _start_coordinator.pending_command()
+    if pending_cmd:
+        q.put(f"event: recording_command\ndata: {json.dumps(pending_cmd)}\n\n")
 
     # Replay active session so reconnecting clients catch up instantly
     if active_sid:
@@ -1750,6 +2102,39 @@ def events():
 @app.route("/api/status")
 def get_status():
     return jsonify(_status_payload())
+
+
+@app.route("/api/recording/request_start", methods=["POST"])
+def request_recording_start():
+    """Ask an app window to start recording (for out-of-process callers).
+
+    Returns immediately: the escalation can take up to ~50 s, so it runs on a
+    worker thread. Poll /api/status (recording, pending_start) for the outcome.
+    """
+    # Same opt-in the Agent API enforces. This route opens windows on the
+    # user's desktop and is reachable by a plain cross-origin POST, so it stays
+    # shut unless the user turned recording control on. Everything in-process
+    # calls the coordinator directly and is unaffected.
+    if not settings.get("agent_api_allow_recording_control", False):
+        return jsonify({"error": "Recording control by other programs is disabled "
+                                 "(Settings > Agent API > Allow recording control)."}), 403
+    body = request.get_json(silent=True) or {}
+    source = str(body.get("source") or "api").strip() or "api"
+    reason = str(body.get("reason") or "").strip()
+    threading.Thread(
+        target=_start_coordinator.request_start, args=(source, reason),
+        daemon=True, name="record-request",
+    ).start()
+    return jsonify({"queued": True, "source": source}), 202
+
+
+@app.route("/api/recording/ack_command", methods=["POST"])
+def ack_recording_command():
+    """A window claims the pending start command so no second one is opened."""
+    body = request.get_json(silent=True) or {}
+    nonce = str(body.get("nonce") or "").strip()
+    client_id = str(body.get("client_id") or "").strip()
+    return jsonify({"ok": bool(_start_coordinator.acknowledge(nonce, client_id))})
 
 
 @app.route("/api/audio/devices")
@@ -1801,6 +2186,29 @@ def set_audio_gain():
 @app.route("/api/sessions")
 def list_sessions():
     return jsonify(storage.list_sessions())
+
+
+@app.route("/api/attention/summary")
+def get_attention_summary():
+    return jsonify(storage.attention_summary())
+
+
+@app.route("/api/sessions/<session_id>/expected_speakers", methods=["PUT"])
+def set_expected_speakers(session_id: str):
+    if not storage.get_session(session_id):
+        return jsonify({"error": "Session not found"}), 404
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or "count" not in data:
+        return jsonify({"error": "count is required"}), 400
+    count = data["count"]
+    if count is not None and (
+        not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 20
+    ):
+        return jsonify({"error": "count must be null or an integer from 0 to 20"}), 400
+    storage.set_expected_speaker_count(session_id, count, "user")
+    attention = storage.get_session_attention(session_id)
+    _push("attention_changed", storage.attention_summary())
+    return jsonify({"ok": True, "attention": attention})
 
 
 @app.route("/api/search")
@@ -1978,273 +2386,304 @@ def start_recording():
     with _state_lock:
         if _state["is_recording"]:
             return jsonify({"error": "Already recording"}), 400
+        # A start runs for seconds (cleanup wait, device open) and only sets
+        # is_recording at the very end, so two POSTs arriving together would
+        # both pass the guard above and open two captures on the same devices.
+        # This reservation is taken under the same lock and released in the
+        # finally below, so exactly one start can be in progress.
+        if _state.get("is_starting"):
+            # A start that wedged inside a device open (the 2026-09-01 freeze
+            # shape) must not block every later recording until a restart:
+            # a reservation older than a minute is treated as abandoned.
+            age = time.monotonic() - float(_state.get("is_starting_at") or 0.0)
+            if age < 60.0:
+                return jsonify({"error": "Already starting"}), 400
+            log.warn("recording", f"Stale start reservation ({age:.0f}s old); taking over")
         can_record, reason = _recording_prereqs_locked()
         if not can_record:
             return jsonify({"error": reason}), 503
+        _state["is_starting"] = True
+        _state["is_starting_at"] = time.monotonic()
         # Stop any active audio test so it doesn't conflict with the real capture
         test_cap = _state["test_capture"]
         _state["test_capture"] = None
         _state["is_testing"]   = False
 
-    if test_cap:
-        # Stop synchronously: the test capture's ffmpeg-dshow process is still
-        # holding the microphone, and DirectShow won't deliver audio to a
-        # second simultaneous open. Backgrounding the stop lets the new
-        # recording's ffmpeg launch while the old one is still tearing down,
-        # which produces a silent mic stream for ~3 seconds (and sometimes
-        # the entire session, if the race lands the wrong way).
-        test_cap.stop()
-        _push("audio_test_status", {"testing": False})
-
-    # Wait for any in-flight cleanup from a previous stop to finish before
-    # opening new audio streams.  This prevents the old capture / transcriber
-    # from racing with the new one (e.g. _transcriber.stop() killing a freshly
-    # started transcriber thread, or old mixer threads still writing to the
-    # shared _audio_queue).
-    if not _recording_cleanup_done.wait(timeout=15):
-        log.warn("recording", "Previous cleanup did not finish in 15 s – starting anyway")
-
-    # Drain stale audio from a previous session
-    while not _audio_queue.empty():
-        try:
-            _audio_queue.get_nowait()
-        except queue.Empty:
-            break
-
-    body = request.get_json(silent=True) or {}
-    title             = body.get("title")
-    loopback_device   = body.get("loopback_device")       # int | None
-    loopback_name     = body.get("loopback_device_name")  # str | None (self-heal)
-    mic_device        = body.get("mic_device")             # int | None | -1
-    ffmpeg_mic_name   = body.get("ffmpeg_mic_name")        # str | None (for mic_device=-3)
-    resume_session_id = body.get("resume_session_id")      # str | None
-
-    # Fall back to saved user preferences when the caller didn't specify devices
-    # (e.g. recording started from the home page which has no device selectors).
-    if loopback_device is None or mic_device is None:
-        _saved = settings.load()
-        if loopback_device is None:
-            # Pull the index and its paired name together so the capture layer
-            # can re-find the same physical device if the PyAudio index drifted.
-            if _saved.get("loopback_device"):
-                try:
-                    loopback_device = int(_saved["loopback_device"])
-                except (ValueError, TypeError):
-                    pass
-            if loopback_name is None and _saved.get("loopback_device_name"):
-                loopback_name = str(_saved["loopback_device_name"]) or None
-        if mic_device is None and _saved.get("mic_device"):
-            _mic_pref = str(_saved["mic_device"])
-            if _mic_pref.startswith("ffmpeg:"):
-                mic_device = -3
-                ffmpeg_mic_name = ffmpeg_mic_name or _mic_pref[7:]
-            else:
-                try:
-                    mic_device = int(_mic_pref)
-                except (ValueError, TypeError):
-                    pass
-
-    # ── Resume an existing session ──────────────────────────────────────────
-    if resume_session_id:
-        sess = storage.get_session(resume_session_id)
-        if not sess:
-            return jsonify({"error": "Session not found"}), 404
-        session_id = resume_session_id
-        storage.resume_session(session_id)
-        existing_segments = [
-            {"text": s["text"], "source": s["source"],
-             "start_time": s["start_time"], "end_time": s["end_time"]}
-            for s in sess.get("segments", [])
-        ]
-        existing_summary   = sess.get("summary", "")
-        existing_chat      = [{"role": m["role"], "content": m["content"]}
-                               for m in sess.get("chat_messages", [])]
-        existing_labels    = {p["speaker_key"]: p["name"]
-                               for p in sess.get("speaker_profiles", [])}
-        existing_seg_count = len(existing_segments)
-        # Determine next speaker label number so resumed diarizer doesn't
-        # collide with existing speaker keys (e.g. "Speaker 1", "Speaker 2").
-        all_speaker_keys = set(existing_labels.keys()) | {
-            s["source"] for s in sess.get("segments", [])
-        }
-        max_label = 0
-        for k in all_speaker_keys:
-            parts = k.rsplit(" ", 1)
-            if len(parts) == 2 and parts[0] == "Speaker":
-                try:
-                    max_label = max(max_label, int(parts[1]))
-                except ValueError:
-                    pass
-        next_speaker_label = max_label + 1
-    else:
-        session_id         = storage.create_session(title)
-        existing_segments  = []
-        existing_summary   = ""
-        existing_chat      = []
-        existing_labels    = {}
-        existing_seg_count = 0
-        next_speaker_label = 1
-
-    log.info("recording", f"Device selection: loopback={loopback_device} "
-             f"({loopback_name!r}), mic={mic_device}, ffmpeg_mic={ffmpeg_mic_name!r}")
-
-    capture = AudioCapture(_audio_queue)
-
-    # Apply echo cancellation setting to the new capture instance
-    from capture_audio.params import resolve_audio_params
-    _ec_params = resolve_audio_params()
-    capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
-    capture.noise_suppress_enabled = bool(int(_ec_params.get("noise_suppress_enabled", 0)))
-    capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
-    capture.agc_mic_enabled = bool(int(_ec_params.get("agc_mic_enabled", 0)))
-    capture.agc_target_rms = float(_ec_params.get("agc_target_rms", 0.15))
-    capture.agc_max_gain = float(_ec_params.get("agc_max_gain", 4.0))
-    capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
-    # macOS desktop-bleed gate aggressiveness (ignored on Windows). The gate lives
-    # in the transcriber now (a per-segment decision). Higher ducks more of the
-    # desktop out of the "mic = Me" track; lower keeps more mic. Accept the legacy
-    # bleed_duck_slack key as an alias so existing settings keep working.
-    _transcriber.mic_bleed_slack = float(
-        _ec_params.get("mic_bleed_slack",
-                       _ec_params.get("bleed_duck_slack",
-                                      getattr(_transcriber, "mic_bleed_slack", 2.0))))
-    _transcriber.mic_bleed_threshold = float(
-        _ec_params.get("mic_bleed_threshold",
-                       getattr(_transcriber, "mic_bleed_threshold", 0.0)))
-
-    # "Mic = Me": when on and a mic is present, the capture writes per-source
-    # tracks so mic audio is always the app user and only desktop is diarized.
-    _mic_present = mic_device is not None and int(mic_device) != -1
-    capture.mic_is_me_enabled = bool(_me_feature_enabled() and _mic_present)
-
-    # Set up WAV recording - append to existing file on resume
-    wav_dir = paths.audio_dir()
-    wav_path = str(wav_dir / f"{session_id}.wav")
-    capture.start_wav(wav_path, append=bool(resume_session_id))
     try:
-        capture.start(
-            loopback_index=loopback_device,
-            mic_index=mic_device,
-            ffmpeg_mic_name=ffmpeg_mic_name,
-            loopback_name=loopback_name,
+        if test_cap:
+            # Stop synchronously: the test capture's ffmpeg-dshow process is still
+            # holding the microphone, and DirectShow won't deliver audio to a
+            # second simultaneous open. Backgrounding the stop lets the new
+            # recording's ffmpeg launch while the old one is still tearing down,
+            # which produces a silent mic stream for ~3 seconds (and sometimes
+            # the entire session, if the race lands the wrong way).
+            test_cap.stop()
+            _push("audio_test_status", {"testing": False})
+
+        # Wait for any in-flight cleanup from a previous stop to finish before
+        # opening new audio streams.  This prevents the old capture / transcriber
+        # from racing with the new one (e.g. _transcriber.stop() killing a freshly
+        # started transcriber thread, or old mixer threads still writing to the
+        # shared _audio_queue).
+        if not _recording_cleanup_done.wait(timeout=15):
+            log.warn("recording", "Previous cleanup did not finish in 15 s, starting anyway")
+
+        # Drain stale audio from a previous session
+        while not _audio_queue.empty():
+            try:
+                _audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        body = request.get_json(silent=True) or {}
+        title             = body.get("title")
+        loopback_device   = body.get("loopback_device")       # int | None
+        loopback_name     = body.get("loopback_device_name")  # str | None (self-heal)
+        mic_device        = body.get("mic_device")             # int | None | -1
+        ffmpeg_mic_name   = body.get("ffmpeg_mic_name")        # str | None (for mic_device=-3)
+        resume_session_id = body.get("resume_session_id")      # str | None
+
+        # Fall back to saved user preferences when the caller didn't specify devices
+        # (e.g. recording started from the home page which has no device selectors).
+        if loopback_device is None or mic_device is None:
+            _saved = settings.load()
+            if loopback_device is None:
+                # Pull the index and its paired name together so the capture layer
+                # can re-find the same physical device if the PyAudio index drifted.
+                if _saved.get("loopback_device"):
+                    try:
+                        loopback_device = int(_saved["loopback_device"])
+                    except (ValueError, TypeError):
+                        pass
+                if loopback_name is None and _saved.get("loopback_device_name"):
+                    loopback_name = str(_saved["loopback_device_name"]) or None
+            if mic_device is None and _saved.get("mic_device"):
+                _mic_pref = str(_saved["mic_device"])
+                if _mic_pref.startswith("ffmpeg:"):
+                    mic_device = -3
+                    ffmpeg_mic_name = ffmpeg_mic_name or _mic_pref[7:]
+                else:
+                    try:
+                        mic_device = int(_mic_pref)
+                    except (ValueError, TypeError):
+                        pass
+
+        # ── Resume an existing session ──────────────────────────────────────────
+        if resume_session_id:
+            sess = storage.get_session(resume_session_id)
+            if not sess:
+                return jsonify({"error": "Session not found"}), 404
+            session_id = resume_session_id
+            storage.resume_session(session_id)
+            existing_segments = [
+                {"text": s["text"], "source": s["source"],
+                 "start_time": s["start_time"], "end_time": s["end_time"]}
+                for s in sess.get("segments", [])
+            ]
+            existing_summary   = sess.get("summary", "")
+            existing_chat      = [{"role": m["role"], "content": m["content"]}
+                                   for m in sess.get("chat_messages", [])]
+            existing_labels    = {p["speaker_key"]: p["name"]
+                                   for p in sess.get("speaker_profiles", [])}
+            existing_seg_count = len(existing_segments)
+            # Determine next speaker label number so resumed diarizer doesn't
+            # collide with existing speaker keys (e.g. "Speaker 1", "Speaker 2").
+            all_speaker_keys = set(existing_labels.keys()) | {
+                s["source"] for s in sess.get("segments", [])
+            }
+            max_label = 0
+            for k in all_speaker_keys:
+                parts = k.rsplit(" ", 1)
+                if len(parts) == 2 and parts[0] == "Speaker":
+                    try:
+                        max_label = max(max_label, int(parts[1]))
+                    except ValueError:
+                        pass
+            next_speaker_label = max_label + 1
+        else:
+            session_id         = storage.create_session(title)
+            existing_segments  = []
+            existing_summary   = ""
+            existing_chat      = []
+            existing_labels    = {}
+            existing_seg_count = 0
+            next_speaker_label = 1
+
+        log.info("recording", f"Device selection: loopback={loopback_device} "
+                 f"({loopback_name!r}), mic={mic_device}, ffmpeg_mic={ffmpeg_mic_name!r}")
+
+        capture = AudioCapture(_audio_queue)
+
+        # Alarm if the desktop/loopback never produces real audio, i.e. the call is
+        # playing to a device we are not capturing (the 2026-09-01 dead-loopback
+        # failure). Bound to this session so a stale alarm cannot fire on a later one.
+        capture.on_loopback_silent = (
+            lambda dev, kind, _sid=session_id: _alert_loopback_silent(_sid, dev, kind)
         )
-    except Exception as e:
-        capture.stop_wav()
-        if not resume_session_id:
-            storage.end_session(session_id)
-        return jsonify({"error": str(e)}), 500
 
-    # Activate the "Me" mic stream only when the capture actually produced
-    # per-source tracks (Windows + mic present). On platforms/paths without
-    # per-source capture, me_label stays None and the transcriber runs the
-    # legacy single mixed-stream path.
-    _me_profile = None
-    if getattr(capture, "_per_source_active", False):
-        _me_profile = _ensure_me_profile()
-    if _me_profile:
-        _transcriber.me_label = ME_KEY
-        # Seed the session label row so "me" segments resolve to the Me name and
-        # so a later rename propagates retroactively via rename_global_speaker.
-        storage.save_speaker_label(session_id, ME_KEY,
-                                   name=_me_profile["name"], color=_me_profile["color"])
-        fingerprint_db.link_session_speaker(session_id, ME_KEY, _me_profile["global_id"])
-        existing_labels[ME_KEY] = _me_profile["name"]
-    else:
-        _transcriber.me_label = None
+        # Apply echo cancellation setting to the new capture instance
+        from capture_audio.params import resolve_audio_params
+        _ec_params = resolve_audio_params()
+        capture.echo_cancel_enabled = bool(int(_ec_params.get("echo_cancel_enabled", 0)))
+        capture.noise_suppress_enabled = bool(int(_ec_params.get("noise_suppress_enabled", 0)))
+        capture.agc_loopback_enabled = bool(int(_ec_params.get("agc_loopback_enabled", 0)))
+        capture.agc_mic_enabled = bool(int(_ec_params.get("agc_mic_enabled", 0)))
+        capture.agc_target_rms = float(_ec_params.get("agc_target_rms", 0.15))
+        capture.agc_max_gain = float(_ec_params.get("agc_max_gain", 4.0))
+        capture.agc_gate_threshold = float(_ec_params.get("agc_gate_threshold", 0.01))
+        # macOS desktop-bleed gate aggressiveness (ignored on Windows). The gate lives
+        # in the transcriber now (a per-segment decision). Higher ducks more of the
+        # desktop out of the "mic = Me" track; lower keeps more mic. Accept the legacy
+        # bleed_duck_slack key as an alias so existing settings keep working.
+        _transcriber.mic_bleed_slack = float(
+            _ec_params.get("mic_bleed_slack",
+                           _ec_params.get("bleed_duck_slack",
+                                          getattr(_transcriber, "mic_bleed_slack", 2.0))))
+        _transcriber.mic_bleed_threshold = float(
+            _ec_params.get("mic_bleed_threshold",
+                           getattr(_transcriber, "mic_bleed_threshold", 0.0)))
 
-    _transcriber.start(capture.sample_rate, capture.channels,
-                       next_speaker_label=next_speaker_label)
+        # "Mic = Me": when on and a mic is present, the capture writes per-source
+        # tracks so mic audio is always the app user and only desktop is diarized.
+        _mic_present = mic_device is not None and int(mic_device) != -1
+        capture.mic_is_me_enabled = bool(_me_feature_enabled() and _mic_present)
 
-    now_mono = time.monotonic()
-    with _state_lock:
-        _state.update({
-            "is_recording": True,
-            "session_id": session_id,
-            "segments": existing_segments,
-            "summary": existing_summary,
-            "chat_history": existing_chat,
-            "pending_segments": 0,
-            "summarized_seg_count": existing_seg_count,
-            "pending_chapter_segments": 0,
-            "last_chapter_gen_at": 0.0,
-            "chapters_generating": False,
-            "audio_capture": capture,
-            "speaker_labels": existing_labels,
-            "speaker_audio_accum":    {},
-            "speaker_emb_counts":     {},
-            "speaker_offer_counts":   {},
-            "fingerprint_dismissals": {},
-            "fingerprint_rejected":   set(),
-            "fingerprint_suggestions": {},
-            "fingerprint_streaks":    {},
-            "source_redirects":       {},
-            "_confirmed_speakers":    set(),
-            "last_audio_activity_at": now_mono,
-            "last_transcript_activity_at": now_mono,
-            "quiet_prompt_sent_at": 0.0,
-            "quiet_prompt_armed": True,
-            "recording_started_at_monotonic": now_mono,
-        })
-
-    # ── Compute video offset for resumed sessions ────────────────────────
-    # When resuming, the WAV writer opened in append mode knows the existing
-    # sample count. Use it so video sync knows the audio offset.
-    video_offset = 0.0
-    if resume_session_id and capture.wav_writer:
-        video_offset = capture.wav_writer.elapsed_seconds
-    settings.put_video_offset(session_id, video_offset)
-
-    # ── Screen recording (optional) ────────────────────────────────────────
-    screen_recording_active = False
-    all_params = resolve_audio_params()
-    if int(all_params.get("screen_record_enabled", 0)) and find_ffmpeg():
+        # Set up WAV recording - append to existing file on resume
+        wav_dir = paths.audio_dir()
+        wav_path = str(wav_dir / f"{session_id}.wav")
+        capture.start_wav(wav_path, append=bool(resume_session_id))
         try:
-            display_idx = int(settings.get("screen_display", 0))
-            # Resolve H.264 preset name from numeric index
-            h264_idx = int(all_params.get("screen_h264_preset", 2))
-            h264_name = H264_PRESETS[min(h264_idx, len(H264_PRESETS) - 1)]
-            framerate = int(all_params.get("screen_framerate", 10))
-            crf = int(all_params.get("screen_crf", 32))
-            scale_w = int(all_params.get("screen_scale_width", 0))
-            scale = f"{scale_w}:-2" if scale_w > 0 else ""
-
-            video_dir = paths.video_dir()
-            video_path = str(video_dir / f"{session_id}.mp4")
-
-            # When resuming, preserve the previous video as a numbered
-            # part file so it isn't overwritten by the new recording.
-            if resume_session_id:
-                existing_video = Path(video_path)
-                if existing_video.exists():
-                    # Find the next available part number
-                    part_num = 0
-                    while (video_dir / f"{session_id}_part{part_num}.mp4").exists():
-                        part_num += 1
-                    part_path = video_dir / f"{session_id}_part{part_num}.mp4"
-                    existing_video.rename(part_path)
-                    log.info("screen", f"Preserved previous video as {part_path.name}")
-
-            _screen_recorder.start(
-                output_path=video_path,
-                display_index=display_idx,
-                framerate=framerate,
-                crf=crf,
-                preset=h264_name,
-                scale=scale,
+            capture.start(
+                loopback_index=loopback_device,
+                mic_index=mic_device,
+                ffmpeg_mic_name=ffmpeg_mic_name,
+                loopback_name=loopback_name,
             )
-            screen_recording_active = True
         except Exception as e:
-            log.warn("screen", f"Could not start screen recording: {e}")
+            capture.stop_wav()
+            if not resume_session_id:
+                storage.end_session(session_id)
+            return jsonify({"error": str(e)}), 500
 
-    verb = "Resumed" if resume_session_id else "Started"
-    log.info("recording", f"{verb} - session {session_id}")
-    _push_status({
-        "recording": True,
-        "session_id": session_id,
-        "resumed": bool(resume_session_id),
-        "screen_recording": screen_recording_active,
-    })
-    return jsonify({"session_id": session_id, "screen_recording": screen_recording_active})
+        # Activate the "Me" mic stream only when the capture actually produced
+        # per-source tracks (Windows + mic present). On platforms/paths without
+        # per-source capture, me_label stays None and the transcriber runs the
+        # legacy single mixed-stream path.
+        _me_profile = None
+        if getattr(capture, "_per_source_active", False):
+            _me_profile = _ensure_me_profile()
+        if _me_profile:
+            _transcriber.me_label = ME_KEY
+            # Seed the session label row so "me" segments resolve to the Me name and
+            # so a later rename propagates retroactively via rename_global_speaker.
+            storage.save_speaker_label(session_id, ME_KEY,
+                                       name=_me_profile["name"], color=_me_profile["color"])
+            fingerprint_db.link_session_speaker(session_id, ME_KEY, _me_profile["global_id"])
+            existing_labels[ME_KEY] = _me_profile["name"]
+        else:
+            _transcriber.me_label = None
+
+        _transcriber.start(capture.sample_rate, capture.channels,
+                           next_speaker_label=next_speaker_label)
+
+        now_mono = time.monotonic()
+        with _state_lock:
+            _state.update({
+                "is_recording": True,
+                "is_starting": False,
+                "session_id": session_id,
+                "segments": existing_segments,
+                "summary": existing_summary,
+                "chat_history": existing_chat,
+                "pending_segments": 0,
+                "summarized_seg_count": existing_seg_count,
+                "pending_chapter_segments": 0,
+                "last_chapter_gen_at": 0.0,
+                "chapters_generating": False,
+                "audio_capture": capture,
+                "speaker_labels": existing_labels,
+                "speaker_audio_accum":    {},
+                "speaker_emb_counts":     {},
+                "speaker_offer_counts":   {},
+                "fingerprint_dismissals": {},
+                "fingerprint_rejected":   set(),
+                "fingerprint_suggestions": {},
+                "fingerprint_streaks":    {},
+                "source_redirects":       {},
+                "_confirmed_speakers":    set(),
+                "last_audio_activity_at": now_mono,
+                "last_transcript_activity_at": now_mono,
+                "quiet_prompt_sent_at": 0.0,
+                "quiet_prompt_armed": True,
+                "recording_started_at_monotonic": now_mono,
+                "capture_silent": False,   # start healthy; the level loop flips this
+            })
+
+        # ── Compute video offset for resumed sessions ────────────────────────
+        # When resuming, the WAV writer opened in append mode knows the existing
+        # sample count. Use it so video sync knows the audio offset.
+        video_offset = 0.0
+        if resume_session_id and capture.wav_writer:
+            video_offset = capture.wav_writer.elapsed_seconds
+        settings.put_video_offset(session_id, video_offset)
+
+        # ── Screen recording (optional) ────────────────────────────────────────
+        screen_recording_active = False
+        all_params = resolve_audio_params()
+        if int(all_params.get("screen_record_enabled", 0)) and find_ffmpeg():
+            try:
+                display_idx = int(settings.get("screen_display", 0))
+                # Resolve H.264 preset name from numeric index
+                h264_idx = int(all_params.get("screen_h264_preset", 2))
+                h264_name = H264_PRESETS[min(h264_idx, len(H264_PRESETS) - 1)]
+                framerate = int(all_params.get("screen_framerate", 10))
+                crf = int(all_params.get("screen_crf", 32))
+                scale_w = int(all_params.get("screen_scale_width", 0))
+                scale = f"{scale_w}:-2" if scale_w > 0 else ""
+
+                video_dir = paths.video_dir()
+                video_path = str(video_dir / f"{session_id}.mp4")
+
+                # When resuming, preserve the previous video as a numbered
+                # part file so it isn't overwritten by the new recording.
+                if resume_session_id:
+                    existing_video = Path(video_path)
+                    if existing_video.exists():
+                        # Find the next available part number
+                        part_num = 0
+                        while (video_dir / f"{session_id}_part{part_num}.mp4").exists():
+                            part_num += 1
+                        part_path = video_dir / f"{session_id}_part{part_num}.mp4"
+                        existing_video.rename(part_path)
+                        log.info("screen", f"Preserved previous video as {part_path.name}")
+
+                _screen_recorder.start(
+                    output_path=video_path,
+                    display_index=display_idx,
+                    framerate=framerate,
+                    crf=crf,
+                    preset=h264_name,
+                    scale=scale,
+                )
+                screen_recording_active = True
+            except Exception as e:
+                log.warn("screen", f"Could not start screen recording: {e}")
+
+        verb = "Resumed" if resume_session_id else "Started"
+        log.info("recording", f"{verb} - session {session_id}")
+        _push_status({
+            "recording": True,
+            "session_id": session_id,
+            "resumed": bool(resume_session_id),
+            "screen_recording": screen_recording_active,
+        })
+        return jsonify({"session_id": session_id, "screen_recording": screen_recording_active})
+    finally:
+        # Released however this returns: early error, exception, or a
+        # started capture. A stuck reservation would lock out every later
+        # start, which is worse than the race it prevents.
+        with _state_lock:
+            _state["is_starting"] = False
 
 
 def _concat_video_parts(session_id: str) -> None:
@@ -2341,6 +2780,7 @@ def stop_recording():
         _state["is_recording"] = False
         _state["audio_capture"] = None
         _state["quiet_prompt_armed"] = True
+        _state["capture_silent"] = False   # clear the orange tray dot on stop
 
     # Return immediately - cleanup blocks for up to 12 s (thread join) so we
     # must not do it on the Flask request handler thread or the server hangs.
@@ -2396,12 +2836,20 @@ def stop_recording():
                     if title:
                         storage.update_session_title(sid, title, user_set=False)
                         _push("session_title", {"session_id": sid, "title": title})
+            # Drop the finalized transcript into the Obsidian vault (after
+            # title generation so the file carries the real title).
+            if sid:
+                obsidian.export_session(sid)
         except Exception:
             import traceback
             log.warn("recording", f"Post-stop tasks failed for session {sid}:")
             traceback.print_exc()
+        finally:
+            _recording_cleanup_done.set()
 
     threading.Thread(target=_cleanup, daemon=True).start()
+    # Run any summary regens that were deferred while this recording was active.
+    threading.Thread(target=_drain_deferred_summaries, daemon=True).start()
     # Update semantic embedding in background after session ends
     if sid:
         threading.Thread(target=update_session_embedding, args=(sid,), daemon=True).start()
@@ -2466,12 +2914,29 @@ def summarize():
         )
 
     # Signal any running auto-summary to discard its result, then regenerate from scratch.
+    force_full = bool(data.get("force_full", False))
+    export_after = bool(data.get("export_after", False))
+
+    # Prevent a bulk background regen/export sweep of OTHER sessions from running
+    # during a live recording; that concurrent load deadlocked the app on
+    # 2026-09-01. Defer such requests until the recording stops. The active
+    # recording's own summary is unaffected and still runs.
+    with _state_lock:
+        recording_now = _state["is_recording"]
+        active_now = _state["session_id"]
+    if recording_now and session_id != active_now and (force_full or export_after):
+        _defer_summary_during_recording(session_id, transcript, seg_count,
+                                        custom_prompt, meta, force_full, export_after)
+        return jsonify({"ok": True, "deferred": True,
+                        "reason": "recording in progress; will run after it stops"})
+
     with _state_lock:
         _state["summary_manual_pending"] = True
     threading.Thread(
         target=_run_summary,
         args=(session_id, "", transcript, seg_count, custom_prompt, meta),
-        kwargs={"is_auto": False, "clears_pending": True},
+        kwargs={"is_auto": False, "clears_pending": True,
+                "force_full": force_full, "export_after": export_after},
         daemon=True,
     ).start()
     return jsonify({"ok": True})
@@ -2587,6 +3052,63 @@ def settings_status():
         "cuda_available": get_cuda_available(),
         "keys": config.get_key_status(),
     })
+
+
+# ── Obsidian export ───────────────────────────────────────────────────────────
+# Thin HTTP shims. All logic lives in core/obsidian_export.py so upstream syncs
+# do not collide with it.
+
+@app.route("/api/obsidian/status")
+def obsidian_status():
+    return jsonify({
+        "enabled": bool(settings.get("obsidian_export_enabled")),
+        "dir": str(settings.get("obsidian_export_dir") or ""),
+    })
+
+
+@app.route("/api/obsidian/export-all", methods=["POST"])
+def obsidian_export_all():
+    """One-shot backfill: export every finalized session with content."""
+    result = obsidian.export_all()
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/api/obsidian/held", methods=["GET"])
+def obsidian_held():
+    """Meetings the speaker-resolution gate is currently withholding."""
+    return jsonify({
+        "gate_enabled": bool(settings.get("obsidian_gate_enabled")),
+        "export_enabled": bool(settings.get("obsidian_export_enabled")),
+        "held": obsidian.held_sessions(),
+    })
+
+
+@app.route("/api/obsidian/gate", methods=["POST"])
+def obsidian_set_gate():
+    """Enable/disable the speaker-resolution export gate. Turning it OFF
+    releases everything held by re-exporting immediately."""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    settings.put("obsidian_gate_enabled", enabled)
+    if not enabled:
+        obsidian.export_all()
+    return jsonify({"ok": True, "gate_enabled": enabled})
+
+
+@app.route("/api/sessions/<session_id>/force-export", methods=["POST"])
+def obsidian_force_export(session_id: str):
+    """Export a held meeting despite unresolved speakers (manual override)."""
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+    forced = list(settings.get("obsidian_export_force_ids") or [])
+    if session_id not in forced:
+        forced.append(session_id)
+        settings.put("obsidian_export_force_ids", forced)
+    obsidian.export_session(session_id)
+    return jsonify({"ok": True})
 
 
 # ── AI provider / model settings ──────────────────────────────────────────────
@@ -3055,17 +3577,63 @@ def set_ai_settings():
     return jsonify({"ok": True, "provider": ai.provider, "model": ai.model})
 
 
+# ── Icons: the image behind every app and tray state ─────────────────────────
+
+def _icons_changed() -> None:
+    """The icon set or one of its images changed: drop every cache, repaint
+    the tray, and re-point the Start Menu shortcut at the new icon."""
+    icons.invalidate()
+    try:
+        from ui_desktop import tray as _tray_mod
+        _tray_mod.reload_icons()
+    except Exception:
+        pass
+    _refresh_tray()
+    _sync_shortcut_icon_async()
+
+
+def _sync_shortcut_icon_async() -> None:
+    """Keep the launcher shortcuts (Start Menu, taskbar pins) on the active
+    set's icon. PowerShell does the .lnk work, so it runs on its own thread."""
+    def _run():
+        try:
+            for lnk in icons.sync_shortcut_icon():
+                log.info("icons", f"Shortcut icon updated: {lnk.name}")
+        except Exception as e:
+            log.warn("icons", f"Could not update the shortcut icon: {e}")
+    threading.Thread(target=_run, name="shortcut-icon", daemon=True).start()
+
+
+# The routes live in core/icons_api.py (mounted below); a change there also
+# repaints the tray and re-points the launcher shortcut, off the request thread.
+icons_api.on_change(_icons_changed)
+app.register_blueprint(icons_api.bp)
+
+
 @app.route("/api/preferences", methods=["GET"])
 def get_preferences():
-    """Return all saved user preferences."""
-    return jsonify(settings.load())
+    """Return all saved user preferences, with the calendar link masked.
+
+    The published-calendar ICS link is a credential (anyone holding it can read
+    the owner's calendar), so only its masked form leaves the server.
+    """
+    values = settings.load()
+    if values.get("calendar_ics_url"):
+        values["calendar_ics_url"] = calendar_feed.mask_url(values["calendar_ics_url"])
+    return jsonify(values)
 
 
 @app.route("/api/preferences", methods=["PUT"])
 def set_preferences():
     """Update one or more user preferences."""
     data = request.get_json(silent=True) or {}
-    updated = settings.update(data)
+    # savePref() echoes the whole prefs object back, and the GET above masked
+    # the calendar link, so this route can only ever receive a mask or a stale
+    # blank for that key. POST /api/calendar/link is the single writer.
+    settings.update(calendar_sync.sanitize_preferences(data))
+    updated = settings.load()
+    if updated.get("calendar_ics_url"):
+        updated["calendar_ics_url"] = calendar_feed.mask_url(updated["calendar_ics_url"])
     return jsonify(updated)
 
 
@@ -5062,8 +5630,10 @@ def _run_context_shell(roots: list[dict], tool_input: dict) -> tuple:
 
 def _chat_context_tool_executor(roots: list[dict]):
     def _execute(name: str, tool_input: dict) -> tuple:
+        # ToolNotHandled, not a bare KeyError: a KeyError raised inside
+        # one of these tools must not read as "unknown tool".
         if name not in _CONTEXT_TOOL_NAMES:
-            raise KeyError(name)
+            raise ToolNotHandled(name)
         tool_input = tool_input or {}
         if name == "inspect_context_codebase":
             return _inspect_context_codebase(roots, tool_input)
@@ -5077,7 +5647,7 @@ def _chat_context_tool_executor(roots: list[dict]):
             return _get_context_file_info(roots, tool_input)
         if name == "run_context_shell":
             return _run_context_shell(roots, tool_input)
-        raise KeyError(name)
+        raise ToolNotHandled(name)
     return _execute
 
 
@@ -5401,14 +5971,27 @@ def chat():
         effective_prompt = session_prompt or global_prompt
         context_prompt = _chat_context_system_block(context_roots)
         context_executor = _chat_context_tool_executor(context_roots) if context_roots else None
-        context_tools = _CONTEXT_TOOLS if context_roots else None
-        context_tools_oai = _CONTEXT_TOOLS_OAI if context_roots else None
+        # The relabel pair is always available; the local-context tools only
+        # when the user attached folders. Composed so neither drops the other.
+        chat_tools = list(ai_assistant._RELABEL_TOOLS)
+        chat_tools_oai = list(ai_assistant._RELABEL_TOOLS_OAI)
+        if context_roots:
+            chat_tools += list(_CONTEXT_TOOLS)
+            chat_tools_oai += list(_CONTEXT_TOOLS_OAI)
+        chat_executor = _compose_tool_executors(
+            _make_relabel_executor(request_id, "session", session_id),
+            context_executor,
+        )
+        # A custom system prompt replaces the built-in QA prompt, and with it
+        # the plan/confirm/apply contract, so re-state the contract here.
+        if effective_prompt:
+            context_prompt = (context_prompt or "") + ai_assistant._RELABEL_CONTRACT_SESSION
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
                cancel=cancel_event, frame_extractor=fe,
                on_tool_event=on_tool_event,
-               tools_anthropic=context_tools,
-               tools_openai=context_tools_oai,
-               tool_executor=context_executor,
+               tools_anthropic=chat_tools,
+               tools_openai=chat_tools_oai,
+               tool_executor=chat_executor,
                provider=cp, model=cm,
                system_prompt=effective_prompt,
                system_context=context_prompt)
@@ -6048,8 +6631,270 @@ def _describe_session(meta: dict, labels: dict, *, summary_chars: int) -> dict:
     return entry
 
 
-def _global_tool_executor(name: str, tool_input: dict) -> tuple:
+# ── Bulk speaker relabel from chat ────────────────────────────────────────────
+# plan_speaker_relabel is read-only and mints a token; apply_speaker_relabel
+# takes nothing but that token. ai/speaker_relabel.py holds the logic and gets
+# every database call it is allowed to make through the deps bundle below.
+
+_RELABEL_TOOL_NAMES = {"plan_speaker_relabel", "apply_speaker_relabel", "cancel_speaker_relabel"}
+
+
+class ToolNotHandled(KeyError):
+    """Raised by a tool executor that does not own the requested tool name.
+
+    A distinct type so composing executors can tell "not my tool" apart from a
+    KeyError thrown inside a tool that already ran, which must surface as a
+    real failure rather than being retried as an unknown tool.
+    """
+
+
+def _queue_relabel_summaries(session_ids: list, from_name: str, to_name: str) -> int:
+    """Queue a summary refresh for each affected session that has a summary.
+
+    Serialized through the single _relabel_summary_worker rather than a thread
+    per session, and skipped entirely while a recording is running: a bulk LLM
+    sweep alongside the live pipeline is the shape that froze the app before.
+    """
+    update_context = _speaker_summary_update_context([(from_name, to_name)])
+    if not update_context or not settings.get("auto_summary", True):
+        return 0
+    with _state_lock:
+        if _state.get("is_recording"):
+            log.info("summary",
+                     "Recording active - skipping bulk relabel summary refresh")
+            return 0
+    metas = storage.get_sessions_meta(list(session_ids))
+    queued = 0
+    for sid in session_ids:
+        if not (metas.get(sid) or {}).get("summary"):
+            continue
+        _relabel_summary_queue.put((sid, update_context))
+        queued += 1
+    if queued:
+        log.info("summary", f"Queued {queued} summary refresh(es) after speaker relabel")
+    return queued
+
+
+def _relabel_deps() -> "speaker_relabel.RelabelDeps":
+    """Wire the relabel planner to storage, the voice library and the routes."""
+    return speaker_relabel.RelabelDeps(
+        find_labels=lambda name, match, session_ids: storage.find_speaker_labels_by_name(
+            name, match=match, session_ids=session_ids),
+        speaker_time_stats=storage.speaker_time_stats,
+        count_label_overrides=lambda name, match, session_ids:
+            storage.count_label_overrides_by_name(
+                name, match=match, session_ids=session_ids),
+        find_profile_by_name=lambda name: (
+            fingerprint_db.find_by_name(name) if fingerprint_db.ready else None),
+        create_profile=fingerprint_db.create_global_speaker,
+        bulk_link=_apply_bulk_link,
+        merge_profiles=_apply_profile_merge,
+        patch_session=lambda session_id, speaker_keys, name: _patch_session_speakers(
+            session_id, speaker_keys, name, None, queue_summary=False),
+        linked_labels=lambda global_id: (
+            fingerprint_db.get_linked_labels(global_id)
+            if fingerprint_db.ready and global_id else []),
+        session_info=lambda session_ids: storage.get_sessions_meta(list(session_ids)),
+        me_profile_id=lambda: (
+            fingerprint_db._me_id or settings.get("me_speaker_global_id") or None),
+        me_key=ME_KEY,
+        library_ready=lambda: bool(fingerprint_db.ready),
+        queue_summaries=_queue_relabel_summaries,
+    )
+
+
+def _relabel_plan_tool(tool_input: dict, request_id: "str | None",
+                       default_scope: str, default_session_id: "str | None") -> tuple:
+    """Read-only planning half of the bulk relabel tool pair."""
+    from_name = (tool_input.get("from_name") or "").strip()
+    to_name = (tool_input.get("to_name") or "").strip()
+    if not from_name or not to_name:
+        return ("from_name and to_name are both required.", True,
+                "Missing speaker names", None)
+
+    match = (tool_input.get("match") or "exact").strip().lower()
+    if match not in speaker_relabel.MATCH_MODES:
+        match = "exact"
+    scope = (tool_input.get("scope") or "").strip().lower()
+    if scope not in speaker_relabel.SCOPES:
+        scope = default_scope
+
+    session_id = (tool_input.get("session_id") or "").strip() or default_session_id
+    if scope == "session":
+        if not session_id:
+            return ("scope 'session' needs a session_id. Pass one, or use "
+                    "scope 'library' for a library-wide change.",
+                    True, "No meeting given", None)
+        if not storage.get_sessions_meta([session_id]).get(session_id):
+            return (f"No meeting with id {session_id} exists.", True,
+                    "Meeting not found", None)
+        session_ids = [session_id]
+        scope_desc = "this meeting"
+    else:
+        filters = _scope_filters(tool_input)
+        if filters["error"]:
+            return _folder_error_result(filters)
+        session_ids = _scoped_session_ids(filters)
+        scope_desc = filters["desc"].removeprefix(" in ") or "the whole library"
+
+    try:
+        plan = speaker_relabel.build_plan(
+            from_name, to_name, scope, session_ids, match, deps=_relabel_deps(),
+        )
+    except ValueError as e:
+        return (str(e), True, "Could not plan the reassignment", None)
+
+    if not plan["sessions"] and not plan.get("profile_only"):
+        return (json.dumps({
+            "matched": 0,
+            "summary": plan["summary"],
+            "warnings": plan["warnings"],
+            "next_step": ("Tell the user nothing matched and offer list_speakers "
+                          "so they can pick the real spelling. Do not guess."),
+        }, indent=2), False,
+            f'No speaker named "{from_name}" in {scope_desc}', None)
+
+    token = speaker_relabel.mint_token(plan, request_id)
+    card = speaker_relabel.plan_card(plan, token)
+    payload = {
+        "token": token,
+        "summary": plan["summary"],
+        "strategy": plan["strategy"],
+        "scope": plan["scope"],
+        "match": plan["match"],
+        "session_count": plan["session_count"],
+        "key_count": plan["key_count"],
+        "segment_total": plan["segment_total"],
+        "sessions": card["sessions"],
+        "warnings": plan["warnings"],
+        "next_step": ("Nothing has changed yet. Describe this plan and every "
+                      "warning to the user in prose, ask them to confirm, and "
+                      "only call apply_speaker_relabel with this token after "
+                      "they say yes in a LATER message."),
+    }
+    summary = (f'Plan: "{from_name}" to "{to_name}", {plan["key_count"]} label(s) '
+               f'in {plan["session_count"]} meeting(s)')
+    return json.dumps(payload, indent=2), False, summary, {"relabel_plan": card}
+
+
+def _relabel_apply_tool(tool_input: dict, request_id: "str | None") -> tuple:
+    """Writing half of the bulk relabel tool pair. Token only, never names."""
+    token = (tool_input.get("token") or "").strip()
+    if not token:
+        return ("token is required. It comes from plan_speaker_relabel.",
+                True, "No plan token", None)
+    if not tool_input.get("user_confirmed"):
+        return ("user_confirmed must be true, and only after the user has "
+                "explicitly approved this exact plan. Ask them first.",
+                True, "Not confirmed by the user", None)
+    try:
+        result = speaker_relabel.apply_plan(
+            token, current_request_id=request_id, confirmed_by="chat",
+            deps=_relabel_deps(),
+        )
+    except ValueError as e:
+        return (str(e), True, "Reassignment not applied", None)
+
+    log.info("speakers",
+             f'Chat relabel applied: "{result["from_name"]}" to '
+             f'"{result["to_name"]}" ({result["key_count"]} label(s) in '
+             f'{result["session_count"]} meeting(s), {result["strategy"]})')
+    summary = (f'Applied: {result["key_count"]} speaker(s) across '
+               f'{result["session_count"]} meeting(s)')
+    # The token is what the chat widget keys its plan card on, so it must be in
+    # the extra payload even if a future apply_plan stops returning it.
+    return (json.dumps(result, indent=2), False, summary,
+            {"relabel_applied": {**result, "token": token}})
+
+
+def _make_relabel_executor(request_id: "str | None", default_scope: str,
+                           default_session_id: "str | None" = None):
+    """Tool executor for the relabel pair.
+
+    Raises ToolNotHandled for any other tool name, and lets nothing else out:
+    an exception escaping a write tool would reach the model as a bare KeyError
+    or a stack trace, with no way to tell whether the write had already run.
+    """
+    def _execute(name: str, tool_input: dict) -> tuple:
+        if name not in _RELABEL_TOOL_NAMES:
+            raise ToolNotHandled(name)
+        try:
+            tool_input = tool_input or {}
+            if name == "plan_speaker_relabel":
+                return _relabel_plan_tool(tool_input, request_id, default_scope,
+                                          default_session_id)
+            if name == "cancel_speaker_relabel":
+                token = (tool_input.get("token") or "").strip()
+                cancelled = bool(token) and speaker_relabel.cancel(token)
+                msg = ("Plan cancelled; nothing was changed." if cancelled
+                       else "No pending plan matched that token (already applied, "
+                            "cancelled, or expired); nothing was changed.")
+                return (msg, False, "Reassignment cancelled",
+                        {"relabel_cancelled": {"token": token, "cancelled": cancelled}})
+            return _relabel_apply_tool(tool_input, request_id)
+        except Exception as e:
+            import traceback
+            log.error("speakers", f"{name} raised: {e}")
+            traceback.print_exc()
+            return (f"{name} failed: {e}", True, "Reassignment failed", None)
+    return _execute
+
+
+def _compose_tool_executors(*executors):
+    """Try each executor in turn. Only ToolNotHandled means 'keep going'."""
+    def _execute(name: str, tool_input: dict) -> tuple:
+        for ex in executors:
+            if ex is None:
+                continue
+            try:
+                return ex(name, tool_input)
+            except ToolNotHandled:
+                continue
+        raise ToolNotHandled(name)
+    return _execute
+
+
+@app.route("/api/speakers/relabel/confirm", methods=["POST"])
+def relabel_confirm():
+    """Apply a planned relabel from the chat widget's Confirm button.
+
+    The user clicked, so this path skips the different-turn rule the model is
+    held to: the confirmation is the click itself.
+    """
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    try:
+        result = speaker_relabel.apply_plan(
+            token, current_request_id=None, confirmed_by="ui",
+            deps=_relabel_deps(),
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    log.info("speakers",
+             f'UI relabel applied: "{result["from_name"]}" to '
+             f'"{result["to_name"]}" ({result["key_count"]} label(s) in '
+             f'{result["session_count"]} meeting(s), {result["strategy"]})')
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/speakers/relabel/cancel", methods=["POST"])
+def relabel_cancel():
+    """Drop a planned relabel so its token can never be applied."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    return jsonify({"ok": True, "cancelled": speaker_relabel.cancel(token)})
+
+
+def _global_tool_executor(name: str, tool_input: dict,
+                          request_id: "str | None" = None) -> tuple:
     """Execute a global chat tool call. Returns (content, is_error, summary, extra)."""
+    if name in _RELABEL_TOOL_NAMES:
+        return _make_relabel_executor(request_id, "library")(name, tool_input)
+
     if name == "list_folders":
         folders = storage.folder_tree()
         if not folders:
@@ -6348,7 +7193,7 @@ def global_chat():
             chat_history, on_token, on_done,
             cancel=cancel_event,
             on_tool_event=on_tool_event,
-            tool_executor=_global_tool_executor,
+            tool_executor=lambda n, i, _rid=request_id: _global_tool_executor(n, i, _rid),
             provider=cp, model=cm,
         )
 
@@ -6438,6 +7283,9 @@ def update_segment_label(seg_id: int):
                 log.info("fingerprint", f"Trained from segment override: {label!r} (seg {seg_id})")
         _fp_executor.submit(_train_from_override)
 
+    seg_row = storage.get_segment(seg_id)
+    if seg_row:
+        obsidian.queue_export(seg_row["session_id"])
     return jsonify({"ok": True})
 
 
@@ -6470,39 +7318,25 @@ def create_speaker_profile(session_id: str):
     return jsonify({"ok": True, "speaker": speaker}), 201
 
 
-@app.route("/api/sessions/<session_id>/speakers", methods=["PATCH"])
-def update_speaker_label(session_id: str):
-    sess = storage.get_session(session_id)
-    if not sess:
-        return jsonify({"error": "Session not found"}), 404
+def _patch_session_speakers(
+    session_id: str,
+    speaker_keys: list,
+    name: "str | None" = None,
+    color: "str | None" = None,
+    *,
+    queue_summary: bool = True,
+) -> list:
+    """Rename and/or recolor speaker keys in one session.
 
-    data = request.get_json(silent=True) or {}
-    raw_keys = data.get("speaker_keys")
-    if raw_keys is None:
-        speaker_key = (data.get("speaker_key") or "").strip()
-        speaker_keys = [speaker_key] if speaker_key else []
-    else:
-        speaker_keys = [
-            str(k).strip() for k in raw_keys
-            if str(k).strip()
-        ]
-    if not speaker_keys:
-        return jsonify({"error": "speaker_key or speaker_keys required"}), 400
+    The whole body of PATCH /api/sessions/<id>/speakers past request
+    validation lives here: live-diarizer merge detection, SSE pushes, the
+    summary refresh, the voice-profile auto-link, and the Obsidian re-export.
+    The bulk-relabel agent calls this so a chat-driven rename is byte for
+    byte the same operation as one typed into the UI. Set queue_summary
+    False to batch the summary refresh yourself.
 
-    name = data.get("name")
-    if name is not None:
-        name = str(name).strip()
-        if not name:
-            return jsonify({"error": "name cannot be blank"}), 400
-
-    try:
-        color = _normalize_speaker_color(data.get("color"))
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-
-    if name is None and color is None:
-        return jsonify({"error": "name and/or color required"}), 400
-
+    Returns the updated speaker dicts. Inputs are assumed validated.
+    """
     updated_speakers = []
     rename_changes: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -6545,7 +7379,7 @@ def update_speaker_label(session_id: str):
         })
 
     update_context = _speaker_summary_update_context(rename_changes)
-    if update_context:
+    if update_context and queue_summary:
         _queue_speaker_summary_refresh(session_id, update_context)
 
     # ── Auto-create or link global voice profile ───────────────────────────────
@@ -6618,6 +7452,45 @@ def update_speaker_label(session_id: str):
         )
     # ── End auto-link ──────────────────────────────────────────────────────────
 
+    obsidian.queue_export(session_id)
+    _push("attention_changed", storage.attention_summary())
+    return updated_speakers
+
+
+@app.route("/api/sessions/<session_id>/speakers", methods=["PATCH"])
+def update_speaker_label(session_id: str):
+    sess = storage.get_session(session_id)
+    if not sess:
+        return jsonify({"error": "Session not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    raw_keys = data.get("speaker_keys")
+    if raw_keys is None:
+        speaker_key = (data.get("speaker_key") or "").strip()
+        speaker_keys = [speaker_key] if speaker_key else []
+    else:
+        speaker_keys = [
+            str(k).strip() for k in raw_keys
+            if str(k).strip()
+        ]
+    if not speaker_keys:
+        return jsonify({"error": "speaker_key or speaker_keys required"}), 400
+
+    name = data.get("name")
+    if name is not None:
+        name = str(name).strip()
+        if not name:
+            return jsonify({"error": "name cannot be blank"}), 400
+
+    try:
+        color = _normalize_speaker_color(data.get("color"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if name is None and color is None:
+        return jsonify({"error": "name and/or color required"}), 400
+
+    updated_speakers = _patch_session_speakers(session_id, speaker_keys, name, color)
     return jsonify({"ok": True, "speakers": updated_speakers})
 
 
@@ -7069,8 +7942,36 @@ def restore_split(session_id: str):
     })
 
 
-def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
-    """Worker: clear DB data, retranscribe the WAV, then regenerate summary."""
+def _start_reanalysis_thread(target, session_id: str, args: tuple):
+    """Start a reanalysis worker, releasing the lock flag if the start fails.
+
+    ``is_reanalyzing`` is taken before the thread exists, and it now gates
+    recording as well as the UI. A Thread.start() that raises would otherwise
+    leave the app unable to record until a restart.
+    """
+    try:
+        threading.Thread(target=target, args=args, daemon=True).start()
+        return True
+    except Exception as exc:  # noqa: BLE001 - thread creation can fail
+        log.error("reanalysis", f"Could not start the reanalysis worker: {exc}")
+        with _state_lock:
+            _state["is_reanalyzing"] = False
+        return False
+
+
+def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
+                    num_speakers: int | None = None,
+                    max_speakers: int | None = None) -> bool:
+    """Worker: clear DB data, retranscribe the WAV, then regenerate summary.
+
+    ``num_speakers`` forces the diarizer to exactly that many speakers for this
+    one meeting; ``max_speakers`` only caps it (the diarizer picks up to N). Both
+    are per-meeting overrides of the global reanalysis settings; None means auto.
+
+    Returns True when the pass completed. Callers that chain follow-up work off
+    a reanalysis need to know whether the transcript was actually rebuilt.
+    """
+    ok = False
     try:
         # Remove old session embeddings from Speaker Library and recompute centroids
         if fingerprint_db.ready:
@@ -7127,6 +8028,22 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
                 raw = live.get("delta_new", 0.5) * 0.75
                 params["reanalysis_clustering_threshold"] = max(0.35, min(0.75, raw))
 
+            # Per-meeting speaker-count override (the "dial"). Forcing an exact
+            # count takes precedence over a cap; both override the global setting.
+            if num_speakers or max_speakers:
+                # Clear any stale global "min speakers": a leftover min greater than
+                # the cap makes pyannote raise, which collapses the whole meeting to
+                # one speaker. The per-meeting dial should stand on its own.
+                params["reanalysis_min_speakers"] = 0
+            if num_speakers:
+                params["reanalysis_num_speakers"] = int(num_speakers)
+                params["reanalysis_max_speakers"] = 0
+                log.info("reanalysis", f"Forcing {int(num_speakers)} speakers for {session_id[:8]}")
+            elif max_speakers:
+                params["reanalysis_num_speakers"] = 0
+                params["reanalysis_max_speakers"] = int(max_speakers)
+                log.info("reanalysis", f"Capping at {int(max_speakers)} speakers for {session_id[:8]}")
+
             # Source-aware ("mic = Me") reanalysis. When per-source tracks exist
             # for this recording, the batch pipeline diarizes only the desktop
             # track and attributes the mic track to the Me speaker. Re-seed the
@@ -7160,14 +8077,18 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str) -> None:
             _transcriber.process_wav_file(wav_path)
 
         _push("reanalysis_done", {"session_id": session_id})
+        ok = True
     except Exception as e:
         log.error("reanalysis", f"{e}")
         import traceback; traceback.print_exc()
         _push("reanalysis_error", {"session_id": session_id, "error": str(e)})
     finally:
         with _state_lock:
-            if _state["session_id"] == session_id:
-                _state["is_reanalyzing"] = False
+            # Cleared unconditionally: only one reanalysis runs at a time, and
+            # the flag now gates recording too, so a sticky True (the session
+            # was deleted mid-pass, say) would lock recording out entirely.
+            _state["is_reanalyzing"] = False
+    return ok
 
 
 @app.route("/api/sessions/<session_id>/reanalyze", methods=["POST"])
@@ -7206,12 +8127,24 @@ def reanalyze_session(session_id: str):
     body = request.get_json(silent=True) or {}
     custom_prompt = body.get("custom_prompt", "")
 
-    threading.Thread(
-        target=_run_reanalysis,
-        args=(session_id, str(wav_path), custom_prompt),
-        daemon=True,
-    ).start()
-    return jsonify({"ok": True})
+    # Per-meeting speaker-count dial. Accept either an exact count or a cap;
+    # clamp to a sane 1-20 range and ignore anything non-numeric (falls back to
+    # auto). num_speakers wins over max_speakers if both are sent.
+    def _clamp_speakers(v):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return None
+        return max(1, min(20, n)) if n > 0 else None
+    num_speakers = _clamp_speakers(body.get("num_speakers"))
+    max_speakers = _clamp_speakers(body.get("max_speakers"))
+
+    if not _start_reanalysis_thread(
+        _run_reanalysis, session_id,
+        (session_id, str(wav_path), custom_prompt, num_speakers, max_speakers),
+    ):
+        return jsonify({"error": "Could not start the reanalysis worker"}), 500
+    return jsonify({"ok": True, "num_speakers": num_speakers, "max_speakers": max_speakers})
 
 
 @app.route("/api/sessions/upload", methods=["POST"])
@@ -7223,6 +8156,13 @@ def upload_session():
     if not f.filename:
         return jsonify({"error": "Empty filename"}), 400
 
+    # Optional real meeting timestamps (ISO 8601) for imported recordings.
+    # An uploaded file is a finalized recording, not a live capture, so the
+    # caller (e.g. the Read AI phone-recording import) can supply the true
+    # meeting time. Without it the export is dated to the upload moment.
+    up_started = (request.form.get("started_at") or "").strip()
+    up_ended = (request.form.get("ended_at") or "").strip()
+
     with _state_lock:
         if _state["is_recording"]:
             return jsonify({"error": "Cannot upload while recording"}), 400
@@ -7231,6 +8171,19 @@ def upload_session():
 
     # Create session
     session_id = storage.create_session()
+
+    # Uploaded files are finalized recordings: stamp the real meeting time when
+    # provided, and ALWAYS set ended_at. export_session() bails on any row with
+    # ended_at IS NULL, so without finalizing here an imported recording could
+    # never reach the Obsidian export even once its speakers are named.
+    if up_started or up_ended:
+        storage.update_session_times(
+            session_id,
+            started_at=up_started or None,
+            ended_at=up_ended or None,
+        )
+    if not up_ended:
+        storage.end_session(session_id)
     audio_dir = paths.audio_dir()
     audio_dir.mkdir(parents=True, exist_ok=True)
     wav_path = audio_dir / f"{session_id}.wav"
@@ -7275,21 +8228,40 @@ def upload_session():
         storage.delete_session(session_id)
         return jsonify({"error": str(exc)}), 500
 
-    # Set up state and launch reanalysis (same as normal reanalysis)
+    # Set up state and launch reanalysis (same as normal reanalysis).
+    # The check at the top of this route is minutes old by now (ffmpeg ran in
+    # between), so the flags are re-checked and taken in one locked step: a
+    # Reanalyze or Smart cleanup started meanwhile must not be joined by a
+    # second pass writing into the same state.
+    refusal = ""
     with _state_lock:
-        _state["session_id"] = session_id
-        _state["is_reanalyzing"] = True
-        _state["segments"] = []
-        _state["pending_segments"] = 0
-        _state["summarized_seg_count"] = 0
-        _state["pending_chapter_segments"] = 0
-        _state["speaker_labels"] = {}
+        if _state["is_recording"]:
+            refusal = "Cannot upload while recording"
+        elif _state.get("is_reanalyzing"):
+            refusal = "Reanalysis already in progress"
+        else:
+            _state["session_id"] = session_id
+            _state["is_reanalyzing"] = True
+            _state["segments"] = []
+            _state["pending_segments"] = 0
+            _state["summarized_seg_count"] = 0
+            _state["pending_chapter_segments"] = 0
+            _state["speaker_labels"] = {}
 
-    threading.Thread(
-        target=_run_reanalysis,
-        args=(session_id, str(wav_path), ""),
-        daemon=True,
-    ).start()
+    if refusal:
+        # Roll the upload back rather than leaving a session with audio nobody
+        # will ever transcribe.
+        storage.delete_session(session_id)
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
+        return jsonify({"error": refusal}), 400
+
+    if not _start_reanalysis_thread(
+        _run_reanalysis, session_id, (session_id, str(wav_path), "")
+    ):
+        return jsonify({"error": "Could not start the reanalysis worker"}), 500
     return jsonify({"ok": True, "session_id": session_id}), 201
 
 
@@ -8038,18 +9010,18 @@ def set_session_me_name(session_id: str):
     return jsonify({"ok": True, "name": name, "color": color})
 
 
-@app.route("/api/fingerprint/speakers/<global_id>/merge", methods=["POST"])
-def fp_merge_speaker(global_id: str):
-    if not fingerprint_db.ready:
-        return _fp_unavailable()
-    data = request.get_json(silent=True) or {}
-    source_id = (data.get("source_id") or "").strip()
-    if not source_id:
-        return jsonify({"error": "source_id is required"}), 400
-    resolved = fingerprint_db.merge_global_speakers(keep_id=global_id, merge_id=source_id)
+def _apply_profile_merge(keep_id: str, merge_id: str) -> dict:
+    """Merge one voice profile into another and refresh every linked label.
+
+    The body of POST /api/fingerprint/speakers/<id>/merge: the embedding move
+    and centroid recompute, then the live state update and speaker_label SSE
+    push for every session the kept profile now covers. Shared with the
+    bulk-relabel agent.
+    """
+    resolved = fingerprint_db.merge_global_speakers(keep_id=keep_id, merge_id=merge_id)
     # Push SSE updates to all linked sessions (including newly merged ones)
     if resolved:
-        for label in fingerprint_db.get_linked_labels(global_id):
+        for label in fingerprint_db.get_linked_labels(keep_id):
             sid = label["session_id"]
             with _state_lock:
                 if _state.get("session_id") == sid:
@@ -8058,6 +9030,18 @@ def fp_merge_speaker(global_id: str):
                 "session_id": sid, "speaker_key": label["speaker_key"],
                 "name": resolved["name"], "color": resolved["color"],
             })
+    return resolved or {}
+
+
+@app.route("/api/fingerprint/speakers/<global_id>/merge", methods=["POST"])
+def fp_merge_speaker(global_id: str):
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    source_id = (data.get("source_id") or "").strip()
+    if not source_id:
+        return jsonify({"error": "source_id is required"}), 400
+    _apply_profile_merge(global_id, source_id)
     return jsonify({"ok": True})
 
 
@@ -8115,6 +9099,262 @@ def fp_library_health():
         "last_run": settings.get("library_maintenance_last_run", "") or None,
     }
     return jsonify(report)
+
+
+def _resolution_candidates_path(session_id: str):
+    return paths.data_dir() / "resolution_candidates" / f"{session_id}.json"
+
+
+@app.route("/api/sessions/<session_id>/resolution_candidates", methods=["GET"])
+def get_resolution_candidates(session_id: str):
+    candidate_path = _resolution_candidates_path(session_id)
+    empty = {
+        "meeting": {},
+        "candidates": [],
+        "speaker_hints": [],
+        "generated_at": None,
+    }
+    if not candidate_path.exists():
+        return jsonify(empty)
+    # The calendar refresh rewrites this file from a background thread, so a
+    # reader can meet a file mid-replace or left broken by an older crash.
+    # Answering with the empty shape keeps the Cleanup tab working.
+    try:
+        with candidate_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        log.warn("calendar", f"Unreadable resolution candidates for "
+                             f"{session_id[:8]}: {exc}")
+        return jsonify(empty)
+    return jsonify(payload if isinstance(payload, dict) else empty)
+
+
+@app.route("/api/sessions/<session_id>/resolution_candidates", methods=["POST"])
+def save_resolution_candidates(session_id: str):
+    data = request.get_json(silent=True) or {}
+    candidate_path = _resolution_candidates_path(session_id)
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    with candidate_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    return jsonify({"ok": True})
+
+
+# ── Calendar (published Outlook ICS feed) ────────────────────────────────────
+# The owner cannot give the app Graph access, so he publishes his calendar and
+# pastes the ICS link into Settings > Calendar. Matching, expected counts and
+# attendee candidates all flow from that feed. The logic lives in
+# core/calendar_sync.py; these routes are a thin shell around it.
+
+def _calendar_active_session_id():
+    """The session being recorded right now, which matching must leave alone."""
+    with _state_lock:
+        return _state["session_id"] if _state["is_recording"] else None
+
+
+def _calendar_resolve_url(candidate: str) -> str:
+    """Use the typed link, or the stored one when the UI sent back the mask."""
+    stored = settings.get("calendar_ics_url", "") or ""
+    value = (candidate or "").strip()
+    if not value or (stored and value == calendar_feed.mask_url(stored)):
+        return stored
+    return value
+
+
+@app.route("/api/calendar/status", methods=["GET"])
+def calendar_status():
+    """Feed state for the Calendar settings tab. The URL is always masked."""
+    return jsonify(calendar_sync.status())
+
+
+@app.route("/api/calendar/refresh", methods=["POST"])
+def calendar_refresh():
+    """Re-read the feed and re-match every recording. Fast enough to be sync."""
+    summary = calendar_sync.refresh(
+        force=True, active_session_id=_calendar_active_session_id()
+    )
+    _push("calendar_refresh_done", summary)
+    return jsonify(summary)
+
+
+@app.route("/api/calendar/link", methods=["POST"])
+def calendar_set_link():
+    """The only writer of calendar_ics_url. Body: {url} or {clear: true}.
+
+    Kept off the generic preferences route: that one round-trips a masked copy
+    of every setting from any open tab, so a stale tab could blank or overwrite
+    the credential simply by saving an unrelated preference.
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get("clear"):
+        return jsonify(calendar_sync.clear_link())
+    result = calendar_sync.set_link(data.get("url"))
+    return jsonify(result) if result.get("ok") else (jsonify(result), 400)
+
+
+@app.route("/api/calendar/test", methods=["POST"])
+def calendar_test():
+    """Fetch and parse a candidate link without saving or matching anything."""
+    data = request.get_json(silent=True) or {}
+    url = _calendar_resolve_url(data.get("url"))
+    if not url:
+        return jsonify({"ok": False, "error": "Paste the ICS link first."})
+    return jsonify(calendar_sync.test_link(url))
+
+
+@app.route("/api/sessions/<session_id>/calendar_match", methods=["GET"])
+def get_session_calendar_match(session_id: str):
+    """The stored calendar match for one recording, plus its alternatives."""
+    if not storage.get_session_times(session_id):
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(calendar_sync.get_match(session_id))
+
+
+@app.route("/api/sessions/<session_id>/calendar_match", methods=["PUT"])
+def put_session_calendar_match(session_id: str):
+    """Confirm or override the match: {uid, recurrence_id} or {clear: true}."""
+    data = request.get_json(silent=True) or {}
+    if data.get("clear"):
+        result = calendar_sync.clear_match(session_id)
+    else:
+        uid = (data.get("uid") or "").strip()
+        if not uid:
+            return jsonify({"error": "uid required"}), 400
+        result = calendar_sync.confirm_match(session_id, uid, data.get("recurrence_id"))
+    if not result.get("ok"):
+        # A vanished event is a conflict with the feed, not a missing route.
+        status = 404 if result.get("reason") == "no_session" else 409
+        return jsonify(result), status
+    _push("calendar_match_changed", {
+        "session_id": session_id,
+        "confirmed": bool(result.get("match")),
+    })
+    return jsonify(result)
+
+
+def _smart_cleanup_worker(session_id: str, wav_path: str, max_speakers, plan: dict) -> None:
+    """Run the reanalysis, then re-merge calendar candidates once it finishes.
+
+    This is the one-shot follow-up on reanalysis_done for this session: the
+    reanalysis runs inline here, so the merge cannot race it. Speaker names are
+    never written from the attendee list; whatever names appear come from the
+    Voice Library auto-match the reanalysis pipeline performs on its own.
+    """
+    ok = False
+    try:
+        ok = bool(_run_reanalysis(session_id, wav_path, "", None, max_speakers))
+    finally:
+        merged = False
+        try:
+            merged = calendar_sync.remerge_candidates(session_id)
+        except Exception as exc:
+            log.warn("calendar", f"Smart cleanup follow-up failed: {exc}")
+        try:
+            attention = storage.get_session_attention(session_id)
+        except Exception:
+            attention = None
+        _push("smart_cleanup_done", {
+            "session_id": session_id,
+            "ok": ok,
+            "error": "" if ok else "The reanalysis failed; the transcript was not rebuilt.",
+            "action": plan.get("action"),
+            "expected": plan.get("expected"),
+            "found_before": plan.get("found"),
+            "max_speakers": max_speakers,
+            "candidates_merged": merged,
+            "attention": attention,
+        })
+
+
+@app.route("/api/sessions/<session_id>/smart_cleanup", methods=["POST"])
+def smart_cleanup(session_id: str):
+    """Plan (or, with apply=true, run) a calendar-guided cleanup.
+
+    The plan is read-only. Applying starts the existing reanalysis with the
+    calendar's attendee count as a ceiling (max_speakers), never as a forced
+    exact count, and never assigns names from the attendee list.
+    """
+    data = request.get_json(silent=True) or {}
+    plan = calendar_sync.build_plan(session_id)
+    if plan.get("error"):
+        return jsonify(plan), 404
+    if not data.get("apply"):
+        return jsonify({"applied": False, "plan": plan})
+
+    if plan.get("action") != "reanalyze":
+        return jsonify({"applied": False, "plan": plan, "reason": plan.get("detail", "")})
+
+    wav_path = paths.audio_dir() / f"{session_id}.wav"
+    if not wav_path.exists():
+        return jsonify({"error": "No audio recording for this session"}), 404
+
+    with _state_lock:
+        if _state["is_recording"]:
+            return jsonify({"error": "Cannot reanalyze while recording"}), 400
+        if _state.get("is_reanalyzing"):
+            return jsonify({"error": "Reanalysis already in progress"}), 400
+        # Same readiness gate the Reanalyze button uses. Without it the
+        # transcript is wiped and nothing can rebuild it.
+        try:
+            from ml.batch_transcriber import BatchTranscriber  # noqa: F401
+            _batch_available = True
+        except ImportError:
+            _batch_available = False
+        if not _batch_available and not _state["model_ready"]:
+            return jsonify({"error": "Transcription model not loaded yet"}), 503
+        if not storage.get_session_times(session_id):
+            return jsonify({"error": "Session not found"}), 404
+        # The same state hand-off the Reanalyze button performs, so _on_segment
+        # callbacks land on this session.
+        _state["session_id"] = session_id
+        _state["is_reanalyzing"] = True
+        _state["segments"] = []
+        _state["pending_segments"] = 0
+        _state["summarized_seg_count"] = 0
+        _state["pending_chapter_segments"] = 0
+        _state["speaker_labels"] = {}
+
+    max_speakers = plan.get("max_speakers")
+    try:
+        max_speakers = max(1, min(20, int(max_speakers))) if max_speakers else None
+    except (TypeError, ValueError):
+        max_speakers = None
+
+    if not _start_reanalysis_thread(
+        _smart_cleanup_worker, session_id,
+        (session_id, str(wav_path), max_speakers, plan),
+    ):
+        return jsonify({"error": "Could not start the reanalysis worker"}), 500
+    return jsonify({"applied": True, "plan": plan, "max_speakers": max_speakers})
+
+
+def _calendar_refresh_loop() -> None:
+    """Background scheduler: re-read the feed every calendar_refresh_minutes.
+
+    Startup is left alone for two minutes, a live recording defers the run, and
+    the published feed itself can lag up to 24 hours, so there is nothing to
+    gain from polling faster than the configured interval.
+    """
+    time.sleep(120)
+    while True:
+        try:
+            if (bool(settings.get("calendar_enabled"))
+                    and (settings.get("calendar_ics_url", "") or "").strip()):
+                with _state_lock:
+                    recording = _state["is_recording"]
+                if not recording and calendar_sync.refresh_due():
+                    summary = calendar_sync.refresh(
+                        active_session_id=_calendar_active_session_id()
+                    )
+                    _push("calendar_refresh_done", summary)
+        except Exception:
+            import traceback
+            log.warn("calendar", "Scheduled calendar refresh failed:")
+            traceback.print_exc()
+        time.sleep(300)
+
+
+threading.Thread(target=_calendar_refresh_loop, daemon=True).start()
 
 
 @app.route("/api/fingerprint/library/maintenance", methods=["POST"])
@@ -8246,28 +9486,14 @@ def _train_from_bulk_link(global_id: str, affected: list[dict], profile_name: st
                  f"Bulk-link training: added {added_total} embeddings for {profile_name!r}")
 
 
-@app.route("/api/fingerprint/bulk-link", methods=["POST"])
-def fp_bulk_link():
-    """Link all unlinked speaker_labels matching a name to a global profile."""
-    if not fingerprint_db.ready:
-        return _fp_unavailable()
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    global_id = (data.get("global_id") or "").strip()
-    create_new = data.get("create_new", False)
+def _apply_bulk_link(name: str, global_id: str) -> dict:
+    """Point every speaker label carrying ``name`` at one voice profile.
 
-    if not name:
-        return jsonify({"error": "name is required"}), 400
-    if not global_id and not create_new:
-        return jsonify({"error": "global_id or create_new is required"}), 400
-
-    if create_new:
-        existing = fingerprint_db.find_by_name(name)
-        if existing:
-            global_id = existing["id"]
-        else:
-            global_id = fingerprint_db.create_global_speaker(name)
-
+    The body of POST /api/fingerprint/bulk-link past profile resolution:
+    the SQL repoint, the speaker_label / speaker_linked SSE pushes, the live
+    state update for the recording session, and the background training pass.
+    Shared with the bulk-relabel agent so both paths behave identically.
+    """
     affected = fingerprint_db.bulk_link_by_name(name, global_id)
     profile = fingerprint_db.get_global_speaker(global_id)
 
@@ -8290,7 +9516,34 @@ def fp_bulk_link():
     if affected:
         _fp_executor.submit(_train_from_bulk_link, global_id, affected, profile["name"])
 
-    return jsonify({"ok": True, "linked_count": len(affected), "global_id": global_id})
+    return {"linked_count": len(affected), "global_id": global_id, "affected": affected}
+
+
+@app.route("/api/fingerprint/bulk-link", methods=["POST"])
+def fp_bulk_link():
+    """Link all unlinked speaker_labels matching a name to a global profile."""
+    if not fingerprint_db.ready:
+        return _fp_unavailable()
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    global_id = (data.get("global_id") or "").strip()
+    create_new = data.get("create_new", False)
+
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    if not global_id and not create_new:
+        return jsonify({"error": "global_id or create_new is required"}), 400
+
+    if create_new:
+        existing = fingerprint_db.find_by_name(name)
+        if existing:
+            global_id = existing["id"]
+        else:
+            global_id = fingerprint_db.create_global_speaker(name)
+
+    result = _apply_bulk_link(name, global_id)
+    return jsonify({"ok": True, "linked_count": result["linked_count"],
+                    "global_id": result["global_id"]})
 
 
 @app.route("/api/fingerprint/bulk-link-all", methods=["POST"])
@@ -8582,6 +9835,10 @@ def _force_quit(delay: float = 0) -> None:
         except Exception:
             pass
         _tray = None
+    try:
+        heartbeat.clear()  # signal a CLEAN quit so the watchdog does not relaunch
+    except Exception:
+        pass
     os._exit(0)
 
 
@@ -8617,12 +9874,24 @@ def _relaunch_app() -> None:
     try:
         root = Path(__file__).parent
         if sys.platform == "win32":
+            # Prefer the silent tray-only launcher (no console window, no
+            # taskbar button), matching the Startup path the user relies on.
+            # launch_hidden.vbs -> launch.bat -> launch.py respawns the external
+            # freeze watchdog and the app. Falling back to the Start Menu
+            # shortcut / launch.bat only if the VBS is missing.
+            vbs = root / "launch_hidden.vbs"
             lnk_path = (
                 Path(os.environ.get("APPDATA", ""))
                 / "Microsoft" / "Windows" / "Start Menu" / "Programs"
                 / "Meeting Assistant.lnk"
             )
-            if lnk_path.exists():
+            if vbs.exists():
+                subprocess.Popen(
+                    ["wscript.exe", str(vbs)],
+                    cwd=str(root),
+                    creationflags=subprocess.DETACHED_PROCESS,
+                )
+            elif lnk_path.exists():
                 os.startfile(str(lnk_path))
             else:
                 bat = root / "launch.bat"
@@ -8785,9 +10054,13 @@ def _build_changelog(root: Path) -> dict:
     skip_substrings = (
         "co-authored-by:",
         "co-author-by:",
+        "claude-session:",
         "🤖 generated with",
         "generated with [claude",
     )
+    # Orchestration trailers ("Batch: ma-b4  Seat: codex-work") are bookkeeping,
+    # not release notes; they only ever appear at the start of a line.
+    skip_prefixes = ("batch:",)
     for raw in log.stdout.split(SEP):
         raw = raw.strip()
         if not raw:
@@ -8802,10 +10075,31 @@ def _build_changelog(root: Path) -> dict:
             continue
         body_lines = []
         for line in body.splitlines():
-            if any(s in line.lower() for s in skip_substrings):
+            lowered = line.strip().lower()
+            if any(s in lowered for s in skip_substrings):
+                continue
+            if lowered.startswith(skip_prefixes):
                 continue
             body_lines.append(line)
-        body_clean = "\n".join(body_lines).strip()
+        # Commit bodies wrap prose at 72 columns. Fold each wrapped paragraph
+        # back into one line (bullets and their indented continuations keep
+        # their own lines) so the What's new overlay shows sentences, not
+        # fragments.
+        folded: list = []
+        for line in body_lines:
+            stripped = line.rstrip()
+            if not stripped.strip():
+                folded.append("")
+                continue
+            is_bullet = bool(re.match(r"^\s*[-*•]\s+", stripped))
+            is_indented = stripped[:1].isspace()
+            prev = folded[-1] if folded else ""
+            prev_is_bullet = bool(re.match(r"^\s*[-*•]\s+", prev))
+            if folded and prev and not is_bullet and not is_indented and not prev_is_bullet:
+                folded[-1] = prev + " " + stripped.strip()
+            else:
+                folded.append(stripped)
+        body_clean = "\n".join(folded).strip()
         commits.append({
             "hash":     h,
             "short":    sh,
@@ -9088,6 +10382,8 @@ def _agent_changelog(limit: int) -> list:
     return (payload.get("commits") or [])[:limit]
 
 
+app.register_blueprint(dashboard_api.bp)
+app.register_blueprint(calendar_events_api.bp)
 register_agent_api(app, AgentContext(
     status_payload=_status_payload,
     live_extras=_agent_live_extras,
@@ -9191,6 +10487,7 @@ def main() -> None:
     if config.needs_setup(_active_provider):
         log.warn("app", "First-run setup required - browser will open to configure API keys.")
     log.info("app", f"Meeting Assistant starting at {url}")
+    _sync_shortcut_icon_async()
 
     # Start Flask in a daemon thread so the main thread is free for the tray
     flask_thread = threading.Thread(
@@ -9252,8 +10549,8 @@ def main() -> None:
 
     # Open browser - go to settings page if keys are missing
     if config.needs_setup(_active_provider):
-        webbrowser.open(f"{url}?settings=1")
-    #else: webbrowser.open(url)
+        browser.open_app_window(f"{url}?settings=1")
+    #else: browser.open_app_window(url)
 
     # Register SIGINT after Flask starts (werkzeug would override an earlier handler).
     # This ensures Ctrl+C in the console immediately stops recording and exits.
@@ -9271,7 +10568,7 @@ def main() -> None:
         except Exception as e:
             log.warn("tray", f"System tray unavailable in this launch context: {e}")
             _tray = None
-            webbrowser.open(url)  # no tray means no UI entry point; give one
+            browser.open_app_window(url)  # no tray means no UI entry point; give one
             _keepalive_loop()
         else:
             # run() returned: the user quit from the menu, or the loop ended.

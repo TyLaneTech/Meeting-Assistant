@@ -11,6 +11,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Under the tray launcher (launch_hidden.vbs) stdout is a file in the console
+# code page, which cannot encode the arrows in a few progress lines; a
+# UnicodeEncodeError there would abort the launch. Replace, never raise.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # ── ANSI colour setup ─────────────────────────────────────────────────────────
 
 def _enable_ansi():
@@ -231,6 +241,22 @@ def _warn_if_cloud_storage_path():
     _warn("Recommended: move this folder to a local path, e.g. ~/meeting-assistant")
 
 
+def _other_launch_bat(arguments: str, ours: Path) -> Path | None:
+    """The launch.bat a shortcut runs when it is a DIFFERENT, still-present
+    checkout than *ours*; None when it is ours, gone, or unreadable."""
+    m = re.search(r'([A-Za-z]:\\[^"]*?launch\.bat)', arguments or "", re.IGNORECASE)
+    if not m:
+        return None
+    other = Path(m.group(1))
+    try:
+        if other.resolve() == ours.resolve():
+            return None
+    except Exception:
+        if str(other).lower() == str(ours).lower():
+            return None
+    return other if other.exists() else None
+
+
 def _create_start_menu_shortcut():
     """
     Ensures a Start Menu shortcut exists and points to the current launch.bat
@@ -247,6 +273,14 @@ def _create_start_menu_shortcut():
     root       = Path(__file__).parent
     bat_path   = root / "launch.bat"
     icon_path  = root / "ui_web" / "static" / "images" / "logo.ico"
+    # The active icon set (Settings > Icons) supplies the shortcut's icon; the
+    # default set is the bundled logo.ico above, so a first run never needs
+    # more than the standard library here.
+    try:
+        from core import icons as _icons
+        icon_path = Path(_icons.shortcut_icon_path())
+    except Exception:
+        pass
     start_menu = (
         Path(os.environ.get("APPDATA", ""))
         / "Microsoft" / "Windows" / "Start Menu" / "Programs"
@@ -286,6 +320,16 @@ def _create_start_menu_shortcut():
                     cur_target, cur_args, cur_wd, cur_icon = parts[:4]
                     cur_icon_file = cur_icon.split(",", 1)[0].strip() if cur_icon else ""
                     target_ok = "cmd.exe" in cur_target.lower()
+                    # Another checkout owns this shortcut (a second clone, a git
+                    # worktree, a colleague's fork run from the same account):
+                    # leave it alone while that checkout's launch.bat still
+                    # exists. A sandbox launch must not re-point the user's
+                    # Start Menu entry at itself (2026-09-05). A moved or
+                    # deleted install still hands the entry over.
+                    other = _other_launch_bat(cur_args, bat_path)
+                    if other is not None:
+                        print(f"{GRY}   Start Menu shortcut belongs to {other.parent}; left unchanged{R}")
+                        return
                     args_ok   = str(bat_path) in cur_args
                     wd_ok     = _norm(cur_wd) == _norm(str(root))
                     if icon_path.exists():
@@ -994,6 +1038,28 @@ def _reexec_native_arm64():
         pass                         # best effort: fall through if arch is missing
 
 
+class _WatchdogDisabled(Exception):
+    """Raised inside the watchdog start block when the preference is off."""
+
+
+def _freeze_watchdog_enabled() -> bool:
+    """Read freeze_watchdog_enabled straight from settings.json.
+
+    Deliberately avoids importing core.settings (and its DEFAULTS) here: the
+    launcher should not pull app modules in just to read one flag. The default
+    is off, matching core/settings.py.
+    """
+    try:
+        import json as _json
+        from core import paths as _paths   # no project-internal imports of its own
+        cfg = _paths.data_dir() / "settings.json"
+        if not cfg.exists():
+            return False
+        return bool(_json.loads(cfg.read_text(encoding="utf-8")).get("freeze_watchdog_enabled", False))
+    except Exception:
+        return False
+
+
 def main():
     global UV
 
@@ -1247,10 +1313,37 @@ def main():
     child_env["HF_HUB_OFFLINE"] = "1"
     child_env["TRANSFORMERS_OFFLINE"] = "1"
 
+    # Start the external freeze watchdog (watchdog.py) in a separate, hidden
+    # process before launching the app. It survives a whole-process app freeze
+    # (which the in-process code cannot catch) and restarts the app. It is a
+    # singleton, so a watchdog-driven relaunch that re-enters this path will not
+    # stack watchdogs. Opt-in via Settings > System; never let a watchdog
+    # problem block the app launch.
+    try:
+        if not _freeze_watchdog_enabled():
+            raise _WatchdogDisabled()
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "watchdog.py")],
+            cwd=str(Path(__file__).parent), env=child_env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except _WatchdogDisabled:
+        pass
+    except Exception as e:
+        print(f"{GRY}   (freeze watchdog not started: {e}){R}")
+
     result = subprocess.run(
         [sys.executable, "-u", "-X", "faulthandler", "app.py"],
         stderr=subprocess.PIPE, text=True, env=child_env,
     )
+    # Always leave a trace of how the app ended. Under the hidden launcher this
+    # log is the only record, and a quiet exit code 0 with nothing else written
+    # is otherwise indistinguishable from a launcher that never ran the app.
+    print(f"{GRY}   Meeting Assistant exited (code {result.returncode}).{R}")
+    if result.returncode == 0 and result.stderr and result.stderr.strip():
+        for line in result.stderr.strip().splitlines()[-12:]:
+            print(f"  {GRY}{line}{R}")
     if result.returncode != 0:
         print()
         _err(f"Meeting Assistant exited with an error (code {result.returncode}).")
@@ -1273,7 +1366,18 @@ def main():
             print(f"  {RED}No error output captured. The process may have crashed in native code.{R}")
             print(f"  {RED}Exit code: {result.returncode}{R}")
         print()
-        input("Press Enter to exit...")
+        # Only wait for a keypress when there's an interactive console. Under the
+        # hidden tray launcher (launch_hidden.vbs) stdin is not a tty, so this
+        # would block invisibly forever; the watchdog kills the app on a freeze,
+        # and a blocking input() here would leave a stuck hidden process behind
+        # on every recovery. Exit cleanly instead so the watchdog's relaunch is
+        # tidy.
+        try:
+            interactive = bool(sys.stdin and sys.stdin.isatty())
+        except Exception:
+            interactive = False
+        if interactive:
+            input("Press Enter to exit...")
 
 
 if __name__ == "__main__":

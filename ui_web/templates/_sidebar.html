@@ -1,41 +1,170 @@
-{# Shared sidebar markup for home + session pages.
-   Behavior is driven entirely by app.js; markup must stay in lockstep. #}
+{# The one navigation. The sidebar owns where you are; the header owns what you
+   can do here (context/ui-overhaul-2026-09.md section 3.3).
+
+   Ids in here are load-bearing for app.js and must not be renamed:
+     #sidebar #sidebar-resize-handle #session-list #sidebar-search-input
+     #sidebar-filter-btn #sidebar-filter-popover #sidebar-bulk-*
+     #attention-control #attention-count #upload-audio-btn #upload-audio-input
+     #status-pill #status-dot #status-text #recording-duration
+     #model-config #audio-viz-pane #screen-capture-section
+     #pane-body-* #pane-arrow-* #viz-* #brand-viz-canvas #}
   <aside class="sidebar" id="sidebar">
-    <div class="sidebar-header">
-      <div class="sidebar-header-pinned">
-        <button class="icon-btn new-session-btn" onclick="newSession()" title="New session"><i class="fa-solid fa-plus"></i></button>
-        <button class="icon-btn sidebar-toggle-btn" id="sidebar-close-btn" onclick="toggleSidebar()" title="Collapse sidebar"><i class="fa-solid fa-bars"></i></button>
+
+    <div class="sidebar-brand">
+      <span class="brand-icon-wrap" id="brand-icon-wrap">
+        <canvas id="brand-viz-canvas" class="brand-viz-canvas"></canvas>
+        <img id="brand-icon" class="brand-icon" src="/api/icons/app_idle" alt="">
+      </span>
+      <span class="brand-name">Meeting Assistant</span>
+      {# applySidebarNavPrefs() moves the nav links in here when the navigation
+         is folded (sidebar_nav_compact). Empty and hidden otherwise. #}
+      <div class="brand-nav" id="brand-nav"></div>
+      <button type="button" class="icon-btn nav-edit-btn" id="nav-edit-btn"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="nav-edit-menu"
+              onclick="_toggleMenu('nav-edit-menu', this)"
+              title="Choose which pages show here" aria-label="Choose which pages show here">
+        <i class="fa-solid fa-pen"></i>
+      </button>
+    </div>
+
+    {# The page picker. Checkable items stay open while you tick, like the
+       header's Layout menu; applySidebarNavPrefs() keeps aria-checked true. #}
+    <div class="menu hidden" id="nav-edit-menu" role="menu" aria-labelledby="nav-edit-btn">
+      <button type="button" class="menu-item" role="menuitemcheckbox" aria-checked="true"
+              id="nav-edit-home" onclick="toggleNavItem('home')">
+        <i class="fa-solid fa-check menu-item-check" aria-hidden="true"></i>
+        <span class="menu-item-label">Home</span>
+      </button>
+      <button type="button" class="menu-item" role="menuitemcheckbox" aria-checked="true"
+              id="nav-edit-calendar" onclick="toggleNavItem('calendar')">
+        <i class="fa-solid fa-check menu-item-check" aria-hidden="true"></i>
+        <span class="menu-item-label">Calendar</span>
+      </button>
+      <button type="button" class="menu-item" role="menuitemcheckbox" aria-checked="false"
+              id="nav-edit-attention" onclick="toggleNavItem('attention')">
+        <i class="fa-solid fa-check menu-item-check" aria-hidden="true"></i>
+        <span class="menu-item-label">Needs attention</span>
+      </button>
+      <button type="button" class="menu-item" role="menuitemcheckbox" aria-checked="true"
+              id="nav-edit-speakers" onclick="toggleNavItem('speakers')">
+        <i class="fa-solid fa-check menu-item-check" aria-hidden="true"></i>
+        <span class="menu-item-label">Speakers</span>
+      </button>
+    </div>
+
+    <nav class="sidebar-nav" aria-label="Primary">
+      <a class="nav-row" data-nav href="/" id="nav-home" data-nav-key="home">
+        <i class="fa-solid fa-house nav-icon" aria-hidden="true"></i>
+        <span class="nav-label">Home</span>
+      </a>
+      <a class="nav-row" data-nav href="/calendar" id="nav-calendar" data-nav-key="calendar">
+        <i class="fa-solid fa-calendar-days nav-icon" aria-hidden="true"></i>
+        <span class="nav-label">Calendar</span>
+      </a>
+      {# #attention-control keeps its id (app.js binds it) but it navigates now:
+         the recordings filter popover owns the Needs attention criterion. #}
+      <a class="nav-row" data-nav href="/attention" id="attention-control" data-nav-key="attention">
+        <i class="fa-solid fa-circle-exclamation nav-icon" aria-hidden="true"></i>
+        <span class="nav-label">Needs attention</span>
+        <span class="attention-count hidden" id="attention-count">0</span>
+      </a>
+      <a class="nav-row" data-nav href="/speakers" id="nav-speakers" data-nav-key="speakers">
+        <i class="fa-solid fa-user-group nav-icon" aria-hidden="true"></i>
+        <span class="nav-label">Speakers</span>
+      </a>
+    </nav>
+
+    {# The border under the pages is the fold control: click it to fold the
+       pages into the header (they become icons beside the app name), click it
+       again to bring them back. Hidden on the icon rail, which always shows
+       the pages. #}
+    <button type="button" class="nav-fold-handle" id="nav-fold-handle" onclick="toggleNavCompact()"
+            title="Fold the navigation into the header" aria-label="Fold the navigation into the header"
+            aria-expanded="true">
+      <i class="nav-fold-glyph fa-solid fa-chevron-up" aria-hidden="true"></i>
+    </button>
+
+    <div class="sidebar-recordings">
+      <div class="recordings-head">
+        <h2 class="recordings-title">Recordings</h2>
+        <span class="recordings-count" id="recordings-count"></span>
+        <button type="button" class="icon-btn recordings-menu-btn" id="recordings-menu-btn"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="recordings-menu"
+                onclick="_toggleMenu('recordings-menu', this)"
+                title="Recording actions" aria-label="Recording actions">
+          <i class="fa-solid fa-ellipsis"></i>
+        </button>
       </div>
-      <div class="sidebar-header-row">
-        <span class="sidebar-title">Sessions</span>
-        <div class="sidebar-header-tools">
-          <button class="icon-btn folder-btn" onclick="createFolder()" title="New folder"><i class="fa-solid fa-folder-plus"></i></button>
-          <button class="icon-btn fingerprint-btn" onclick="openFingerprintPanel()" title="Voice Library"><i class="fa-solid fa-waveform-lines"></i></button>
-          <button class="icon-btn multiselect-btn" id="sidebar-multiselect-btn" onclick="toggleMultiselect()" title="Multiselect sessions"><i class="fa-solid fa-list-check"></i></button>
+
+      <div class="menu hidden" id="recordings-menu" role="menu" aria-labelledby="recordings-menu-btn">
+        <button type="button" class="menu-item" role="menuitem" onclick="newSession()">
+          <i class="fa-solid fa-plus" aria-hidden="true"></i>
+          <span class="menu-item-label">New workspace</span>
+          <kbd class="menu-item-key">Ctrl+N</kbd>
+        </button>
+        <button type="button" class="menu-item" role="menuitem" onclick="createFolder()">
+          <i class="fa-solid fa-folder-plus" aria-hidden="true"></i>
+          <span class="menu-item-label">New folder</span>
+        </button>
+        <button type="button" class="menu-item" role="menuitem" id="sidebar-multiselect-btn"
+                onclick="toggleMultiselect()">
+          <i class="fa-solid fa-list-check" aria-hidden="true"></i>
+          <span class="menu-item-label">Select recordings</span>
+        </button>
+        <hr class="menu-rule">
+        <button type="button" class="menu-item" role="menuitem" id="upload-audio-btn"
+                onclick="document.getElementById('upload-audio-input').click()">
+          <i class="fa-solid fa-upload" aria-hidden="true"></i>
+          <span class="menu-item-label">Import audio or video</span>
+        </button>
+        <input type="file" id="upload-audio-input" accept="audio/*,video/*"
+               class="visually-hidden-input" onchange="handleAudioUpload(this)">
+        <button type="button" class="menu-item" role="menuitem" onclick="openImportPicker()">
+          <i class="fa-solid fa-file-import" aria-hidden="true"></i>
+          <span class="menu-item-label">Import meeting package</span>
+        </button>
+      </div>
+
+      <div class="sidebar-bulk-bar hidden" id="sidebar-bulk-bar">
+        <span class="sidebar-bulk-count" id="sidebar-bulk-count">0 selected</span>
+        <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI"><i class="fa-solid fa-arrows-rotate"></i> Titles</button>
+        <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()"><i class="fa-solid fa-trash"></i> Delete</button>
+        <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+
+      <div class="sidebar-search" id="sidebar-search">
+        <label class="visually-hidden" for="sidebar-search-input">Filter recordings</label>
+        <div class="sidebar-search-wrap">
+          <i class="fa-solid fa-magnifying-glass sidebar-search-icon" aria-hidden="true"></i>
+          <input type="text" id="sidebar-search-input" placeholder="Filter recordings…"
+                 oninput="_onSidebarSearch(this.value)" autocomplete="off" spellcheck="false">
+          <button class="sidebar-search-clear hidden" id="sidebar-search-clear"
+                  aria-label="Clear the filter text"
+                  onclick="_clearSidebarSearch()"><i class="fa-solid fa-xmark"></i></button>
         </div>
+        <button type="button" class="icon-btn sidebar-filter-btn" id="sidebar-filter-btn"
+                title="Filter recordings" aria-label="Filter recordings"
+                onclick="_toggleSidebarFilter(event)"><i class="fa-solid fa-filter"></i></button>
+      </div>
+      <div class="sidebar-filter-popover hidden" id="sidebar-filter-popover" role="dialog" aria-label="Recording filters"></div>
+
+      <div class="sidebar-body" id="session-list">
+        <p class="sidebar-empty">No recordings yet.</p>
       </div>
     </div>
-    <div class="sidebar-bulk-bar hidden" id="sidebar-bulk-bar">
-      <span class="sidebar-bulk-count" id="sidebar-bulk-count">0 selected</span>
-      <button class="sidebar-bulk-btn" id="sidebar-bulk-retitle" onclick="bulkRetitle()" title="Regenerate titles with AI"><i class="fa-solid fa-arrows-rotate"></i> Titles</button>
-      <button class="sidebar-bulk-btn sidebar-bulk-delete" onclick="bulkDelete()"><i class="fa-solid fa-trash"></i> Delete</button>
-      <button class="sidebar-bulk-btn sidebar-bulk-clear" onclick="clearSidebarSelection()"><i class="fa-solid fa-xmark"></i></button>
-    </div>
-    <div class="sidebar-search" id="sidebar-search">
-      <div class="sidebar-search-wrap">
-        <i class="fa-solid fa-magnifying-glass sidebar-search-icon"></i>
-        <input type="text" id="sidebar-search-input" placeholder="Search sessions…"
-               oninput="_onSidebarSearch(this.value)" autocomplete="off" spellcheck="false">
-        <button class="sidebar-search-clear hidden" id="sidebar-search-clear"
-                onclick="_clearSidebarSearch()"><i class="fa-solid fa-xmark"></i></button>
-        <button type="button" class="sidebar-filter-btn" id="sidebar-filter-btn"
-                title="Filter sessions" onclick="_toggleSidebarFilter(event)"><i class="fa-solid fa-filter"></i></button>
-      </div>
-    </div>
-    <div class="sidebar-filter-popover hidden" id="sidebar-filter-popover" role="dialog" aria-label="Session filters"></div>
-    <div class="sidebar-body" id="session-list">
-      <p class="sidebar-empty">No past sessions yet.</p>
-    </div>
+
+    {# ── Capture setup: the status row plus the three input panes ─────────── #}
+    <div class="capture-setup" id="capture-setup">
+      <button type="button" class="capture-setup-row" id="status-pill"
+              aria-expanded="false" aria-controls="capture-setup-panes"
+              onclick="toggleCaptureSetup()">
+        <span class="status-dot" id="status-dot"></span>
+        <span class="status-text" id="status-text">Loading model…</span>
+        <span id="recording-duration" class="recording-duration hidden"></span>
+        <i class="fa-solid fa-chevron-up capture-setup-chevron" aria-hidden="true"></i>
+      </button>
+
+      <div class="capture-setup-panes hidden" id="capture-setup-panes">
     <div class="sidebar-pane" id="model-config">
       <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('models')">
         <div class="nav-menu-left">
@@ -66,7 +195,7 @@
     <div class="sidebar-pane" id="audio-viz-pane">
       <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('audio')">
           <div class="nav-menu-left">
-            <i class="fa-solid fa-sliders sidebar-pane-icon"></i><span class="sidebar-pane-label">Input Devices</span>
+            <i class="fa-solid fa-sliders sidebar-pane-icon"></i><span class="sidebar-pane-label">Input devices</span>
           </div>
           <span class="sidebar-pane-arrow" id="pane-arrow-audio">
           <i class="fa-solid fa-chevron-down"></i></span>
@@ -85,7 +214,7 @@
             <label class="viz-gain-lbl viz-lbl-desktop">Gain</label>
             <span id="viz-lb-gain-val" class="viz-gain-val viz-lbl-desktop">1.0×</span>
         </div>
-        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('lb', this.value)">
+        <input type="range" id="viz-lb-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('lb', this.value)" aria-label="Desktop gain">
       </div>
 
       <!-- Waveform canvas + level meter -->
@@ -107,7 +236,7 @@
             <label class="viz-gain-lbl viz-lbl-mic">Gain</label>
             <span id="viz-mic-gain-val" class="viz-gain-val viz-lbl-mic">1.0×</span>
         </div>
-            <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('mic', this.value)">
+            <input type="range" id="viz-mic-gain" class="viz-gain-slider" min="0.25" max="8" step="0.05" value="1" oninput="onGainInput('mic', this.value)" aria-label="Microphone gain">
       </div>
       <div class="viz-device-row">
         <label class="viz-device-lbl viz-lbl-mic">Mic</label>
@@ -118,10 +247,10 @@
       </div>
 
       <div class="viz-btn-row">
-        <button id="viz-test-btn" class="btn viz-test-btn" onclick="toggleAudioTest()">
-          <i class="fa-solid fa-play"></i> Test Audio
+        <button id="viz-test-btn" class="btn btn-secondary viz-test-btn" onclick="toggleAudioTest()">
+          <i class="fa-solid fa-play"></i> Test audio
         </button>
-        <button id="viz-autodetect-btn" class="btn viz-test-btn viz-autodetect-btn" onclick="autoDetectDevices()" title="Auto-detect best audio devices">
+        <button id="viz-autodetect-btn" class="btn btn-secondary viz-test-btn viz-autodetect-btn" onclick="autoDetectDevices()" title="Auto-detect best audio devices" aria-label="Auto-detect best audio devices">
           <i class="fa-duotone fa-wand-magic-sparkles"></i>
         </button>
       </div>
@@ -138,11 +267,11 @@
       <button class="sidebar-pane-toggle" onclick="toggleSidebarPane('screen')">
       <div class="nav-menu-left">
         <i class="fa-solid fa-display sidebar-pane-icon"></i>
-        <span class="sidebar-pane-label">Screen Recording</span>
+        <span class="sidebar-pane-label">Screen recording</span>
       </div>
         <span class="sidebar-pane-actions">
           <label class="toggle-switch toggle-switch-sm" onclick="event.stopPropagation()">
-            <input type="checkbox" id="screen-record-toggle" onchange="toggleScreenRecordEnabled(this.checked)">
+            <input type="checkbox" id="screen-record-toggle" onchange="toggleScreenRecordEnabled(this.checked)" aria-label="Record the screen alongside the audio">
             <span class="toggle-slider"></span>
           </label>
           <span class="sidebar-pane-arrow" id="pane-arrow-screen"><i class="fa-solid fa-chevron-right"></i></span>
@@ -155,5 +284,48 @@
         <div class="screen-capture-status" id="screen-capture-status"></div>
       </div>
     </div>
+      </div><!-- /capture-setup-panes -->
+    </div>
+
+    <div class="sidebar-footer">
+      <button type="button" class="footer-btn" onclick="openSettings()">
+        <i class="fa-solid fa-gear" aria-hidden="true"></i>
+        <span class="footer-btn-label">Settings</span>
+      </button>
+      <button type="button" class="icon-btn app-menu-btn" id="app-menu-btn"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="app-menu"
+              onclick="_toggleMenu('app-menu', this)"
+              title="App menu" aria-label="App menu">
+        <i class="fa-solid fa-ellipsis"></i>
+        <span class="app-menu-dot hidden" id="app-menu-dot" aria-hidden="true"></span>
+      </button>
+      <div class="menu menu-up hidden" id="app-menu" role="menu" aria-labelledby="app-menu-btn">
+        <button type="button" class="menu-item" role="menuitem" id="app-update-item"
+                onclick="appUpdateItemClick()">
+          <i class="fa-solid fa-download" aria-hidden="true"></i>
+          <span class="menu-item-label">Check for updates</span>
+        </button>
+        <button type="button" class="menu-item" role="menuitem" onclick="openWhatsNew()">
+          <i class="fa-solid fa-sparkles" aria-hidden="true"></i>
+          <span class="menu-item-label">What's new</span>
+        </button>
+        <hr class="menu-rule">
+        <button type="button" class="menu-item" role="menuitem" onclick="confirmRestart()">
+          <i class="fa-solid fa-rotate-right" aria-hidden="true"></i>
+          <span class="menu-item-label">Restart Meeting Assistant</span>
+        </button>
+        <button type="button" class="menu-item menu-item-danger" role="menuitem" onclick="confirmShutdown()">
+          <i class="fa-solid fa-power-off" aria-hidden="true"></i>
+          <span class="menu-item-label">Quit Meeting Assistant</span>
+        </button>
+      </div>
+    </div>
+
   </aside>
-  <div class="sidebar-resize-handle" id="sidebar-resize-handle"></div>
+  {# The sidebar's one collapse control. Drag it inward to fold the sidebar to
+     the icon rail, drag the rail's edge back out to expand, or double-click
+     (Enter or Space when focused) to toggle. #}
+  <div class="sidebar-resize-handle" id="sidebar-resize-handle"
+       role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize the sidebar. Double-click, or press Enter, to collapse or expand it."
+       title="Drag to resize. Double-click to collapse or expand."></div>

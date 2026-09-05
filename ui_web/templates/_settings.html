@@ -40,6 +40,12 @@
         <button class="settings-nav-item" data-target="section-system" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-microchip"></i><span>System</span>
         </button>
+        <button class="settings-nav-item" data-target="section-icons" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-icons"></i><span>Icons</span>
+        </button>
+        <button class="settings-nav-item" data-target="section-calendar" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-calendar-days"></i><span>Calendar</span>
+        </button>
         <button class="settings-nav-item" data-target="section-agent-api" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-plug"></i><span>Agent API</span>
         </button>
@@ -517,6 +523,117 @@
               </label>
             </div>
           </div>
+
+          <div class="settings-group-title">Sidebar</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Compact navigation</div>
+                <div class="settings-row-desc">Fold the page links into small icons beside the app name, so the recordings list gets the height. The same button sits in the sidebar header.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="nav-compact-toggle" onchange="setNavCompact(this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Show Home</div>
+                <div class="settings-row-desc">The dashboard. The app icon in the header always goes there too.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="nav-item-home" onchange="setNavItemVisible('home', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Show Calendar</div>
+                <div class="settings-row-desc">Scheduled meetings and recordings on one month grid.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="nav-item-calendar" onchange="setNavItemVisible('calendar', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Show Needs attention</div>
+                <div class="settings-row-desc">Off by default. The Home dashboard already lists the recordings that need speaker work, with a link to the full queue.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="nav-item-attention" onchange="setNavItemVisible('attention', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Show Speakers</div>
+                <div class="settings-row-desc">The Voice Library and the speaker tools.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="nav-item-speakers" onchange="setNavItemVisible('speakers', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-group-title">Recording Reliability</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Follow call audio to its output device</div>
+                <div class="settings-row-desc">Off records the desktop device selected in the recorder, exactly as chosen. On binds the desktop capture to the current Windows default output when a recording starts and, while that capture is silent, re-binds it to whichever output device is actually playing (Teams and Zoom often use the Communications device). Needs the pycaw and comtypes packages.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="loopback-follow-toggle" onchange="savePref('loopback_follow_output', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Freeze watchdog</div>
+                <div class="settings-row-desc">Run a separate hidden process that restarts Meeting Assistant if the whole app stops responding. Takes effect on the next launch.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="freeze-watchdog-toggle" onchange="savePref('freeze_watchdog_enabled', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+          <div class="settings-group-title">Obsidian Export</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Export transcripts to Obsidian</div>
+                <div class="settings-row-desc">
+                  Drop each finalized session into a vault folder as markdown.
+                  Files update automatically when you rename speakers or edit the transcript.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="obsidian-toggle" onchange="saveObsidianSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Vault folder</div>
+                <div class="settings-row-desc">Absolute path to the export folder inside your vault</div>
+              </div>
+              <input type="text" class="settings-number-input" id="obsidian-dir"
+                     style="width:340px" onchange="saveObsidianSettings()" spellcheck="false">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Backfill</div>
+                <div class="settings-row-desc" id="obsidian-export-status">Export every existing session to the vault folder</div>
+              </div>
+              <div class="settings-row-actions">
+                <button class="btn-settings-action" id="obsidian-export-all-btn" onclick="obsidianExportAll()">Export all now</button>
+              </div>
+            </div>
+          </div>
           <div class="settings-group-title">Storage</div>
           <div class="settings-group">
             <div class="settings-row">
@@ -560,6 +677,129 @@
                 <div class="settings-row-desc" id="settings-update-status"></div>
               </div>
               <button class="btn-settings-action" id="check-update-btn" onclick="checkForUpdates()">Check for Updates</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Calendar -->
+        <!-- Icons -->
+        <div class="settings-panel" id="section-icons">
+          <div class="settings-group-title">Icon set</div>
+          <p class="icon-settings-intro">
+            One set covers every place the app shows an icon: the sidebar, the browser
+            tab, the installed app, the system tray, and the Start Menu shortcut. Pick a
+            set, or copy one and replace the images you want to change. Custom sets are
+            kept with your data, so an update never overwrites them.
+          </p>
+          <div class="settings-group icon-set-list" id="icon-set-list">
+            <p class="settings-row-desc icon-settings-loading">Loading…</p>
+          </div>
+          {# Creating a custom set is its own row, not a side effect of Copy:
+             name it, pick what it starts from, Create. It is in use right away. #}
+          <div class="settings-group" id="icon-set-new">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">New custom set</div>
+                <div class="settings-row-desc">Starts as a copy of the set you pick. Every icon in it can then be replaced.</div>
+              </div>
+              <form class="settings-row-actions icon-set-new-form" onsubmit="createIconSet(); return false;">
+                <label class="visually-hidden" for="icon-set-new-name">Name</label>
+                <input type="text" class="settings-number-input" id="icon-set-new-name"
+                       placeholder="Name" maxlength="40" autocomplete="off" spellcheck="false">
+                <label class="visually-hidden" for="icon-set-new-base">Start from</label>
+                <select class="model-config-sel" id="icon-set-new-base" title="Start from"></select>
+                <button type="submit" class="btn-settings-action" id="icon-set-new-btn">Create</button>
+              </form>
+            </div>
+          </div>
+          <div class="settings-group-title" id="icon-slots-title">Icons in this set</div>
+          <p class="icon-settings-intro" id="icon-slots-intro"></p>
+          <div class="settings-group icon-settings-grid" id="icon-settings-grid">
+            <p class="settings-row-desc icon-settings-loading">Loading…</p>
+          </div>
+        </div>
+
+        <div class="settings-panel" id="section-calendar">
+          <div class="settings-setup-hint settings-setup-steps" style="display:block">
+            <p>Match each recording to the meeting it came from with a published copy of your Outlook calendar. Three steps:</p>
+            <ol>
+              <li>Open <a href="https://outlook.office365.com/calendar/options/calendar/SharedCalendars" target="_blank" rel="noopener">Outlook's shared calendar settings</a> and scroll to <strong>Publish a calendar</strong>.</li>
+              <li>Pick your calendar, choose <strong>Can view all details</strong>, and click <strong>Publish</strong>.</li>
+              <li>Copy the <strong>ICS</strong> link that appears and paste it below.</li>
+            </ol>
+            <p class="settings-setup-note">The attendee count caps how many speakers a reanalysis looks for, and attendee names are offered when you clean up speakers. Nothing is renamed on its own.</p>
+          </div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Use my published calendar</div>
+                <div class="settings-row-desc">Match recordings to calendar events and read the attendee count</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="calendar-enabled" onchange="saveCalendarSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <!-- The link is a credential, so this row follows the API-key layout:
+                 label, the field with its reveal button inline, then a status line. -->
+            <div class="settings-key-row calendar-link-row">
+              <div class="settings-key-header">
+                <span class="settings-row-label">ICS link</span>
+              </div>
+              <div class="settings-row-desc">
+                Treated as a password: anyone with this link can read your calendar, so it is
+                stored locally and only ever shown masked. Test reads the feed once without
+                saving or matching anything.
+              </div>
+              <div class="calendar-link-field">
+                <div class="key-input-row calendar-link-input">
+                  <input type="password" id="calendar-ics-url" placeholder="Paste the ICS link"
+                         spellcheck="false" autocomplete="off">
+                  <button class="icon-btn key-vis-btn" id="calendar-reveal-btn"
+                          onclick="toggleCalendarLinkReveal()" title="Show what you typed">
+                    <i class="fa-solid fa-eye"></i>
+                  </button>
+                </div>
+                <div class="calendar-link-buttons">
+                  <button class="btn-settings-action" id="calendar-save-btn" onclick="saveCalendarLink()">Save link</button>
+                  <button class="btn-settings-action btn-settings-secondary" id="calendar-test-btn"
+                          onclick="testCalendarLink()">Test link</button>
+                  <button class="btn-settings-action btn-settings-secondary" id="calendar-forget-btn"
+                          onclick="forgetCalendarLink()" hidden>Forget link</button>
+                </div>
+              </div>
+              <div class="settings-row-desc settings-row-mono calendar-link-state" id="calendar-link-state">…</div>
+              <div class="settings-row-desc calendar-test-result" id="calendar-test-result"></div>
+            </div>
+          </div>
+
+          <div class="settings-group-title">Refresh</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Check for changes</div>
+                <div class="settings-row-desc">
+                  A published feed can lag up to 24 hours, so there is nothing to gain
+                  from checking more often than hourly.
+                </div>
+              </div>
+              <select id="calendar-refresh-minutes" class="model-config-sel" onchange="saveCalendarSettings()">
+                <option value="60">Every hour</option>
+                <option value="180">Every 3 hours</option>
+                <option value="360">Every 6 hours</option>
+                <option value="720">Every 12 hours</option>
+                <option value="1440">Once a day</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Status</div>
+                <div class="settings-row-desc" id="calendar-status-line">…</div>
+                <div class="settings-row-desc settings-row-mono" id="calendar-status-detail"></div>
+              </div>
+              <div class="settings-row-actions">
+                <button class="btn-settings-action" id="calendar-refresh-btn" onclick="refreshCalendarNow()">Refresh now</button>
+              </div>
             </div>
           </div>
         </div>

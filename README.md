@@ -23,6 +23,10 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 | **Session Management** | Organized session history with folders, search, and full audio playback |
 | **Voice Library** | Cross-session speaker fingerprinting that learns and improves over time |
 | **Analytics Dashboard** | Real-time speaking time distribution, segment counts, and timeline visualization |
+| **Home Dashboard** | Headline stats, meeting load and activity charts, a when-you-meet heatmap, and the people you meet with most |
+| **Calendar** | Scheduled meetings shown next to their recordings, fed by a published Outlook calendar link; attendee counts guide reanalysis and attendee names are offered when cleaning up speakers |
+| **Needs Attention** | A queue of recordings that still have unnamed speakers, each one click from cleanup |
+| **Custom Icons** | Swap the app, tray, and shortcut icons for your own set from Settings |
 | **System Tray** | Control recording and monitor status without opening the browser |
 
 ### Transcript Tools

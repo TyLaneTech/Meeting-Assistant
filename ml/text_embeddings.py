@@ -59,6 +59,21 @@ def is_ready() -> bool:
     return _model is not None
 
 
+def unload() -> None:
+    """Release the SentenceTransformer to reclaim memory. Idempotent.
+
+    CAUTION: `encode()` does NOT self-load; it returns None while the model
+    is absent, which silently degrades semantic search to keyword-only. A
+    caller that unloads this model owns reloading it (`ensure_loaded()` /
+    `_load_text_embeddings`) before search quality matters again. The app's
+    idle sweep deliberately does NOT unload this model for that reason; it
+    is small next to Whisper and the CUDA context.
+    """
+    global _model
+    with _model_lock:
+        _model = None
+
+
 def is_loading() -> bool:
     return _loading
 

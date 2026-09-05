@@ -41,6 +41,13 @@ DEFAULTS: dict = {
     # UI preferences
     "sidebar_open": True,
     "sidebar_width": 252,
+    # Sidebar navigation (Settings > System > Sidebar): which page links show
+    # at the top of the sidebar, and whether they fold into small icons beside
+    # the app name. Needs attention is off by default: the Home dashboard
+    # already lists what needs speaker work, and the sidebar's height is
+    # better spent on the recordings list.
+    "sidebar_nav_compact": False,
+    "sidebar_nav_items": {"home": True, "calendar": True, "attention": False, "speakers": True},
     "col_proportions": None,   # [f1, f2, f3] fractions; null = use default 1:1.1:1.1
     "playback_speed": "1",
 
@@ -99,6 +106,17 @@ DEFAULTS: dict = {
     # start the recording automatically on detection, confirming with a toast.
     # Default OFF. Has no effect unless meeting_detect_enabled is also on.
     "meeting_detect_autostart": False,
+    # When ON, stop an auto-started recording once the meeting has been gone for
+    # ~45s. Without this an auto-started recording runs forever, the session
+    # never finalizes, and no title / summary / Obsidian export is ever produced.
+    # Only ever stops recordings that auto-start began, never a manual one.
+    "meeting_detect_autostop": True,
+    # Chrome extension id of the installed Meeting Assistant PWA (the app the
+    # taskbar pin launches, via app_launcher.vbs). When set, an auto-detected
+    # meeting focuses THAT window instead of opening a second one: core/browser
+    # launches chrome_proxy.exe --app-id=<this>. Blank it to always use a plain
+    # --app= window.
+    "pwa_app_id": "",
 
     # Cloudflare WARP auto-toggle. When ON, the app briefly disconnects WARP
     # around package installs, model downloads, AI provider calls, and the
@@ -114,6 +132,44 @@ DEFAULTS: dict = {
     # auto-migrates older settings files at load time.
     "video_offsets": {},
 
+    # Obsidian export: drop finalized transcripts as markdown into a vault
+    # folder, and keep the file current when the transcript is edited after.
+    "obsidian_export_enabled": False,
+    "obsidian_export_dir": "",
+    # Speaker-resolution gate for the Obsidian export. When on, a finalized
+    # meeting is withheld from the vault until its content-bearing speakers are
+    # named (no lingering "Speaker N"). Phantom over-splits under BOTH thresholds
+    # are ignored, so a stray segment can't hold a named meeting hostage. Force a
+    # specific held session out by adding its id to obsidian_export_force_ids.
+    # Existing exports are never removed; this only withholds new writes.
+    "obsidian_gate_enabled": True,
+    "obsidian_gate_min_seconds": 15.0,
+    "obsidian_gate_min_words": 25,
+    "obsidian_export_force_ids": [],
+
+    # Freeze watchdog (watchdog.py). When ON, launch.py starts a separate hidden
+    # process that restarts the app if the whole process stops responding.
+    # Opt-in: it is an extra moving part, and a stuck app on a machine that
+    # does not need it is rarer than a surprise relaunch. Read by launch.py
+    # directly from settings.json, so it takes effect on the next launch.
+    "freeze_watchdog_enabled": False,
+
+    # Loopback follows the audio (Windows). OFF (the default) records the
+    # desktop device the user selected, re-resolved by name, exactly as chosen;
+    # only the silence alarm runs. ON binds to the current Windows default
+    # output at start and lets the silence watchdog ask the out-of-process
+    # render probe which output device is actually playing, re-binding the
+    # desktop capture to it mid-recording (call apps often render to the
+    # Communications-role device). Needs pycaw + comtypes; with them missing
+    # the probe is a no-op.
+    "loopback_follow_output": False,
+
+    # The icon set in use (Settings > Icons): "default" (the owner's logo),
+    # "wave" (Pat Gordon's), or the id of a custom set under <data>/icons/sets.
+    # It drives the sidebar, the tab, the installed app, the tray and the
+    # Start Menu shortcut together. Written only by core.icons.
+    "icon_set": "default",
+
     # Voice-library automated maintenance. When enabled, the app periodically
     # (every library_maintenance_days, while idle) runs the same hygiene pass
     # exposed at POST /api/fingerprint/library/maintenance: merge same-name
@@ -123,6 +179,22 @@ DEFAULTS: dict = {
     "library_maintenance_enabled": True,
     "library_maintenance_days": 7,
     "library_maintenance_last_run": "",
+
+    # Calendar (published Outlook ICS feed). The owner publishes his calendar
+    # from Outlook on the web and pastes the ICS link here; the app matches each
+    # recording to an event by time, uses the attendee count as a ceiling for
+    # reanalysis, and offers attendee names in the Speakers Cleanup picker. Nothing is
+    # renamed automatically: names land on voices only via the Voice Library.
+    # calendar_ics_url is a credential (anyone holding it can read the calendar)
+    # so it is masked in every API response and never logged.
+    # calendar_last_refresh / calendar_last_error are machine-managed.
+    "calendar_enabled": False,
+    "calendar_ics_url": "",
+    "calendar_timezone": "America/Chicago",
+    "calendar_refresh_minutes": 60,
+    "calendar_match_window_minutes": 20,
+    "calendar_last_refresh": "",
+    "calendar_last_error": "",
 
     # Agent API (REST + MCP interface for external AI agents, agent_api/).
     # The server only ever binds to 127.0.0.1, so exposure is local-only.
