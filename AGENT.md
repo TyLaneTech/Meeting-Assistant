@@ -259,6 +259,7 @@ _state = {
     "model_ready": bool,
     "model_info": str,
     "diarizer_ready": bool,
+    "ml_sleeping": bool,           # idle sweep unloaded the models (not a load error)
     "speaker_labels": dict,        # speaker_key → display name
     "custom_prompt": str,
 }
@@ -445,6 +446,8 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 **Recording cleanup is always async:** `stop_recording()` returns immediately and dispatches `_cleanup()` to a daemon thread. This thread stops streams, finalizes WAV, ends the DB session, and runs auto-title. Never move this back to the request handler — the operations can take up to 12s (thread join timeout).
 
 **Audio stream graveyard:** `capture_audio/windows.py` retires closed streams to a `_stream_graveyard` list rather than deleting them immediately. This avoids a PortAudio bug on WASAPI loopback that triggers `ExitProcess()` if a stream is cleaned up too early. Don't remove this pattern.
+
+**Idle model unload:** `_idle_unload_loop()` drops Whisper, the diarizer and the fingerprint embedder after `ml_idle_unload_minutes` (default 20) with nothing recording, testing, reanalyzing or summarizing, because under WDDM their VRAM is charged to process commit (8.6 GB idle before this, 2026-09-05). Sleeping is not "not ready": `_recording_prereqs_locked()` keeps `recording_ready` true, `start_recording()` calls `_wake_ml_and_wait()` and blocks until the reload lands, and the meeting-detect loop wakes the models on its first positive poll. `SpeakerFingerprintDB` stays `ready` while asleep and reloads its model on demand, so nothing that gates on `fingerprint_db.ready` may be changed to gate on the model being loaded. `OPENBLAS_NUM_THREADS` is capped at the top of app.py before numpy imports; keep it ahead of every numpy or scipy import.
 
 **CUDA DLL registration:** `ml/transcriber.py` registers nvidia pip-package DLL directories at import time (before ctranslate2 loads). This must happen before any CUDA library is imported. Do not move this code.
 

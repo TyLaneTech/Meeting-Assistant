@@ -178,6 +178,12 @@ DEFAULTS: dict = {
     # last_run is machine-managed (UTC ISO timestamp of the last applied run).
     "library_maintenance_enabled": True,
     "library_maintenance_days": 7,
+
+    # Minutes with no recording, test, reanalysis or summary before the ML
+    # stack (Whisper, diarizer, fingerprint embedder) is unloaded to give its
+    # commit charge back to the machine. Anything that needs the models wakes
+    # them; a recording start waits for the reload (about 10 s). 0 disables.
+    "ml_idle_unload_minutes": 20,
     "library_maintenance_last_run": "",
 
     # Calendar (published Outlook ICS feed). The owner publishes his calendar

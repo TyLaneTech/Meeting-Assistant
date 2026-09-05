@@ -13,6 +13,7 @@ Usage:
 """
 import base64
 import sqlite3
+import threading
 import traceback
 import uuid
 import warnings
@@ -160,10 +161,24 @@ class SpeakerFingerprintDB:
     STREAK_N             = _STREAK_N
     STREAK_FLOOR         = _STREAK_FLOOR
 
+    # Class-level defaults: app.py builds the instance with __new__ and runs
+    # __init__ later on a background thread, so ready / unload / ensure_model
+    # must behave before that, and in tests that bypass __init__.
+    _ready = False
+    _inference = None
+    _hf_token = ""
+    _device = "cpu"
+    _model_lock = threading.Lock()
+
     def __init__(self, db_path: Path, hf_token: str, device: str = "cpu") -> None:
         self._db_path = db_path
         self._ready   = False
         self._inference = None
+        # Kept so the embedding model can be dropped while idle and reloaded
+        # on demand (see unload / ensure_model) without re-running __init__.
+        self._hf_token = hf_token
+        self._device = device
+        self._model_lock = threading.Lock()
         # global_id of the "Me" speaker (microphone = app user). When set, this
         # profile is kept embedding-free (centroid NULL) so it never participates
         # in desktop diarization/matching/clustering. Set via set_me_id().
@@ -192,23 +207,34 @@ class SpeakerFingerprintDB:
         except Exception:
             pass
 
+        if self._load_inference():
+            self._ready = True
+
+    def _load_inference(self) -> bool:
+        """Load the wespeaker embedding model onto self._device. Blocking.
+
+        Returns True on success. Failure is logged and leaves self._inference
+        None; callers degrade to "no embedding" rather than raising.
+        """
         try:
             with _suppress_model_load_noise():
                 from pyannote.audio import Inference, Model  # type: ignore
                 log.info("fingerprint", "Loading embedding model…")
                 model = Model.from_pretrained(
                     "pyannote/wespeaker-voxceleb-resnet34-LM",
-                    use_auth_token=hf_token,
+                    use_auth_token=self._hf_token,
                 )
-                self._inference = Inference(model, window="whole")
+                inference = Inference(model, window="whole")
             # Move to requested device
-            if device and device != "cpu":
+            if self._device and self._device != "cpu":
                 import torch
-                self._inference.model = self._inference.model.to(torch.device(device))
-            self._ready = True
-            log.info("fingerprint", f"Embedding model ready on {device}.")
+                inference.model = inference.model.to(torch.device(self._device))
+            self._inference = inference
+            log.info("fingerprint", f"Embedding model ready on {self._device}.")
+            return True
         except Exception as e:
             log.warn("fingerprint", f"Could not load embedding model: {e}")
+            return False
 
     # ── Public helpers ────────────────────────────────────────────────────────
 
@@ -238,17 +264,35 @@ class SpeakerFingerprintDB:
 
     @property
     def ready(self) -> bool:
+        """True when the voice library is usable (a token was accepted and the
+        embedding model loaded at least once). Stays True across an idle
+        unload: profile lookups and links never needed the model, and
+        extract_embedding() reloads it on demand."""
         return self._ready
 
-    def unload(self) -> None:
-        """Release the embedding Inference model to reclaim memory.
+    @property
+    def model_loaded(self) -> bool:
+        return self._inference is not None
 
-        Every consumer already guards on `self._ready`, so an unloaded DB
-        degrades to a no-op rather than an error; `__init__` (re-run by the
-        app's wake path) brings it back. Idempotent.
+    def unload(self) -> None:
+        """Drop the embedding Inference model to reclaim memory. Idempotent.
+
+        The library stays ``ready``: every DB-only consumer (links, names,
+        candidates) keeps working, and the next extract_embedding() call
+        reloads the model transparently (``ensure_model`` pre-warms it).
         """
-        self._inference = None
-        self._ready = False
+        with self._model_lock:
+            self._inference = None
+
+    def ensure_model(self) -> bool:
+        """Load the embedding model if it was dropped. Returns True when a
+        model is available afterwards. Safe to call from any thread."""
+        if not self._ready:
+            return False
+        with self._model_lock:
+            if self._inference is not None:
+                return True
+            return self._load_inference()
 
     # ── Profile CRUD ──────────────────────────────────────────────────────────
 
@@ -492,7 +536,7 @@ class SpeakerFingerprintDB:
         audio: float32 mono numpy array at 16 kHz.
         Returns None if not ready or extraction fails.
         """
-        if not self._ready or self._inference is None:
+        if not self.ensure_model():
             return None
         try:
             import torch
