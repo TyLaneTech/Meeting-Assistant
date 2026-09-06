@@ -16,14 +16,6 @@ How an entry is read:
 - Infrastructure, docs, CI and tooling changes get no entry.
 
 
-## Improved memory use while idle (2026-09-05)
-
-### Recording
-
-- The transcription and speaker models are released after 20 minutes without a recording, giving about 4 GB of memory back to Windows. The Record button stays available; the first recording after a break takes a few seconds longer to start while they reload, and meeting detection reloads them as soon as a meeting appears
-- The app uses about 1.3 GB less memory from the moment it starts
-- The idle timeout is `ml_idle_unload_minutes` in settings.json; 0 keeps the models loaded
-
 ## Added a Home dashboard, a Calendar view, and a redesigned Speakers workflow (2026-09-05)
 
 ### Home

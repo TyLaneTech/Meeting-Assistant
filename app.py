@@ -38,16 +38,6 @@ import flask.cli
 flask.cli.show_server_banner = lambda *a, **kw: None
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-# ── Cap the OpenBLAS thread pools before numpy/scipy load ─────────────────────
-# numpy and scipy each ship their own OpenBLAS, and each pool spawns one thread
-# per logical CPU with a ~24 MB buffer committed up front. On a 32-thread
-# machine that is ~1.5 GB of commit charge for two pools the app barely uses
-# (transcription and diarization run on the GPU; the CPU-side numpy work is
-# audio resampling and 256-dim dot products). Measured 2026-09-05: 1548 MB
-# private after `import scipy.signal` with the default pool, 262 MB with 4
-# threads. setdefault so an explicit environment override still wins.
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
-
 import numpy as np
 
 from core import log as log
@@ -167,7 +157,6 @@ _state: dict = {
     "model_info": "",
     "diarizer_ready": False,
     "diarizer_failed": False,
-    "ml_sleeping": False,   # True while the idle sweep has the models unloaded (not a load error)
     "speaker_labels": {},   # speaker_key → display name for the active session
     "custom_prompt": "",    # user-supplied context appended to the summary system prompt
     "is_reanalyzing": False,
@@ -386,27 +375,13 @@ def _recording_prereqs_locked() -> tuple[bool, str]:
         # interleaves two meetings into one transcript, so the record button and
         # the auto-start coordinator both wait for the reanalysis to finish.
         return False, "Reanalysis in progress; recording can start when it finishes"
-    if _state["ml_sleeping"] and not _state["model_ready"]:
-        # Idle-unloaded is not "not ready": start_recording wakes the models
-        # and waits for them itself, so the Record button (and the auto-start
-        # coordinator behind it) stays live instead of showing "Preparing".
-        return True, "Ready (models sleeping after idle; they wake when recording starts)"
     if not _state["model_ready"]:
         info = (_state.get("model_info") or "").strip()
         return False, info or "Loading transcription model..."
-    if not _ml_awake_locked():
+    needs_diarizer = _transcriber.diarization_enabled and bool(os.getenv("HUGGING_FACE_KEY"))
+    if needs_diarizer and not _state["diarizer_ready"] and not _state["diarizer_failed"]:
         return False, "Loading speaker diarization..."
     return True, _state.get("model_info") or "Ready"
-
-
-def _ml_awake_locked() -> bool:
-    """True when everything a recording needs is loaded: Whisper, plus the
-    diarizer when it is enabled and possible (a failed diarizer load counts as
-    settled; recording then runs without speaker labels). Caller holds _state_lock."""
-    if not _state["model_ready"]:
-        return False
-    needs_diarizer = _transcriber.diarization_enabled and bool(os.getenv("HUGGING_FACE_KEY"))
-    return (not needs_diarizer) or _state["diarizer_ready"] or _state["diarizer_failed"]
 
 
 def _status_payload(extra: dict | None = None) -> dict:
@@ -418,7 +393,6 @@ def _status_payload(extra: dict | None = None) -> dict:
             "model_ready": _state["model_ready"],
             "model_info": _state["model_info"],
             "diarizer_ready": _state["diarizer_ready"],
-            "ml_sleeping": bool(_state.get("ml_sleeping")),
             "is_reanalyzing": bool(_state.get("is_reanalyzing")),
             "screen_recording": _screen_recorder.is_recording,
         }
@@ -1319,15 +1293,12 @@ def _load_model() -> None:
         with _state_lock:
             _state["model_ready"] = True
             _state["model_info"] = info
-            _state["ml_sleeping"] = False
-        _touch_ml()  # a fresh load must not be re-slept by a stale idle clock
         _push_status()
     except Exception as e:
         log.error("whisper", f"Error loading model: {e}")
         with _state_lock:
             _state["model_ready"] = False
             _state["model_info"] = f"Error: {e}"
-            _state["ml_sleeping"] = False  # an honest error, not a nap
         _push_status()
 
 
@@ -1350,7 +1321,6 @@ def _load_diarizer() -> None:
             _transcriber.load_diarizer(hf_token)
         with _state_lock:
             _state["diarizer_ready"] = True
-        _touch_ml()
         _push_status()
         log.info("diarizer", "Speaker diarization ready.")
         if fingerprint_db.ready:
@@ -1418,151 +1388,6 @@ def update_session_embedding(session_id: str) -> None:
         storage.save_session_embedding(session_id, text_embeddings.embedding_to_bytes(vec))
 
 
-# ── Idle model unload ─────────────────────────────────────────────────────────
-# The loaded ML stack (Whisper on the GPU, the CUDA context, the pyannote
-# diarizer, the fingerprint embedder) holds gigabytes of commit charge for as
-# long as the process lives: on Windows every VRAM allocation is backed by
-# system commit, so an idle process sat at 8.6 GB private with a 316 MB
-# working set (measured 2026-09-05). After `ml_idle_unload_minutes` (settings,
-# default 20; 0 disables) with no recording, test, reanalysis or summary, the
-# models are dropped; anything that needs them wakes them again:
-#   - start_recording wakes and WAITS, so a click or an auto-start lands a
-#     recording instead of bouncing;
-#   - the meeting-detect loop wakes on the first positive poll, so the reload
-#     overlaps the debounce window;
-#   - reanalysis loads its own batch models and the fingerprint embedder
-#     reloads itself on demand, so neither needs a wake.
-# The text-embeddings model is deliberately NOT unloaded: it is small next to
-# Whisper and `encode()` degrades silently rather than reloading.
-
-from core.ml_idle import IdleClock
-_ml_idle = IdleClock()
-_ml_wake_lock = threading.Lock()
-_ml_waking = False
-_ML_WAKE_TIMEOUT_SEC = 90.0
-
-
-def _touch_ml() -> None:
-    _ml_idle.touch()
-
-
-def _wake_ml(reason: str) -> None:
-    """Reload the unloaded ML stack in the background. Safe to call often."""
-    global _ml_waking
-    with _ml_wake_lock:
-        if _ml_waking:
-            return
-        with _state_lock:
-            if _state["model_ready"]:
-                return
-            _state["model_info"] = "Waking models..."
-        _ml_waking = True
-    log.info("idle", f"Waking ML models ({reason})")
-    _push_status()
-
-    def _run() -> None:
-        global _ml_waking
-        try:
-            # The same loaders boot runs, in parallel like boot does; each is
-            # idempotent and owns its own state flags. The fingerprint
-            # embedder is pre-warmed here so the first live match is not
-            # delayed by a lazy load inside the transcription loop.
-            threads = [
-                threading.Thread(target=_load_model, daemon=True),
-                threading.Thread(target=_load_diarizer, daemon=True),
-                threading.Thread(target=fingerprint_db.ensure_model, daemon=True),
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=_ML_WAKE_TIMEOUT_SEC)
-        finally:
-            with _state_lock:
-                if not _state["model_ready"]:
-                    _state["ml_sleeping"] = False  # the wake failed; show the real error
-            with _ml_wake_lock:
-                _ml_waking = False
-            _touch_ml()
-            _push_status()
-
-    threading.Thread(target=_run, daemon=True).start()
-
-
-def _wake_ml_and_wait(reason: str, timeout: float = _ML_WAKE_TIMEOUT_SEC) -> bool:
-    """If the models are idle-unloaded, wake them and block until a recording
-    can use them (or the wake settles into an error). Returns True when awake.
-    A model that never loaded (boot in progress, or a load error) is left to
-    the prereq gate to report, so this returns True immediately for it."""
-    with _state_lock:
-        if _ml_awake_locked():
-            return True
-        if not _state["ml_sleeping"]:
-            return True
-    _wake_ml(reason)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with _state_lock:
-            if _ml_awake_locked():
-                return True
-            settled = not _state["ml_sleeping"] and not _ml_waking
-        if settled:
-            with _state_lock:
-                return _ml_awake_locked()
-        time.sleep(0.25)
-    return False
-
-
-def _ml_busy_locked() -> bool:
-    """Anything that is using, or about to use, the models. Caller holds _state_lock."""
-    return bool(
-        _state["is_recording"] or _state["is_testing"] or _state.get("is_starting")
-        or _state["is_reanalyzing"] or _state["summary_generating"]
-        or _state.get("chapters_generating")
-    )
-
-
-def _idle_unload_loop() -> None:
-    while True:
-        time.sleep(60)
-        try:
-            minutes = float(settings.get("ml_idle_unload_minutes", 20))
-        except (TypeError, ValueError):
-            minutes = 20.0
-        with _state_lock:
-            busy = _ml_busy_locked()
-            ready = _state["model_ready"]
-        if not _ml_idle.unload_due(minutes, busy=busy, ready=ready, waking=_ml_waking):
-            continue
-        idle_min = _ml_idle.idle_minutes()
-        # Flags flip FIRST, under the lock and after a busy re-check, so no
-        # new start can pass the prereq gate against a model this pass is
-        # about to drop. (start_recording also stamps the idle clock as its
-        # first statement, which is what keeps a click at the idle boundary
-        # from racing this tick at all.)
-        with _state_lock:
-            if _ml_busy_locked():
-                _touch_ml()
-                continue
-            _state["model_ready"] = False
-            _state["diarizer_ready"] = False
-            _state["ml_sleeping"] = True
-            _state["model_info"] = "Models sleeping (idle) - they reload when a recording starts"
-        _transcriber.unload()
-        if _transcriber.model is not None:
-            # unload() refused (a capture is running after all): restore the
-            # honest flags and leave everything, fingerprints included, alone.
-            with _state_lock:
-                _state["model_ready"] = True
-                _state["ml_sleeping"] = False
-                _state["diarizer_ready"] = _transcriber.diarizer is not None
-                _state["model_info"] = _transcriber.device_info
-            _touch_ml()
-            continue
-        fingerprint_db.unload()
-        log.info("idle", f"Models unloaded after {idle_min}m idle; a recording start wakes them.")
-        _push_status()
-
-
 def _start_background_initializers() -> None:
     global _startup_init_started
     with _startup_init_lock:
@@ -1574,7 +1399,6 @@ def _start_background_initializers() -> None:
     threading.Thread(target=_load_fingerprint_db, daemon=True).start()
     threading.Thread(target=_load_text_embeddings, daemon=True).start()
     threading.Thread(target=_library_maintenance_loop, daemon=True).start()
-    threading.Thread(target=_idle_unload_loop, daemon=True).start()
     # Warm the AI /models cache so the settings pane opens instantly on first
     # visit. Non-blocking; if the network is slow/unreachable the fallback
     # static lists are used until the fetch completes.
@@ -1770,13 +1594,6 @@ def _meeting_detect_loop() -> None:
         # A meeting looks active.
         clear_since = None
         consecutive += 1
-        # Wake sleeping models on the FIRST positive poll, before the debounce
-        # even completes: the load then runs during the debounce window, so an
-        # auto-started recording is not delayed (or missed) waiting on Whisper.
-        with _state_lock:
-            _ml_asleep = _state["ml_sleeping"] and not _state["model_ready"]
-        if _ml_asleep:
-            _wake_ml("meeting detected")
         if consecutive < debounce or prompted:
             continue
         if last_prompt_at and now - last_prompt_at < cooldown:
@@ -2567,16 +2384,6 @@ def stop_audio_test():
 
 @app.route("/api/recording/start", methods=["POST"])
 def start_recording():
-    # Stamp the idle clock FIRST: a start landing exactly at the idle
-    # threshold must reset the sweep, never race it into unloading the model
-    # the capture is about to use. Then, if the sweep already dropped the
-    # models, wake them and wait here so the click (or the auto-start
-    # coordinator) starts the recording itself instead of bouncing off a 503.
-    _touch_ml()
-    if not _wake_ml_and_wait("recording start requested"):
-        with _state_lock:
-            info = (_state.get("model_info") or "").strip()
-        return jsonify({"error": info or "Transcription model is still waking; try again"}), 503
     with _state_lock:
         if _state["is_recording"]:
             return jsonify({"error": "Already recording"}), 400
@@ -4410,7 +4217,6 @@ def set_whisper_model():
         return jsonify({"ok": True, "info": _transcriber.device_info})
 
     with _state_lock:
-        was_sleeping = _state["ml_sleeping"]
         _state["model_ready"] = False
         _state["model_info"] = f"Loading {preset['label']}…"
     _push_status()
@@ -4423,13 +4229,7 @@ def set_whisper_model():
             with _state_lock:
                 _state["model_ready"] = True
                 _state["model_info"] = info
-                _state["ml_sleeping"] = False
-            _touch_ml()
             _push_status()
-            if was_sleeping and _transcriber.diarizer is None:
-                # The idle sweep had dropped the diarizer too; bring it back so
-                # the prereq gate does not wait on a load nobody started.
-                _load_diarizer()
         except Exception as e:
             log.error("whisper", f"Error reloading model: {e}")
             with _state_lock:
@@ -4475,7 +4275,6 @@ def set_diarizer_model():
         return jsonify({"error": "HUGGING_FACE_KEY not set"}), 400
 
     with _state_lock:
-        was_sleeping = _state["ml_sleeping"] and not _state["model_ready"]
         _state["diarizer_ready"] = False
         _state["diarizer_failed"] = False   # reset - we're retrying
     _push_status()
@@ -4487,10 +4286,7 @@ def set_diarizer_model():
             with _state_lock:
                 _state["diarizer_ready"] = True
                 _state["diarizer_failed"] = False
-            _touch_ml()
             _push_status()
-            if was_sleeping and _transcriber.model is None:
-                _load_model()  # Whisper was asleep too; wake it alongside
         except Exception as e:
             log.error("diarizer", f"Error reloading: {e}")
             with _state_lock:
@@ -8329,11 +8125,6 @@ def reanalyze_session(session_id: str):
         except ImportError:
             _batch_available = False
         if not _batch_available and not _state["model_ready"]:
-            if _state["ml_sleeping"]:
-                # Deferred to a thread because _wake_ml takes _state_lock,
-                # which this block already holds (the lock is not reentrant).
-                threading.Thread(target=_wake_ml, args=("reanalysis requested",), daemon=True).start()
-                return jsonify({"error": "Waking transcription model - retry in a few seconds"}), 503
             return jsonify({"error": "Transcription model not loaded yet"}), 503
         # Load the session into active state so _on_segment callbacks work
         sess = storage.get_session(session_id)
@@ -9524,11 +9315,6 @@ def smart_cleanup(session_id: str):
         except ImportError:
             _batch_available = False
         if not _batch_available and not _state["model_ready"]:
-            if _state["ml_sleeping"]:
-                # Deferred to a thread because _wake_ml takes _state_lock,
-                # which this block already holds (the lock is not reentrant).
-                threading.Thread(target=_wake_ml, args=("reanalysis requested",), daemon=True).start()
-                return jsonify({"error": "Waking transcription model - retry in a few seconds"}), 503
             return jsonify({"error": "Transcription model not loaded yet"}), 503
         if not storage.get_session_times(session_id):
             return jsonify({"error": "Session not found"}), 404

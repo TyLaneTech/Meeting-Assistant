@@ -169,7 +169,7 @@ The server also exposes this guide as an MCP resource
 | `GET /docs` | This guide (markdown). |
 | `GET /openapi.json` | OpenAPI 3.1. |
 | `GET /system/health` | Liveness; answers even when the API is disabled. |
-| `GET /system/status` | Recording flag, active session, model/diarizer readiness, audio levels. `ml_sleeping: true` means the models were unloaded after idle and reload on the next recording start (`recording_ready` stays true). |
+| `GET /system/status` | Recording flag, active session, model/diarizer readiness, audio levels. |
 | `GET /system/info` | Version (git), platform, uptime, data folder, models, AI config, counts. |
 | `GET /system/stats` | Analytics (talk time, activity, top speakers) + storage usage breakdown. |
 | `GET /system/logs` | Ring buffer since app start. Params: `limit`, `level` (info/warn/error), `tag`, `contains`, `after_id` (incremental polling). |

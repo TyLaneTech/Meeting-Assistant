@@ -385,26 +385,6 @@ Runtime-configurable options accessible from the web interface:
 - **Auto-summary** - toggle automatic summary generation
 - **Custom prompt** - persistent context that shapes all AI outputs
 
-### Idle memory
-
-On Windows every VRAM allocation is backed by system commit charge, so the
-loaded models (Whisper large-v3 on the GPU, the diarizer, the fingerprint
-embedder) cost about 4.5 GB of commit for as long as they stay loaded, even
-while nothing is recording. Two things keep that in check:
-
-- **Idle unload** - after `ml_idle_unload_minutes` (in `settings.json`,
-  default 20) with no recording, audio test, reanalysis or summary, the models
-  are unloaded. The Record button stays live: a start wakes them and waits
-  (about 3 to 10 seconds), meeting detection wakes them as soon as a meeting
-  appears, and reanalysis and voice-library lookups need no wake at all. The
-  status payload reports `ml_sleeping: true` while they are down. Set the
-  value to `0` to keep the models resident.
-- **OpenBLAS thread cap** - numpy and scipy each spawn a BLAS pool with one
-  thread per logical CPU and a ~24 MB buffer each (about 1.5 GB of commit on a
-  32-thread machine, for work the app does on the GPU). The app sets
-  `OPENBLAS_NUM_THREADS=4` before importing them; an explicit environment
-  variable still wins.
-
 ---
 
 ## Troubleshooting
@@ -414,17 +394,6 @@ while nothing is recording. Two things keep that in check:
 <br>
 
 The Whisper model downloads on first run - `large-v3` is ~3 GB. Check the terminal window for download progress.
-
-</details>
-
-<details>
-<summary><strong>Status says "Models sleeping" / the first recording after a break takes a few seconds to start</strong></summary>
-<br>
-
-That is the idle unload (see *Configuration > Idle memory*): the models were
-released after `ml_idle_unload_minutes` without use and are reloading. A
-recording start waits for them, so nothing is lost. Set
-`ml_idle_unload_minutes` to `0` in `settings.json` to keep them loaded.
 
 </details>
 
