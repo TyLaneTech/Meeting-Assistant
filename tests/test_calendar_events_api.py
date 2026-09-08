@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 import pytest
 from flask import Flask
 
-from core import calendar_events_api, calendar_feed, paths, settings, storage
+from core import (calendar_events_api, calendar_feed, meeting_links, paths,
+                  settings, storage)
 
 UTC = timezone.utc
 FROZEN_NOW = datetime(2026, 9, 3, 20, 0, tzinfo=UTC)
@@ -115,7 +116,7 @@ def test_redaction_filters_and_private_title(client, monkeypatch):
     assert event["day"] == "2026-09-02"
     assert set(event) == {
         "key", "title", "start", "end", "all_day", "private", "status",
-        "day", "session_id", "session_title", "state",
+        "day", "session_id", "session_title", "state", "join", "join_label",
     }
     serialized = json.dumps(payload).lower()
     for forbidden in (
@@ -128,6 +129,82 @@ def test_redaction_filters_and_private_title(client, monkeypatch):
         "/api/calendar/events?start=2026-09-01&end=2026-09-30&include_cancelled=1"
     ).get_json()["events"]
     assert [item["status"] for item in included] == ["confirmed", "cancelled"]
+
+
+TEAMS_JOIN = (
+    "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc@thread.v2/"
+    "0?context=%7b%22Tid%22%3a%22aaa%22%7d"
+)
+
+
+def test_a_joinable_meeting_exposes_its_provider_and_never_its_url(client, monkeypatch):
+    """The provider slug is presentation; the URL is a credential. Anyone
+    holding it can walk into the meeting, so it stays server-side and
+    POST /api/calendar/join resolves it out of the cache."""
+    upcoming = _instance(
+        "joinable", "Renewal strategy",
+        "2026-09-03T21:00:00Z", "2026-09-03T22:00:00Z",
+        join_url=TEAMS_JOIN, location="Microsoft Teams Meeting",
+    )
+    private = _instance(
+        "hidden", "Oncology results",
+        "2026-09-03T22:30:00Z", "2026-09-03T23:00:00Z",
+        join_url=TEAMS_JOIN, is_private=True,
+    )
+    # Ended over the grace period ago: joining it is meaningless, so it gets
+    # no provider at all and its row cannot open anything.
+    stale = _instance(
+        "stale", "This morning", "2026-09-03T12:00:00Z", "2026-09-03T13:00:00Z",
+        join_url=TEAMS_JOIN,
+    )
+    monkeypatch.setattr(
+        calendar_feed, "cached_instances", lambda: [upcoming, private, stale]
+    )
+
+    payload = client.get(
+        "/api/calendar/events?start=2026-09-01&end=2026-09-30"
+    ).get_json()
+    by_title = {item["title"]: item for item in payload["events"]}
+
+    assert by_title["Renewal strategy"]["join"] == "teams"
+    assert by_title["Renewal strategy"]["join_label"] == "Teams"
+    # A private appointment is still the owner's own meeting, so Join works;
+    # only its subject is redacted, exactly as before.
+    assert by_title["Private appointment"]["join"] == "teams"
+    assert by_title["This morning"]["join"] == ""
+    assert by_title["This morning"]["join_label"] == ""
+    assert "teams.microsoft.com" not in json.dumps(payload)
+
+
+def test_an_event_key_resolves_back_to_its_occurrence(client, monkeypatch):
+    """What the join route stands on: the key the client already holds finds
+    the cached occurrence again, and a stale or forged one finds nothing."""
+    instance = _instance(
+        "joinable", "Renewal strategy",
+        "2026-09-03T21:00:00Z", "2026-09-03T22:00:00Z", join_url=TEAMS_JOIN,
+    )
+    monkeypatch.setattr(calendar_feed, "cached_instances", lambda: [instance])
+
+    key = calendar_events_api.event_key(instance)
+    found = calendar_events_api.find_instance(key)
+    assert found is not None
+    assert meeting_links.find_link(found)["url"] == TEAMS_JOIN
+    for miss in ("", None, "0" * 24, "not-a-key"):
+        assert calendar_events_api.find_instance(miss) is None
+
+
+def test_an_all_day_block_is_never_joinable(client, monkeypatch):
+    block = calendar_feed.Instance(
+        uid="ooo", summary="Remote",
+        start=calendar_feed.parse_iso_utc("2026-09-04T05:00:00Z"),
+        end=calendar_feed.parse_iso_utc("2026-09-05T05:00:00Z"),
+        all_day=True, join_url=TEAMS_JOIN,
+    )
+    monkeypatch.setattr(calendar_feed, "cached_instances", lambda: [block])
+    payload = client.get(
+        "/api/calendar/events?start=2026-09-01&end=2026-09-30"
+    ).get_json()
+    assert payload["events"][0]["join"] == ""
 
 
 def test_recorded_recording_missed_and_upcoming_states(client, monkeypatch):

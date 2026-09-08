@@ -39,7 +39,25 @@
       that voice in every later meeting.
     </p>
 
-    <!-- Band 1. The hero row: meeting load over 12 weeks on the left, the
+    <!-- Band 1. What is next, full width and first, because it is the only
+         band you act on: the rest of the page is what already happened. The
+         one meeting to act on right now gets its own strip on top; under it
+         today and the two days after it as three columns. Everything comes
+         from the one calendarEvents range the page already loads, so this
+         costs no extra request. -->
+    <section class="dash-cell dash-next" id="dash-next" aria-labelledby="dash-next-title">
+      <div class="dash-section-head">
+        <h2 class="dash-section-title" id="dash-next-title">Next</h2>
+        <span class="dash-next-head-end">
+          <span class="dash-section-note" id="dash-next-note"></span>
+          <a class="dash-section-link" id="dash-next-all" data-nav href="/calendar">Open calendar</a>
+        </span>
+      </div>
+      <div class="dash-next-focus" id="dash-next-focus" hidden></div>
+      <div class="dash-next-body" id="dash-next-body"></div>
+    </section>
+
+    <!-- Band 2. The hero row: meeting load over 12 weeks on the left, the
          needs-attention queue on the right, its height tied to the chart. -->
     <div class="dash-grid" id="dash-grid">
 
@@ -62,7 +80,7 @@
 
     </div>
 
-    <!-- Band 2. Your patterns on the left (when you meet, then recent activity),
+    <!-- Band 3. Your patterns on the left (when you meet, then recent activity),
          the people you meet with on the right. The two stacked charts on the
          left run to about the height of the People list, so the columns balance
          instead of one card stretching past its content. -->
@@ -98,16 +116,6 @@
         </div>
       </section>
 
-    </div>
-
-    <!-- Band 3. What is next, full width. -->
-    <div class="dash-grid dash-low" id="dash-low">
-      <section class="dash-cell dash-next" id="dash-next" aria-labelledby="dash-next-title">
-        <div class="dash-section-head">
-          <h2 class="dash-section-title" id="dash-next-title">Next</h2>
-        </div>
-        <div class="dash-next-body" id="dash-next-body"></div>
-      </section>
     </div>
 
   </div>

@@ -960,26 +960,27 @@ function _restoreCaptureSetup() {
   toggleCaptureSetup(_getLayoutCache().capture_setup_open === true);
 }
 
-/* ── Capture strip ───────────────────────────────────────────────────────── */
+/* ── Capture meters ───────────────────────────────────────────────────────── */
 
 let _captureLastDesktopAudio = 0;
 let _captureWarnTimer = null;
 
-function _syncCaptureStrip() {
-  const strip = document.getElementById('capture-strip');
-  if (!strip) return;
+/** Show or hide the header's meter pair and put the header into its recording
+ *  colour. Off the session view the header title is the view's own, so the
+ *  live meeting's name rides on the group's tooltip, not a second bar. */
+function _syncCaptureMeters() {
+  const meters = document.getElementById('capture-meters');
+  if (!meters) return;
   const live = !!state.isRecording;
-  strip.hidden = !live;
+  meters.hidden = !live;
   document.body.classList.toggle('is-recording', live);
   if (!live) {
+    meters.removeAttribute('title');
     if (_captureWarnTimer) { clearInterval(_captureWarnTimer); _captureWarnTimer = null; }
     return;
   }
-  const title = document.getElementById('capture-title');
-  if (title) {
-    const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
-    title.textContent = (entry && entry.title) || 'New recording';
-  }
+  const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
+  meters.title = `Recording ${(entry && entry.title) || 'New recording'}`;
   if (!_captureWarnTimer) {
     _captureLastDesktopAudio = Date.now();
     _captureWarnTimer = setInterval(_syncCaptureWarning, 1000);
@@ -992,7 +993,9 @@ function _syncCaptureWarning() {
   if (!el) return;
   if (!state.isRecording) { el.classList.add('hidden'); return; }
   const messages = [];
-  if (Date.now() - _captureLastDesktopAudio > 20000) messages.push('No desktop audio for 20 s');
+  // A minute, not twenty seconds: a pause in a call is not a fault, and this
+  // pill was showing through every normal conversational gap.
+  if (Date.now() - _captureLastDesktopAudio > 60000) messages.push('No desktop audio for a minute');
   const micSel = document.getElementById('viz-mic-sel');
   if (micSel && String(micSel.value) === '-1') messages.push('Mic muted');
   el.textContent = messages.join(' · ');
@@ -1601,24 +1604,39 @@ function fmtDuration(secs) {
 let _recordingStartTime = null;
 let _durationInterval   = null;
 
-/** One clock, three readouts: the capture setup row, the capture strip and
- *  the Record button's "Stop · mm:ss". */
+/** One clock, two readouts: the capture setup row and the Record button's
+ *  "Stop · mm:ss". */
 function _writeElapsed(text) {
   const row = document.getElementById('recording-duration');
   if (row) row.textContent = text;
-  const strip = document.getElementById('capture-time');
-  if (strip) strip.textContent = text;
   const btn = document.getElementById('record-elapsed');
   if (btn) btn.textContent = text;
 }
 
-function startDurationCounter() {
-  _recordingStartTime = Date.now();
+/** Start the elapsed clock, anchored `elapsedSec` into a recording that is
+ *  already running. Without the anchor a reload mid-meeting restarted the
+ *  readout at 0:00 on an hour-old recording; the server sends how long it has
+ *  really been going (see elapsed_sec in _status_payload). */
+function startDurationCounter(elapsedSec) {
+  const behind = Number(elapsedSec);
+  _recordingStartTime = Date.now() - (behind > 0 ? behind * 1000 : 0);
   document.getElementById('recording-duration')?.classList.remove('hidden');
-  _writeElapsed('0:00');
+  _writeElapsed(fmtDuration((Date.now() - _recordingStartTime) / 1000));
   _durationInterval = setInterval(() => {
     _writeElapsed(fmtDuration((Date.now() - _recordingStartTime) / 1000));
   }, 1000);
+}
+
+/** Re-anchor a running clock when the server's elapsed has drifted from it.
+ *  Covers a reconnect after a gap and a machine that slept mid-recording. Only
+ *  a real gap re-anchors, so the readout never jitters by a second. */
+function _syncDurationCounter(elapsedSec) {
+  const behind = Number(elapsedSec);
+  if (!_durationInterval || !(behind > 0)) return;
+  const local = (Date.now() - _recordingStartTime) / 1000;
+  if (Math.abs(local - behind) < 2) return;
+  _recordingStartTime = Date.now() - behind * 1000;
+  _writeElapsed(fmtDuration(behind));
 }
 
 function stopDurationCounter() {
@@ -2280,7 +2298,7 @@ function _onSidebarSlices() {
   }
   // The workspace title comes from this slice, so it lands with it.
   updateTopbarSessionTitle();
-  _syncCaptureStrip();
+  _syncCaptureMeters();
 }
 
 /* ── Sidebar search ───────────────────────────────────────────────────────── */
@@ -6046,9 +6064,11 @@ function onStatus(d) {
       refreshSessionChatPromptBadge();
       destroyPlayback();
       if (!_durationInterval) {
-        startDurationCounter();
+        startDurationCounter(d.elapsed_sec);
         // Push stored gain values now - AudioCapture is guaranteed to exist
         initGainSliders();
+      } else {
+        _syncDurationCounter(d.elapsed_sec);
       }
       _updateBrandIcons(true);
       if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
@@ -6061,7 +6081,7 @@ function onStatus(d) {
         _sessionLinks['me'] = { global_id: d.me_speaker.global_id, name: d.me_speaker.name };
       }
       AppData.invalidate(['sessions'], 'recording_start');
-      _syncCaptureStrip();
+      _syncCaptureMeters();
       if (_quietPromptLanding === d.session_id) {
         setTimeout(() => showQuietStopConfirm(d.session_id), 150);
         _quietPromptLanding = null;
@@ -6218,7 +6238,7 @@ function updateRecordBtn() {
     resumeItem.classList.toggle(
       'hidden', state.isRecording || !state.isViewingPast || !state.sessionId);
   }
-  _syncCaptureStrip();
+  _syncCaptureMeters();
   // Disable device/model selectors while recording
   const lbSel  = document.getElementById('viz-loopback-sel');
   const micSel = document.getElementById('viz-mic-sel');
@@ -17323,6 +17343,11 @@ function setSessionChapters(list) {
 function openChaptersManager() {
   _chaptersModalOpen = true;
   document.getElementById('chapters-overlay').classList.remove('hidden');
+  // The header toggle governs both tabs, so it loads with the dialog rather
+  // than with either one. Absent means on: the default lives in settings.py
+  // and a client that has never seen the key must agree with it.
+  const regenAfter = document.getElementById('chapters-regen-after-toggle');
+  if (regenAfter) regenAfter.checked = _prefs.chapters_regen_after_meeting !== false;
   _chaptersSwitchTab('list');
   renderChaptersList();
   loadChaptersTuning();
@@ -17644,6 +17669,13 @@ function _setChaptersGranularity(g) {
 
 function _onChaptersAutoToggle(checked) {
   savePref('chapters_auto', !!checked);
+}
+
+/** One full rebuild when a recording stops, from the finished transcript. The
+ *  server owns the run (see _final_chapters_pass); this only stores the
+ *  preference, so turning it on mid-meeting still applies to that meeting. */
+function _onChaptersRegenAfterToggle(checked) {
+  savePref('chapters_regen_after_meeting', !!checked);
 }
 
 async function saveChaptersSystemPrompt() {
@@ -19933,9 +19965,13 @@ function flashStatus(msg) {
 }
 
 // Persistent top banner warning that call/desktop audio is not being captured.
-// Driven by the server's capture_alert SSE event; dismissable, and cleared when
-// a recording stops (see onStatus).
+// Driven by the server's capture_alert SSE event. It comes down on its own
+// three ways, so a warning never outlives the problem it describes: the server
+// says the loopback recovered (level 'clear'), desktop audio turns up in the
+// level meters, or the recording stops (see onStatus). The x is the fourth,
+// for a user who wants it gone regardless.
 function _showCaptureAlert(d) {
+  if (d && (d.cleared || d.level === 'clear')) { _clearCaptureAlert(); return; }
   const msg = (d && d.message) || 'Call/desktop audio is not being captured.';
   let bar = document.getElementById('capture-alert-bar');
   if (!bar) {
@@ -20280,19 +20316,24 @@ function updateLevelMeters(lb, mic, hasMic) {
     micEl.style.height = hasMic ? toH(mic) + '%' : '0%';
     micEl.classList.toggle('peak', hasMic && mic > 0.55);
   }
-  // The capture strip runs on the same numbers, so proof that audio is
+  // The header meters run on the same numbers, so proof that audio is
   // arriving is on screen in every view, not only in the input pane.
-  const stripLb  = document.getElementById('capture-meter-desktop');
-  const stripMic = document.getElementById('capture-meter-mic');
-  if (stripLb) {
-    stripLb.style.width = toH(lb) + '%';
-    stripLb.classList.toggle('peak', lb > 0.55);
+  const hdrLb  = document.getElementById('capture-meter-desktop');
+  const hdrMic = document.getElementById('capture-meter-mic');
+  if (hdrLb) {
+    hdrLb.style.width = toH(lb) + '%';
+    hdrLb.classList.toggle('peak', lb > 0.55);
   }
-  if (stripMic) {
-    stripMic.style.width = hasMic ? toH(mic) + '%' : '0%';
-    stripMic.classList.toggle('peak', hasMic && mic > 0.55);
+  if (hdrMic) {
+    hdrMic.style.width = hasMic ? toH(mic) + '%' : '0%';
+    hdrMic.classList.toggle('peak', hasMic && mic > 0.55);
   }
-  if (lb > 0.01) _captureLastDesktopAudio = Date.now();
+  if (lb > 0.01) {
+    _captureLastDesktopAudio = Date.now();
+    // Proof the desktop side is being captured, straight from the stream the
+    // alarm is about. Nothing to warn about any more.
+    _clearCaptureAlert();
+  }
 }
 
 function startVizLoop() {
@@ -20807,10 +20848,22 @@ async function openSettings(section) {
     if (startup.supported) {
       row.style.display = '';
       document.getElementById('startup-toggle').checked = startup.enabled;
+      // Windows keeps its own approval flag for Startup entries, and with it
+      // set the shortcut is ignored. Say so instead of showing a toggle that
+      // claims the app will launch when it will not; turning it back on here
+      // clears the flag.
+      const note = document.getElementById('startup-blocked');
+      if (note) {
+        note.textContent = startup.reason || '';
+        note.classList.toggle('hidden', !startup.blocked);
+      }
     } else {
       row.style.display = 'none';
     }
   } catch (_) {}
+
+  const openOnLaunch = document.getElementById('open-on-launch-toggle');
+  if (openOnLaunch) openOnLaunch.checked = _prefs.open_window_on_launch === true;
 
   // Audio params - load eagerly so panels are ready when clicked
   _apRefresh().then(() => _syncScreenToggle());
@@ -21996,14 +22049,42 @@ function _escHtml(s) {
 
 async function setStartupLaunch(enabled) {
   try {
-    await fetch('/api/settings/startup', {
+    const res = await fetch('/api/settings/startup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled }),
     });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      // Never leave the toggle claiming something the server just refused.
+      document.getElementById('startup-toggle').checked = false;
+      uiToast({ message: data.error || 'Could not change the startup setting.',
+                kind: 'error', id: 'startup-toggle', duration: 8000 });
+    }
   } catch (_) {
     document.getElementById('startup-toggle').checked = !enabled;
+    uiToast({ message: 'Could not change the startup setting.', kind: 'error',
+              id: 'startup-toggle' });
   }
+  // Re-read: enabling clears Windows' block, so the note has to catch up.
+  loadStartupState();
+}
+
+/** Refresh just the Launch at Startup row from the server's real state. */
+async function loadStartupState() {
+  const row = document.getElementById('startup-row');
+  if (!row) return;
+  try {
+    const st = await fetch('/api/settings/startup').then(r => r.json());
+    if (!st.supported) { row.style.display = 'none'; return; }
+    row.style.display = '';
+    document.getElementById('startup-toggle').checked = !!st.enabled;
+    const note = document.getElementById('startup-blocked');
+    if (note) {
+      note.textContent = st.reason || '';
+      note.classList.toggle('hidden', !st.blocked);
+    }
+  } catch (_) {}
 }
 
 // ── Obsidian export ──────────────────────────────────────────────────────
@@ -22029,6 +22110,60 @@ function saveObsidianSettings() {
   }).catch(() => {});
 }
 
+/* ── Joining a meeting ────────────────────────────────────────────────────── */
+
+/** The Join control for one calendar event, or '' when it has no join link.
+ *
+ *  `key` is the opaque event key the events API already handed this page.
+ *  The join URL is deliberately not here: it lets anyone walk into the
+ *  meeting, so it stays server-side and is resolved from the calendar cache
+ *  when the button is pressed. Both the key and the label go through data
+ *  attributes rather than into the onclick string, so nothing from the feed
+ *  is ever interpolated into JavaScript.
+ */
+function calendarJoinButton(key, provider, label, cls) {
+  if (!key || !provider) return '';
+  const name = label || provider;
+  return `<button type="button" class="${cls}"`
+    + ` data-join-key="${escapeHtml(key)}" data-join-label="${escapeHtml(name)}"`
+    + ` title="Open this meeting in ${escapeHtml(name)}"`
+    + ` aria-label="Join this meeting in ${escapeHtml(name)}"`
+    + ` onclick="joinCalendarMeeting(this.dataset.joinKey, this.dataset.joinLabel, this)">Join</button>`;
+}
+
+/** Open one calendar meeting in its own app. The server tries the desktop
+ *  client's URL scheme first and falls back to the browser, and says which
+ *  one it used so the toast does not promise the wrong thing. */
+async function joinCalendarMeeting(key, label, btn) {
+  if (!key || (btn && btn.disabled)) return;
+  const what = label || 'the meeting';
+  if (btn) { btn.disabled = true; btn.classList.add('is-loading'); }
+  try {
+    const res = await fetch('/api/calendar/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      uiToast({ message: data.error || `Could not open ${what}.`,
+                kind: 'error', id: 'calendar-join' });
+      return;
+    }
+    const name = data.label || what;
+    uiToast({
+      message: data.opened === 'browser'
+        ? `Opening ${name} in your browser…`
+        : `Opening ${name}…`,
+      kind: 'success', id: 'calendar-join', duration: 2500,
+    });
+  } catch (_) {
+    uiToast({ message: `Could not open ${what}.`, kind: 'error', id: 'calendar-join' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('is-loading'); }
+  }
+}
+
 // ── Calendar (published ICS feed) ────────────────────────────────────────
 
 /**
@@ -22050,6 +22185,8 @@ async function loadCalendarStatus() {
   }
   const toggle = document.getElementById('calendar-enabled');
   if (toggle) toggle.checked = !!st.enabled;
+  const naming = document.getElementById('calendar-title-from-event');
+  if (naming) naming.checked = !!st.title_from_event;
   const interval = document.getElementById('calendar-refresh-minutes');
   if (interval) interval.value = String(st.refresh_minutes || 60);
   const input = document.getElementById('calendar-ics-url');
@@ -22096,6 +22233,7 @@ function toggleCalendarLinkReveal() {
 function saveCalendarSettings() {
   const updates = {
     calendar_enabled: document.getElementById('calendar-enabled')?.checked === true,
+    calendar_title_from_event: document.getElementById('calendar-title-from-event')?.checked === true,
     calendar_refresh_minutes: parseInt(document.getElementById('calendar-refresh-minutes')?.value || '60', 10),
   };
   Object.assign(_prefs, updates);

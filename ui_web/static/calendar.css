@@ -300,7 +300,17 @@ a.cal-chip--live:hover {
   color: var(--fg-muted);
 }
 
-.cal-agenda-act { flex-shrink: 0; }
+/* Up to two controls now, stacked: the panel is 300 to 440 px and a second
+   button beside the first would eat the title. Each sizes to its own text
+   (stretch would blow Join out to the width of the button under it) and they
+   line up on the right edge. */
+.cal-agenda-act {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
 
 .cal-agenda-action {
   white-space: nowrap;

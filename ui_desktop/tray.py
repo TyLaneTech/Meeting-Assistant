@@ -39,7 +39,7 @@ _IS_MACOS = sys.platform == "darwin"
 # ── Icon loading ───────────────────────────────────────────────────────────────
 _IMAGES_DIR = Path(__file__).parent.parent / "ui_web" / "static" / "images"
 _TRAY_SIZE  = 64
-_icons: dict[str, "Image.Image"] = {}   # populated lazily by _ensure_icons()
+_icons: dict[str, "Image.Image"] = {}   # per state, filled by _icon_image()
 
 
 # Which icon slot (core/icons.py) backs each tray state. The images default to
@@ -54,25 +54,44 @@ _STATE_SLOT = {
 }
 
 
-def _ensure_icons() -> None:
-    """Resolve every tray state's image through core.icons on first use."""
-    if _icons:
-        return
+def _icon_image(state: str):
+    """The image for one tray state, resolved through core.icons and cached.
+
+    One state at a time, on demand. This used to decode and LANCZOS-resize all
+    six state PNGs on first use, which was fine when the tray came up after
+    everything else. It now starts before the model stack, and six image
+    decodes on the tray thread were taking about a second of GIL time straight
+    out of the imports running on the main thread. Only the state actually
+    being painted is built; the other five arrive if and when they are shown.
+
+    Returns None when the image cannot be resolved, and the caller draws a
+    fallback.
+    """
+    img = _icons.get(state)
+    if img is not None:
+        return img
+    slot = _STATE_SLOT.get(state)
+    if slot is None:
+        return None
     try:
         from core import icons as _slots
-        for state, slot in _STATE_SLOT.items():
-            _icons[state] = (
-                _slots.resolve_image(slot)
-                .convert("RGBA")
-                .resize((_TRAY_SIZE, _TRAY_SIZE), Image.LANCZOS)
-            )
+        img = (
+            _slots.resolve_image(slot)
+            .convert("RGBA")
+            .resize((_TRAY_SIZE, _TRAY_SIZE), Image.LANCZOS)
+        )
     except Exception as e:
-        print(f"[tray] Could not load icons, falling back to drawn icons: {e}")
+        print(f"[tray] Could not load the {state} icon, drawing a fallback: {e}")
+        return None
+    _icons[state] = img
+    return img
 
 
 def reload_icons() -> None:
     """Forget the cached images so the next paint re-resolves them. Called by
-    the icons API after an upload or reset; pair it with MeetingTray.refresh()."""
+    the icons API after an upload or reset; pair it with
+    MeetingTray.refresh(force=True), since the state has not changed, only the
+    images behind it."""
     _icons.clear()
 
 
@@ -121,6 +140,14 @@ class MeetingTray:
         self._get_state = state_getter
         self._on_quit = on_quit
         self._icon: pystray.Icon | None = None
+        # Set once the icon is on screen. app.py waits on this so the rest of
+        # its imports do not race the tray for the GIL and the import lock.
+        self.ready = threading.Event()
+        # What the icon is currently showing. refresh() is called on every
+        # status push, and a push happens for each step of model loading, so
+        # without this the whole menu was rebuilt natively a dozen times over
+        # to keep saying "Loading models...".
+        self._painted: tuple | None = None
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -151,10 +178,24 @@ class MeetingTray:
         except Exception:
             pass
 
-    def refresh(self) -> None:
-        """Update the icon image and tooltip to reflect current state. Thread-safe."""
+    def refresh(self, force: bool = False) -> None:
+        """Repaint the icon and menu if what they show has changed.
+
+        Thread-safe. Cheap to call on every status push, which is the point:
+        the caller does not have to know whether anything the tray shows
+        actually moved. ``force`` repaints regardless, for the icon-set change
+        that swaps the images out from under the same state.
+        """
         if self._icon is None:
             return
+        if not force:
+            try:
+                showing = (self._get_tray_state(), self._pick_tooltip())
+            except Exception:
+                showing = None
+            if showing is not None and showing == self._painted:
+                return
+            self._painted = showing
         # AppKit objects (NSImage, NSStatusItem, NSMenu) may only be touched
         # from the main thread; refresh() is called from Flask request threads
         # and the state-push loop, so on macOS hop onto the main run loop. On
@@ -217,6 +258,7 @@ class MeetingTray:
             if _IS_MACOS:
                 self._size_status_image(icon)
         self._call_on_ui_thread(_apply)
+        self.ready.set()
 
     @staticmethod
     def _size_status_image(icon: "pystray.Icon") -> None:
@@ -271,10 +313,10 @@ class MeetingTray:
         return "loading"
 
     def _pick_icon(self) -> "Image.Image":
-        _ensure_icons()
         key = self._get_tray_state()
-        if key in _icons:
-            return _icons[key]
+        img = _icon_image(key)
+        if img is not None:
+            return img
         # Fallback: a drawn mic in the state's colour if the images failed to load.
         fallbacks = {
             "setup":            (210, 153,  34),

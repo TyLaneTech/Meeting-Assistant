@@ -97,8 +97,8 @@ SHELL_IDS = [
     "pane-toggle-transcript", "pane-toggle-summary", "pane-toggle-chat",
     "pane-toggle-notes",
     # capture
-    "capture-strip", "capture-title", "capture-time", "capture-meter-desktop",
-    "capture-meter-mic", "capture-warning", "capture-stop-btn",
+    "capture-meters", "capture-meter-desktop", "capture-meter-mic",
+    "capture-warning",
     "status-pill", "status-dot", "status-text", "recording-duration",
     "capture-setup-panes", "model-config", "audio-viz-pane",
     "screen-capture-section", "pane-body-audio", "pane-arrow-models",
@@ -197,6 +197,52 @@ def test_record_button_states_are_the_three_the_brief_names():
     resume = js[js.index("async function resumeRecording()"):]
     resume = resume[:resume.index("/* ── App menu")]
     assert "resume: true" in resume
+
+
+def test_the_capture_meters_live_in_the_header_and_the_strip_is_gone():
+    """One bar, not two. Everything the strip carried apart from the meters was
+    already on screen: the title is the header title, the clock and Stop are
+    the Record button, and "Recording" is the subtitle plus that button's dot."""
+    header = _read(TEMPLATES / "_header.html")
+    assert 'id="capture-meters"' in header
+    assert "capture-strip" not in header
+    for gone in ("capture-title", "capture-time", "capture-stop-btn",
+                 "capture-live", "capture-dot"):
+        assert gone not in header, gone
+    # Beside the title, not stranded next to the actions: the title stops
+    # growing and the actions take the right edge instead.
+    title_at = header.index('class="app-header-title"')
+    meters_at = header.index('id="capture-meters"')
+    actions_at = header.index('class="app-header-actions"')
+    assert title_at < meters_at < actions_at
+    shell = _shell_css()
+    assert "flex: 0 1 auto" in shell[shell.index(".app-header-title {"):]
+    actions = shell[shell.index(".app-header-actions {"):]
+    assert "margin-left: auto" in actions[:actions.index("}")]
+    # The alert the strip carried is a real one, so it survives the move.
+    assert 'id="capture-warning"' in header
+    js = _read(STATIC / "app.js")
+    assert "capture-strip" not in js
+    assert "function _syncCaptureMeters()" in js
+
+
+def test_the_header_turns_red_while_recording():
+    """The strip's red is the header's own now, and every surface and accent
+    inside the row is re-mixed against it so nothing reads as a leftover."""
+    js = _read(STATIC / "app.js")
+    meters = js[js.index("function _syncCaptureMeters()"):]
+    meters = meters[:meters.index("function _syncCaptureWarning()")]
+    assert "document.body.classList.toggle('is-recording', live)" in meters
+    assert "meters.hidden = !live" in meters
+    shell = _shell_css()
+    recording = shell[shell.index("body.is-recording .app-header {"):]
+    recording = recording[:recording.index("/* \u2500\u2500 Ask rail")]
+    assert "var(--red)" in recording
+    # No accent-blue glyph left stranded on a red row.
+    for element in (".pane-toggle-btn", ".home-search-ai", ".home-search-wrap",
+                    ".record-group"):
+        assert element in recording, element
+    assert "var(--accent)" not in recording
 
 
 def test_the_layout_control_keeps_the_pane_toggle_ids():
@@ -614,7 +660,7 @@ def test_reduced_motion_covers_the_shell_animations():
     css = _read(STATIC / "style.css")
     blocks = re.findall(r"@media \(prefers-reduced-motion: reduce\) \{(.*?)\n\}", css, re.S)
     joined = "\n".join(blocks)
-    for selector in (".capture-dot", ".record-pulse", ".status-dot.recording"):
+    for selector in (".record-pulse", ".status-dot.recording"):
         assert selector in joined, selector
 
 

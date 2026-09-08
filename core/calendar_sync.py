@@ -361,6 +361,48 @@ def test_link(url: str) -> dict:
     return result
 
 
+# ── Naming a new recording after its meeting ─────────────────────────────────
+
+def title_for_start(started_at_utc=None, ended_at_utc=None) -> str:
+    """The calendar's name for a recording starting now, or "".
+
+    Opt-in through ``calendar_title_from_event``. Reads the cached feed and
+    nothing else: pressing Record must never wait on a network fetch, and the
+    hourly refresh has the cache warm long before a scheduled meeting starts.
+
+    Returns "" for every case that should fall back to the default name: the
+    setting off, no link, an empty cache, no confident match, a private
+    appointment (its subject is redacted everywhere else in the app, so naming
+    a recording after it would leak it into the sidebar, exports and the
+    Obsidian vault), or a blank subject. Never raises.
+    """
+    try:
+        prefs = _prefs()
+        if not prefs.get("calendar_title_from_event"):
+            return ""
+        if not prefs.get("calendar_enabled"):
+            return ""
+        if not (prefs.get("calendar_ics_url") or "").strip():
+            return ""
+        instances = calendar_feed.cached_instances()
+        if not instances:
+            return ""
+        result = calendar_feed.match_session(
+            instances, started_at_utc or _utcnow().isoformat(),
+            ended_at_utc, _match_window(),
+        )
+        best = result.get("best")
+        if not best or (best.get("score") or 0) < MIN_MATCH_SCORE:
+            return ""
+        instance = best["instance"]
+        if instance.is_private:
+            return ""
+        return (instance.summary or "").strip()
+    except Exception as exc:  # noqa: BLE001 - naming must never block a start
+        log.warn("calendar", f"Could not read a calendar title ({type(exc).__name__}).")
+        return ""
+
+
 # ── Refresh ──────────────────────────────────────────────────────────────────
 
 def refresh(force: bool = False, active_session_id: str | None = None) -> dict:
@@ -521,6 +563,7 @@ def status() -> dict:
         "timezone": _timezone_name(),
         "refresh_minutes": _refresh_minutes(),
         "match_window_minutes": _match_window(),
+        "title_from_event": bool(prefs.get("calendar_title_from_event")),
         "last_refresh": prefs.get("calendar_last_refresh", "") or "",
         "last_error": prefs.get("calendar_last_error", "") or "",
         "event_count": cache.get("event_count") or 0,

@@ -129,6 +129,67 @@ def set_icon(lnk: Path, icon: Path | str) -> bool:
     return r.returncode == 0
 
 
+# ── Windows' startup approval ────────────────────────────────────────────────
+# A shortcut in the Startup folder is only half the story. Task Manager's
+# Startup apps tab, Settings > Apps > Startup and every "speed up my PC" tool
+# switch entries off by writing a disable flag here, and Windows then ignores
+# the shortcut completely. Checking only that the .lnk exists reports the
+# feature as on while nothing launches at sign-in, which is exactly what it did
+# (2026-09-08). The value name is the shortcut's file name; the data is a 12
+# byte blob whose first byte carries the flag (bit 0 set means disabled).
+_APPROVAL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+
+
+def startup_approval(name: str) -> str:
+    """Whether Windows will run the Startup entry *name*.
+
+    "enabled"  - approved, or no opinion recorded (the default)
+    "disabled" - switched off outside this app; the shortcut will not run
+    "unknown"  - not Windows, or the registry could not be read
+    """
+    if sys.platform != "win32":
+        return "unknown"
+    try:
+        import winreg
+    except ImportError:
+        return "unknown"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APPROVAL_KEY) as key:
+            blob, _kind = winreg.QueryValueEx(key, name)
+    except FileNotFoundError:
+        return "enabled"      # no entry means Windows has no objection
+    except OSError:
+        return "unknown"
+    if not blob:
+        return "enabled"
+    return "disabled" if blob[0] & 0x01 else "enabled"
+
+
+def approve_startup(name: str) -> bool:
+    """Let Windows run the Startup entry *name* again.
+
+    Deletes the disable flag rather than writing an enabled one: absence is
+    Windows' own default for "approved", so there is no blob format to get
+    wrong. Only ever called when the user turns the setting on, so it cannot
+    quietly undo a choice they made in Task Manager.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _APPROVAL_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, name)
+        return True
+    except FileNotFoundError:
+        return True           # nothing to clear
+    except OSError:
+        return False
+
+
 def same_path(a: str | Path, b: str | Path) -> bool:
     """Case-insensitive, separator-insensitive path equality."""
     try:

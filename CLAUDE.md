@@ -43,13 +43,22 @@ pull request text never reach users.
   word of the title picks the icon: Added, Fixed, Improved, Removed, Reworked.
 - Under the heading: `### ` sub-headings for areas (Recording, Speakers, Settings), `- `
   bullets in plain user language. No module names, no emoji, no marketing verbs.
+- The notes render as full markdown in both surfaces, and both are narrow, so format for
+  scanning: `**bold**` on the thing that changed (usually the bullet's opening words),
+  `` `code` `` for what the user sees or types in the app (a control name, a path like
+  `Settings > Calendar`, a displayed value), `*italic*` for an aside or a `*Fixed:*`
+  prefix, nested `- ` bullets for the detail behind a bullet, and at most one `> ` note
+  per entry for something that applies across it. Never `code` a module or file path:
+  users do not have those. Tables and rules render but rarely earn the width.
+- Do not bold whole sentences. If everything is bold, nothing is.
 
 ```
 ## Fixed the desktop audio device (2026-09-05)
 
 ### Recording
-- The device you select is always the device captured, even when Windows reports a
+- **The device you select is always the device captured**, even when Windows reports a
   different default output
+  - `Settings > System` no longer needs the follow-output workaround for this
 ```
 
 The parser is `core/changelog.py`; `tests/test_changelog.py` fails if the file stops parsing.

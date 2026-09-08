@@ -9,11 +9,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Blueprint, jsonify, request
 
-from core import calendar_feed, paths, settings
+from core import calendar_feed, meeting_links, paths, settings
 
 UTC = timezone.utc
 DEFAULT_TIMEZONE = "America/Chicago"
 MAX_RANGE_DAYS = 62
+# How long after a meeting ends its Join button is still worth offering. Past
+# meetings carry no provider slug at all, so a stale row cannot open anything.
+JOIN_GRACE = timedelta(minutes=15)
 
 bp = Blueprint("calendar_events_api", __name__)
 
@@ -156,11 +159,32 @@ def _find_session(
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
-def _opaque_key(instance: calendar_feed.Instance) -> str:
+def event_key(instance: calendar_feed.Instance) -> str:
+    """The opaque id the client uses for one occurrence.
+
+    A hash, not the UID: the UID names the meeting in the owner's mailbox and
+    is not the client's business. It is stable across refreshes, which is what
+    find_instance() needs to resolve a Join back to the event it came from.
+    """
     occurrence = instance.recurrence_id or instance.start
     recurrence = calendar_feed.as_utc(occurrence).isoformat() if occurrence else ""
     raw = f"{instance.uid}\0{recurrence}".encode("utf-8", errors="replace")
     return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def find_instance(key: str) -> calendar_feed.Instance | None:
+    """The cached occurrence an event key came from, or None.
+
+    The join route resolves the meeting link through this, so the URL (a
+    credential like the feed itself) never travels to the browser and back.
+    """
+    wanted = str(key or "").strip()
+    if not wanted:
+        return None
+    for instance in calendar_feed.cached_instances():
+        if event_key(instance) == wanted:
+            return instance
+    return None
 
 
 def _event_status(instance: calendar_feed.Instance) -> str:
@@ -243,8 +267,12 @@ def get_calendar_events():
             state = "missed"
         else:
             state = "upcoming"
+        # The provider slug, never the URL, and only while the meeting is
+        # still joinable. The button POSTs the key back to open it.
+        join = (meeting_links.provider_for(instance)
+                if event_end >= now - JOIN_GRACE and not instance.all_day else "")
         events.append({
-            "key": _opaque_key(instance),
+            "key": event_key(instance),
             "title": "Private appointment" if instance.is_private else instance.summary,
             "start": event_start.replace(microsecond=0).isoformat(),
             "end": event_end.replace(microsecond=0).isoformat(),
@@ -255,6 +283,8 @@ def get_calendar_events():
             "session_id": matched["id"] if matched else None,
             "session_title": matched["title"] if matched else None,
             "state": state,
+            "join": join,
+            "join_label": meeting_links.label_for(join) if join else "",
         })
     events.sort(key=lambda item: (item["start"], item["key"]))
     base["events"] = events

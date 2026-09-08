@@ -891,10 +891,13 @@ def heal_stale_in_progress(active_session_id: str | None = None) -> int:
 def update_session_title(session_id: str, title: str, *, user_set: bool = False) -> None:
     """Update a session's title.
 
-    Pass ``user_set=True`` when the change originates from a user edit; that
-    sets the title-lock flag so future auto-title generation skips this
-    session. Pass ``user_set=False`` (default) for AI-generated titles; the
-    lock flag is cleared so subsequent auto-gens can run freely.
+    Pass ``user_set=True`` for a title the user chose, which sets the
+    title-lock flag so future auto-title generation skips this session. A
+    rename is the obvious case; a name taken from the user's own calendar
+    (the opt-in ``calendar_title_from_event``) is the other, and it locks for
+    the same reason: they picked it, so the AI must not replace it. Pass
+    ``user_set=False`` (default) for AI-generated titles; the lock flag is
+    cleared so subsequent auto-gens can run freely.
     """
     with _conn() as conn:
         conn.execute(

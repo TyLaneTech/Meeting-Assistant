@@ -891,6 +891,12 @@
       <div class="chapters-header-main">
         <h3 class="chapters-title">Chapters</h3>
         <p class="chapters-subtitle">High-level topic markers across the meeting. They show on the playback bar and feed the Summary and Chat.</p>
+        <label class="chapters-header-toggle"
+               title="When a recording stops, rebuild its chapters once from the whole transcript, using your current chapter settings">
+          <input type="checkbox" id="chapters-regen-after-toggle"
+                 onchange="_onChaptersRegenAfterToggle(this.checked)">
+          <span>Regenerate chapters after meeting</span>
+        </label>
       </div>
       <button class="icon-btn chapters-close" onclick="closeChaptersManager()"><i class="fa-solid fa-xmark"></i></button>
     </div>

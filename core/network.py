@@ -142,6 +142,8 @@ def _load_hf_pipeline(model_id: str, hf_token: str):
     Returns the Pipeline object or None on failure.
     """
     import os
+    from core import config as _cfg
+    _cfg.apply_torchaudio_shims()
     from pyannote.audio import Pipeline as PyannotePipeline
 
     # Attempt 1: load from cache (no network)

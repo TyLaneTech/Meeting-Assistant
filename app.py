@@ -45,6 +45,7 @@ from core import browser as browser
 from core import calendar_feed as calendar_feed
 from core import calendar_sync as calendar_sync
 from core import calendar_events_api as calendar_events_api
+from core import meeting_links as meeting_links
 from core import changelog as changelog
 from core import dashboard_api as dashboard_api
 from core import heartbeat as heartbeat
@@ -60,6 +61,152 @@ from core import paths as paths
 from core import recording_request as recording_request
 from core import settings as settings
 from core import storage as storage
+
+# ── The tray icon, before the model stack ────────────────────────────────────
+# Headless, the tray icon is the only thing the user can see that the app is
+# alive, so it appearing late reads as the app being hung. Everything below
+# this line costs about a second and a half of imports, and main() cannot run
+# until they finish, so the icon is started here instead: from a daemon thread,
+# on a module that now costs 0.2 s (see apply_torchaudio_shims in core/config).
+#
+# The state callback is swapped in by main() once _status_payload and _state
+# exist. Until then the tray reads an empty dict, and its own .get() defaults
+# describe exactly the right thing: not ready, "Loading models...".
+_tray = None                    # the MeetingTray, wherever it got built
+_tray_started = False           # so main() never starts a second one
+_tray_state_provider = None     # set by main(); the real _status_payload view
+
+
+def _tray_state() -> dict:
+    provider = _tray_state_provider
+    return provider() if provider is not None else {}
+
+
+def _tray_quit(icon) -> None:
+    """Quit from the tray menu, including during the import window above.
+
+    _force_quit is defined much further down this module, so resolve it when
+    the menu is actually clicked rather than binding it now.
+    """
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception:
+            pass
+    quit_fn = globals().get("_force_quit")
+    if quit_fn is None:
+        os._exit(0)             # clicked before the module finished loading
+    quit_fn()
+
+
+def _port_is_busy(url: str) -> bool:
+    """True when something already answers on our port.
+
+    A read-only probe, not the handshake: main() still owns the decision to
+    take over or abort. This only keeps a second instance from flashing a tray
+    icon it is about to throw away.
+
+    A bare socket, not urllib: the first urlopen() in a process builds the
+    default opener, which asks Windows for the system proxy configuration, and
+    on a machine running a VPN client that took two seconds (measured, 2.03 s)
+    to answer a question about 127.0.0.1. See _local_opener below.
+    """
+    import socket
+    try:
+        port = int(url.rsplit(":", 1)[-1])
+    except ValueError:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+# How long the imports below will wait for the icon. Generous, because the
+# whole point is that it is on screen first; short enough that a tray that
+# cannot start (no pystray, a locked-up shell) delays the app by a second and
+# then gets out of the way for good.
+_TRAY_READY_TIMEOUT = 6.0
+
+
+_local_http = None
+
+
+def _local_opener():
+    """A urllib opener for talking to ourselves, with no proxy lookup.
+
+    urlopen()'s default opener asks the OS for the system proxy configuration
+    the first time it is used, which on a machine running a VPN client cost two
+    seconds of startup. A proxy is never the right answer for 127.0.0.1
+    anyway, so an explicit empty ProxyHandler is both faster and more correct.
+    """
+    global _local_http
+    if _local_http is None:
+        import urllib.request
+        _local_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _local_http
+
+
+def _start_tray(url: str, wait: bool = False) -> bool:
+    """Put the tray icon up on a daemon thread. False if it cannot be started.
+
+    Everything including the import happens on that thread, and with
+    ``wait=True`` the caller blocks until the icon is on screen. That looks
+    backwards for a "run it in the background" call, and it is deliberate:
+    running the tray concurrently with the imports below sounds free but is
+    not, because both threads want the GIL and the import lock. Measured, it
+    put the icon up 4.2 s earlier and pushed the server 1.1 s and the model
+    2.0 s later. Waiting hands the tray thread a clear run at its 0.3 s of
+    work, then the imports get an uncontended one: the icon lands about six
+    seconds sooner and nothing else moves.
+
+    Windows/Linux only. On macOS the NSStatusItem has to be created on the main
+    thread or AppKit aborts, so main() builds and runs that one itself at the
+    very end.
+    """
+    global _tray_started
+    if _tray_started or sys.platform == "darwin":
+        return False
+    _tray_started = True
+    up = threading.Event()
+
+    def _boot() -> None:
+        global _tray, _tray_started
+        try:
+            from ui_desktop.tray import TRAY_AVAILABLE, MeetingTray
+            if not TRAY_AVAILABLE:
+                raise ImportError("pystray or Pillow not installed")
+            _tray = MeetingTray(url, _tray_state, _tray_quit)
+        except ImportError:
+            _tray_started = False
+            log.warn("tray", "pystray/Pillow not installed - running without system tray.")
+            log.warn("tray", "Install with: pip install pystray Pillow")
+            return
+        except Exception as e:
+            _tray_started = False
+            log.warn("tray", f"System tray unavailable: {e}")
+            return
+        finally:
+            up.set()
+        log.info("tray", "System tray active - right-click for menu.")
+        _tray.run()
+
+    threading.Thread(target=_boot, daemon=True, name="tray").start()
+    if wait:
+        # Two stages: the object exists, then the icon is actually painted.
+        up.wait(_TRAY_READY_TIMEOUT)
+        tray = _tray
+        if tray is not None:
+            tray.ready.wait(_TRAY_READY_TIMEOUT)
+    return True
+
+
+if __name__ == "__main__":
+    # Only the real app process puts an icon up. Importing app.py (the tests,
+    # the selftest, a REPL) must not.
+    _server_url = f"http://localhost:{int(os.getenv('PORT', 6969))}"
+    if not _port_is_busy(_server_url):
+        _start_tray(_server_url, wait=True)
+
 from ai.assistant import AIAssistant
 from ai import assistant as ai_assistant
 from ai import speaker_relabel as speaker_relabel
@@ -202,7 +349,8 @@ _fp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fp-train")
 # Thread pool for bulk auto-title regeneration. AI calls are network-bound so
 # concurrency >> CPU count is fine; capped at 4 to avoid hammering the LLM API.
 _retitle_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retitle")
-_tray = None  # MeetingTray instance (set in main(), None if no tray)
+# _tray, _tray_started and _tray_state_provider are declared above, with the
+# early tray start: re-binding _tray here would drop the icon already running.
 _server_url = f"http://localhost:{int(os.getenv('PORT', 6969))}"
 _APP_STARTED_AT = time.time()   # wall-clock start, surfaced via the Agent API
 _quiet_audio_rms_threshold = float(settings.get("quiet_prompt_audio_rms_threshold", 0.006))
@@ -230,10 +378,15 @@ _CUSTOM_SPEAKER_PREFIX = "custom:"
 ME_KEY = ME_SPEAKER_KEY
 
 
-def _refresh_tray() -> None:
-    """Update tray icon/menu if a tray is running. Safe to call from any thread."""
+def _refresh_tray(force: bool = False) -> None:
+    """Update tray icon/menu if a tray is running. Safe to call from any thread.
+
+    A no-op when nothing the tray shows has changed, so status pushes (one per
+    model-loading step) do not each rebuild the native menu. ``force`` is for
+    the icon-set change, where the state is the same but the images are not.
+    """
     if _tray is not None:
-        _tray.refresh()
+        _tray.refresh(force=force)
 
 
 def _is_custom_speaker_key(speaker_key: str) -> bool:
@@ -367,6 +520,20 @@ def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
         log.warn("audio", f"capture-alert toast failed: {e}")
 
 
+def _alert_loopback_recovered(session_id: str, dev_name: str) -> None:
+    """Tell the UI the desktop side is capturing again, so the banner clears.
+
+    Same event as the alarm, flagged as a clear. A warning about a problem that
+    has already gone away is worse than no warning: the user learns to dismiss
+    the banner without reading it. No toast: "it is fine again" is not worth
+    interrupting anyone for."""
+    with _state_lock:
+        if not _state.get("is_recording") or _state.get("session_id") != session_id:
+            return
+    _push("capture_alert", {"level": "clear", "kind": "recovered",
+                            "cleared": True, "device": dev_name})
+
+
 def _recording_prereqs_locked() -> tuple[bool, str]:
     """Return whether recording can start and, if not, why not."""
     if _state.get("is_reanalyzing"):
@@ -397,8 +564,29 @@ def _status_payload(extra: dict | None = None) -> dict:
             "screen_recording": _screen_recorder.is_recording,
         }
         recording_ready, recording_ready_reason = _recording_prereqs_locked()
+        capture = _state["audio_capture"] if payload["recording"] else None
+        started_mono = _state.get("recording_started_at_monotonic") or 0.0
     payload["recording_ready"] = recording_ready
     payload["recording_ready_reason"] = recording_ready_reason
+    # How long this recording has been running, from the server. The browser
+    # used to start its own clock at zero, so a reload mid-meeting showed
+    # "Stop - 0:00" on a recording that was an hour old. The WAV writer's
+    # clock is the meeting timeline the transcript is stamped against, and it
+    # carries across a pause or a resume; the monotonic start is the fallback
+    # for the seconds before the writer exists. Read outside the lock: it is
+    # an attribute on an object the lock only had to hand over.
+    payload["elapsed_sec"] = None
+    if payload["recording"]:
+        elapsed = None
+        if capture is not None:
+            try:
+                elapsed = float(capture.wav_writer.elapsed_seconds)
+            except Exception:
+                elapsed = None
+        if elapsed is None and started_mono:
+            elapsed = max(0.0, time.monotonic() - started_mono)
+        if elapsed is not None:
+            payload["elapsed_sec"] = round(elapsed, 1)
     # True while a start command is waiting for a window to take it. Read
     # outside _state_lock: the coordinator has its own lock.
     payload["pending_start"] = _start_coordinator.pending_command() is not None
@@ -1126,6 +1314,60 @@ def _run_chapters(
                 if _state["session_id"] == session_id:
                     _state["chapters_generating"] = False
             _push("chapters_busy", {"busy": False, "session_id": session_id})
+
+
+def _chapters_args_from_storage(session_id: str) -> tuple | None:
+    """Build (transcript, seg_times, meta) for a finished session, or None.
+
+    The same three values /api/chapters/generate assembles for a session that
+    is not the live one, so a post-stop pass and a hand-pressed Regenerate see
+    identical input.
+    """
+    sess = storage.get_session(session_id)
+    if not sess:
+        return None
+    labels = sess.get("speaker_labels") or {}
+    transcript = _build_transcript(sess["segments"], labels)
+    if not transcript.strip():
+        return None
+    meta = _build_session_meta(
+        sess["segments"], labels,
+        session_title=sess.get("title", ""),
+        is_live=False,
+        started_at=sess.get("started_at", ""),
+        ended_at=sess.get("ended_at", ""),
+        current_summary=sess.get("summary", ""),
+    )
+    return transcript, _segment_times(sess["segments"]), meta
+
+
+def _final_chapters_pass(session_id: str) -> None:
+    """Rebuild a finished recording's chapters from the complete transcript.
+
+    Opt-in through ``chapters_regen_after_meeting`` (on by default). A live
+    auto-run is handed the chapters already placed and asked to keep them, by
+    design, so nothing renames a chapter under the user mid-meeting; the cost
+    is that the opening chapters were chosen when the meeting was thirty
+    seconds old. One authoritative pass over the finished transcript is what
+    makes the list describe the meeting instead of its first few minutes.
+
+    Runs the manual path (``is_auto=False``), so it uses whatever the provider,
+    model, granularity and prompt settings say at that moment. Never raises:
+    this is the tail of a stop, and a failed chapter pass must not lose the
+    work queued behind it.
+    """
+    try:
+        if not settings.get("chapters_regen_after_meeting", True):
+            return
+        args = _chapters_args_from_storage(session_id)
+        if args is None:
+            log.info("chapters", f"No transcript to re-chapter for {session_id}")
+            return
+        transcript, seg_times, meta = args
+        log.info("chapters", f"Recording stopped; re-chaptering {session_id}")
+        _run_chapters(session_id, transcript, seg_times, meta, is_auto=False)
+    except Exception as e:
+        log.warn("chapters", f"Post-recording chapter pass failed: {e}")
 
 
 def _defer_summary_during_recording(session_id, transcript, seg_count,
@@ -2502,7 +2744,18 @@ def start_recording():
                         pass
             next_speaker_label = max_label + 1
         else:
-            session_id         = storage.create_session(title)
+            # Opt-in: a recording that starts inside a calendar meeting takes
+            # that meeting's name instead of "Meeting <date> <time>". Reads
+            # the cached feed only, and returns "" for anything short of a
+            # confident, non-private match, so the default name still wins.
+            cal_title = "" if title else calendar_sync.title_for_start()
+            session_id         = storage.create_session(title or cal_title or None)
+            if cal_title:
+                # The lock the auto-titler reads. A name the user opted into
+                # taking from their own calendar is a chosen name, so the
+                # post-stop AI title must not overwrite it.
+                storage.update_session_title(session_id, cal_title, user_set=True)
+                log.info("recording", f"Named session {session_id} from the calendar")
             existing_segments  = []
             existing_summary   = ""
             existing_chat      = []
@@ -2520,6 +2773,9 @@ def start_recording():
         # failure). Bound to this session so a stale alarm cannot fire on a later one.
         capture.on_loopback_silent = (
             lambda dev, kind, _sid=session_id: _alert_loopback_silent(_sid, dev, kind)
+        )
+        capture.on_loopback_recovered = (
+            lambda dev, _sid=session_id: _alert_loopback_recovered(_sid, dev)
         )
 
         # Apply echo cancellation setting to the new capture instance
@@ -2841,6 +3097,10 @@ def stop_recording():
             # title generation so the file carries the real title).
             if sid:
                 obsidian.export_session(sid)
+            # Last in the tail: the only thing here that waits on a model with
+            # no deadline, and nothing below it should be held up by that.
+            if sid:
+                _final_chapters_pass(sid)
         except Exception:
             import traceback
             log.warn("recording", f"Post-stop tasks failed for session {sid}:")
@@ -3021,9 +3281,29 @@ def open_window():
 
 @app.route("/api/settings/startup")
 def get_startup():
+    """Whether the app really will launch at sign-in.
+
+    Not just "does the shortcut exist": Windows keeps its own approval flag for
+    every Startup entry, and Task Manager, Settings > Apps > Startup and any
+    number of tune-up tools set it. With the flag set the shortcut is ignored,
+    so reporting the file's existence showed the toggle on while nothing
+    launched at sign-in. ``blocked`` says that happened, and turning the toggle
+    on clears it.
+    """
     if sys.platform != "win32":
-        return jsonify({"supported": False, "enabled": False})
-    return jsonify({"supported": True, "enabled": _startup_lnk_path().exists()})
+        return jsonify({"supported": False, "enabled": False, "blocked": False})
+    from core import shortcut as _shortcut
+    lnk = _startup_lnk_path()
+    present = lnk.exists()
+    approval = _shortcut.startup_approval(lnk.name) if present else "enabled"
+    blocked = present and approval == "disabled"
+    return jsonify({
+        "supported": True,
+        "enabled": present and not blocked,
+        "blocked": blocked,
+        "reason": ("Windows has this switched off in Task Manager > Startup apps. "
+                   "Turn it on here to re-enable it.") if blocked else "",
+    })
 
 
 @app.route("/api/settings/startup", methods=["POST"])
@@ -3047,13 +3327,28 @@ def set_startup():
             lnk, "wscript.exe", f'"{root / "launch_hidden.vbs"}"', str(root),
             icon if icon.exists() else None,
         )
-        if not ok:
+        if not ok or not lnk.exists():
             return jsonify({"ok": False, "error": "Failed to create startup shortcut"}), 500
+        # The shortcut alone is not enough: Windows keeps a per-entry approval
+        # flag and honours it over the file. Turning this on is the user saying
+        # they want it, so clear anything that had switched it off.
+        if not _shortcut.approve_startup(lnk.name):
+            log.warn("app", "Startup shortcut written but Windows' approval flag "
+                            "could not be cleared; check Task Manager > Startup apps.")
+        if _shortcut.startup_approval(lnk.name) == "disabled":
+            return jsonify({
+                "ok": False,
+                "enabled": False,
+                "error": "Windows is blocking this in Task Manager > Startup apps. "
+                         "Enable Meeting Assistant there and it will stick.",
+            }), 409
+        log.info("app", "Launch at startup enabled.")
     else:
         try:
             lnk.unlink()
         except FileNotFoundError:
             pass
+        log.info("app", "Launch at startup disabled.")
     return jsonify({"ok": True, "enabled": lnk.exists()})
 
 
@@ -3602,7 +3897,9 @@ def _icons_changed() -> None:
         _tray_mod.reload_icons()
     except Exception:
         pass
-    _refresh_tray()
+    # force: the tray state has not moved, only the images behind it, and the
+    # coalescing refresh would otherwise decide there is nothing to redraw.
+    _refresh_tray(force=True)
     _sync_shortcut_icon_async()
 
 
@@ -6140,24 +6437,18 @@ def api_generate_chapters():
             seg_times = None
             meta = None
 
+    no_transcript = jsonify({"error": "No transcript to generate chapters from"}), 400
     if transcript is None:
-        sess = storage.get_session(session_id)
-        if not sess:
+        # get_session_times is the cheap existence check; the helper below
+        # loads the session itself, so don't load it twice.
+        if not storage.get_session_times(session_id):
             return jsonify({"error": "Session not found"}), 404
-        labels = sess.get("speaker_labels") or {}
-        transcript = _build_transcript(sess["segments"], labels)
-        seg_times = _segment_times(sess["segments"])
-        meta = _build_session_meta(
-            sess["segments"], labels,
-            session_title=sess.get("title", ""),
-            is_live=False,
-            started_at=sess.get("started_at", ""),
-            ended_at=sess.get("ended_at", ""),
-            current_summary=sess.get("summary", ""),
-        )
-
-    if not transcript.strip():
-        return jsonify({"error": "No transcript to generate chapters from"}), 400
+        args = _chapters_args_from_storage(session_id)
+        if args is None:
+            return no_transcript
+        transcript, seg_times, meta = args
+    elif not transcript.strip():
+        return no_transcript
 
     threading.Thread(
         target=_run_chapters,
@@ -9216,6 +9507,38 @@ def calendar_test():
     return jsonify(calendar_sync.test_link(url))
 
 
+@app.route("/api/calendar/join", methods=["POST"])
+def calendar_join():
+    """Open one calendar event's meeting link. Body: {key}.
+
+    The client sends the opaque event key it already has, never a URL: a join
+    link is a credential in the same sense the feed is, so it is resolved out
+    of the cache here and handed straight to the OS. That also means nothing a
+    page could forge reaches the launcher.
+    """
+    data = request.get_json(silent=True) or {}
+    instance = calendar_events_api.find_instance(data.get("key"))
+    if instance is None:
+        return jsonify({"ok": False, "error": "That meeting is no longer in the calendar."}), 404
+    link = meeting_links.find_link(instance)
+    if not link:
+        return jsonify({"ok": False, "error": "This meeting has no join link."}), 404
+    result = meeting_links.open_link(link)
+    if not result.get("ok"):
+        return jsonify({
+            "ok": False,
+            "provider": link["provider"],
+            "label": link["label"],
+            "error": f"Could not open {link['label']} on this computer.",
+        }), 502
+    return jsonify({
+        "ok": True,
+        "provider": link["provider"],
+        "label": link["label"],
+        "opened": result.get("opened") or "",
+    })
+
+
 @app.route("/api/sessions/<session_id>/calendar_match", methods=["GET"])
 def get_session_calendar_match(session_id: str):
     """The stored calendar match for one recording, plus its alternatives."""
@@ -10237,12 +10560,13 @@ def _handshake_existing_instance(url: str) -> bool:
     Returns True if startup should continue, False if we must abort.
     """
     import urllib.request
+    opener = _local_opener()
     try:
         req = urllib.request.Request(
             f"{url}/api/instance-handshake", data=b"{}",
             headers={"Content-Type": "application/json"}, method="POST",
         )
-        resp = urllib.request.urlopen(req, timeout=3)
+        resp = opener.open(req, timeout=3)
         data = json.loads(resp.read())
     except Exception:
         return True  # nothing listening — port is free
@@ -10261,7 +10585,7 @@ def _handshake_existing_instance(url: str) -> bool:
             f"{url}/api/shutdown", data=b"{}",
             headers={"Content-Type": "application/json"}, method="POST",
         )
-        urllib.request.urlopen(req, timeout=3)
+        opener.open(req, timeout=3)
     except Exception:
         pass  # may fail if it exits before responding — that's fine
 
@@ -10269,7 +10593,7 @@ def _handshake_existing_instance(url: str) -> bool:
     for _ in range(30):
         time.sleep(0.3)
         try:
-            urllib.request.urlopen(f"{url}/api/status", timeout=1)
+            opener.open(f"{url}/api/status", timeout=1)
         except Exception:
             log.info("app", "Previous instance shut down.")
             return True
@@ -10318,49 +10642,42 @@ def main() -> None:
     )
     flask_thread.start()
 
-    # Build the tray now; *when* it runs depends on the platform. On
-    # Windows/Linux it runs on a daemon thread (just below) so the main thread
-    # can receive Ctrl+C. On macOS the NSStatusItem MUST be created on the main
-    # thread (AppKit aborts otherwise), so the darwin tray runs on the main
-    # thread at the very end of main().
-    try:
-        from ui_desktop.tray import TRAY_AVAILABLE, MeetingTray
-        if not TRAY_AVAILABLE:
-            raise ImportError("pystray or Pillow not installed")
+    # Hand the tray the real state. Up to here it has been reading an empty
+    # dict and showing "Loading models...", which is what it should have been
+    # saying anyway. The icon itself has been up since the top of this module
+    # (see "The tray icon, before the model stack").
+    global _tray_state_provider
 
-        def _state_snapshot() -> dict:
-            snap = _status_payload()
-            with _state_lock:
-                snap.update({**_state})
-            snap["ai_provider"] = settings.get("ai_provider", "openai")
-            return snap
+    def _state_snapshot() -> dict:
+        snap = _status_payload()
+        with _state_lock:
+            snap.update({**_state})
+        snap["ai_provider"] = settings.get("ai_provider", "openai")
+        return snap
 
-        def _on_tray_quit(icon) -> None:
-            if icon:
-                try:
-                    icon.stop()
-                except Exception:
-                    pass
-            _force_quit()
+    _tray_state_provider = _state_snapshot
 
-        _tray = MeetingTray(url, _state_snapshot, _on_tray_quit)
-    except ImportError:
-        log.warn("tray", "pystray/Pillow not installed - running without system tray.")
-        log.warn("tray", "Install with: pip install pystray Pillow")
-
-    if _tray is not None and sys.platform != "darwin":
-        # Windows/Linux: run the tray in a daemon thread so the main thread
-        # stays in Python code where it can receive signals (Ctrl+C).  pystray's
-        # Win32 message loop blocks in native C, which would otherwise prevent
-        # Python signal handlers from firing.
-        threading.Thread(target=_tray.run, daemon=True).start()
-        log.info("tray", "System tray active - right-click for menu.")
+    # Windows/Linux: normally already started above, so this covers the paths
+    # that skipped it (a busy port that main() then took over). _tray_started,
+    # not _tray: the boot thread may still be importing pystray.
+    if not _tray_started and sys.platform != "darwin":
+        _start_tray(url)
+    elif _tray is None and sys.platform == "darwin":
+        try:
+            from ui_desktop.tray import TRAY_AVAILABLE, MeetingTray
+            if not TRAY_AVAILABLE:
+                raise ImportError("pystray or Pillow not installed")
+            _tray = MeetingTray(url, _tray_state, _tray_quit)
+        except ImportError:
+            log.warn("tray", "pystray/Pillow not installed - running without system tray.")
+            log.warn("tray", "Install with: pip install pystray Pillow")
+    _refresh_tray()
 
     # Wait for Flask to bind
-    import urllib.request
+    _opener = _local_opener()
     for _ in range(40):
         try:
-            urllib.request.urlopen(f"{url}/api/status", timeout=1)
+            _opener.open(f"{url}/api/status", timeout=1)
             break
         except Exception:
             time.sleep(0.15)
@@ -10369,10 +10686,14 @@ def main() -> None:
     # requests so the UI can render immediately and show startup progress.
     _start_background_initializers()
 
-    # Open browser - go to settings page if keys are missing
+    # Open the window: always when keys are missing (there is nothing to do
+    # until they are set), otherwise only if the user asked for it. Off by
+    # default because the app is normally started to sit in the tray, and at
+    # sign-in a window nobody asked for is in the way.
     if config.needs_setup(_active_provider):
         browser.open_app_window(f"{url}?settings=1")
-    #else: browser.open_app_window(url)
+    elif settings.get("open_window_on_launch", False):
+        browser.open_app_window(url)
 
     # Register SIGINT after Flask starts (werkzeug would override an earlier handler).
     # This ensures Ctrl+C in the console immediately stops recording and exits.

@@ -94,12 +94,25 @@ function _timeAgo(isoDate) {
   return d.toLocaleDateString();
 }
 
+/** A talk-time total, as days, hours and minutes: "8d 2h 22m".
+ *
+ *  These are eight-week aggregates, so they run to hundreds of hours, and
+ *  "194h 22m" leaves the reader doing the division. Zero components are
+ *  dropped, so eight whole days reads "8d" and not "8d 0h 0m", and a total
+ *  under a minute reads in seconds rather than rounding down to a bare "0m".
+ */
 function _formatDuration(seconds) {
-  if (!seconds || seconds <= 0) return '0m';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
+  const total = Math.floor(Number(seconds) || 0);
+  if (total <= 0) return '0m';
+  if (total < 60) return `${total}s`;
+  const parts = [];
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  return parts.join(' ');
 }
 
 /* ── Chat Rendering ───────────────────────────────────────────────────────── */
@@ -1664,9 +1677,32 @@ function _renderOverview(booting) {
 }
 
 /* ── C. Next ─────────────────────────────────────────────────────────────────
- * Today and the next two days as a short agenda, from the same loaded range.
- * Not connected shows one restrained line, not an empty panel.
+ * Full width, straight under the hero row. Two parts, because the section
+ * answers two different questions:
+ *
+ *   the focus strip  "what do I do right now" - whatever is running, else the
+ *                    soonest thing still to come, with its countdown and its
+ *                    Join button, on its own surface so it reads as an answer
+ *                    rather than as another row
+ *   three columns    "what does the shape of the next three days look like" -
+ *                    today and the two days after it, each with its count and
+ *                    its total, today carrying a line where the clock is
+ *
+ * Both read the one calendarEvents range the page already loads, so nothing
+ * here fetches. The join URL is never on this page: rows carry the provider
+ * slug and the opaque event key, and app.js's calendarJoinButton turns those
+ * into the control (see "A join link never reaches the browser" in AGENT.md).
  * ─────────────────────────────────────────────────────────────────────────── */
+
+const _NEXT_ROWS_PER_DAY = 5;
+// Past this length an entry is a container, not a meeting ("Focus time",
+// "Out of office"), so it never takes the focus strip. Same threshold the
+// backend matcher uses for the same reason.
+const _NEXT_BLOCK_MS = 4 * 3600 * 1000;
+// Beyond this a countdown has stopped meaning anything and the strip says the
+// day and the time instead.
+const _NEXT_COUNTDOWN_MS = 12 * 3600 * 1000;
+const _NEXT_TICK_MS = 30000;
 
 function _homeNextDayLabel(dayKey, todayKey) {
   if (dayKey === todayKey) return 'Today';
@@ -1677,66 +1713,330 @@ function _homeNextDayLabel(dayKey, todayKey) {
     .toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
 }
 
-function _homeNextRow(e) {
-  const start = new Date(e.start);
-  const time = e.all_day ? 'All day' : _homeClock(start);
-  let stateHtml = '';
-  if (e.state === 'recorded') stateHtml = '<span class="next-state next-state-recorded">Recorded</span>';
-  else if (e.state === 'recording') stateHtml = '<span class="next-state next-state-live">Live</span>';
-  else if (e.state === 'missed') stateHtml = '<span class="next-state next-state-missed">Not recorded</span>';
-  const inner = `<span class="next-time">${escapeHtml(time)}</span>`
-    + `<span class="next-title">${escapeHtml(e.title || 'Untitled')}</span>${stateHtml}`;
-  if (e.session_id) {
-    return `<a class="dash-next-row is-link" href="/session?id=${encodeURIComponent(e.session_id)}">${inner}</a>`;
-  }
-  return `<div class="dash-next-row">${inner}</div>`;
+/** "45m", "1h", "2h 30m". One formatter for a row, a day total and a
+ *  countdown, so the three never disagree about how long an hour looks. */
+function _homeDurLabel(mins) {
+  if (!(mins > 0)) return '';
+  if (mins < 60) return `${Math.round(mins)}m`;
+  const h = Math.floor(mins / 60);
+  const m = Math.round(mins % 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
 }
+
+function _nextStart(e) { return new Date(e.start).getTime(); }
+function _nextEnd(e) {
+  const end = e.end ? new Date(e.end).getTime() : NaN;
+  return Number.isFinite(end) ? end : _nextStart(e);
+}
+function _nextMinutes(e) {
+  if (e.all_day) return 0;
+  const span = _nextEnd(e) - _nextStart(e);
+  return span > 0 ? Math.round(span / 60000) : 0;
+}
+/** The events for the range Home already loaded. */
+function _homeNextEvents(range) {
+  const payload = AppData.get('calendarEvents', range.rangeKey);
+  return (payload && payload.events) || [];
+}
+/** The Calendar view, on that month, with that day's panel open. */
+function _homeNextDayHref(dayKey) {
+  return `/calendar?month=${dayKey.slice(0, 7)}&amp;day=${dayKey}`;
+}
+
+/* ── The focus strip ──────────────────────────────────────────────────────── */
+
+/** The one meeting worth a strip of its own: whatever is running now, else the
+ *  soonest one still to come. All-day items and multi-hour blocks are skipped;
+ *  a "Focus time" block that spans the afternoon would otherwise hold the strip
+ *  all afternoon and hide the meeting you actually have to join. */
+function _homeNextFocus(events, now) {
+  const t = now.getTime();
+  let running = null, upcoming = null;
+  for (const e of events || []) {
+    const start = _nextStart(e);
+    if (e.all_day || !Number.isFinite(start)) continue;
+    const end = _nextEnd(e);
+    if (end - start >= _NEXT_BLOCK_MS) continue;
+    if (start <= t && t < end) {
+      // Two overlapping meetings: the one that started last is the one you are
+      // most likely in.
+      if (!running || start > _nextStart(running)) running = e;
+    } else if (start > t) {
+      if (!upcoming || start < _nextStart(upcoming)) upcoming = e;
+    }
+  }
+  return running || upcoming || null;
+}
+
+function _homeFocusRunning(e, now) {
+  const t = now.getTime();
+  return _nextStart(e) <= t && t < _nextEnd(e);
+}
+
+/** Time until it starts, or how much of it is left. */
+function _homeFocusCountdown(e, now, running) {
+  const t = now.getTime();
+  if (running) {
+    const left = _nextEnd(e) - t;
+    if (left <= 60000) return 'ending now';
+    return `${_homeDurLabel(left / 60000)} left`;
+  }
+  const until = _nextStart(e) - t;
+  if (until <= 60000) return 'starting now';
+  if (until > _NEXT_COUNTDOWN_MS) return '';
+  return `in ${_homeDurLabel(until / 60000)}`;
+}
+
+function _renderNextFocus(focus, range, now) {
+  const box = document.getElementById('dash-next-focus');
+  if (!box) return;
+  if (!focus) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+
+  const start = new Date(focus.start);
+  const running = _homeFocusRunning(focus, now);
+  const recording = focus.state === 'recording';
+  // Urgency reads as colour: green while it is being recorded, accent while it
+  // is happening, quiet while it is still ahead.
+  let flag = 'Next up', cls = 'is-next';
+  if (recording) { flag = 'Recording now'; cls = 'is-recording'; }
+  else if (running) { flag = 'Happening now'; cls = 'is-now'; }
+
+  const meta = [];
+  const dayKey = _homeDayKey(start);
+  if (dayKey !== range.todayKey) meta.push(_homeNextDayLabel(dayKey, range.todayKey));
+  meta.push(focus.end
+    ? `${_homeClock(start)} to ${_homeClock(new Date(focus.end))}`
+    : _homeClock(start));
+  const mins = _nextMinutes(focus);
+  if (mins > 0) meta.push(_homeDurLabel(mins));
+  if (focus.join_label) meta.push(focus.join_label);
+  if (focus.status === 'tentative') meta.push('Tentative');
+
+  const countdown = _homeFocusCountdown(focus, now, running);
+  const acts = [calendarJoinButton(focus.key, focus.join, focus.join_label,
+                                   'dash-next-join is-solid')];
+  if (focus.session_id) {
+    acts.push(`<a class="btn btn-secondary next-focus-open"`
+      + ` href="/session?id=${encodeURIComponent(focus.session_id)}">Open recording</a>`);
+  }
+
+  box.hidden = false;
+  _dashMorph(box, `
+    <div class="next-focus ${cls}">
+      <span class="next-focus-flag">
+        <span class="next-focus-dot" aria-hidden="true"></span>${escapeHtml(flag)}
+      </span>
+      <span class="next-focus-main">
+        <span class="next-focus-title">${escapeHtml(focus.title || 'Untitled')}</span>
+        <span class="next-focus-meta">${escapeHtml(meta.join(' · '))}</span>
+      </span>
+      <span class="next-focus-count"${countdown ? '' : ' hidden'}>${escapeHtml(countdown)}</span>
+      <span class="next-focus-act">${acts.filter(Boolean).join('')}</span>
+    </div>`);
+}
+
+/* ── The three day columns ────────────────────────────────────────────────── */
+
+function _homeNextRow(e, now) {
+  const start = new Date(e.start);
+  const t = now.getTime();
+  const past = !e.all_day && _nextEnd(e) <= t;
+  const current = !e.all_day && _nextStart(e) <= t && t < _nextEnd(e);
+
+  let chip = '';
+  if (e.state === 'recorded') chip = '<span class="next-state next-state-recorded">Recorded</span>';
+  else if (e.state === 'recording') chip = '<span class="next-state next-state-live">Live</span>';
+  else if (e.state === 'missed') chip = '<span class="next-state next-state-missed">Not recorded</span>';
+
+  // What the meta line is for: which app Join will open, and any flag on the
+  // invite. Empty for a plain meeting with no link, and then the row is one
+  // line instead of two.
+  const bits = [];
+  if (e.join_label) bits.push(e.join_label);
+  if (e.status === 'tentative') bits.push('Tentative');
+  const meta = bits.length
+    ? `<span class="next-meta">${escapeHtml(bits.join(' · '))}</span>` : '';
+
+  const len = _homeDurLabel(_nextMinutes(e));
+  const inner = '<span class="next-when">'
+    + `<span class="next-at">${escapeHtml(e.all_day ? 'All day' : _homeClock(start))}</span>`
+    + (len ? `<span class="next-len">${escapeHtml(len)}</span>` : '')
+    + '</span>'
+    + '<span class="next-main">'
+    + `<span class="next-titlerow"><span class="next-title">${escapeHtml(e.title || 'Untitled')}</span>${chip}</span>`
+    + meta
+    + '</span>';
+
+  const cls = ['dash-next-row'];
+  if (past) cls.push('is-past');
+  if (current) cls.push('is-current');
+  const row = e.session_id
+    ? `<a class="${cls.join(' ')} is-link" href="/session?id=${encodeURIComponent(e.session_id)}"`
+      + ` title="Open this recording">${inner}</a>`
+    : `<div class="${cls.join(' ')}">${inner}</div>`;
+  // A button cannot live inside the row's own link, so a joinable meeting
+  // gets a wrapper and everything else keeps the markup it always had.
+  const join = calendarJoinButton(e.key, e.join, e.join_label, 'dash-next-join');
+  return join ? `<div class="dash-next-item">${row}${join}</div>` : row;
+}
+
+function _homeNextDayColumn(dayKey, evs, range, now) {
+  const isToday = dayKey === range.todayKey;
+  const label = escapeHtml(_homeNextDayLabel(dayKey, range.todayKey));
+  let head = '<div class="dash-next-dayhead">'
+    + `<h3 class="dash-next-daylabel${isToday ? ' is-today' : ''}">${label}</h3>`;
+  if (evs.length) {
+    const parts = [`${evs.length} meeting${evs.length === 1 ? '' : 's'}`];
+    const total = _homeDurLabel(evs.reduce((sum, e) => sum + _nextMinutes(e), 0));
+    if (total) parts.push(total);
+    head += `<span class="dash-next-daymeta">${escapeHtml(parts.join(' · '))}</span>`;
+  }
+  head += '</div>';
+
+  if (!evs.length) {
+    return `<div class="dash-next-day">${head}`
+      + '<p class="dash-next-dayempty">Nothing scheduled</p></div>';
+  }
+
+  const shown = evs.slice(0, _NEXT_ROWS_PER_DAY);
+  const t = now.getTime();
+  let rows = '';
+  // A hairline where the clock is, drawn only between something that has
+  // finished and something that has not. At the top or the bottom of the
+  // column it would mark nothing.
+  let sawPast = false, drawn = !isToday;
+  for (const e of shown) {
+    const done = !e.all_day && _nextEnd(e) <= t;
+    if (!drawn && sawPast && !done) {
+      rows += '<div class="dash-next-now" aria-hidden="true"></div>';
+      drawn = true;
+    }
+    rows += _homeNextRow(e, now);
+    if (done) sawPast = true;
+  }
+
+  const hidden = evs.length - shown.length;
+  const more = hidden > 0
+    ? `<a class="dash-next-more" href="${_homeNextDayHref(dayKey)}">${hidden} more</a>`
+    : '';
+  return `<div class="dash-next-day">${head}${rows}${more}</div>`;
+}
+
+function _homeNextDaySkeleton(dayKey, todayKey) {
+  const row = '<div class="dash-next-row dash-next-row-skel">'
+    + '<span class="skeleton skeleton-chip"></span>'
+    + '<span class="skeleton skeleton-line"></span></div>';
+  return '<div class="dash-next-day"><div class="dash-next-dayhead">'
+    + `<h3 class="dash-next-daylabel">${escapeHtml(_homeNextDayLabel(dayKey, todayKey))}</h3>`
+    + '</div>' + row.repeat(3) + '</div>';
+}
+
+/* ── The section ──────────────────────────────────────────────────────────── */
 
 function _renderNext() {
   const body = document.getElementById('dash-next-body');
+  const note = document.getElementById('dash-next-note');
+  const link = document.getElementById('dash-next-all');
+  const focusBox = document.getElementById('dash-next-focus');
   if (!body) return;
 
   const range = _homeWeekRange();
   const status = AppData.get('calendarStatus');
   const enabled = !!(status && (status.enabled != null ? status.enabled : status.calendar_enabled));
+  if (focusBox) { focusBox.hidden = true; focusBox.innerHTML = ''; }
+  if (note) note.textContent = '';
+  if (link) link.classList.toggle('hidden', !enabled);
 
+  // One restrained line, not an empty three column layout.
   if (!enabled) {
-    body.innerHTML = '<p class="dash-next-connect">Connect your calendar to see what is next. '
+    body.classList.add('is-flat');
+    body.innerHTML = '<p class="dash-next-connect">Connect a published calendar and the next '
+      + 'three days land here, each meeting one click from its own app. '
       + '<a href="/session?settings=1&amp;section=calendar">Connect your calendar</a></p>';
     return;
   }
 
-  const payload = AppData.get('calendarEvents', range.rangeKey);
-  const events = (payload && payload.events) || [];
+  const events = _homeNextEvents(range);
   const days = [0, 1, 2].map(n => {
     const d = new Date(range.today);
     d.setDate(d.getDate() + n);
     return _homeDayKey(d);
   });
-  const daySet = new Set(days);
 
-  const byDay = new Map();
-  for (const e of events) {
-    const key = _homeDayKey(new Date(e.start));
-    if (!daySet.has(key)) continue;
-    if (!byDay.has(key)) byDay.set(key, []);
-    byDay.get(key).push(e);
+  const slice = AppData.status('calendarEvents', range.rangeKey);
+  if (!events.length && slice === 'error') {
+    body.classList.add('is-flat');
+    body.innerHTML = '<p class="dash-next-empty">Could not load your calendar.</p>';
+    return;
   }
-
-  if (!days.some(k => (byDay.get(k) || []).length)) {
-    body.innerHTML = '<p class="dash-next-empty">Nothing scheduled.</p>';
+  // First load of the range: three skeleton columns, so the section does not
+  // flash "nothing scheduled" at a calendar that is still arriving.
+  if (!events.length && slice !== 'ready') {
+    body.classList.remove('is-flat');
+    body.innerHTML = days.map(k => _homeNextDaySkeleton(k, range.todayKey)).join('');
     return;
   }
 
-  let html = '';
-  for (const key of days) {
-    const evs = (byDay.get(key) || []).slice().sort((a, b) => String(a.start).localeCompare(String(b.start)));
-    if (!evs.length) continue;
-    html += `<div class="dash-next-day"><h3 class="dash-next-daylabel">${escapeHtml(_homeNextDayLabel(key, range.todayKey))}</h3>`;
-    for (const e of evs) html += _homeNextRow(e);
-    html += '</div>';
+  const byDay = new Map(days.map(k => [k, []]));
+  for (const e of events) {
+    const key = _homeDayKey(new Date(e.start));
+    if (byDay.has(key)) byDay.get(key).push(e);
   }
-  body.innerHTML = html;
+  // All-day items head their day, then everything else by the clock.
+  for (const list of byDay.values()) {
+    list.sort((a, b) => (!!a.all_day === !!b.all_day)
+      ? String(a.start).localeCompare(String(b.start))
+      : (a.all_day ? -1 : 1));
+  }
+
+  const total = days.reduce((n, k) => n + byDay.get(k).length, 0);
+  if (note) {
+    note.textContent = total
+      ? `${total} meeting${total === 1 ? '' : 's'} over three days`
+      : 'Today and the next two days';
+  }
+  if (!total) {
+    body.classList.add('is-flat');
+    body.innerHTML = '<p class="dash-next-empty">Nothing scheduled for the next three days.</p>';
+    return;
+  }
+
+  const now = new Date();
+  _renderNextFocus(_homeNextFocus(events, now), range, now);
+  body.classList.remove('is-flat');
+  // Keyed update: the countdown reruns this every half minute and a wholesale
+  // innerHTML swap would drop focus off a Join button mid-tab.
+  _dashMorph(body, days.map(k => _homeNextDayColumn(k, byDay.get(k), range, now)).join(''));
+}
+
+/* ── The clock ────────────────────────────────────────────────────────────────
+ * The countdown, the "happening now" flag and today's now line all move on
+ * their own, so Home keeps a slow clock for as long as it is the visible view
+ * and drops it the moment it is not.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+let _homeNextTimer = null;
+
+function _homeStartNextClock() {
+  if (_homeNextTimer) return;
+  _homeNextTimer = setInterval(() => {
+    if (Views.current !== 'home') return;
+    // Past midnight the three days, and so the cache key, are different ones.
+    // A ready or in-flight range makes this a no-op; a brand new one gets
+    // loaded, which is what stops the section sitting on skeletons.
+    AppData.load('calendarEvents', { key: _homeWeekRange().rangeKey });
+    _renderNext();
+  }, _NEXT_TICK_MS);
+}
+
+function _homeStopNextClock() {
+  if (!_homeNextTimer) return;
+  clearInterval(_homeNextTimer);
+  _homeNextTimer = null;
 }
 
 /* ── Timeline and histogram tooltip ──────────────────────────────────────────
@@ -1790,10 +2090,12 @@ Views.register('home', {
     AppData.load('calendarStatus');
     AppData.load('calendarEvents', { key: _homeWeekRange().rangeKey });
     _homeBindTips();
+    _homeStartNextClock();
     loadAnalytics();
   },
   deactivate() {
     _homeHideTip();
+    _homeStopNextClock();
   },
 });
 

@@ -12,9 +12,82 @@ How an entry is read:
   Reworked, and so on. Past tense, user language, no module names.
 - Everything below the heading, until the next `## `, is that entry's notes:
   `### ` sub-headings for areas (Recording, Speakers, Settings), `- ` bullets,
-  paragraphs. Plain markdown.
+  paragraphs. Rendered as full markdown, so use it.
 - Infrastructure, docs, CI and tooling changes get no entry.
 
+Formatting the notes. An entry is read in two places, both of them narrow: the
+Changelog tab, and the What's new card that pops up after an update. Nobody
+reads either one start to finish, so the formatting is there to make a bullet
+scannable, not to decorate it. Everything below is styled for both surfaces:
+
+- `**bold**` for **the thing that changed**, usually the first few words of the
+  bullet. This is the one that earns its keep: it lets someone find the change
+  they care about without reading every line.
+- `` `code` `` for text the reader will see or type *in the app*: a control's
+  name (`Open on Launch`), a path through the UI (`Settings > Calendar`), a
+  value the app displays (`8d 2h 22m`). Never for a module, a function or a
+  file path. Users do not have those.
+- `*italic*` for a light aside, and for the `*Fixed:*` prefix when a repair
+  sits under an area heading that is mostly new features.
+- Nested `- ` bullets for the detail behind a bullet, so the top level stays a
+  list of changes and the specifics sit one level down where they can be
+  skipped.
+- `> ` for a note that is not itself a change: something that applies across
+  the entry, or a caveat worth pulling out of the flow. At most one per entry.
+- `[link text](https://...)` when the change needs a page elsewhere. Opens in
+  a new tab.
+- Tables, `---` rules and fenced blocks all render, and are almost never the
+  right answer at this width. A table has to be genuinely tabular to beat two
+  bullets.
+
+What not to do: bold whole sentences (nothing stands out if everything does),
+`code` for emphasis, or an entry where every bullet opens with the same bold
+word. If a bullet needs more than two of these, it is two bullets.
+
+
+## Added a Join button, reworked Next on Home, folded the recording bar into the top bar, and sped up startup (2026-09-08)
+
+### Home
+
+- **Next** has moved up to sit directly under the meeting load chart, full width, and now shows today and the next two days side by side, each with its own count and total
+- Whatever is running, or whatever is soonest if nothing is, gets **a strip of its own** at the top with a countdown and its Join button
+- Today's column draws **a line where the clock is**, so what is behind you and what is ahead of you read apart at a glance
+- Every meeting shows its start time, how long it runs, which app it opens in, and whether it was recorded
+- Talk time in **People** breaks into days once it passes one: `194h 22m` now reads `8d 2h 22m` instead of leaving you to do the division
+
+### Calendar
+
+- Scheduled meetings with a Teams, Zoom, Google Meet or Webex link now have a **Join** button, on the Calendar day panel and in Next on Home. It opens the meeting *in that app*, or in your browser if the app is not installed
+- Join shows while a meeting is upcoming or running, and for fifteen minutes after it ends
+
+### Recording
+
+- **The red bar under the top bar is gone.** While a recording is live the top bar itself turns red and shows the Desktop and Mic level meters next to the meeting name, so the window keeps a row of height and nothing is on screen twice
+- The elapsed time and **Stop** are where they always were, on the Record button
+- *Fixed:* refreshing the page mid-meeting no longer restarts the elapsed timer at zero. The clock now comes from the recording itself, so it reads the same everywhere and survives a reload, a reconnect, or a laptop waking up
+- *Fixed:* `Call/desktop audio went silent` no longer fires during an ordinary conversation. It was sampling the desktop level once every couple of seconds and kept landing in the pauses between words, so a call that was recording perfectly looked silent
+  - It now measures the whole interval, and only warns after **a minute and a half** of real silence while you are talking into the meeting
+  - The warning also clears itself the moment desktop audio comes back, and when the recording stops, instead of waiting to be dismissed
+  - The `No desktop audio` note in the top bar waits a minute too, for the same reason
+
+### Chapters
+
+- The Chapters window gains **Regenerate chapters after meeting**, on by default. Chapters added while a meeting runs are kept as they were placed, so the early ones were picked before most of the meeting had happened; this rebuilds the whole list once the recording stops, using whatever chapter settings you have at the time
+- It runs in the background after the recording is saved, and the Chapters window updates itself when it finishes
+
+### Starting up
+
+- The tray icon now appears **about half a second** after launch instead of nearly seven. Headless, that icon is the only sign the app is alive, so the wait made a working app look hung
+- *Fixed:* **Launch at Startup** could be switched on and still launch nothing. Windows keeps its own on/off switch for startup items, under `Task Manager > Startup apps`, and it wins; the setting only checked that it had created the shortcut
+  - It now shows the real state, says so when Windows has it switched off, and clears that for you when you turn it back on
+- New **Open on Launch**, below Launch at Startup and off by default: show the app window every time Meeting Assistant starts. Off means it starts in the tray and waits, and you open it from the tray icon
+
+> A launch that still needs API keys opens the window either way, whatever these two are set to.
+
+### Settings
+
+- `Settings > Calendar` gains **Name recordings after the meeting**. With it on, a recording you start during a meeting on your calendar is named after that meeting instead of the date and time, and that name is left alone when the recording ends
+- Private appointments are skipped and keep the default name
 
 ## Added a Home dashboard, a Calendar view, and a redesigned Speakers workflow (2026-09-05)
 

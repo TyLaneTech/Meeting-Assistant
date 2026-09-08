@@ -4615,6 +4615,87 @@ body.video-fullscreen .playback-bar {
 .changelog-entry-body strong { color: var(--fg); font-weight: 600; }
 .changelog-entry-body a { color: var(--accent); }
 
+/* The rest of the markdown an entry may use. Each of these already rendered
+   (the body is parsed by the same marked as everything else); what they did
+   not have was a look, so a blockquote was indistinguishable from a paragraph
+   and a nested bullet from its parent. Both surfaces inherit these: the
+   Changelog tab and the narrower What's new card. */
+
+/* Emphasis, one step brighter than the body so it reads as emphasis and not
+   as an accident of the font. */
+.changelog-entry-body em {
+  font-style: italic;
+  color: color-mix(in srgb, var(--fg) 70%, var(--fg-muted));
+}
+
+/* Superseded wording: struck and receding, never the reader's problem. */
+.changelog-entry-body del { color: var(--fg-subtle); }
+
+/* A callout: the one line of an entry that is not itself a change. Carries
+   the accent rule the area headings use, at half strength, so it reads as
+   related furniture rather than a new section. */
+.changelog-entry-body blockquote {
+  margin: 8px 0;
+  padding: 2px 0 2px 11px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  color: color-mix(in srgb, var(--fg) 60%, var(--fg-muted));
+}
+.changelog-entry-body blockquote p { margin: 2px 0; }
+
+/* A sub-point under a bullet. Indented, and hollow rather than filled, so the
+   two levels are told apart by shape and not only by position. */
+.changelog-entry-body li > ul,
+.changelog-entry-body li > ol { margin: 2px 0 2px 14px; }
+.changelog-entry-body li > ul > li::before {
+  background: none;
+  border: 1px solid color-mix(in srgb, var(--fg-subtle) 80%, transparent);
+  width: 4px;
+  height: 4px;
+}
+
+/* A break between two halves of one entry. Tokens, not the browser's grey. */
+.changelog-entry-body hr {
+  margin: 12px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* A fenced block, for the rare entry that has to show exact text. The inline
+   code rule would otherwise put a chip background behind every line. */
+.changelog-entry-body pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: var(--surface2);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+.changelog-entry-body pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  white-space: pre;
+}
+
+/* Tables scroll rather than widen: the What's new card is about 330 px, and an
+   unconstrained table pushed the whole entry sideways. */
+.changelog-entry-body table {
+  display: block;
+  overflow-x: auto;
+  width: max-content;
+  max-width: 100%;
+  margin: 8px 0;
+  border-collapse: collapse;
+}
+.changelog-entry-body th,
+.changelog-entry-body td {
+  padding: 4px 10px 4px 0;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-sub);
+}
+.changelog-entry-body th { color: var(--fg); font-weight: 600; }
+.changelog-entry-body tr:last-child td { border-bottom: 0; }
+
 .changelog-entry-toggle {
   margin-top: 8px;
   background: none;
@@ -10510,6 +10591,27 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   line-height: 1.45;
   max-width: 46ch;
 }
+/* Under the description and above the tabs, because it governs both of them
+   and it is the one chapters control whose effect you cannot see now. */
+.chapters-header-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 11px;
+  font-size: 12.5px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.chapters-header-toggle input { cursor: pointer; }
+
+/* A settings row explaining why the control above it is not doing what its
+   label promises. Yellow, because it is the user's to act on. */
+.settings-row-warn {
+  margin-top: 4px;
+  color: var(--yellow);
+}
+.settings-row-warn.hidden { display: none; }
+
 .chapters-close { flex: none; margin: -2px -4px 0 0; }
 
 .chapters-tabs {
@@ -11686,7 +11788,6 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
    own. One scoped rule covers the shell's regions, present and future. */
 .app-header .hidden,
 .sidebar .hidden,
-.capture-strip .hidden,
 .ask-rail .hidden,
 .attn-page .hidden,
 .dash .hidden { display: none; }
@@ -12440,12 +12541,15 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   flex-shrink: 0;
 }
 
+/* Shrink-to-fit, not grow: the capture meters belong beside the title text,
+   so the title must not eat the row. .app-header-actions keeps the right edge
+   with margin-left: auto. */
 .app-header-title {
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 1px;
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
 }
 .app-header-title-row { display: flex; min-width: 0; }
@@ -12476,6 +12580,7 @@ body[data-view="session"] #view-title { display: none; }
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 .header-ask-btn.hidden { display: none; }
@@ -12544,6 +12649,14 @@ body[data-view="session"] #view-title { display: none; }
   .home-search-wrap { width: 200px; }
   .header-ask-btn .btn-label { display: none; }
   .header-ask-btn { padding: 0 10px; }
+  .capture-meter-label { width: 0; overflow: hidden; }
+}
+/* The meters give up their labels before any action gives up anything (the
+   bars are the signal), and below 1100 px the row cannot hold both them and
+   the actions, so they go entirely. The red header and the red Stop control
+   still say a capture is live. */
+@container maincol (max-width: 1099px) {
+  .capture-meters { display: none; }
 }
 @container maincol (max-width: 999px) {
   .header-search-open { display: inline-flex; }
@@ -12562,59 +12675,35 @@ body[data-view="session"] #view-title { display: none; }
   .app-header { gap: 10px; }
 }
 
-/* ── Capture strip ────────────────────────────────────────────────────────── */
+/* ── Capture meters (in the header) ──────────────────────────────────────────
+   Two stacked bars beside the view title, live only while recording. The pair
+   is deliberately small: it is proof that audio is arriving, not a control,
+   and the header still has to hold Record without collapsing. */
 
-.capture-strip {
+.capture-meters {
   display: flex;
-  align-items: center;
-  gap: 16px;
-  height: 40px;
-  padding: 0 20px;
-  background: color-mix(in srgb, var(--red) 10%, var(--surface));
-  border-bottom: 1px solid color-mix(in srgb, var(--red) 30%, var(--border));
+  flex-direction: column;
+  gap: 3px;
   flex-shrink: 0;
+  margin-left: 4px;
+  padding-left: 14px;
+  border-left: 1px solid color-mix(in srgb, var(--red) 30%, var(--border));
 }
-.capture-strip[hidden] { display: none; }
-.capture-live {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  flex-shrink: 0;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--red);
-}
-.capture-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--red);
-  animation: pulse 1.4s ease-in-out infinite;
-}
-.capture-title {
-  min-width: 0;
-  flex: 1;
-  font-size: 13px;
-  color: var(--fg);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.capture-time {
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-  color: var(--fg);
-  flex-shrink: 0;
-}
-.capture-meters { display: flex; gap: 16px; flex-shrink: 0; }
+.capture-meters[hidden] { display: none; }
 .capture-meter { display: flex; align-items: center; gap: 7px; }
-.capture-meter-label { font-size: 12px; color: var(--fg-muted); }
+.capture-meter-label {
+  width: 44px;
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1;
+  color: color-mix(in srgb, var(--red) 45%, var(--fg-muted));
+}
 .capture-meter-track {
   display: block;
-  width: 72px;
-  height: 6px;
+  width: 64px;
+  height: 5px;
   border-radius: 3px;
-  background: var(--surface3);
+  background: color-mix(in srgb, var(--red) 16%, var(--surface3));
   overflow: hidden;
 }
 .capture-meter-fill {
@@ -12626,17 +12715,69 @@ body[data-view="session"] #view-title { display: none; }
   transition: width 90ms linear;
 }
 .capture-meter-fill.peak { background: var(--yellow); }
+
+/* A real alert ("No desktop audio for 20 s", "Mic muted"), so it keeps the
+   yellow it had in the strip rather than dissolving into the red header. */
 .capture-warning {
+  flex-shrink: 0;
   padding: 3px 8px;
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--yellow) 18%, transparent);
+  background: color-mix(in srgb, var(--yellow) 18%, var(--surface));
   color: var(--yellow);
   font-size: 12px;
   font-weight: 500;
-  flex-shrink: 0;
 }
 .capture-warning.hidden { display: none; }
-.capture-stop-btn { flex-shrink: 0; height: 30px; padding: 0 14px; }
+
+/* ── The header while recording ──────────────────────────────────────────────
+   The strip's red is now the header's own. Every element that carried a
+   surface fill is re-mixed against the same red so the row reads as one
+   surface instead of grey tiles floating on a red band. Nothing changes
+   shape or position: only the tint. */
+
+body.is-recording .app-header {
+  background: color-mix(in srgb, var(--red) 12%, var(--surface));
+  border-bottom-color: color-mix(in srgb, var(--red) 34%, var(--border));
+}
+body.is-recording .app-header .view-subtitle { color: color-mix(in srgb, var(--red) 38%, var(--fg-muted)); }
+body.is-recording .app-header .home-search-wrap,
+body.is-recording .app-header .pane-toggle-btn {
+  background: color-mix(in srgb, var(--red) 8%, var(--surface2));
+  border-color: color-mix(in srgb, var(--red) 26%, var(--border));
+}
+/* The accent glyphs would read as a second theme against the red, so the
+   accent itself goes red for as long as the capture runs. This ladder mirrors
+   the one the toggles already have, so a hidden column's toggle still
+   recedes. :focus-visible is left alone: it is an accessibility affordance,
+   not decoration, and it has to stay the one colour everywhere. */
+body.is-recording .app-header .pane-toggle-btn { color: var(--red); }
+body.is-recording .app-header .pane-toggle-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+body.is-recording .app-header .pane-toggle-btn:not(.active) {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--red) 22%, var(--border-sub));
+  color: color-mix(in srgb, var(--red) 50%, var(--fg-subtle));
+}
+body.is-recording .app-header .pane-toggle-btn:not(.active):hover {
+  border-color: color-mix(in srgb, var(--red) 26%, var(--border));
+  color: color-mix(in srgb, var(--red) 70%, var(--fg-muted));
+}
+body.is-recording .app-header .home-search-ai { color: color-mix(in srgb, var(--red) 40%, var(--fg-subtle)); }
+body.is-recording .app-header .home-search-ai.ready { color: var(--red); }
+body.is-recording .app-header .home-search-wrap:focus-within { border-color: var(--red); }
+body.is-recording .app-header .header-refresh-btn:hover,
+body.is-recording .app-header .header-search-open:hover,
+body.is-recording .app-header .header-ask-btn:hover {
+  background: color-mix(in srgb, var(--red) 20%, transparent);
+}
+/* Record is solid red on a red-tinted row, so it earns a hairline of the
+   header's own surface to keep its edge. */
+body.is-recording .app-header .record-group {
+  border-radius: var(--radius-sm);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 12%, var(--surface));
+}
 
 /* ── Ask rail ─────────────────────────────────────────────────────────────── */
 
@@ -12673,7 +12814,6 @@ body[data-view="session"] #view-title { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .view { transition: none !important; }
   .status-dot.recording,
-  .capture-dot,
   .record-pulse { animation: none; }
   .header-refresh-btn.is-spinning i { animation: none; }
 }

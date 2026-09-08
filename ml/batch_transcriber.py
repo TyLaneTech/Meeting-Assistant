@@ -334,6 +334,8 @@ class BatchTranscriber:
         import torch
 
         try:
+            from core import config as _cfg
+            _cfg.apply_torchaudio_shims()
             from pyannote.audio import Pipeline as PyannotePipeline
         except ImportError:
             log.error("batch", "pyannote.audio not installed - skipping diarization")

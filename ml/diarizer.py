@@ -87,6 +87,11 @@ warnings.filterwarnings(
 )
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+    # First pyannote import in the process, so the shims go on immediately
+    # before it: older pyannote.audio reads torchaudio symbols that
+    # torchaudio 2.x removed. Kept next to the import it protects.
+    from core import config as _config
+    _config.apply_torchaudio_shims()
     from pyannote.audio import Model as _PyannoteModel
 
 # Patch the hf_hub_download reference that pyannote.audio already bound at

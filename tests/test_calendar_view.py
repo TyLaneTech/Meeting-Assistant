@@ -141,6 +141,22 @@ def test_the_day_panel_is_an_agenda_with_one_action_per_row(cal_js):
     assert "Show in Settings" in body
 
 
+def test_the_day_panel_offers_join_above_the_row_action(cal_js):
+    """Join is the one action with a deadline on it, so it leads and demotes
+    whatever else the row offers. It never carries the URL: the button holds
+    the opaque event key and the server resolves the link."""
+    row = cal_js[cal_js.index("function _calAgendaRowHtml("):]
+    row = row[:row.index("function _calRenderDetail(")]
+    assert "calendarJoinButton(it.eventKey, it.join, it.joinLabel" in row
+    assert "${join}${_calAgendaAction(it, !!join)}" in row
+    # The fold carries the provider slug and its label, and nothing more.
+    fold = cal_js[cal_js.index("function calendarBuildItems("):]
+    fold = fold[:fold.index("function _calItemOrder(")]
+    assert "join: e.join || ''" in fold
+    assert "joinLabel: e.join_label || ''" in fold
+    assert "join_url" not in cal_js
+
+
 def test_the_sync_state_and_stale_banner_read_from_calendar_status(cal_js):
     assert "Calendar could not sync:" in cal_js
     assert "Showing the last successful sync." in cal_js
@@ -206,6 +222,14 @@ def test_calendar_css_defines_the_chip_vocabulary(cal_css):
                      ".cal-chip--live", ".cal-chip--missed", ".cal-allday-chip",
                      ".cal-agenda-row", ".cal-agenda-state"):
         assert selector in cal_css, selector
+
+
+def test_the_agenda_action_cell_stacks_two_controls(cal_css):
+    """The panel is 300 to 440 px, so Join sits above the row's own action
+    rather than beside it and squeezing the title."""
+    cell = cal_css[cal_css.index(".cal-agenda-act {"):]
+    cell = cell[:cell.index("}")]
+    assert "flex-direction: column" in cell
 
 
 def test_no_dashes_in_the_calendar_files():

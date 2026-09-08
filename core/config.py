@@ -67,10 +67,28 @@ except Exception:
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 # torchaudio 2.x removed symbols that older pyannote.audio references at import
-# time.  Apply shims early (before any pyannote import) so both diarizer.py and
-# speaker_db.py see them regardless of load order.
-try:
-    import torchaudio as _ta
+# time, so they have to be back in place before anything imports pyannote.
+#
+# This used to run at import, which meant `import core.config` imported
+# torchaudio, which imported the whole of PyTorch: 1.2 of the 1.4 seconds this
+# module cost. Every consumer paid it, including ui_desktop.tray, whose job is
+# to draw an icon. So it is a function now, and the four places that import
+# pyannote call it first (ml/diarizer.py at module level, and inside the
+# functions in ml/speaker_db.py, ml/batch_transcriber.py and core/network.py).
+# It is idempotent and cheap once torchaudio is loaded, so calling it on every
+# path is fine. If you add a fifth pyannote import, call it there too.
+_shims_applied = False
+
+
+def apply_torchaudio_shims() -> None:
+    """Restore the torchaudio symbols older pyannote.audio expects. Idempotent."""
+    global _shims_applied
+    if _shims_applied:
+        return
+    try:
+        import torchaudio as _ta
+    except ImportError:
+        return
     if not hasattr(_ta, "AudioMetaData"):
         import collections as _collections
         _ta.AudioMetaData = _collections.namedtuple(
@@ -81,8 +99,7 @@ try:
         _ta.list_audio_backends = lambda: ["soundfile"]
     if not hasattr(_ta, "set_audio_backend"):
         _ta.set_audio_backend = lambda backend: None
-except ImportError:
-    pass
+    _shims_applied = True
 
 REQUIRED_KEYS = {
     "ANTHROPIC_API_KEY": {

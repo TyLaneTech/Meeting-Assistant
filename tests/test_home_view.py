@@ -7,6 +7,7 @@ nothing here starts the server, opens the database, or touches the network.
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import jinja2
@@ -52,7 +53,8 @@ SECTION_ROOTS = [
     "dash-overview", "dash-overview-metrics", "dash-overview-heat",
     "dash-overview-desc",
     "dash-attention", "dash-attention-list", "dash-attention-all",
-    "dash-next", "dash-next-body",
+    "dash-next", "dash-next-body", "dash-next-focus", "dash-next-note",
+    "dash-next-all",
     "home-speakers-list", "home-activity-chart", "home-activity-desc",
 ]
 
@@ -81,7 +83,7 @@ def test_the_home_stylesheet_is_linked_once_after_the_shell(home_html):
 def test_no_kpi_tiles_or_stat_cards_return(home_html):
     partial = _read(TEMPLATES / "_view_home.html")
     for banned in ("dash-figures", "stat-sessions", "stat-week", "stat-attention",
-                   "home-recent-list", "kpi", "hero-number"):
+                   "home-recent-list", "kpi", "hero-number", "dash-low"):
         assert banned not in partial, banned
 
 
@@ -117,6 +119,218 @@ def test_the_next_agenda_loads_its_range_from_the_store(home_js):
     assert "function _renderNext(" in home_js
     # Next reads today and the next two days from the same one loaded range.
     assert "[0, 1, 2].map(" in home_js
+
+
+# ── Next: the focus strip, the three columns, the clock ──────────────────────
+
+def test_next_sits_directly_under_the_stat_cards(home_html):
+    """Full width, first band after the figures: Next is the only part of the
+    page you act on, and everything below it is what already happened."""
+    partial = _read(TEMPLATES / "_view_home.html")
+    cards = partial.index('id="dash-overview"')
+    nxt = partial.index('id="dash-next"')
+    hero = partial.index('id="dash-grid"')
+    mid = partial.index('id="dash-mid"')
+    assert cards < nxt < hero < mid
+    # Its own card, not a cell inside a band, which is what makes it full width.
+    assert 'class="dash-cell dash-next"' in partial[nxt - 60:nxt]
+    assert "dash-low" not in partial
+
+
+# ── People: talk time reads in days once it passes one ───────────────────────
+
+_NODE = shutil.which("node")
+
+
+def home_js_text() -> str:
+    return _read(STATIC / "home.js")
+
+_DURATION_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const found = src.match(/function _formatDuration\(seconds\) \{[\s\S]*?\n\}/);
+if (!found) { throw new Error('FAIL: _formatDuration not found in home.js'); }
+eval(found[0]);
+
+function eq(secs, want) {
+  const got = _formatDuration(secs);
+  if (got !== want) { throw new Error(`FAIL: ${secs}s -> "${got}", wanted "${want}"`); }
+}
+
+// The eight-week aggregates that prompted this: 194h 22m of talk time is
+// eight days of it, and saying so beats making the reader divide.
+eq(194 * 3600 + 22 * 60, '8d 2h 22m');
+eq(438 * 3600 + 17 * 60, '18d 6h 17m');
+
+// Under a day is untouched.
+eq(23 * 3600 + 42 * 60, '23h 42m');
+eq(2 * 3600 + 55 * 60, '2h 55m');
+eq(47 * 60, '47m');
+
+// Zero components drop out rather than padding the string.
+eq(8 * 86400, '8d');
+eq(86400 + 22 * 60, '1d 22m');
+eq(7200, '2h');
+
+// A total under a minute reads in seconds instead of a bare "0m", which was
+// the one case the old formatter reported as nothing at all.
+eq(40, '40s');
+eq(1, '1s');
+
+// Nothing is still nothing, and junk does not throw.
+eq(0, '0m');
+eq(null, '0m');
+eq(undefined, '0m');
+eq(-5, '0m');
+
+console.log('OK');
+"""
+
+
+@pytest.mark.skipif(_NODE is None, reason="node is not on PATH")
+def test_talk_time_breaks_into_days_under_node():
+    """_formatDuration is pure, so it is unit tested rather than asserted at.
+    home.js cannot be required under node (it touches browser globals at
+    module scope), so the harness extracts just this function."""
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = Path(tmp) / "duration.js"
+        harness.write_text(_DURATION_HARNESS, encoding="utf-8")
+        result = subprocess.run(
+            [_NODE, str(harness), str(STATIC / "home.js").replace("\\", "/")],
+            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, (
+        f"stdout={result.stdout}\nstderr={result.stderr}")
+    assert "OK" in result.stdout
+
+
+def test_only_the_people_list_uses_that_formatter():
+    """Changing it must not have moved another widget's numbers. The charts and
+    the agenda have their own formatters with their own rounding."""
+    assert home_js_text().count("_formatDuration(") == 2   # the definition + one call
+    call = home_js_text()[home_js_text().index("function _renderPeople("):]
+    assert "_formatDuration(sp.talk_seconds)" in call[:call.index("/* \u2500\u2500 A. This week")]
+
+
+def test_a_joinable_meeting_gets_a_join_button(home_js, home_css):
+    """A button cannot live inside the row's own link, so a joinable meeting
+    wraps the row and everything else keeps the markup it always had."""
+    row = home_js[home_js.index("function _homeNextRow("):]
+    row = row[:row.index("function _homeNextDayColumn(")]
+    assert "calendarJoinButton(e.key, e.join, e.join_label, 'dash-next-join')" in row
+    assert 'join ? `<div class="dash-next-item">${row}${join}</div>` : row' in row
+    # The join URL is never on this page; only the provider slug arrives.
+    assert "join_url" not in home_js
+    for selector in (".dash-next-item", ".dash-next-join",
+                     ".dash-next-join:hover", ".dash-next-join:focus-visible",
+                     ".dash-next-join.is-solid"):
+        assert selector in home_css, selector
+
+
+def test_the_focus_strip_takes_whatever_is_running_then_whatever_is_soonest(home_js):
+    """The strip answers "what do I do right now", so a meeting in progress
+    beats one still to come, and a multi-hour block never qualifies: a "Focus
+    time" spanning the afternoon would hold the strip all afternoon and hide
+    the meeting you actually have to join."""
+    body = home_js[home_js.index("function _homeNextFocus("):]
+    body = body[:body.index("function _homeFocusRunning(")]
+    assert "if (e.all_day || !Number.isFinite(start)) continue;" in body
+    assert "if (end - start >= _NEXT_BLOCK_MS) continue;" in body
+    assert "return running || upcoming || null;" in body
+    # Two overlapping meetings: the later start is the one you are in.
+    assert "if (!running || start > _nextStart(running)) running = e;" in body
+    assert "if (!upcoming || start < _nextStart(upcoming)) upcoming = e;" in body
+    assert "_NEXT_BLOCK_MS = 4 * 3600 * 1000" in home_js
+
+
+def test_the_focus_strip_reads_its_urgency_off_the_event(home_js, home_css):
+    focus = home_js[home_js.index("function _renderNextFocus("):]
+    focus = focus[:focus.index("function _homeNextRow(")]
+    assert "if (recording) { flag = 'Recording now'; cls = 'is-recording'; }" in focus
+    assert "else if (running) { flag = 'Happening now'; cls = 'is-now'; }" in focus
+    assert "calendarJoinButton(focus.key, focus.join, focus.join_label," in focus
+    assert "'dash-next-join is-solid'" in focus
+    # A recording behind the meeting is reachable from the strip.
+    assert "Open recording" in focus
+    for selector in (".next-focus.is-now", ".next-focus.is-recording",
+                     ".next-focus-flag", ".next-focus-count"):
+        assert selector in home_css, selector
+
+
+def test_a_countdown_stops_when_it_stops_meaning_anything(home_js):
+    body = home_js[home_js.index("function _homeFocusCountdown("):]
+    body = body[:body.index("function _renderNextFocus(")]
+    assert "return 'ending now';" in body
+    assert "return 'starting now';" in body
+    assert "if (until > _NEXT_COUNTDOWN_MS) return '';" in body
+    assert "_NEXT_COUNTDOWN_MS = 12 * 3600 * 1000" in home_js
+
+
+def test_every_one_of_the_three_days_gets_a_column(home_js, home_css):
+    """Three columns even when a day is empty: skipping one left a ragged
+    section that read as broken rather than as a free day."""
+    body = home_js[home_js.index("function _renderNext("):]
+    body = body[:body.index("/* ── The clock ─")]
+    assert "const byDay = new Map(days.map(k => [k, []]));" in body
+    assert "days.map(k => _homeNextDayColumn(k, byDay.get(k), range, now))" in body
+    col = home_js[home_js.index("function _homeNextDayColumn("):]
+    col = col[:col.index("function _homeNextDaySkeleton(")]
+    assert "Nothing scheduled" in col
+    # The day head carries the count and the total, and today reads louder.
+    assert "meeting${evs.length === 1 ? '' : 's'}" in col
+    assert "_nextMinutes(e)" in col
+    assert "isToday ? ' is-today' : ''" in col
+    assert ".dash-next-daymeta" in home_css
+    assert ".dash-next-daylabel.is-today" in home_css
+
+
+def test_the_now_line_only_marks_a_real_boundary(home_js, home_css):
+    """A hairline between something finished and something not. At the top or
+    the bottom of the column it would mark nothing, and it belongs to today."""
+    col = home_js[home_js.index("function _homeNextDayColumn("):]
+    col = col[:col.index("function _homeNextDaySkeleton(")]
+    assert "let sawPast = false, drawn = !isToday;" in col
+    assert "if (!drawn && sawPast && !done) {" in col
+    assert ".dash-next-now" in home_css
+
+
+def test_a_long_day_is_capped_and_hands_off_to_the_calendar(home_js):
+    col = home_js[home_js.index("function _homeNextDayColumn("):]
+    col = col[:col.index("function _homeNextDaySkeleton(")]
+    assert "evs.slice(0, _NEXT_ROWS_PER_DAY)" in col
+    assert "_homeNextDayHref(dayKey)" in col
+    href = home_js[home_js.index("function _homeNextDayHref("):]
+    href = href[:href.index("\n}")]
+    # Month and day both, so the panel opens on the right month.
+    assert "/calendar?month=" in href and "&amp;day=" in href
+
+
+def test_next_keeps_a_clock_only_while_home_is_visible(home_js):
+    """The countdown, the live flag and the now line all move on their own."""
+    start = home_js[home_js.index("function _homeStartNextClock("):]
+    start = start[:start.index("function _homeStopNextClock(")]
+    assert "if (_homeNextTimer) return;" in start
+    assert "if (Views.current !== 'home') return;" in start
+    # Past midnight the three days, and the cache key, are different ones.
+    assert "AppData.load('calendarEvents', { key: _homeWeekRange().rangeKey });" in start
+    life = home_js[home_js.index("Views.register('home', {"):]
+    life = life[:life.index("AppData.subscribe(")]
+    assert "_homeStartNextClock();" in life
+    assert "_homeStopNextClock();" in life
+
+
+def test_the_agenda_never_flashes_empty_at_a_loading_calendar(home_js):
+    body = home_js[home_js.index("function _renderNext("):]
+    body = body[:body.index("/* ── The clock ─")]
+    assert "_homeNextDaySkeleton(k, range.todayKey)" in body
+    assert "if (!events.length && slice === 'error')" in body
+    assert "Could not load your calendar." in body
+    # A repaint every half minute must not drop focus off a Join button.
+    assert "_dashMorph(body," in body
+
+
+def test_the_agenda_repaint_is_a_keyed_update(home_js):
+    assert "_dashMorph(box," in home_js
+    assert "_dashMorph(body," in home_js
 
 
 def test_the_overview_is_derived_from_the_sessions_slice(home_js):

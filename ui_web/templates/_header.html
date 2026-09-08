@@ -1,11 +1,18 @@
 {# The header owns what you can do here (brief section 3.4). 56 px. The view
-   title is on the left, the actions on the right in one priority order:
-   Ask, the column toggles (session only), Search, Refresh, Record. Record
-   never collapses.
+   title is on the left with the capture meters beside it, the actions on the
+   right in one priority order: Ask, the column toggles (session only), Search,
+   Refresh, Record. Record never collapses.
+
+   While a recording is live the header itself turns red and the meters appear;
+   there is no second bar under it. Everything the old capture strip carried
+   apart from the meters was already on screen twice: the title is the header
+   title, the elapsed clock and the Stop control are the Record button, and
+   "Recording" is the subtitle plus the pulsing dot inside that button.
 
    Load-bearing ids: #record-btn #topbar-session-title #home-search-input
    #home-search-clear #home-search-results #home-search-ai #pane-toggle-*
-   #refresh-btn #}
+   #refresh-btn #capture-meters #capture-meter-desktop #capture-meter-mic
+   #capture-warning #}
 <header class="app-header" id="app-header">
 
   <div class="app-header-title">
@@ -15,6 +22,23 @@
     </div>
     <p class="view-subtitle" id="view-subtitle"></p>
   </div>
+
+  {# Capture meters: the one thing the old strip owned outright. They sit right
+     of the title so proof that audio is arriving is on screen in every view,
+     and they leave the flow entirely when nothing is recording. app.js writes
+     the group's title so the live meeting is still nameable off the session
+     view. #}
+  <div class="capture-meters" id="capture-meters" hidden>
+    <div class="capture-meter">
+      <span class="capture-meter-label">Desktop</span>
+      <span class="capture-meter-track"><span class="capture-meter-fill" id="capture-meter-desktop"></span></span>
+    </div>
+    <div class="capture-meter">
+      <span class="capture-meter-label">Mic</span>
+      <span class="capture-meter-track"><span class="capture-meter-fill" id="capture-meter-mic"></span></span>
+    </div>
+  </div>
+  <span class="capture-warning hidden" id="capture-warning" role="status"></span>
 
   <div class="app-header-actions">
 
@@ -118,29 +142,3 @@
 
   </div>
 </header>
-
-{# Capture strip: while a recording is live, every view shows it. It never
-   depends on the workspace being visible (review finding 1). #}
-<div class="capture-strip" id="capture-strip" hidden>
-  <span class="capture-live">
-    <span class="capture-dot" aria-hidden="true"></span>
-    <span class="capture-live-label">Recording</span>
-  </span>
-  <span class="capture-title" id="capture-title"></span>
-  <span class="capture-time" id="capture-time">0:00</span>
-  <div class="capture-meters">
-    <div class="capture-meter">
-      <span class="capture-meter-label">Desktop</span>
-      <span class="capture-meter-track"><span class="capture-meter-fill" id="capture-meter-desktop"></span></span>
-    </div>
-    <div class="capture-meter">
-      <span class="capture-meter-label">Mic</span>
-      <span class="capture-meter-track"><span class="capture-meter-fill" id="capture-meter-mic"></span></span>
-    </div>
-  </div>
-  <span class="capture-warning hidden" id="capture-warning" role="status"></span>
-  <button type="button" class="btn btn-record recording capture-stop-btn" id="capture-stop-btn"
-          onclick="toggleRecording()">
-    <span class="btn-icon"><i class="fa-solid fa-stop"></i></span> Stop
-  </button>
-</div>

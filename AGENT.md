@@ -108,8 +108,9 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/attention.py` | The Needs attention queue: recordings whose speakers are still unnamed, against the calendar's expected count |
 | `core/browser.py` | Opens the UI as an app window (Chrome/Edge `--app=` or the installed PWA) instead of a browser tab |
 | `core/calendar_feed.py` | Published-calendar (ICS) download, RRULE expansion, time zones, attendee parsing, URL masking |
-| `core/calendar_sync.py` | Matches recordings to calendar instances, stores the match and expected speaker count, feeds attendee candidates to the Speakers Cleanup tab, runs the hourly refresh |
-| `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view |
+| `core/calendar_sync.py` | Matches recordings to calendar instances, stores the match and expected speaker count, feeds attendee candidates to the Speakers Cleanup tab, runs the hourly refresh, and answers `title_for_start()` for the opt-in calendar naming of a new recording |
+| `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view; `event_key` / `find_instance` turn one opaque key back into its cached occurrence |
+| `core/meeting_links.py` | Finds a Teams/Zoom/Meet/Webex join link in a calendar event and hands it to the OS, preferring the desktop client's own URL scheme. The link is a credential and never reaches the browser |
 | `core/changelog.py` | Parses `CHANGELOG.md` into the entries the Changelog tab and What's new card show |
 | `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries |
 | `core/heartbeat.py` | `<data>/heartbeat.json`, refreshed while alive and removed on a clean quit; read by `watchdog.py` |
@@ -370,7 +371,7 @@ All API routes follow these conventions:
 | `/api/update/check`, `/api/update/apply` | Self-update: fetch `main`, compare, pull, relaunch |
 | `/`, `/session/<id>`, `/calendar`, `/attention`, `/speakers` | The one app shell (`index.html`); the client router picks the view |
 | `/api/dashboard` | Home dashboard data (`core/dashboard_api.py`) |
-| `/api/calendar/*`, `/api/sessions/<id>/calendar_match` | Published-calendar status, link, test, refresh, events; the per-recording match |
+| `/api/calendar/*`, `/api/sessions/<id>/calendar_match` | Published-calendar status, link, test, refresh, events, join; the per-recording match |
 | `/api/attention/summary`, `/api/sessions/<id>/expected_speakers` | Needs attention queue; the expected speaker count |
 | `/api/sessions/<id>/resolution_candidates`, `/api/sessions/<id>/smart_cleanup` | Calendar attendees offered in the Cleanup picker; the smart cleanup reanalysis |
 | `/api/speakers/relabel/*`, `PATCH /api/sessions/<id>/speakers` | Bulk relabel agent confirm/cancel; speaker reassignment |
@@ -442,6 +443,8 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **Speaker label merging:** When a user renames two speakers to the same display name, `_state["speaker_labels"]` is checked for collision and `diarizer.merge_speakers(keep, merge)` is called to combine their embedding pools. This should always happen atomically under `_state_lock`.
 
+**Chapters get one authoritative pass after the stop:** a live auto-run is handed the chapters already placed and told to keep them (`is_auto=True`), by design, so nothing renames a chapter under the user mid-meeting; the cost is that the opening chapters were chosen from a fraction of the transcript. `_final_chapters_pass()` runs the manual path once the recording stops, so the list describes the meeting rather than its first few minutes. Opt-in through `chapters_regen_after_meeting` (default on), read when it runs so a toggle during a meeting still decides that meeting's ending. It is **last** in the stop tail: the only thing there that waits on a model with no deadline, and the tail already sits behind the gate that lets a new recording start. Both it and `/api/chapters/generate` build their input through `_chapters_args_from_storage()`, or the button and the automatic run drift apart.
+
 **Recording cleanup is always async:** `stop_recording()` returns immediately and dispatches `_cleanup()` to a daemon thread. This thread stops streams, finalizes WAV, ends the DB session, and runs auto-title. Never move this back to the request handler — the operations can take up to 12s (thread join timeout).
 
 **Audio stream graveyard:** `capture_audio/windows.py` retires closed streams to a `_stream_graveyard` list rather than deleting them immediately. This avoids a PortAudio bug on WASAPI loopback that triggers `ExitProcess()` if a stream is cleaned up too early. Don't remove this pattern.
@@ -454,11 +457,21 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **Loopback silence watchdog:** `_loopback_silence_watchdog()` raises `capture_alert` when the desktop capture never produces signal or drops out. It only ever switches devices when following is on and the probe shows a different endpoint actually playing; silence alone never moves the capture.
 
+**The watchdog measures a window's peak, never a spot reading:** it polls every two seconds, and reading `loopback_level` (the latest chunk's RMS) at that cadence samples the gaps between words, so it called a live two-way call silent and fired the alarm through ordinary conversation (2026-09-08). `take_peaks()` returns and resets the loudest RMS since the last call, which partitions the timeline into windows with nothing falling through the gap. The thresholds go with it: `SILENT_FLOOR` (0.0008) is far below the speech level the meters use, because a dead loopback delivers digital silence while a live but quiet call does not, and the "dropped" alarm now needs 90 s of that silence *plus* 45 s of mic activity inside it, so an idle desk or a recording left running is not mistaken for a one-sided call. Measured numbers are in the constants' comment and replayed in `tests/test_capture_silence_alarm.py`; do not raise the floor back toward the speech threshold.
+
+**A capture warning never outlives its fault:** the loopback fires `on_loopback_recovered` the first time it produces signal after an alarm, `_alert_loopback_recovered()` pushes `capture_alert` with `cleared: true`, and the banner also takes itself down when desktop audio shows up in the level meters or the recording stops. A banner that has to be dismissed by hand teaches the user to dismiss it without reading it, which is worse than no banner.
+
+**The elapsed clock belongs to the server:** `_status_payload()` carries `elapsed_sec` (the WAV writer's clock, which is the timeline the transcript is stamped against, with the monotonic start as the fallback) and `startDurationCounter(elapsedSec)` anchors to it. The browser used to start its own clock at zero, so a reload mid-meeting showed `Stop - 0:00` on an hour-old recording. `_syncDurationCounter()` re-anchors only on a gap over two seconds, so a reconnect or a slept machine snaps back without the readout jittering.
+
 **Preference writes are partial:** `savePref()` sends only the changed keys (see User preferences). Do not reintroduce a whole-object `PUT`.
 
 **WAV append walks the RIFF chunks:** `WavWriter(append=True)` locates the data chunk instead of patching offset 40, and the resume path decodes Opus parts with `-fflags +bitexact`. Pause/resume with per-source tracks corrupted both tracks without this.
 
 **Console logging never raises:** `core/log.py` reconfigures stdout/stderr with `errors="replace"` and echoes through `_echo()`. Under `launch_hidden.vbs` stdout is a cp1252 file, and a `→` in a log line used to raise inside the screen recorder at record start. `launch.py` does the same for its own output.
+
+**Launch at Startup is two things, not one:** a shortcut in the Startup folder *and* Windows' own approval flag for it (`HKCU\...\Explorer\StartupApproved\StartupFolder`, first byte, bit 0 set means disabled). Task Manager's Startup apps tab, Settings > Apps > Startup and every tune-up utility write that flag, and Windows then ignores the shortcut. `get_startup` reported only whether the .lnk existed, so the toggle sat on while nothing launched at sign-in (2026-09-08, found set to `03` on the owner's machine). It now reports `blocked` and the UI says so; `set_startup` clears the flag with `shortcut.approve_startup()` and re-reads it, because writing the shortcut alone does not make it run. Clearing happens **only** when the user turns the toggle on: doing it at startup would silently undo a choice they made in Task Manager.
+
+**The tray icon comes up before the model stack:** headless it is the only sign the app is alive, and it used to appear about 6.7 s in, which reads as hung. It is now started from the middle of app.py's imports (see "The tray icon, before the model stack"), before the ai/ml block, and lands at about 0.65 s. Three things made that possible and each will undo it if reverted: `core/config.py`'s pyannote shim is a function (`apply_torchaudio_shims()`) instead of an import-time `import torchaudio`, which was pulling all of PyTorch into every consumer including the tray; `_port_is_busy()` uses a socket, because the first `urlopen()` in a process asks Windows for the system proxy configuration and on a machine running a VPN client that took 2.03 s to answer a question about 127.0.0.1 (`_local_opener()` keeps the rest of the self-calls off it); and `MeetingTray.refresh()` coalesces, since it is called on every status push and model loading pushes a dozen, each of which rebuilt the native menu to keep saying "Loading models...". `_start_tray(url, wait=True)` deliberately blocks the imports until the icon is painted: 0.12 s, and it keeps the two off each other's GIL. Any pyannote import added anywhere must call `apply_torchaudio_shims()` first.
 
 **Silent shortcuts:** `launch.py` points the Start Menu shortcut at `app_launcher.vbs` and migrates a sign-in shortcut that still runs `cmd /c launch.bat` onto `launch_hidden.vbs`, so neither leaves a console window open. `launch.bat --hidden` shows a message box on failure instead of `pause`, which a hidden console can never answer. A first run (no `.venv`) still gets a visible console for the install.
 
@@ -467,6 +480,46 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 **One launcher log per launch:** `launch_hidden.vbs` names its redirect target with a timestamp. `cmd` opens a redirect target without write sharing, so a fixed name could not be reopened while the chain being replaced (an in-app restart or update) still held it, and the second launcher died before running anything: every restart from a hidden-launched app silently never came back (2026-09-05). `launch.py` always prints how the app exited so a quiet exit leaves a trace.
 
 **Speakers dialog lands on Cleanup:** the Resolve tab was folded into Cleanup, whose picker lists the calendar invite's attendees ahead of the Voice Library. Every entry point (post-recording auto-open, `?speakers=cleanup`, the Home, Needs attention and Calendar buttons) opens Cleanup.
+
+**One bar while recording, not two:** the capture strip under the header is
+gone. The header itself turns red (`body.is-recording`, set by
+`_syncCaptureMeters()`) and shows the Desktop/Mic meters beside the view title;
+everything else the strip carried was already on screen twice (the title is the
+header title, the clock and Stop are the Record button, "Recording" is the
+subtitle plus that button's pulsing dot). `.app-header-title` is `flex: 0 1 auto`
+and `.app-header-actions` takes `margin-left: auto`, which is what keeps the
+meters next to the title instead of stranding them beside the actions. Every
+accent inside the row is re-mixed red for the duration; a blue glyph on a red
+band reads as a second theme. Record still never collapses, so below 1100 px of
+main column the meters are what goes.
+
+**Next on Home keeps a clock:** the focus strip's countdown, its live flag and
+today's now line all move on their own, so `_homeStartNextClock()` repaints the
+section every 30 s and `_homeStopNextClock()` drops the interval the moment Home
+stops being the visible view. The repaint goes through `_dashMorph`, not
+`innerHTML`, or a tab landing on a Join button would lose it twice a minute. The
+tick also re-`load`s the calendarEvents range: past midnight the three days, and
+so the cache key, are different ones, and without that the section would sit on
+skeletons until the view was reactivated. The focus strip never features an
+all-day item or anything four hours or longer: a "Focus time" block spanning the
+afternoon would hold the strip all afternoon and hide the meeting to join.
+
+**A join link never reaches the browser:** anyone holding one can walk into the
+meeting, exactly like the feed URL. `/api/calendar/events` returns only a
+provider slug (`join`) and its label, and only while the meeting has not ended
+more than 15 minutes ago; the button POSTs the opaque event key to
+`/api/calendar/join`, which resolves the URL out of the cache server-side and
+launches it. `core/meeting_links.py` matches a host *and* a join path, because an
+Outlook invite is full of same-host links that are not the meeting (Meeting
+options, `aka.ms` help, Zoom's download and SIP lines).
+
+**A calendar name is a chosen name:** with `calendar_title_from_event` on, a
+recording that starts inside a calendar meeting takes that meeting's subject and
+`title_user_set` is set, so the post-stop AI auto-title leaves it alone. Private
+appointments are skipped: their subject is redacted everywhere else, and naming
+a recording after one would leak it into the sidebar, exports and the vault.
+`title_for_start()` reads the cache only and returns `""` on anything unclear,
+because pressing Record must never wait on a fetch or fail on a bad feed.
 
 **Sidebar page links are preferences:** `sidebar_nav_items` and `sidebar_nav_compact` drive `applySidebarNavPrefs()`, which moves the nav anchors (not copies) into the brand row when folded, so ids and the router's current-page marking keep working. The collapsed rail always shows the icons and pins Settings and the status dot to its bottom.
 
@@ -634,7 +687,8 @@ The audio pipeline is designed to avoid progressive slowdown during long session
 ### CHANGELOG.md
 
 - Every `## ` heading (exactly two hashes) opens one entry: `## <Title> (YYYY-MM-DD)`. Newest first. The date may also lead the heading (`## 2026-09-05 Title`).
-- Everything until the next `## ` is the entry's notes, rendered as markdown by `_renderChangelogBody()` in `app.js`: `### ` sub-headings for areas, `- ` bullets, paragraphs, links (opened in a new tab).
+- Everything until the next `## ` is the entry's notes, rendered as markdown by `_renderChangelogBody()` in `app.js` (plain `marked`, so anything markdown supports parses): `### ` sub-headings for areas, `- ` bullets, paragraphs, links (opened in a new tab).
+- **Formatting is styled, so it is meant to be used.** `.changelog-entry-body` in `style.css` covers headings, `strong`, `em`, `code`, `pre`, `a`, ordered and unordered lists, nested lists (indented, hollow marker), `blockquote` (accent left rule), `del`, `hr` and tables (scroll rather than widen, because the What's new card is about 512 px and an unconstrained table pushed the entry sideways). Both surfaces inherit those rules; there is no separate What's new stylesheet for them. Add a rule before using an element the list above does not name, or it lands with browser defaults and looks broken. The house style for writing the notes is in `CHANGELOG.md`'s own preamble, which is the version to keep current.
 - `changelog.category(title)` picks the icon from the title's first word: Added, Created, Built, New → feature; Fixed, Guarded, Hardened → fix; Updated, Improved, Polished, Reworked, Made, Replaced → improvement; Refactored, Rewrote, Restructured → refactor; Removed, Deleted, Dropped, Retired → removal; anything else → neutral dot.
 - Text before the first entry is a preamble (the file documents its own format there) and is ignored.
 - Entry ids are `<date>-<slug>`; the What's new card shows the newest entry once per browser when the id changes (`localStorage` key `ma:lastSeenChangelogEntry`).

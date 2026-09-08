@@ -137,6 +137,11 @@ function calendarBuildItems(sessions, events, opts) {
         title: e.title || (session && session.title) || 'Untitled',
         start, end,
         allDay: !!e.all_day,
+        // The provider slug and its label, never the join URL: the API only
+        // sends these two, and only while the meeting is still joinable.
+        eventKey: e.key,
+        join: e.join || '',
+        joinLabel: e.join_label || '',
         tentative: e.status === 'tentative',
         private: !!e.private,
         sessionId: sid,
@@ -162,6 +167,10 @@ function calendarBuildItems(sessions, events, opts) {
       title: s.title || s.id,
       start, end,
       allDay: false,
+      // A recording with no calendar event behind it has nothing to join.
+      eventKey: '',
+      join: '',
+      joinLabel: '',
       tentative: false,
       private: false,
       sessionId: s.id,
@@ -466,17 +475,23 @@ function _calCloseDetail() {
   _calSyncUrl();
 }
 
-/** One action per row: Open recording, Clean up speakers, or Show in Settings. */
-function _calAgendaAction(it) {
+/** One action per row: Open recording, Clean up speakers, or Show in Settings.
+ *
+ *  `joinable` says a Join button is already above it. That demotes a recording
+ *  action to secondary, and drops the "Show in Settings" fallback entirely:
+ *  for a meeting nobody has recorded, Join is the whole answer and a second
+ *  button would only take width off the title. */
+function _calAgendaAction(it, joinable) {
   const isRec = it.sessionId && (it.kind === 'recorded' || it.kind === 'recording' || it.kind === 'live');
   if (isRec && it.needsAttention) {
-    return `<a class="btn btn-primary cal-agenda-action"`
+    return `<a class="btn ${joinable ? 'btn-secondary' : 'btn-primary'} cal-agenda-action"`
       + ` href="/session?id=${encodeURIComponent(it.sessionId)}&amp;speakers=cleanup">Clean up speakers</a>`;
   }
   if (isRec) {
     return `<a class="btn btn-secondary cal-agenda-action"`
       + ` href="/session?id=${encodeURIComponent(it.sessionId)}">Open recording</a>`;
   }
+  if (joinable) return '';
   return `<a class="btn btn-quiet cal-agenda-action"`
     + ` href="/session?settings=1&amp;section=calendar">Show in Settings</a>`;
 }
@@ -493,6 +508,10 @@ function _calAgendaRowHtml(it) {
     ? `<p class="cal-agenda-attn"><span class="cal-chip-dot" aria-label="Needs attention"></span>`
       + `${escapeHtml(reason)}</p>`
     : '';
+  // Join sits above whatever else the row offers: it is the one action with a
+  // deadline on it.
+  const join = calendarJoinButton(it.eventKey, it.join, it.joinLabel,
+                                  'btn btn-primary cal-agenda-action');
   return `
     <article class="cal-agenda-row">
       <div class="cal-agenda-time">${escapeHtml(time)}</div>
@@ -501,7 +520,7 @@ function _calAgendaRowHtml(it) {
         <div class="cal-agenda-meta">${metaBits.join('<span class="cal-agenda-sep">&middot;</span>')}</div>
         ${attn}
       </div>
-      <div class="cal-agenda-act">${_calAgendaAction(it)}</div>
+      <div class="cal-agenda-act">${join}${_calAgendaAction(it, !!join)}</div>
     </article>`;
 }
 

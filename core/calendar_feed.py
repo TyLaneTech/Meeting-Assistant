@@ -627,6 +627,10 @@ class Event:
     summary: str = ""
     description: str = ""
     location: str = ""
+    # X-MICROSOFT-SKYPETEAMSMEETINGURL, when Exchange adds it. The most
+    # reliable Teams join link there is; core.meeting_links prefers it over
+    # digging one out of LOCATION or the description body.
+    join_url: str = ""
     organizer: dict | None = None
     attendees: list = field(default_factory=list)
     status: str = ""
@@ -657,6 +661,7 @@ class Instance:
     summary: str = ""
     description: str = ""
     location: str = ""
+    join_url: str = ""
     organizer: dict | None = None
     attendees: list = field(default_factory=list)
     status: str = ""
@@ -673,6 +678,7 @@ class Instance:
             "summary": self.summary,
             "description": self.description,
             "location": self.location,
+            "join_url": self.join_url,
             "organizer": self.organizer,
             "attendees": self.attendees,
             "status": self.status,
@@ -691,6 +697,7 @@ class Instance:
             summary=data.get("summary") or "",
             description=data.get("description") or "",
             location=data.get("location") or "",
+            join_url=data.get("join_url") or "",
             organizer=data.get("organizer"),
             attendees=list(data.get("attendees") or []),
             status=data.get("status") or "",
@@ -735,6 +742,7 @@ def _instance_from_event(event: Event, start: datetime, end: datetime) -> Instan
         summary=event.summary,
         description=event.description,
         location=event.location,
+        join_url=event.join_url,
         organizer=event.organizer,
         attendees=list(event.attendees),
         status=event.status,
@@ -796,6 +804,8 @@ def parse_ics(text: str, default_tz: str = DEFAULT_TIMEZONE,
             current.description = _unescape_text(value).strip()
         elif name == "LOCATION":
             current.location = _unescape_text(value).strip()
+        elif name == "X-MICROSOFT-SKYPETEAMSMEETINGURL":
+            current.join_url = _unescape_text(value).strip()
         elif name == "STATUS":
             current.status = value.strip().upper()
         elif name == "CLASS":

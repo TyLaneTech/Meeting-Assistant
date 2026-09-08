@@ -183,6 +183,14 @@ class AudioCapture:
         # Live RMS levels - read by app.py to push to the visualizer
         self.loopback_level: float = 0.0
         self.mic_level: float = 0.0
+        # Peak-hold since the last take_peaks(), for the silence watchdog. It
+        # polls every couple of seconds, and a single instantaneous RMS read at
+        # that cadence lands in the gap between two words all the time: it was
+        # reporting a live call as silent and firing the capture alarm during
+        # ordinary conversation. A peak over the whole interval answers the
+        # question actually being asked, "did this device produce anything".
+        self.loopback_peak: float = 0.0
+        self.mic_peak: float = 0.0
 
         # Device names + first-valid-audio flags. The capture loops emit a
         # one-shot "Verified audio device ..." log line as soon as a non-zero
@@ -200,6 +208,10 @@ class AudioCapture:
         # whose audio plays to a device we are not capturing never fails silently.
         self.loopback_had_signal: bool = False
         self.on_loopback_silent = None       # optional callback(dev_name, kind)
+        # Fired once when the loopback comes back after an alarm, so the UI can
+        # take its banner down by itself instead of leaving the user to dismiss
+        # a warning about a problem that has already gone away.
+        self.on_loopback_recovered = None    # optional callback(dev_name)
         self._silence_watchdog: threading.Thread | None = None
         # Live device following: which PyAudio owns the loopback stream (starts as
         # self._pa, becomes a fresh instance after a mid-recording switch), and a
@@ -1066,6 +1078,7 @@ class AudioCapture:
             self._loopback_verified = False
             self.loopback_had_signal = False
             self.loopback_level = 0.0
+            self.loopback_peak = 0.0
             self._loopback_thread = threading.Thread(
                 target=self._capture_loop,
                 args=(new_stream, self._loopback_q),
@@ -1144,6 +1157,17 @@ class AudioCapture:
             return max(playing, key=lambda e: e.get("peak", 0.0))["name"]
         return None
 
+    def take_peaks(self) -> tuple[float, float]:
+        """Loudest (loopback, mic) RMS since the last call, and reset.
+
+        Read-and-reset, so consecutive calls partition the timeline into
+        windows with no sample falling through the gap between them.
+        """
+        lb, mic = self.loopback_peak, self.mic_peak
+        self.loopback_peak = 0.0
+        self.mic_peak = 0.0
+        return lb, mic
+
     def _loopback_silence_watchdog(self) -> None:
         """Keep the loopback bound to wherever the call/desktop audio is ACTUALLY
         playing, and alarm if it is genuinely not being captured.
@@ -1172,10 +1196,30 @@ class AudioCapture:
         RECOVER_COOLDOWN = 15.0    # base gap between probe attempts
         MAX_COOLDOWN = 30.0        # backoff ceiling: cap the follow delay at ~30s
         GRACE = 40.0               # alarm if the CURRENT device never produced signal
-        DROP_AFTER = 25.0          # alarm if a live loopback dropped
-        ALARM_COOLDOWN = 120.0
+        # A dead WASAPI loopback delivers digital silence, so the floor sits
+        # far below the speech threshold the meters use. Measured over a minute
+        # of a real two-way call (2026-09-08): the loopback ran 0.0003 to 0.15,
+        # and against the old 0.003 threshold it read as SILENT for stretches
+        # of 16 s, which is how a healthy call kept tripping a 25 s alarm. At
+        # 0.0008 the longest silent stretch in the same minute was 4 s.
+        SILENT_FLOOR = 0.0008
+        MIC_ACTIVE = 0.003         # the mic peaked like someone talking
+        # The failure this alarm exists for (the 2026-09-01 dead loopback) is
+        # permanent: the call plays to a device nobody is capturing and the
+        # desktop side is silent for the whole meeting. A pause is not that.
+        # Ninety seconds of true digital silence while someone is talking on
+        # this end is the shape of the real thing, and it is not the shape of a
+        # conversation.
+        DROP_AFTER = 90.0          # alarm if a live loopback dropped
+        MIC_ACTIVE_NEEDED = 45.0   # of which this much had the mic talking
+        ALARM_COOLDOWN = 300.0
         started = time.monotonic()
         last_signal_ts = started
+        # Mic-active seconds accrued since the loopback last produced anything.
+        # Without it a recording nobody is talking on (or an idle desk between
+        # meetings) reads exactly like a one-sided call.
+        mic_active_for = 0.0
+        alarm_showing = False
         last_recover_ts = started - RECOVER_COOLDOWN
         last_alarm_ts = started - ALARM_COOLDOWN
         # grace_base resets on every switch so each newly-bound device gets its
@@ -1244,9 +1288,18 @@ class AudioCapture:
 
             time.sleep(2)
             now = time.monotonic()
-            if self.loopback_level > 0.003:
+            lb_peak, mic_peak = self.take_peaks()
+            if lb_peak > SILENT_FLOOR:
                 last_signal_ts = now
+                mic_active_for = 0.0
                 quiet_probe_streak = 0
+                if alarm_showing:
+                    # The desktop side is back. Say so, so the banner and the
+                    # toast do not outlive the problem.
+                    alarm_showing = False
+                    self._emit_loopback_recovered()
+            elif mic_peak > MIC_ACTIVE:
+                mic_active_for += 2.0
             silent_for = now - last_signal_ts
 
             recover_after = (RECOVER_AFTER if self.loopback_had_signal
@@ -1266,6 +1319,7 @@ class AudioCapture:
                     # momentary silence right after the switch is not reported
                     # as a capture failure.
                     last_signal_ts = grace_base = now
+                    mic_active_for = 0.0
                     fired_start = False
                     continue
                 quiet_probe_streak += 1
@@ -1273,13 +1327,26 @@ class AudioCapture:
             if not self.loopback_had_signal:
                 if not fired_start and now - grace_base > GRACE:
                     fired_start = True
+                    alarm_showing = True
                     last_alarm_ts = now
                     self._emit_loopback_silent("never")
-            elif (self._has_mic and self.mic_level > 0.003
+            elif (self._has_mic
                     and silent_for > DROP_AFTER
+                    and mic_active_for >= MIC_ACTIVE_NEEDED
                     and now - last_alarm_ts > ALARM_COOLDOWN):
+                alarm_showing = True
                 last_alarm_ts = now
                 self._emit_loopback_silent("dropped")
+
+    def _emit_loopback_recovered(self) -> None:
+        log.info("audio", f"Loopback has signal again (device "
+                          f"'{self._loopback_device_name}')")
+        cb = self.on_loopback_recovered
+        if cb:
+            try:
+                cb(self._loopback_device_name)
+            except Exception as e:
+                log.warn("audio", f"on_loopback_recovered callback failed: {e}")
 
     def _emit_loopback_silent(self, kind: str) -> None:
         log.warn("audio", f"Loopback has no signal ({kind}); desktop/call audio "
@@ -1817,6 +1884,8 @@ class AudioCapture:
                             self.agc_lb_gated = True
                         lb_rms = float(np.sqrt(np.mean(lb_chunk ** 2)))
                         self.loopback_level = lb_rms
+                        if lb_rms > self.loopback_peak:
+                            self.loopback_peak = lb_rms
                         if not self.loopback_had_signal and lb_rms > 0.003:
                             self.loopback_had_signal = True
                         self._lb_fft_buf.extend(lb_chunk.tolist())
@@ -1846,6 +1915,8 @@ class AudioCapture:
                             self.agc_mic_gated = True
                         mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
                         self.mic_level = mic_rms
+                        if mic_rms > self.mic_peak:
+                            self.mic_peak = mic_rms
                         self._mic_fft_buf.extend(mic_chunk.tolist())
                     else:
                         mic_rms = 0.0

@@ -515,10 +515,26 @@
             <div class="settings-row" id="startup-row" style="display:none">
               <div class="settings-row-info">
                 <div class="settings-row-label">Launch at Startup</div>
-                <div class="settings-row-desc">Open Meeting Assistant when you log in</div>
+                <div class="settings-row-desc">Start Meeting Assistant in the tray when you log in</div>
+                <div class="settings-row-desc settings-row-warn hidden" id="startup-blocked"></div>
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="startup-toggle" onchange="setStartupLaunch(this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Open on Launch</div>
+                <div class="settings-row-desc">
+                  Show the app window every time Meeting Assistant starts. Off means it
+                  starts in the tray and waits; open it from the tray icon whenever you
+                  want it. The window always opens on a launch that still needs API keys.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="open-on-launch-toggle"
+                       onchange="savePref('open_window_on_launch', this.checked)">
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -737,6 +753,22 @@
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="calendar-enabled" onchange="saveCalendarSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Name recordings after the meeting</div>
+                <div class="settings-row-desc">
+                  Start a recording during a meeting on your calendar and it takes that
+                  meeting's subject as its name, instead of the date and time. The name
+                  is yours from then on, so the AI title written when the recording ends
+                  leaves it alone. Private appointments are skipped and keep the default
+                  name.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="calendar-title-from-event" onchange="saveCalendarSettings()">
                 <span class="toggle-slider"></span>
               </label>
             </div>

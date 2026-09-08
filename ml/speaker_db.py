@@ -194,6 +194,8 @@ class SpeakerFingerprintDB:
 
         try:
             with _suppress_model_load_noise():
+                from core import config as _cfg
+                _cfg.apply_torchaudio_shims()
                 from pyannote.audio import Inference, Model  # type: ignore
                 log.info("fingerprint", "Loading embedding model…")
                 model = Model.from_pretrained(

@@ -48,6 +48,10 @@ DEFAULTS: dict = {
     # better spent on the recordings list.
     "sidebar_nav_compact": False,
     "sidebar_nav_items": {"home": True, "calendar": True, "attention": False, "speakers": True},
+    # Open the app window when the app starts. Off by default: the app is
+    # normally started to sit in the tray, and at sign-in a window nobody
+    # asked for is in the way.
+    "open_window_on_launch": False,
     "col_proportions": None,   # [f1, f2, f3] fractions; null = use default 1:1.1:1.1
     "playback_speed": "1",
 
@@ -82,6 +86,10 @@ DEFAULTS: dict = {
     # how coarse/fine the chapter breaks are. The system prompt is tunable in
     # the same 3-tier way as summary/chat (built-in default < global < session).
     "chapters_auto": True,
+    # One full rebuild once the recording stops. The live auto-runs only ever
+    # see the meeting so far and are told to keep the chapters they already
+    # placed, so the early ones get chosen from a fraction of the transcript.
+    "chapters_regen_after_meeting": True,
     "chapters_granularity": "balanced",   # "coarse" | "balanced" | "fine"
     "chapters_system_prompt": "",
 
@@ -193,6 +201,10 @@ DEFAULTS: dict = {
     "calendar_timezone": "America/Chicago",
     "calendar_refresh_minutes": 60,
     "calendar_match_window_minutes": 20,
+    # Opt-in: name a new recording after the meeting it starts in, instead of
+    # "Meeting <date> <time>". Off by default because it puts a subject line
+    # from an external feed into the sidebar, exports and the vault.
+    "calendar_title_from_event": False,
     "calendar_last_refresh": "",
     "calendar_last_error": "",
 
