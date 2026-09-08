@@ -87,7 +87,7 @@ def test_the_client_surfaces_the_block_and_never_lies():
     assert "st.reason" in reload
 
 
-# ── Open on Launch ───────────────────────────────────────────────────────────
+# ── Open on Launch, and Open from Start Menu ─────────────────────────────────
 
 def test_open_on_launch_is_off_by_default():
     """The app is normally started to sit in the tray, and at sign-in a window
@@ -102,6 +102,59 @@ def test_the_checkbox_sits_under_launch_at_startup():
     assert startup < on_launch < group_end, "same group, directly below"
     assert "Open on Launch" in SETTINGS_HTML
     assert "savePref('open_window_on_launch', this.checked)" in SETTINGS_HTML
+
+
+def test_open_from_start_menu_is_on_by_default():
+    """The Start Menu entry has always meant "open Meeting Assistant", so the
+    default keeps doing that; the toggle exists for the user who wants a Start
+    Menu start to sit in the tray like a sign-in start does (2026-09-08: Open
+    on Launch was off and the window still came up, because app_launcher.vbs
+    opened it on its own)."""
+    assert settings.DEFAULTS["open_window_from_start_menu"] is True
+
+
+def test_the_start_menu_toggle_sits_under_open_on_launch_and_is_windows_only():
+    on_launch = SETTINGS_HTML.index('id="open-on-launch-toggle"')
+    start_menu = SETTINGS_HTML.index('id="open-from-start-menu-toggle"')
+    group_end = SETTINGS_HTML.index('<div class="settings-group-title">Sidebar</div>')
+    assert on_launch < start_menu < group_end, "same group, directly below"
+    assert "Open from Start Menu" in SETTINGS_HTML
+    assert "savePref('open_window_from_start_menu', this.checked)" in SETTINGS_HTML
+    # Hidden like the Startup row until the server says the platform has it.
+    row_start = SETTINGS_HTML.rindex('<div class="settings-row"', 0, start_menu)
+    assert 'id="start-menu-row" style="display:none"' in SETTINGS_HTML[row_start:start_menu]
+    assert APP_JS.count("_syncStartMenuRow(") == 3     # the definition and both callers
+    # On by default, so an absent preference reads as checked.
+    assert "_prefs.open_window_from_start_menu !== false" in APP_JS
+
+
+def test_a_cold_start_from_the_start_menu_is_the_apps_call():
+    """The launcher reports whether it started the server; the app decides
+    what that means. A warm click never consults the setting: showing the
+    window is the only thing a click on a running app can mean."""
+    handler = _fn(APP_PY, "def open_window(", "def get_startup(")
+    assert 'if body.get("cold_start"):' in handler
+    assert 'settings.get("open_window_from_start_menu", True)' in handler
+    # No second window when main() is already opening one.
+    assert 'settings.get("open_window_on_launch", False)' in handler
+    assert "config.needs_setup(" in handler
+    decision = handler.index('if body.get("cold_start"):')
+    assert decision < handler.index("browser.open_app_window(")
+    # Declining is still a 200: the launcher's Chrome fallback is for a server
+    # without the route, not for an app that chose the tray.
+    assert 'jsonify({"ok": True, "app_window": False, "opened": False' in handler
+
+
+def test_the_click_launcher_reports_whether_it_started_the_server():
+    vbs = (ROOT / "app_launcher.vbs").read_text(encoding="utf-8")
+    assert "Function OpenWindowViaApp(coldStart)" in vbs
+    assert '""cold_start"":" & LCase(CStr(coldStart))' in vbs
+    assert "started = False" in vbs and "started = True" in vbs
+    assert "OpenWindowViaApp(started)" in vbs
+    assert vbs.index("started = True") < vbs.index("OpenWindowViaApp(started)")
+    # Option Explicit: the new variable is declared.
+    assert "chrome, started" in vbs
+    assert "If http.status = 200 Then OpenWindowViaApp = True" in vbs
 
 
 def test_a_launch_that_needs_keys_opens_the_window_regardless():

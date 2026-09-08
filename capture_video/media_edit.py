@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from core import paths as paths
+from core import media as media
 
 
 def __getattr__(name):
@@ -85,11 +86,11 @@ def build_audio_profile(
     quiet_threshold: float = 0.006,
     min_quiet_sec: float = 30.0,
 ) -> dict:
-    path = wav_path(session_id)
-    if not path.exists():
+    source = media.audio_path(session_id)
+    if source is None:
         raise FileNotFoundError("Audio not found")
     bins = max(50, min(int(bins or 1200), 5000))
-    stat = path.stat()
+    stat = source.stat()
     cache = paths.profile_dir() / f"{session_id}.{int(stat.st_mtime)}.{stat.st_size}.{bins}.json"
     if cache.exists():
         try:
@@ -97,6 +98,10 @@ def build_audio_profile(
         except Exception:
             pass
 
+    # PCM to read: the WAV itself, or a cached decode of an Opus session.
+    path = media.pcm_wav_path(session_id)
+    if path is None:
+        raise FileNotFoundError("Audio could not be decoded")
     audio, rate = _read_wav_mono_float(path)
     duration = len(audio) / rate if rate else 0.0
     n = len(audio)
@@ -190,11 +195,7 @@ def _detect_quiet_spans(
 def backup_original_media(session_id: str) -> None:
     target = backup_dir(session_id)
     target.mkdir(parents=True, exist_ok=True)
-    src_audio = wav_path(session_id)
-    if src_audio.exists():
-        dst = target / "audio-original.wav"
-        if not dst.exists():
-            shutil.copy2(src_audio, dst)
+    media.copy_audio_as(session_id, target)     # kept in the format it is in
     src_video = video_path(session_id)
     if src_video.exists():
         dst = target / "video-original.mp4"
@@ -236,10 +237,10 @@ def has_trim_backup(session_id: str) -> bool:
 
 def restore_original_media(session_id: str) -> None:
     target = backup_dir(session_id)
-    src_audio = target / "audio-original.wav"
-    if not src_audio.exists():
+    src_audio = media.find_backup_audio(target)
+    if src_audio is None:
         raise FileNotFoundError("No original audio backup found for this session")
-    shutil.copy2(src_audio, wav_path(session_id))
+    _restore_audio_from(src_audio, session_id)
 
     src_video = target / "video-original.mp4"
     dst_video = video_path(session_id)
@@ -326,9 +327,7 @@ def create_split_backup(
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(split_snapshot_path(group_id))
 
-    src_audio = wav_path(source_session_id)
-    if src_audio.exists():
-        shutil.copy2(src_audio, split_audio_backup_path(group_id))
+    media.copy_audio_as(source_session_id, target)   # audio-original.<wav|opus>
     src_video = video_path(source_session_id)
     if src_video.exists():
         shutil.copy2(src_video, split_video_backup_path(group_id))
@@ -346,11 +345,9 @@ def load_split_snapshot(group_id: str) -> dict | None:
 
 def restore_split_media(group_id: str, target_session_id: str) -> None:
     """Copy the backed-up WAV/MP4 into ``target_session_id``'s live media paths."""
-    src_audio = split_audio_backup_path(group_id)
-    if src_audio.exists():
-        dst = wav_path(target_session_id)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_audio, dst)
+    src_audio = media.find_backup_audio(split_backup_dir(group_id))
+    if src_audio is not None:
+        _restore_audio_from(src_audio, target_session_id)
     src_video = split_video_backup_path(group_id)
     if src_video.exists():
         dst = video_path(target_session_id)
@@ -384,8 +381,26 @@ def trim_wav_file(src: Path, dst: Path, start_sec: float, end_sec: float) -> flo
 
 
 def trim_wav(session_id: str, start_sec: float, end_sec: float) -> float:
+    """Trim the session's mixed audio in place. Reads PCM (the recorder's WAV,
+    or a decode of an Opus session) and writes a WAV, which then replaces
+    whatever format the session had; the Free up space tool can re-encode it."""
     backup_original_media(session_id)
-    return trim_wav_file(wav_path(session_id), wav_path(session_id), start_sec, end_sec)
+    src = media.pcm_wav_path(session_id)
+    if src is None:
+        raise FileNotFoundError("Audio not found")
+    staged = paths.tmp_dir() / f"{session_id}.trim.wav"
+    trim_wav_file(src, staged, start_sec, end_sec)
+    final = media.replace_audio(session_id, staged)
+    return get_wav_duration(final)
+
+
+def _restore_audio_from(backup: Path, session_id: str) -> None:
+    """Put a backed-up mixed track back as the session's audio, in the format
+    the backup has, retiring whatever the session has now (a trimmed WAV over
+    an Opus original, or the reverse)."""
+    staged = paths.audio_dir() / f"{session_id}.restore{backup.suffix.lower()}"
+    shutil.copy2(backup, staged)
+    media.replace_audio(session_id, staged)
 
 
 def trim_video_file(

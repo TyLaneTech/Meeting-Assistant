@@ -52,6 +52,14 @@ DEFAULTS: dict = {
     # normally started to sit in the tray, and at sign-in a window nobody
     # asked for is in the way.
     "open_window_on_launch": False,
+    # Whether the Start Menu entry opens the window when it is the one that
+    # starts the app. On by default: that entry has always meant "open Meeting
+    # Assistant". Off makes a Start Menu start tray-only, like sign-in. Only a
+    # cold start is affected: clicking the entry while the app is already
+    # running always opens the window, because that is the only thing the
+    # click could mean. Windows only (nothing else has the launcher). Decided
+    # in /api/window/open, which app_launcher.vbs calls with cold_start set.
+    "open_window_from_start_menu": True,
     "col_proportions": None,   # [f1, f2, f3] fractions; null = use default 1:1.1:1.1
     "playback_speed": "1",
 

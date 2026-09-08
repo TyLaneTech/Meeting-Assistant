@@ -46,6 +46,9 @@ from core import calendar_feed as calendar_feed
 from core import calendar_sync as calendar_sync
 from core import calendar_events_api as calendar_events_api
 from core import meeting_links as meeting_links
+from core import media as media
+from core import media_compress as media_compress
+from core import storage_api as storage_api
 from core import changelog as changelog
 from core import dashboard_api as dashboard_api
 from core import heartbeat as heartbeat
@@ -2577,9 +2580,8 @@ def get_session(session_id: str):
     data = storage.get_session(session_id)
     if not data:
         return jsonify({"error": "Not found"}), 404
-    wav_path = paths.audio_dir() / f"{session_id}.wav"
-    video_path = paths.video_dir() / f"{session_id}.mp4"
-    data["has_audio"] = wav_path.exists()
+    video_path = media.video_path(session_id)
+    data["has_audio"] = media.has_audio(session_id)
     data["has_video"] = video_path.exists()
     data["video_offset"] = settings.get_video_offset(session_id)
     data["has_trim_backup"] = media_edit.has_trim_backup(session_id)
@@ -3317,13 +3319,34 @@ def open_window():
     server answers, so the window logic (installed PWA, then a chromeless
     --app window, then the default browser) lives in core/browser.py alone
     instead of being repeated in VBScript with hardcoded paths and ids.
+
+    The launcher says whether it was the one that started the server
+    (``cold_start``). On a cold start the window is the app's decision, not
+    the launcher's: it stays in the tray when ``open_window_from_start_menu``
+    is off, and when ``open_window_on_launch`` or first-run setup is already
+    opening a window from main(), a second open here gave a user without the
+    PWA two windows. A click while the app is already running (``cold_start``
+    false) always opens the window, because that is the only thing the click
+    could mean. Either way the answer is 200: the launcher only falls back to
+    its own Chrome window when this route does not exist.
     """
     body = request.get_json(silent=True) or {}
     path = str(body.get("path") or "/")
     if not path.startswith("/"):
         path = "/" + path
+    if body.get("cold_start"):
+        why = None
+        if not settings.get("open_window_from_start_menu", True):
+            why = "Open from Start Menu is off"
+        elif settings.get("open_window_on_launch", False):
+            why = "Open on Launch is opening it"
+        elif config.needs_setup(settings.get("ai_provider", "openai")):
+            why = "the setup window is opening"
+        if why:
+            log.info("app", f"Start Menu launch: not opening a window here, {why}")
+            return jsonify({"ok": True, "app_window": False, "opened": False, "reason": why})
     opened = browser.open_app_window(f"{_server_url}{path}", prefer_pwa=(path == "/"))
-    return jsonify({"ok": True, "app_window": bool(opened)})
+    return jsonify({"ok": True, "app_window": bool(opened), "opened": True})
 
 
 @app.route("/api/settings/startup")
@@ -7612,8 +7635,8 @@ def update_segment_label(seg_id: int):
             seg = storage.get_segment(seg_id)
             if not seg:
                 return
-            wav_path = paths.audio_dir() / f"{seg['session_id']}.wav"
-            if not wav_path.exists():
+            wav_path = media.pcm_wav_path(seg['session_id'])
+            if wav_path is None:
                 return
             if seg["end_time"] - seg["start_time"] < fingerprint_db.MIN_DURATION_SEC:
                 return
@@ -7779,8 +7802,8 @@ def _patch_session_speakers(
                             log.info("fingerprint", f"Added embedding from accumulator for {label!r}")
                             continue
                     # Fallback: extract from WAV file (past session or accumulator empty)
-                    wav_path = paths.audio_dir() / f"{sid}.wav"
-                    if wav_path.exists():
+                    wav_path = media.pcm_wav_path(sid)
+                    if wav_path is not None:
                         segments = storage.get_segments_by_speaker(sid, k)
                         added = 0
                         for seg in segments:
@@ -7859,11 +7882,11 @@ def get_speaker_clusters(session_id: str):
         return jsonify({"error": "Session not found"}), 404
     if not fingerprint_db.ready:
         return jsonify({"error": "Voice fingerprint model not ready"}), 503
-    wav_path = paths.audio_dir() / f"{session_id}.wav"
+    wav_path = media.pcm_wav_path(session_id)
     try:
         payload = fingerprint_db.cluster_session_speakers(
             session_id,
-            wav_path=str(wav_path) if wav_path.exists() else None,
+            wav_path=str(wav_path) if wav_path is not None else None,
         )
         return jsonify(payload)
     except Exception as e:
@@ -7912,11 +7935,12 @@ def apply_speaker_clusters(session_id: str):
 
 @app.route("/api/sessions/<session_id>/audio")
 def session_audio(session_id: str):
-    """Serve the recorded WAV file for browser playback."""
-    wav_path = paths.audio_dir() / f"{session_id}.wav"
-    if not wav_path.exists():
+    """Serve the session's mixed audio for browser playback: the WAV the
+    recorder wrote, or the Opus the Free up space tool replaced it with."""
+    audio = media.audio_path(session_id)
+    if audio is None:
         return jsonify({"error": "No audio recording for this session"}), 404
-    return send_file(str(wav_path), mimetype="audio/wav", conditional=True)
+    return send_file(str(audio), mimetype=media.audio_mime(audio), conditional=True)
 
 
 @app.route("/api/sessions/<session_id>/audio-profile")
@@ -7944,10 +7968,10 @@ def session_audio_profile(session_id: str):
 
 
 def _validate_media_range(session_id: str, start_sec: float, end_sec: float) -> tuple[bool, str, float]:
-    wav_path = media_edit.wav_path(session_id)
-    if not wav_path.exists():
+    audio = media.audio_path(session_id)
+    if audio is None:
         return False, "No audio recording for this session", 0.0
-    duration = media_edit.get_wav_duration(wav_path)
+    duration = media.audio_duration(audio) or 0.0
     if start_sec < 0 or end_sec <= start_sec or end_sec > duration + 0.05:
         return False, f"Invalid range. Expected 0 <= start < end <= {duration:.2f}", duration
     return True, "", duration
@@ -8028,7 +8052,10 @@ def split_session(session_id: str):
     if not isinstance(ranges, list) or not ranges:
         return jsonify({"error": "ranges required"}), 400
 
-    source_audio = media_edit.wav_path(session_id)
+    # Split cuts PCM: the recorder's WAV, or a decode of an Opus session.
+    source_audio = media.pcm_wav_path(session_id)
+    if source_audio is None:
+        return jsonify({"error": "No audio recording for this session"}), 404
     source_video = media_edit.video_path(session_id)
     source_video_offset = settings.get_video_offset(session_id)
     ffmpeg_bin = find_ffmpeg()
@@ -8325,6 +8352,15 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
     """
     ok = False
     try:
+        # The recorder's WAV, or a decode of the Opus the Free up space tool
+        # left in its place. Resolved here on the worker, because decoding a
+        # long meeting takes seconds, and before the transcript is cleared, so
+        # a failure leaves the session exactly as it was.
+        pcm = media.pcm_wav_path(session_id)
+        if pcm is None:
+            raise RuntimeError("The recording's audio could not be read (is ffmpeg installed?)")
+        wav_path = str(pcm)
+
         # Remove old session embeddings from Speaker Library and recompute centroids
         if fingerprint_db.ready:
             affected_ids = fingerprint_db.remove_session_embeddings(session_id)
@@ -8422,7 +8458,8 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                     {"session_id": session_id, "progress": pct},
                 ),
             )
-            batch.process_wav_file(wav_path, params)
+            batch.process_wav_file(wav_path, params,
+                                   tracks_root=media.tracks_root(session_id))
         except ImportError as ie:
             log.warn("reanalysis", f"Batch pipeline unavailable ({ie}), "
                      f"falling back to real-time pipeline")
@@ -8446,8 +8483,8 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
 @app.route("/api/sessions/<session_id>/reanalyze", methods=["POST"])
 def reanalyze_session(session_id: str):
     """Re-transcribe + re-summarize a session from its saved WAV file."""
-    wav_path = paths.audio_dir() / f"{session_id}.wav"
-    if not wav_path.exists():
+    wav_path = media.audio_path(session_id)
+    if wav_path is None:
         return jsonify({"error": "No audio recording for this session"}), 404
 
     with _state_lock:
@@ -8832,8 +8869,12 @@ def export_session(session_id: str):
         include_video = include is None or "video" in (include or set())
 
         if include_audio:
-            wav = data_dir / "audio" / f"{session_id}.wav"
-            if wav.exists():
+            audio = media.audio_path(session_id)
+            if audio is not None and audio.suffix.lower() == ".opus":
+                # Already the format the bundle uses: store it as it is.
+                zf.write(str(audio), "audio.opus", compress_type=zipfile.ZIP_STORED)
+            elif audio is not None:
+                wav = audio
                 # Compress WAV → Opus for much smaller export (~8x smaller than FLAC)
                 # Opus at 32kbps is excellent for speech; the app converts back to WAV on import
                 ffmpeg_bin = find_ffmpeg()
@@ -9668,8 +9709,8 @@ def smart_cleanup(session_id: str):
     if plan.get("action") != "reanalyze":
         return jsonify({"applied": False, "plan": plan, "reason": plan.get("detail", "")})
 
-    wav_path = paths.audio_dir() / f"{session_id}.wav"
-    if not wav_path.exists():
+    wav_path = media.audio_path(session_id)
+    if wav_path is None:
         return jsonify({"error": "No audio recording for this session"}), 404
 
     with _state_lock:
@@ -9848,8 +9889,8 @@ def _train_from_bulk_link(global_id: str, affected: list[dict], profile_name: st
         # Skip if this session/speaker already has embeddings for this profile
         if fingerprint_db.get_latest_embedding(global_id, sid, key) is not None:
             continue
-        wav_path = audio_dir / f"{sid}.wav"
-        if not wav_path.exists():
+        wav_path = media.pcm_wav_path(sid)
+        if wav_path is None:
             continue
         segments = storage.get_segments_by_speaker(sid, key)
         added = 0
@@ -10044,8 +10085,8 @@ def fp_confirm():
             _fp_executor.submit(_add_emb)
         else:
             # Fallback: extract from WAV file
-            wav_path = paths.audio_dir() / f"{session_id}.wav"
-            if wav_path.exists():
+            wav_path = media.pcm_wav_path(session_id)
+            if wav_path is not None:
                 def _add_wav_embs():
                     segments = storage.get_segments_by_speaker(session_id, speaker_key)
                     added = 0
@@ -10576,6 +10617,21 @@ def _agent_changelog(limit: int) -> list:
 
 app.register_blueprint(dashboard_api.bp)
 app.register_blueprint(calendar_events_api.bp)
+app.register_blueprint(storage_api.bp)
+
+
+def _busy_session_ids() -> set[str]:
+    """The sessions the Free up space tool must not touch right now: the one
+    recording, or the one being reanalysed. Its media is being written or read
+    end to end, and a replaced file under either would be a corrupt result."""
+    with _state_lock:
+        if not (_state.get("is_recording") or _state.get("is_reanalyzing")):
+            return set()
+        sid = _state.get("session_id")
+        return {sid} if sid else set()
+
+
+media_compress.configure(push=_push, busy=_busy_session_ids)
 register_agent_api(app, AgentContext(
     status_payload=_status_payload,
     live_extras=_agent_live_extras,
@@ -10681,6 +10737,8 @@ def main() -> None:
         log.warn("app", "First-run setup required - browser will open to configure API keys.")
     log.info("app", f"Meeting Assistant starting at {url}")
     _sync_shortcut_icon_async()
+    # PCM decodes of Opus sessions that nobody has read in a day (core/media.py).
+    media.prune_pcm_cache()
 
     # PyTorch, once, on this thread, while nothing else can want it: after the
     # handshake (a second instance exits without paying for it) and before the

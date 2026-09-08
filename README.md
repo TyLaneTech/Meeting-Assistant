@@ -23,7 +23,7 @@ Meeting Assistant captures desktop and microphone audio simultaneously, transcri
 | **Session Management** | Organized session history with folders, search, and full audio playback |
 | **Voice Library** | Cross-session speaker fingerprinting that learns and improves over time |
 | **Analytics Dashboard** | Real-time speaking time distribution, segment counts, and timeline visualization |
-| **Home Dashboard** | Headline stats, meeting load and activity charts, a when-you-meet heatmap, and the people you meet with most |
+| **Home Dashboard** | Headline stats, an Activity chart with knobs for measure, span and grouping, a when-you-meet heatmap, a Storage card (by type, meeting, month or folder) with a Free up space tool that re-encodes recordings to Opus and AV1, and the people you meet with most |
 | **Calendar** | Scheduled meetings shown next to their recordings, fed by a published Outlook calendar link; a Join button opens the meeting in Teams or Zoom, attendee counts guide reanalysis and attendee names are offered when cleaning up speakers |
 | **Needs Attention** | A queue of recordings that still have unnamed speakers, each one click from cleanup |
 | **Custom Icons** | Swap the app, tray, and shortcut icons for your own set from Settings |
@@ -102,7 +102,7 @@ git pull
 
 Then run `launch.bat`. Dependencies are installed automatically if `requirements.txt` has changed.
 
-After the first run, open Meeting Assistant from the Start Menu: it starts the app silently in the system tray and opens the app window, with no console window.
+After the first run, open Meeting Assistant from the Start Menu: it starts the app silently in the system tray and opens the app window, with no console window. If you would rather a Start Menu launch stayed in the tray like a sign-in launch does, turn off `Settings > System > Open from Start Menu`; clicking the entry while the app is already running still opens the window.
 
 ---
 

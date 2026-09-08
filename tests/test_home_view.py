@@ -55,7 +55,11 @@ SECTION_ROOTS = [
     "dash-attention", "dash-attention-list", "dash-attention-all",
     "dash-next", "dash-next-body", "dash-next-focus", "dash-next-note",
     "dash-next-all",
-    "home-speakers-list", "home-activity-chart", "home-activity-desc",
+    "home-speakers-list",
+    "dash-activity", "home-activity-knobs", "home-activity-chart",
+    "home-activity-summary", "home-activity-desc",
+    "dash-storage", "home-storage-knobs", "home-storage-note", "home-storage-chart",
+    "home-storage-detail", "home-storage-summary", "home-storage-free", "home-storage-desc",
 ]
 
 
@@ -91,7 +95,7 @@ def test_no_kpi_tiles_or_stat_cards_return(home_html):
 
 def test_home_js_dashboard_targets_all_exist(home_html, home_js):
     targets = set(re.findall(
-        r"getElementById\('((?:dash-|home-activity|home-speakers)[^']*)'\)", home_js))
+        r"getElementById\('((?:dash-|home-activity|home-speakers|home-storage)[^']*)'\)", home_js))
     assert targets, "expected dashboard getElementById targets"
     for element_id in targets:
         assert home_html.count(f'id="{element_id}"') >= 1, element_id
@@ -104,6 +108,7 @@ def test_home_reads_slices_through_appdata(home_js):
     assert "AppData.get('sessions')" in home_js
     assert "AppData.get('calendarStatus')" in home_js
     assert "AppData.get('calendarEvents'" in home_js
+    assert "AppData.get('storage')" in home_js
 
 
 def test_home_never_fetches_the_cached_slice_endpoints(home_js):
@@ -341,12 +346,148 @@ def test_the_overview_is_derived_from_the_sessions_slice(home_js):
     assert "ov-metric" in home_js
 
 
-# ── E. Activity: an inline SVG histogram of recorded seconds ─────────────────
+# ── Activity: one chart with knobs that are remembered ───────────────────────
 
-def test_activity_is_an_inline_svg_of_seconds(home_js):
+def test_meeting_load_and_activity_are_one_chart(home_html, home_js, home_css):
+    """Recorded hours per week over twelve weeks and recorded minutes per day
+    over fourteen days were two views of the same numbers. One chart carries
+    both, plus meetings and average length, any span, any grouping."""
     assert '<svg class="act-svg"' in home_js
-    assert "(a.seconds || 0) / 60" in home_js
-    # Accent at a mix, not a raw colour, is enforced in the stylesheet test.
+    assert "function _renderActivity(" in home_js
+    assert "function _dashDerivedActivity(state)" in home_js
+    for gone in ("_renderCadence", "_renderActivityChart", "home-cadence", "cad-svg"):
+        assert gone not in home_js, gone
+        assert gone not in home_html, gone
+        assert gone not in home_css, gone
+    # The default view is the old Meeting load: recorded time by week, three months.
+    assert "_ACT_DEFAULTS = { measure: 'time', span: '3m', group: 'auto' }" in home_js
+    assert "_ACT_MEASURES = [['time', 'Time'], ['count', 'Meetings'], ['avg', 'Avg length']]" in home_js
+    assert "['all', 'All', 0]" in home_js and "['month', 'Month']" in home_js
+    # It is one card in the hero row, where Meeting load was.
+    partial = home_html
+    assert partial.index('id="dash-activity"') < partial.index('id="dash-attention"')
+    assert partial.index('id="dash-grid"') < partial.index('id="dash-activity"')
+
+
+def test_the_knobs_persist_in_local_storage_and_survive_bad_values(home_js):
+    assert "_ACT_STORE_KEY = 'home-activity-v1'" in home_js
+    assert "_STO_STORE_KEY = 'home-storage-v1'" in home_js
+    body = home_js[home_js.index("function _homeLoadKnobs("):home_js.index("function _homeSaveKnobs(")]
+    assert "localStorage.getItem(key)" in body
+    assert "options.some(o => o[0] === saved[k])" in body, "an unknown saved value falls back"
+    save = home_js[home_js.index("function _homeSaveKnobs("):home_js.index("/** One segmented control.")]
+    assert "localStorage.setItem(key, JSON.stringify(state))" in save
+    assert "try {" in save, "storage can throw in a private window; the chart must not"
+    # Turning a knob saves and repaints; it never fetches.
+    act = home_js[home_js.index("function _actOnKnob("):home_js.index("function _actBucketKey(")]
+    assert "_homeSaveKnobs(_ACT_STORE_KEY, _actState)" in act and "fetch(" not in act
+
+
+def test_a_grouping_that_cannot_be_read_steps_up(home_js):
+    body = home_js[home_js.index("function _actResolveUnit("):home_js.index("/** The chart's buckets")]
+    assert "_ACT_MAX_BARS" in body
+    assert "if (unit === 'day' && days > _ACT_MAX_BARS) unit = 'week';" in body
+    assert "if (unit === 'week' && days / 7 > _ACT_MAX_BARS) unit = 'month';" in body
+
+
+def test_activity_buckets_under_node():
+    """The bucketing is pure, so it runs under node against synthetic sessions:
+    a week span groups by day with gaps kept, an all-time span with a year of
+    data groups by month, and an explicit Day over a year steps up."""
+    node = _node()
+    js = _read(STATIC / "home.js")
+    start = js.index("const _ACT_STORE_KEY")
+    end = js.index("function _actValue(")
+    helpers = (js[js.index("function _weekStartLocal("):js.index("/** The last `n` weeks")]
+               + js[js.index("function _dashDurationSec("):js.index("function _dashHours(")]
+               + js[js.index("function _homeLoadKnobs("):js.index("/** Delegated clicks")])
+    harness = """
+const localStorage = { getItem() { return null; }, setItem() {} };
+const escapeHtml = s => String(s);
+let _dashSessions = [];
+%s
+%s
+function _renderActivity() {}
+const day = 86400000;
+const iso = d => new Date(d).toISOString().slice(0, 19);
+const now = Date.now();
+_dashSessions = [
+  { started_at: iso(now - 1 * day), ended_at: iso(now - 1 * day + 3600000) },
+  { started_at: iso(now - 1 * day + 1000), ended_at: iso(now - 1 * day + 1800000) },
+  { started_at: iso(now - 6 * day), ended_at: iso(now - 6 * day + 1800000) },
+  { started_at: iso(now - 300 * day), ended_at: iso(now - 300 * day + 3600000) },
+];
+const week = _dashDerivedActivity({ measure: 'time', span: '2w', group: 'auto' });
+const all = _dashDerivedActivity({ measure: 'time', span: 'all', group: 'auto' });
+const forced = _dashDerivedActivity({ measure: 'time', span: 'all', group: 'day' });
+const counts = week.buckets.map(b => b.count);
+console.log(JSON.stringify({
+  weekUnit: week.unit, weekLen: week.buckets.length, weekTotal: counts.reduce((a, b) => a + b, 0),
+  yesterday: counts[counts.length - 2], allUnit: all.unit, allCount: all.buckets.reduce((a, b) => a + b.count, 0),
+  forcedUnit: forced.unit, firstHasOld: all.buckets[0].count,
+}));
+""" % (helpers, js[start:end])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "act.js"
+        path.write_text(harness, encoding="utf-8")
+        out = subprocess.run([node, str(path)], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    import json
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    assert got["weekUnit"] == "day" and got["weekLen"] == 14
+    assert got["weekTotal"] == 3 and got["yesterday"] == 2
+    assert got["allUnit"] == "month" and got["allCount"] == 4 and got["firstHasOld"] == 1
+    assert got["forcedUnit"] == "week", "a day grouping over a year steps up to weeks"
+
+
+# ── Storage: the card, its knobs and the tool ─────────────────────────────────
+
+def test_storage_sits_where_the_old_activity_histogram_was(home_html):
+    partial = _read(TEMPLATES / "_view_home.html")
+    mid = partial.index('id="dash-mid"')
+    heat = partial.index('id="dash-overview-heat"')
+    storage = partial.index('id="dash-storage"')
+    people = partial.index('id="home-speakers-widget"')
+    assert mid < heat < storage < people
+    assert 'onclick="openStorageTool()"' in partial
+    assert 'id="storage-tool-overlay"' in home_html and 'id="storage-tool-body"' in home_html
+
+
+def test_storage_renders_from_its_slice_with_four_views(home_js):
+    body = home_js[home_js.index("function _renderStorage("):home_js.index("function _stoRenderType(")]
+    assert "AppData.get('storage')" in body and "AppData.status('storage')" in body
+    assert "fetch(" not in body
+    assert "_STO_VIEWS = [['type', 'By type'], ['meeting', 'By meeting'], ['month', 'By month'], ['folder', 'By folder']]" in home_js
+    for fn in ("_stoRenderType", "_stoRenderMeetings", "_stoRenderMonths", "_stoRenderFolders"):
+        assert f"function {fn}(" in home_js, fn
+    # Details is a toggle knob, remembered with the rest.
+    assert "_STO_DEFAULTS = { view: 'type', span: 'all', top: '8', detail: false }" in home_js
+    assert "_homeKnobToggle('detail'" in home_js
+
+
+def test_the_tool_prices_before_it_runs_and_follows_the_job(home_js):
+    assert "function openStorageTool(" in home_js and "function closeStorageTool(" in home_js
+    assert "fetch('/api/storage/plan'" in home_js
+    run = home_js[home_js.index("async function runStorageTool("):home_js.index("async function cancelStorageTool(")]
+    assert "fetch('/api/storage/compress'" in run and "method: 'POST'" in run
+    assert "src.addEventListener('storage_job'" in home_js
+    done = home_js[home_js.index("function _toolOnJobEvent("):]
+    assert "AppData.invalidate(['storage'], 'storage_job')" in done
+    # Deleting is a decision for each run: never remembered as on.
+    assert "out.orphans.enabled = false;" in home_js
+    assert "orphans: { enabled: false }" in home_js
+
+
+def test_the_chosen_meetings_list_sorts_by_newest_or_largest(home_js):
+    assert "_TOOL_LIST_SORTS = [['date', 'Newest'], ['size', 'Largest']]" in home_js
+    assert "list: { sort: 'date' }" in home_js
+    rows = home_js[home_js.index("function _toolSessionRows("):home_js.index("function _toolScopeMode(")]
+    assert "if (_tool.options.list.sort === 'size')" in rows
+    assert "(sizes.get(b.id) || 0) - (sizes.get(a.id) || 0)" in rows
+    assert "function _toolListSort(" in home_js
+    # A dialog preference, remembered with the format choices but never sent.
+    body = home_js[home_js.index("function _toolRequestBody("):home_js.index("function openStorageTool(")]
+    assert "..._tool.options" not in body and "orphans: o.orphans" in body
 
 
 # ── home.css: tokens only, balanced braces, no dashes ────────────────────────

@@ -538,6 +538,22 @@
                 <span class="toggle-slider"></span>
               </label>
             </div>
+            <div class="settings-row" id="start-menu-row" style="display:none">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Open from Start Menu</div>
+                <div class="settings-row-desc">
+                  Show the app window when the Start Menu entry is what starts Meeting
+                  Assistant. Off makes a Start Menu launch start in the tray, the same as
+                  signing in (unless Open on Launch is on). Clicking the entry while the
+                  app is already running always opens the window.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="open-from-start-menu-toggle"
+                       onchange="savePref('open_window_from_start_menu', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
           </div>
 
           <div class="settings-group-title">Sidebar</div>

@@ -227,7 +227,14 @@ function linkifyTimestamps(container) {
 // Stores layout values locally so they can be applied synchronously on load,
 // eliminating the flash caused by the async /api/preferences fetch.
 const _LAYOUT_CACHE_KEY = 'ma-layout';
-const _FOLDER_STATE_KEY = 'ma-folder-state';
+// The sidebar folders the user has opened. A folder with no stored state is
+// closed. The list used to hold the folders that were *closed*, so a folder
+// nobody had touched opened itself and a long library started fully unfolded;
+// for a sidebar that fills up, that is the wrong way round. The old key is
+// removed on first load rather than converted: under the new default the
+// folders it named are closed anyway.
+const _FOLDER_STATE_KEY = 'ma-folder-open';
+const _FOLDER_STATE_KEY_LEGACY = 'ma-folder-state';
 
 function _getLayoutCache() {
   try { return JSON.parse(localStorage.getItem(_LAYOUT_CACHE_KEY) || '{}'); } catch (_) { return {}; }
@@ -264,6 +271,7 @@ const _SLICE_ENDPOINTS = {
   analytics:      '/api/dashboard',
   attention:      '/api/attention/summary',
   calendarStatus: '/api/calendar/status',
+  storage:        '/api/dashboard/storage',
 };
 
 // Slices the whole shell depends on (the sidebar list, the attention badge).
@@ -272,7 +280,7 @@ const _EAGER_SLICES = new Set(['sessions', 'folders', 'attention']);
 
 // Which slices each view renders from. Also drives the Refresh control.
 const VIEW_SLICES = {
-  home:      ['analytics', 'sessions', 'attention', 'calendarStatus'],
+  home:      ['analytics', 'sessions', 'attention', 'calendarStatus', 'storage'],
   calendar:  ['sessions', 'calendarStatus', 'calendarEvents'],
   attention: ['sessions', 'attention'],
   speakers:  [],
@@ -296,6 +304,7 @@ const AppData = {
     analytics:      _newSlice(null),
     attention:      _newSlice(null),
     calendarStatus: _newSlice(null),
+    storage:        _newSlice(null),   // disk use per kind and meeting; Home only
     calendarEvents: {},          // rangeKey -> slice, lazy, one load per range
   },
   _subs: [],
@@ -451,6 +460,9 @@ const AppData = {
 /** refreshSidebar() is the old name for "the recordings list changed". */
 async function refreshSidebar() {
   await AppData.invalidate(['sessions', 'folders'], 'sidebar');
+  // A list change is usually a media change too (a delete, an import, a split).
+  // View-only, so this is a mark until Home is on screen.
+  AppData.invalidate(['storage'], 'sidebar');
 }
 
 /* ── Popovers and menus ──────────────────────────────────────────────────────
@@ -2214,7 +2226,8 @@ function _syncSettingsNavUI() {
 // ── Sidebar state ─────────────────────────────────────────────────────────────
 let _sidebarSelected    = new Set();      // selected session IDs
 let _sidebarMultiselect = false;          // multiselect mode on/off
-let _sidebarCollapsed   = (() => {        // collapsed folder IDs - persisted in localStorage
+let _sidebarExpanded    = (() => {        // open folder IDs - persisted in localStorage; closed otherwise
+  try { localStorage.removeItem(_FOLDER_STATE_KEY_LEGACY); } catch (_) {}
   try { return new Set(JSON.parse(localStorage.getItem(_FOLDER_STATE_KEY) || '[]')); }
   catch (_) { return new Set(); }
 })();
@@ -3583,8 +3596,9 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
     if (filterActive && totalCount === 0) continue;
     // Always honor the user's saved expand/collapse state; filters/search never
     // force-expand a folder. Empty folders are pruned above, so a collapsed
-    // folder only appears when it actually contains matches.
-    const collapsed = _sidebarCollapsed.has(folder.id);
+    // folder only appears when it actually contains matches. A folder with no
+    // saved state is closed.
+    const collapsed = !_sidebarExpanded.has(folder.id);
 
     const folderEl = document.createElement('div');
     folderEl.className = `sidebar-folder ${collapsed ? 'collapsed' : 'expanded'}`;
@@ -4028,16 +4042,20 @@ function _closeFolderMenu() {
 
 // ── Folder actions ────────────────────────────────────────────────────────────
 
+function _saveFolderState() {
+  try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarExpanded])); } catch (_) {}
+}
+
 function _toggleFolder(folderId) {
-  if (_sidebarCollapsed.has(folderId)) _sidebarCollapsed.delete(folderId);
-  else _sidebarCollapsed.add(folderId);
-  try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+  if (_sidebarExpanded.has(folderId)) _sidebarExpanded.delete(folderId);
+  else _sidebarExpanded.add(folderId);
+  _saveFolderState();
   _renderSidebar();
 }
 
 // Expand every ancestor folder of the given session so the active session
-// is visible in the sidebar. Persists the new collapsed-set to localStorage
-// and re-renders. No-op if the session isn't in any folder.
+// is visible in the sidebar. Persists the open set to localStorage and
+// re-renders. No-op if the session isn't in any folder.
 function _revealSessionInSidebar(sessionId) {
   if (!sessionId) return;
   const sess = _sidebarAllSessions.find(s => s.id === sessionId);
@@ -4049,11 +4067,11 @@ function _revealSessionInSidebar(sessionId) {
   const seen = new Set();
   while (cursor && !seen.has(cursor.id)) {
     seen.add(cursor.id);
-    if (_sidebarCollapsed.delete(cursor.id)) changed = true;
+    if (!_sidebarExpanded.has(cursor.id)) { _sidebarExpanded.add(cursor.id); changed = true; }
     cursor = cursor.parent_id ? folderById.get(cursor.parent_id) : null;
   }
   if (changed) {
-    try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+    _saveFolderState();
     _renderSidebar();
   }
 }
@@ -4073,8 +4091,8 @@ async function createSubfolder(parentId) {
   const name = await uiPrompt({ title: 'New subfolder', message: 'Subfolder name:', validate: v => v.trim() ? null : 'Enter a subfolder name.' });
   if (name === null) return;
   // Expand the parent folder so the new subfolder is visible
-  _sidebarCollapsed.delete(parentId);
-  try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+  _sidebarExpanded.add(parentId);
+  _saveFolderState();
   await fetch('/api/folders', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -4123,9 +4141,9 @@ async function deleteFolder(e, folderId) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ delete_contents: deleteContents }),
   });
-  // Clean up collapsed state for this folder and any subfolders
-  for (const id of allFolderIds) _sidebarCollapsed.delete(id);
-  try { localStorage.setItem(_FOLDER_STATE_KEY, JSON.stringify([..._sidebarCollapsed])); } catch (_) {}
+  // Clean up the open state for this folder and any subfolders
+  for (const id of allFolderIds) _sidebarExpanded.delete(id);
+  _saveFolderState();
   refreshSidebar();
 }
 
@@ -6109,6 +6127,7 @@ function onStatus(d) {
       updateRecordBtn();
       // A stop finalises in place, from whichever view the user is on.
       AppData.invalidate(['sessions', 'analytics', 'attention'], 'recording_stop');
+      AppData.invalidate(['storage'], 'recording_stop');
       if (_wasRecording && state.sessionId) _announceRecordingSaved(state.sessionId);
       // The WAV is finalized before this event fires, so playback is available
       // immediately - no need to reload the page or click the session.
@@ -18533,7 +18552,7 @@ async function loadSession(sessionId) {
   _revealSessionInSidebar(sessionId);
   // _revealSessionInSidebar only re-renders if it actually expanded
   // anything; refresh the highlight unconditionally so the new active
-  // session's folders get the class even when nothing was collapsed.
+  // session's folders get the class even when they were open already.
   _updateActiveFolderHighlights();
 
   if (data.speaker_profiles?.length) {
@@ -20845,6 +20864,7 @@ async function openSettings(section) {
   try {
     const startup = await fetch('/api/settings/startup').then(r => r.json());
     const row = document.getElementById('startup-row');
+    _syncStartMenuRow(!!startup.supported);
     if (startup.supported) {
       row.style.display = '';
       document.getElementById('startup-toggle').checked = startup.enabled;
@@ -20864,6 +20884,9 @@ async function openSettings(section) {
 
   const openOnLaunch = document.getElementById('open-on-launch-toggle');
   if (openOnLaunch) openOnLaunch.checked = _prefs.open_window_on_launch === true;
+  // On by default, so an absent preference reads as checked.
+  const openFromStartMenu = document.getElementById('open-from-start-menu-toggle');
+  if (openFromStartMenu) openFromStartMenu.checked = _prefs.open_window_from_start_menu !== false;
 
   // Audio params - load eagerly so panels are ready when clicked
   _apRefresh().then(() => _syncScreenToggle());
@@ -22070,12 +22093,20 @@ async function setStartupLaunch(enabled) {
   loadStartupState();
 }
 
+/** The Start Menu launcher exists only where the Startup toggle does (Windows),
+ *  so its row shows and hides with that one. */
+function _syncStartMenuRow(supported) {
+  const row = document.getElementById('start-menu-row');
+  if (row) row.style.display = supported ? '' : 'none';
+}
+
 /** Refresh just the Launch at Startup row from the server's real state. */
 async function loadStartupState() {
   const row = document.getElementById('startup-row');
   if (!row) return;
   try {
     const st = await fetch('/api/settings/startup').then(r => r.json());
+    _syncStartMenuRow(!!st.supported);
     if (!st.supported) { row.style.display = 'none'; return; }
     row.style.display = '';
     document.getElementById('startup-toggle').checked = !!st.enabled;
@@ -23856,7 +23887,7 @@ if (window.ResizeObserver) {
 // "updated 2 min ago" has to keep being true while the window sits open, and
 // it has to be right the moment a slice lands.
 setInterval(_syncRefreshTooltip, 30000);
-AppData.subscribe(['sessions', 'folders', 'analytics', 'attention', 'calendarStatus', 'calendarEvents'],
+AppData.subscribe(['sessions', 'folders', 'analytics', 'attention', 'calendarStatus', 'calendarEvents', 'storage'],
                   _syncRefreshTooltip);
 
 /* ── Reconciling after a gap ──────────────────────────────────────────────── */
@@ -23875,6 +23906,7 @@ function _reconcileAfterGap(reason) {
   const active = VIEW_SLICES[Views.current] || [];
   if (active.includes('analytics')) AppData.invalidate(['analytics'], reason);
   if (active.includes('calendarStatus')) AppData.invalidate(['calendarStatus'], reason);
+  if (active.includes('storage')) AppData.invalidate(['storage'], reason);
 }
 
 window.addEventListener('blur', () => { _lastFocusAt = Date.now(); });

@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from core import paths, settings
+from core import media as media
 
 # ── Timestamps ────────────────────────────────────────────────────────────────
 
@@ -304,7 +305,7 @@ def build_note_append_ops(text: str, heading: str | None) -> list[dict]:
 def meeting_flags(session_id: str) -> dict:
     """Cheap media / notes availability flags for one session."""
     return {
-        "has_audio": (paths.audio_dir() / f"{session_id}.wav").exists(),
+        "has_audio": media.has_audio(session_id),
         "has_video": (paths.video_dir() / f"{session_id}.mp4").exists(),
     }
 
@@ -505,6 +506,7 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "pwa_app_id": "Chrome app id of the installed Meeting Assistant PWA, so a start request focuses that window instead of opening a second one.",
     "warp_toggle_enabled": "Briefly disconnect Cloudflare WARP around network-heavy operations (rarely needed).",
     "open_window_on_launch": "Open the app window every time the app starts. Off means it starts in the tray and waits. A launch that still needs API keys opens the window regardless.",
+    "open_window_from_start_menu": "Windows: whether the Start Menu entry opens the app window when it is the one that starts the app. Off means a Start Menu launch starts in the tray, like sign-in. Clicking the entry while the app is already running always opens the window.",
     "sidebar_open": "UI: whether the session sidebar is expanded.",
     "playback_speed": "UI: default playback speed for recordings.",
     "calendar_enabled": "Match recordings against the published Outlook calendar feed.",

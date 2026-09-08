@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Blueprint, jsonify, request
 
-from core import paths, settings, storage
+from core import disk_usage, paths, settings, storage
 from core.attention import is_generic_speaker_name
 from core.calendar_feed import parse_iso_utc
 
@@ -249,3 +249,38 @@ def get_dashboard():
             "unresolved_speakers": attention["unresolved_speakers"],
         },
     })
+
+
+# ── Storage: the data folder measured against the sessions table ─────────────
+
+def storage_report() -> dict:
+    """What /api/dashboard/storage returns, and what the Free up space planner
+    prices (core/storage_api.py): core/disk_usage.py's scan, given every
+    session's title, folder and duration and the encode ledger."""
+    with _connect() as conn:
+        rows = _session_rows(conn)
+        meta_rows = conn.execute("SELECT id, title, folder_id FROM sessions").fetchall()
+        folders = [dict(r) for r in conn.execute(
+            "SELECT id, name, parent_id FROM folders ORDER BY sort_order, name"
+        ).fetchall()]
+    meta = {r["id"]: {"title": r["title"], "folder_id": r["folder_id"]} for r in meta_rows}
+    sessions: dict[str, dict] = {}
+    for row in rows:
+        m = meta.get(row["id"], {})
+        sessions[row["id"]] = {
+            "title": m.get("title") or "",
+            "started_at": row["started_at"],
+            "folder_id": m.get("folder_id"),
+            "seconds": _duration_seconds(row),
+        }
+    report = disk_usage.scan(sessions, encodes=storage.media_encodes())
+    report["folders"] = folders
+    report["generated_at"] = _utcnow().replace(microsecond=0).isoformat()
+    return report
+
+
+@bp.route("/api/dashboard/storage")
+def get_storage():
+    """Disk use per kind and per meeting, for the Storage card on Home."""
+    return jsonify(storage_report())
+

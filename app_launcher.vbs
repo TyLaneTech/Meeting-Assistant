@@ -3,7 +3,9 @@
 ' This is what the Start Menu entry (and any pin made from it) runs. Clicking it:
 '   1. if the local server is already up  -> just open the app window (instant);
 '   2. if it is not up                    -> start it hidden (tray-only), wait
-'      for it to start accepting requests, THEN open the window;
+'      for it to start accepting requests, THEN ask it to open the window. The
+'      app may keep it closed: Settings > System > Open from Start Menu off
+'      makes a Start Menu start tray-only, like sign-in;
 '   3. on a first run (no .venv yet)      -> run launch.bat in a visible console
 '      instead, so the one-time install shows its progress and any error.
 ' No console window otherwise (run under wscript). The window itself is opened
@@ -12,7 +14,7 @@
 ' fallback at the bottom only runs against a server too old to have that route.
 Option Explicit
 
-Dim shell, fso, projDir, port, statusUrl, appUrl, i, chrome
+Dim shell, fso, projDir, port, statusUrl, appUrl, i, chrome, started
 Set shell = CreateObject("WScript.Shell")
 Set fso   = CreateObject("Scripting.FileSystemObject")
 
@@ -54,7 +56,12 @@ End Function
 
 ' Ask the running app to open (or focus) its window. False on an older server
 ' without the route, or any error.
-Function OpenWindowViaApp()
+'
+' coldStart says whether this launcher started the server. The app decides
+' what a cold start means (Settings > System > Open from Start Menu; Open on
+' Launch already opening it), so a 200 that opened nothing is still success
+' here and must not run the Chrome fallback below.
+Function OpenWindowViaApp(coldStart)
   Dim http
   OpenWindowViaApp = False
   On Error Resume Next
@@ -62,7 +69,7 @@ Function OpenWindowViaApp()
   http.setTimeouts 2000, 2000, 5000, 5000
   http.open "POST", "http://localhost:" & port & "/api/window/open", False
   http.setRequestHeader "Content-Type", "application/json"
-  http.send "{}"
+  http.send "{""source"":""start-menu"",""cold_start"":" & LCase(CStr(coldStart)) & "}"
   If Err.Number = 0 Then
     If http.status = 200 Then OpenWindowViaApp = True
   End If
@@ -77,12 +84,14 @@ If Not fso.FileExists(projDir & "\.venv\Scripts\python.exe") Then
   WScript.Quit
 End If
 
-' 1) Ensure the server is up.
+' 1) Ensure the server is up. Remember whether we were the one to start it.
+started = False
 If Not ServerUp() Then
   shell.CurrentDirectory = projDir
   ' launch_hidden.vbs -> launch.bat --hidden -> launch.py: starts the app
   ' tray-only. Fire and forget.
   shell.Run "wscript.exe """ & projDir & "\launch_hidden.vbs""", 0, False
+  started = True
   ' Wait up to three minutes: an update installs its new packages first. Flask
   ' answers /api/status within a few seconds of the app starting, well before
   ' the models finish loading, so the window opens fast and the app shows its
@@ -97,10 +106,12 @@ If Not ServerUp() Then
   End If
 End If
 
-' 2) Open the app window. The app decides how (installed PWA, chromeless app
-'    window, default browser). Older servers lack the route: fall back to a
-'    chromeless Chrome window, then the default browser.
-If Not OpenWindowViaApp() Then
+' 2) Ask the app to open its window. The app decides how (installed PWA,
+'    chromeless app window, default browser) and, on a cold start, whether
+'    (Open from Start Menu; Open on Launch already opening it). Older servers
+'    lack the route: fall back to a chromeless Chrome window, then the default
+'    browser.
+If Not OpenWindowViaApp(started) Then
   chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
   If Not fso.FileExists(chrome) Then chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
   If fso.FileExists(chrome) Then

@@ -80,8 +80,15 @@ class BatchTranscriber:
         self.hf_token = hf_token
         self.on_progress_callback = on_progress_callback
 
-    def process_wav_file(self, wav_path: str, params: dict) -> None:
-        """Run the full batch pipeline on a WAV file (blocking)."""
+    def process_wav_file(self, wav_path: str, params: dict,
+                         tracks_root: str | None = None) -> None:
+        """Run the full batch pipeline on a WAV file (blocking).
+
+        ``tracks_root`` is where the per-source tracks live, as ``audio/{sid}``
+        with no suffix. It used to be derived from ``wav_path``, which stopped
+        holding the day the WAV could be a decode in tmp/ of an Opus session
+        (core/media.py); the caller knows the session, so it says.
+        """
         import torch
 
         # ── Resolve device ────────────────────────────────────────────────────
@@ -114,7 +121,7 @@ class BatchTranscriber:
         # speaker. Falls back to the mixed path for old recordings.
         me_label = params.get("me_label")
         if me_label:
-            ps = self._per_source_inputs(wav_path)
+            ps = self._per_source_inputs(wav_path, tracks_root)
             if ps is not None:
                 desktop_audio, mic_audio = ps
                 total_duration = max(len(desktop_audio), len(mic_audio)) / TARGET_RATE
@@ -173,16 +180,24 @@ class BatchTranscriber:
     # ── Source-aware ("mic = Me") reanalysis ──────────────────────────────────
 
     @staticmethod
-    def _per_source_opus_paths(wav_path: str) -> tuple[str, str]:
-        root = wav_path[:-4] if wav_path.lower().endswith(".wav") else wav_path
+    def _tracks_root(wav_path: str, tracks_root: str | None = None) -> str:
+        if tracks_root:
+            return tracks_root
+        return wav_path[:-4] if wav_path.lower().endswith(".wav") else wav_path
+
+    @classmethod
+    def _per_source_opus_paths(cls, wav_path: str,
+                               tracks_root: str | None = None) -> tuple[str, str]:
+        root = cls._tracks_root(wav_path, tracks_root)
         return root + "_desktop.opus", root + "_mic.opus"
 
-    def _per_source_inputs(self, wav_path: str):
-        """If both per-source Opus tracks exist beside ``wav_path``, decode them
-        to 16 kHz mono numpy and return (desktop_audio, mic_audio); else None.
-        Also accepts leftover temp WAVs (e.g. an interrupted encode)."""
-        desktop_opus, mic_opus = self._per_source_opus_paths(wav_path)
-        root = wav_path[:-4] if wav_path.lower().endswith(".wav") else wav_path
+    def _per_source_inputs(self, wav_path: str, tracks_root: str | None = None):
+        """If both per-source Opus tracks exist at ``tracks_root`` (or beside
+        ``wav_path`` when no root is given), decode them to 16 kHz mono numpy
+        and return (desktop_audio, mic_audio); else None. Also accepts leftover
+        temp WAVs (e.g. an interrupted encode)."""
+        desktop_opus, mic_opus = self._per_source_opus_paths(wav_path, tracks_root)
+        root = self._tracks_root(wav_path, tracks_root)
         desktop_src = desktop_opus if os.path.isfile(desktop_opus) else (
             root + "_desktop.wav" if os.path.isfile(root + "_desktop.wav") else None)
         mic_src = mic_opus if os.path.isfile(mic_opus) else (

@@ -159,6 +159,25 @@ def test_the_primary_nav_is_four_routed_links(rendered):
     assert "Needs attention" in html
 
 
+def test_sidebar_folders_default_to_closed():
+    """The persisted set is the folders the user opened; anything else is
+    closed. It used to be the other way round, so a fresh browser (or a new
+    folder) started fully unfolded."""
+    js = _read(STATIC / "app.js")
+    assert "const _FOLDER_STATE_KEY = 'ma-folder-open';" in js
+    assert "const collapsed = !_sidebarExpanded.has(folder.id);" in js
+    assert "_sidebarCollapsed" not in js
+    # The old key is dropped, not converted: its folders are closed anyway.
+    assert "localStorage.removeItem(_FOLDER_STATE_KEY_LEGACY)" in js
+    # Opening a recording still unfolds its folder chain, and a new subfolder
+    # opens its parent; both persist through the one save helper.
+    reveal = js[js.index("function _revealSessionInSidebar("):js.index("async function createFolder(")]
+    assert "_sidebarExpanded.add(cursor.id)" in reveal and "_saveFolderState()" in reveal
+    sub = js[js.index("async function createSubfolder("):js.index("refreshSidebar();", js.index("async function createSubfolder("))]
+    assert "_sidebarExpanded.add(parentId)" in sub
+    assert js.count("_saveFolderState();") == 4
+
+
 def test_the_sidebar_says_recordings_not_sessions(rendered):
     html = rendered["home"]
     assert ">Recordings</h2>" in html
@@ -417,7 +436,7 @@ def test_each_view_registers_a_lifecycle():
 
 def test_the_dashboard_renders_from_slices_and_never_fetches_them():
     js = _read(STATIC / "home.js")
-    body = js[js.index("function loadAnalytics()"):js.index("function _dashDerivedActivity()")]
+    body = js[js.index("function loadAnalytics()"):js.index("function _dashObserveResize()")]
     assert "AppData.get('analytics')" in body
     assert "AppData.get('sessions')" in body
     assert "fetch(" not in body

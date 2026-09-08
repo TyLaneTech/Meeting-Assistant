@@ -45,6 +45,33 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Added a Storage view and a Free up space tool, and made Activity one chart (2026-09-08)
+
+### Home
+
+- **Activity** is now one chart, where Meeting load was. Three sets of buttons above it choose what it measures (`Time`, `Meetings`, `Avg length`), how far back it looks (`2w` to `All`) and how it groups (`Day`, `Week`, `Month`, or `Auto`). The choices are remembered across reloads and restarts
+  - `Auto` picks the finest grouping that stays readable, and a grouping that would draw too many bars steps up on its own
+  - The old two-week histogram is gone; the same view is `Time`, `2w`, `Day`
+- New **Storage** card, where that histogram was: how much disk the recordings use, `By type`, `By meeting`, `By month` or `By folder`, over any span, with a `Details` table under the chart. Remembered the same way
+  - The footer says how much of the drive is free, how many recordings are still uncompressed, and how much sits in files that belong to no meeting
+
+### Free up space
+
+- **`Free up space`**, on the Storage card, re-encodes recordings into smaller formats. Choose every meeting, meetings older than a while, a date range, particular meetings or folders; it prices the run before anything happens
+  - The meeting list shows each meeting's size and can be filtered by name and sorted by `Newest` or `Largest`
+  - **Audio** goes from WAV to Opus at a quality you choose. Speech at the recommended setting is about twenty-five times smaller and sounds the same. Transcripts, chapters, notes and speakers are untouched, and playback, reanalysis, clips and trimming keep working
+  - **Screen recordings** can be re-encoded to AV1, HEVC or a tighter H.264, on the graphics card when it can, and optionally reduced from 4K to 1440p. The file keeps its name
+  - **Trim and split backup copies** are re-encoded too, and undo still works
+  - **Files that belong to no meeting**, and fragments encoders left behind, can be removed. That switch is off unless you turn it on, every time, and only files older than six hours are touched
+- Each file is checked before it replaces the original, a meeting that is recording or being reanalysed is skipped, and a file that is open in a player is left as it was and reported
+- Progress shows file by file while it runs, you can stop after the current file, and closing the window lets it carry on
+
+### Recordings list
+
+- **Folders start closed.** A folder you have not opened stays folded instead of every folder unfolding itself in a fresh browser. Open one and it stays open; opening a recording still unfolds the folder it is in
+
+> Everything the tool changed is recorded, so the Storage card can say what is compressed and a second run skips it.
+
 ## Added a Join button, reworked Next on Home, folded the recording bar into the top bar, and sped up startup (2026-09-08)
 
 ### Home
@@ -81,8 +108,10 @@ word. If a bullet needs more than two of these, it is two bullets.
 - *Fixed:* **Launch at Startup** could be switched on and still launch nothing. Windows keeps its own on/off switch for startup items, under `Task Manager > Startup apps`, and it wins; the setting only checked that it had created the shortcut
   - It now shows the real state, says so when Windows has it switched off, and clears that for you when you turn it back on
 - New **Open on Launch**, below Launch at Startup and off by default: show the app window every time Meeting Assistant starts. Off means it starts in the tray and waits, and you open it from the tray icon
+- New **Open from Start Menu**, next to it and on by default: the Start Menu entry opens the window when it is what starts the app. Turn it off and a Start Menu launch stays in the tray, the same as signing in
+  - Clicking the entry while the app is already running always opens the window
 
-> A launch that still needs API keys opens the window either way, whatever these two are set to.
+> A launch that still needs API keys opens the window either way, whatever these are set to.
 
 ### Settings
 

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from core import paths as paths
+from core import media as media
 from core.attention import compute_attention, get_attention_thresholds
 
 
@@ -160,6 +161,19 @@ def init_db() -> None:
                 kind UNINDEXED,
                 text,
                 tokenize='porter unicode61'
+            )""",
+            # Media encode ledger: what the Free up space tool re-encoded, so
+            # the Storage card can say "compressed" and the tool can skip it.
+            """CREATE TABLE IF NOT EXISTS media_encodes (
+                session_id   TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                codec        TEXT NOT NULL,
+                preset       TEXT NOT NULL,
+                before_bytes INTEGER NOT NULL,
+                after_bytes  INTEGER NOT NULL,
+                duration_sec REAL,
+                encoded_at   TEXT NOT NULL,
+                PRIMARY KEY (session_id, kind)
             )""",
             # Semantic search embeddings per session
             """CREATE TABLE IF NOT EXISTS session_embeddings (
@@ -1320,20 +1334,10 @@ def delete_session(session_id: str) -> None:
         conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM media_encodes WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-    # Clean up WAV file if it exists
-    wav_path = paths.audio_dir() / f"{session_id}.wav"
-    if wav_path.exists():
-        try:
-            wav_path.unlink()
-        except OSError:
-            pass
-    video_path = paths.video_dir() / f"{session_id}.mp4"
-    if video_path.exists():
-        try:
-            video_path.unlink()
-        except OSError:
-            pass
+    # Every media file the session owns, in whatever format it ended up in.
+    media.delete_session_media(session_id)
     # Notes attachments live in data_dir()/notes/<session_id>/
     notes_dir = paths.data_dir() / "notes" / session_id
     if notes_dir.exists():
@@ -1419,7 +1423,6 @@ def attention_summary() -> dict:
 
 
 def list_sessions() -> list[dict]:
-    audio_dir = paths.audio_dir()
     with _conn() as conn:
         rows = conn.execute(
             "SELECT s.id, s.title, s.started_at, s.ended_at,"
@@ -1449,7 +1452,7 @@ def list_sessions() -> list[dict]:
         )
     return [
         {**{k: r[k] for k in r.keys() if k != "calendar_match"},
-         "has_audio": (audio_dir / f"{r['id']}.wav").exists(),
+         "has_audio": media.has_audio(r["id"]),
          "speakers": speakers_by_session.get(r["id"], []),
          "attention": attention_by_session[r["id"]],
          "calendar_match": _calendar_match_summary(r["calendar_match"])}
@@ -1627,15 +1630,9 @@ def delete_folder(folder_id: str, delete_contents: bool = False) -> list[str]:
             conn.execute("UPDATE sessions SET folder_id=NULL WHERE folder_id=?", (folder_id,))
             conn.execute("DELETE FROM folders WHERE id=?", (folder_id,))
 
-    # Clean up WAV files outside the transaction
-    audio_dir = paths.audio_dir()
+    # Media cleanup outside the transaction
     for sid in deleted_session_ids:
-        wav_path = audio_dir / f"{sid}.wav"
-        if wav_path.exists():
-            try:
-                wav_path.unlink()
-            except OSError:
-                pass
+        media.delete_session_media(sid)
 
     return deleted_session_ids
 
@@ -2905,3 +2902,52 @@ def import_session_data(pkg: dict) -> str:
             )
 
     return sid
+
+
+# ── Media encode ledger (the Free up space tool) ─────────────────────────────
+# One row per (session, kind) that the compressor re-encoded. The Storage card
+# uses it to say "compressed" and to show what was saved; the compressor uses
+# it to skip work already done. core/disk_usage.py only trusts a row while the
+# file on disk still matches it (a trim writes a fresh WAV over an Opus
+# session, and that session is uncompressed again).
+
+def record_media_encode(session_id: str, kind: str, codec: str, preset: str,
+                        before_bytes: int, after_bytes: int,
+                        duration_sec: float | None = None) -> None:
+    import time as _time
+    now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO media_encodes (session_id, kind, codec, preset,"
+            " before_bytes, after_bytes, duration_sec, encoded_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(session_id, kind) DO UPDATE SET"
+            " codec=excluded.codec, preset=excluded.preset,"
+            " before_bytes=excluded.before_bytes, after_bytes=excluded.after_bytes,"
+            " duration_sec=excluded.duration_sec, encoded_at=excluded.encoded_at",
+            (session_id, kind, codec, preset, int(before_bytes), int(after_bytes),
+             duration_sec, now),
+        )
+
+
+def media_encodes() -> dict[tuple[str, str], dict]:
+    """Every ledger row, keyed by (session_id, kind)."""
+    with _conn() as conn:
+        try:
+            rows = conn.execute(
+                "SELECT session_id, kind, codec, preset, before_bytes, after_bytes,"
+                " duration_sec, encoded_at FROM media_encodes"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+    return {(r["session_id"], r["kind"]): dict(r) for r in rows}
+
+
+def clear_media_encode(session_id: str, kind: str | None = None) -> None:
+    with _conn() as conn:
+        if kind is None:
+            conn.execute("DELETE FROM media_encodes WHERE session_id = ?", (session_id,))
+        else:
+            conn.execute("DELETE FROM media_encodes WHERE session_id = ? AND kind = ?",
+                         (session_id, kind))
+

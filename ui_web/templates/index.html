@@ -1058,6 +1058,20 @@
   </div>
 </div>
 
+<!-- ── Free up space (Home > Storage): the compression tool ────────────── -->
+<div class="overlay hidden" id="storage-tool-overlay" onclick="if(event.target===this)closeStorageTool()">
+  <div class="dialog storage-dialog" role="dialog" aria-modal="true" aria-labelledby="storage-tool-title">
+    <div class="storage-head">
+      <div class="storage-head-main">
+        <h3 class="storage-title" id="storage-tool-title">Free up space</h3>
+        <p class="storage-subtitle">Re-encode recordings into smaller formats. Transcripts, chapters, notes and speakers are untouched, and everything still plays.</p>
+      </div>
+      <button type="button" class="icon-btn storage-close" onclick="closeStorageTool()" aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="storage-body" id="storage-tool-body"></div>
+  </div>
+</div>
+
 <!-- ── Import drop zone overlay ──────────────────────────────────────── -->
 <div class="import-drop-overlay hidden" id="import-drop-overlay">
   <div class="import-drop-content">

@@ -90,7 +90,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `mcp_server.py` | Stdio MCP server for external AI agents (Claude Desktop/Code, Codex). Pure stdlib, zero project imports — proxies to the Agent REST API over localhost HTTP, so it works with any Python and never loads app modules. |
 | `watchdog.py` | External freeze watchdog, opt-in via `freeze_watchdog_enabled`. Polls `/api/status` from outside the process and reads `<data>/heartbeat.json` to tell a frozen or crashed app (restart) from a clean quit (leave alone). Started by `launch.py`, never by the app. |
 | `launch_hidden.vbs` | Tray-only Windows start: runs `launch.bat --hidden` with no console and sends the startup output to `storage/logs/launch-startup-<stamp>.log`, one file per launch, pruned after a week. `_relaunch_app()` prefers it for restarts and updates; the sign-in shortcut runs it. |
-| `app_launcher.vbs` | What the Start Menu shortcut runs. Server up: asks it to open the app window (`POST /api/window/open`, so the PWA / app-window / browser choice lives in `core/browser.py`). Server down: starts it through `launch_hidden.vbs` and waits up to three minutes. No `.venv` yet: runs `launch.bat` in a visible console so the first-run install shows its progress. |
+| `app_launcher.vbs` | What the Start Menu shortcut runs. Server up: asks it to open the app window (`POST /api/window/open`, so the PWA / app-window / browser choice lives in `core/browser.py`). Server down: starts it through `launch_hidden.vbs`, waits up to three minutes, then asks the same with `cold_start` set, so the app can keep the window closed (`open_window_from_start_menu` off, or `open_window_on_launch` / first-run setup already opening one from `main()`). No `.venv` yet: runs `launch.bat` in a visible console so the first-run install shows its progress. |
 | `CHANGELOG.md` | The release notes users read (Settings → Changelog, What's new card). Parsed by `core/changelog.py`; see Release Notes below. |
 | `tests/` | pytest suite, no hardware needed: unit tests for the pure modules plus static assertions over the templates, scripts and stylesheets. `python -m pytest tests -q` runs in about ten seconds. See CONTRIBUTING.md. |
 
@@ -104,7 +104,11 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/settings.py` | JSON user preferences (device selections, model choices, UI prefs) |
 | `core/network.py` | HuggingFace token + pipeline download helpers |
 | `core/compute_device.py` | `best_torch_device()` — single source of truth for CUDA/MPS/CPU choice |
-| `core/storage.py` | SQLite CRUD — sessions, segments, summaries, chat, speaker labels, calendar matches, expected speaker counts |
+| `core/storage.py` | SQLite CRUD: sessions, segments, summaries, chat, speaker labels, calendar matches, expected speaker counts, the `media_encodes` ledger |
+| `core/media.py` | Where a meeting's media is, in either format: `audio_path()` (Opus or WAV), `pcm_wav_path()` (the WAV, or a cached decode of the Opus in `tmp/pcm/` for `wave`-based readers), `replace_audio()`, `delete_session_media()`. Every reader of a recording's audio goes through it; only writers name `{sid}.wav` |
+| `core/disk_usage.py` | The Storage card's scan: bytes per kind, per meeting, per backup folder, plus orphans and encoder leftovers with their age. Pure filesystem over the metadata the route hands in |
+| `core/media_compress.py` | The Free up space engine: audio and video presets, encoder discovery (NVENC probed by a test encode), `plan()` pricing, the one-at-a-time `Job` (WAV to Opus with the per-source tracks, MP4 re-encode, backup WAVs, orphan removal), the ledger writes |
+| `core/storage_api.py` | `/api/storage/*` blueprint: price a plan, start it, read the job, cancel it |
 | `core/attention.py` | The Needs attention queue: recordings whose speakers are still unnamed, against the calendar's expected count |
 | `core/browser.py` | Opens the UI as an app window (Chrome/Edge `--app=` or the installed PWA) instead of a browser tab |
 | `core/calendar_feed.py` | Published-calendar (ICS) download, RRULE expansion, time zones, attendee parsing, URL masking |
@@ -112,7 +116,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view; `event_key` / `find_instance` turn one opaque key back into its cached occurrence |
 | `core/meeting_links.py` | Finds a Teams/Zoom/Meet/Webex join link in a calendar event and hands it to the OS, preferring the desktop client's own URL scheme. The link is a credential and never reaches the browser |
 | `core/changelog.py` | Parses `CHANGELOG.md` into the entries the Changelog tab and What's new card show |
-| `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries |
+| `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries; `/api/dashboard/storage` and `storage_report()`, the disk scan joined to the sessions table |
 | `core/heartbeat.py` | `<data>/heartbeat.json`, refreshed while alive and removed on a clean quit; read by `watchdog.py` |
 | `core/icons.py`, `core/icons_api.py` | Icon sets (Settings > Icons): per-state slots, tinting, PNG/ICO rendering, custom uploads, the tray and shortcut icons; `/api/icons/*` and the web manifest |
 | `core/obsidian_export.py` | Optional Markdown export of finished meetings into an Obsidian vault |
@@ -141,7 +145,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `capture_video/windows.py` | gdigrab capture, DPI-aware `EnumDisplayMonitors`, kill_stale_ffmpeg |
 | `capture_video/mac.py` | AVFoundation screen capture |
 | `capture_video/ffmpeg_util.py` | `find_ffmpeg()`, `download_ffmpeg()`, `_LOCAL_FFMPEG` constants |
-| `capture_video/media_edit.py` | Trim, split, concatenate audio/video files |
+| `capture_video/media_edit.py` | Trim, split, waveform profile and the trim/split backups. Reads PCM through `core/media.py`, so an Opus session trims, profiles and restores like a WAV one; a trim writes a WAV that retires the Opus |
 
 ### `ml/` — transcription, diarization, speakers
 
@@ -325,6 +329,7 @@ es.addEventListener("event_name", e => {
 | `calendar_match_changed` | `session_id`, `confirmed` | A recording's calendar match was confirmed or cleared |
 | `attention_changed` | `session_id` | The Needs attention queue changed for a recording |
 | `capture_alert` | `kind`, `message`, ... | The desktop capture has produced no signal (loopback silence watchdog) |
+| `storage_job` | job snapshot (`id`, `state`, `done`, `total`, `saved`, `current`) | The Free up space job progressed (throttled to twice a second) or finished; the dialog follows it and Home invalidates the `storage` slice when it ends |
 | `smart_cleanup_done` | `session_id`, ... | A smart cleanup reanalysis finished |
 | `recording_command` | `nonce`, `source`, `reason` | A start-recording request offered to open windows; one acks it via `/api/recording/ack_command` (`core/recording_request.py`) |
 
@@ -366,11 +371,15 @@ All API routes follow these conventions:
 | `/api/preferences` | User preferences (JSON settings) |
 | `/api/shutdown` | Graceful exit |
 | `/api/restart` | Graceful stop, then relaunch through the launcher (`_relaunch_app()`) |
-| `/api/window/open` | Open or focus the app window (`core/browser.py`); called by `app_launcher.vbs` |
+| `/api/window/open` | Open or focus the app window (`core/browser.py`); called by `app_launcher.vbs`. With `cold_start` true the app decides: nothing opens when `open_window_from_start_menu` is off, or when `open_window_on_launch` or first-run setup is already opening a window from `main()`. Always 200 |
 | `/api/changelog` | `CHANGELOG.md` parsed into entries (`core/changelog.py`); `?refresh=1` re-reads |
 | `/api/update/check`, `/api/update/apply` | Self-update: fetch `main`, compare, pull, relaunch |
 | `/`, `/session/<id>`, `/calendar`, `/attention`, `/speakers` | The one app shell (`index.html`); the client router picks the view |
 | `/api/dashboard` | Home dashboard data (`core/dashboard_api.py`) |
+| `/api/dashboard/storage` | Disk use per kind, per meeting, per backup folder, orphans and leftovers (`core/disk_usage.py`); the Home `storage` slice |
+| `/api/storage/plan` | POST: price a Free up space run (scope, audio, video, backups, orphans) without touching anything |
+| `/api/storage/compress` | GET the current or last job with every item; POST starts the run the plan described (409 while one runs) |
+| `/api/storage/compress/cancel` | Stop after the current file |
 | `/api/calendar/*`, `/api/sessions/<id>/calendar_match` | Published-calendar status, link, test, refresh, events, join; the per-recording match |
 | `/api/attention/summary`, `/api/sessions/<id>/expected_speakers` | Needs attention queue; the expected speaker count |
 | `/api/sessions/<id>/resolution_candidates`, `/api/sessions/<id>/smart_cleanup` | Calendar attendees offered in the Cleanup picker; the smart cleanup reanalysis |
@@ -455,6 +464,12 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **Desktop device choice (Windows):** `_resolve_loopback()` uses the device the user selected: the saved index when it still carries the saved name, otherwise the live device with that name, and the default output only when the saved device is gone. Following the default output, at start and mid-recording through `render_probe.py`, is behind `loopback_follow_output` (default off). Windows keeps two output roles and PortAudio reports only one, so "the default output" is routinely not the device the user hears; following it captured an idle endpoint for a whole call (2026-09-05). The word-level name tier ignores the `[Loopback]` suffix, which every loopback device carries.
 
+**A meeting's audio is resolved, never assumed:** a session's mixed track is `audio/{sid}.wav` as recorded or `audio/{sid}.opus` once Free up space has been over it, and `core/media.py` is the only code that knows. Readers ask `media.audio_path()` for the file to serve or copy and `media.pcm_wav_path()` for a WAV to open with `wave` (the recorder's own, or a cached decode in `tmp/pcm/` that lives until the Opus changes). The player, reanalysis (which resolves PCM on its worker before it clears the transcript), the fingerprint extractor, the waveform profile, trim and split, export and the agent API's media, audio and clip routes all go through it; only the recorder and the two importers may write a `{sid}.wav` path, and `tests/test_storage_tool.py::test_only_writers_still_build_a_wav_path` fails the moment a reader does. The per-source tracks are found by session (`media.tracks_root()`), not beside the WAV, because the WAV may be a decode in tmp/.
+
+**Free up space never touches a file it has not checked:** every re-encode lands in `tmp/compress/`, is checked (exists, not tiny, duration within a second or half a percent of the source) and only then replaces the original with `os.replace`, the old file going after the new one is in place. A meeting that is recording or being reanalysed is skipped (`_busy_session_ids()`), a file the browser is streaming is reported in use and left alone, a video whose re-encode was not smaller keeps its original, and orphan removal is a separate switch that is never remembered as on, only touches files older than six hours, and re-checks at the moment of deletion that no meeting with that id exists. Every replacement is written to the `media_encodes` ledger, which `core/disk_usage.py` trusts only while the file on disk still matches it (a trim that wrote a fresh WAV over an Opus session makes that meeting uncompressed again). One job, one worker thread, one ffmpeg at a time.
+
+**Home's charts are two, with remembered knobs:** Activity (measure, span, grouping) and Storage (view, span, top-N, details) keep their choices in localStorage (`home-activity-v1`, `home-storage-v1`; the tool's format choices in `home-storage-tool-v1`), validated against the allowed values on load so a stale entry can never wedge a card. Both derive everything from slices (Activity from `sessions`, Storage from `storage`); turning a knob never fetches. The `storage` slice is view-only: it is invalidated by `refreshSidebar()` (a list change is usually a media change), `recording_stop`, the reconnect reconciliation and `storage_job` finishing, and reloads when Home is on screen.
+
 **Loopback silence watchdog:** `_loopback_silence_watchdog()` raises `capture_alert` when the desktop capture never produces signal or drops out. It only ever switches devices when following is on and the probe shows a different endpoint actually playing; silence alone never moves the capture.
 
 **The watchdog measures a window's peak, never a spot reading:** it polls every two seconds, and reading `loopback_level` (the latest chunk's RMS) at that cadence samples the gaps between words, so it called a live two-way call silent and fired the alarm through ordinary conversation (2026-09-08). `take_peaks()` returns and resets the loudest RMS since the last call, which partitions the timeline into windows with nothing falling through the gap. The thresholds go with it: `SILENT_FLOOR` (0.0008) is far below the speech level the meters use, because a dead loopback delivers digital silence while a live but quiet call does not, and the "dropped" alarm now needs 90 s of that silence *plus* 45 s of mic activity inside it, so an idle desk or a recording left running is not mistaken for a one-sided call. Measured numbers are in the constants' comment and replayed in `tests/test_capture_silence_alarm.py`; do not raise the floor back toward the speech threshold.
@@ -475,7 +490,7 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **PyTorch is imported once, on the main thread, before the server or any loader thread exists** (`_preload_torch()` in `main()`, after the second-instance handshake and before Flask starts; `_start_background_initializers()` calls it again as a free guard). The eager `import torchaudio` in `core/config.py` had been guaranteeing this for years without anyone knowing. The first launch after it went lazy (0f470a4, 2026-09-08) had the four model loaders take the first `import torch` together: the diarizer was handed the half-built module object (`module 'torch' has no attribute 'cuda'`, logged before whisper had even printed `CUDA OK`), the fingerprint DB and text embeddings got `WinError 1114` on `c10.dll`, and the process died with an access violation (exit 3221225477), twice in a row. CPython's per-module import lock hands a waiting thread the in-progress module when its deadlock detector fires, and four threads importing overlapping ML graphs at once is exactly the shape that trips it. The preload costs about 1.2 s on the main thread, which is where that time was spent before the tray moved ahead of the imports. Do not move it onto a background thread to get the server up sooner, do not start a loader thread before it, and do not import torch from any thread that can run before `main()` reaches it.
 
-**Silent shortcuts:** `launch.py` points the Start Menu shortcut at `app_launcher.vbs` and migrates a sign-in shortcut that still runs `cmd /c launch.bat` onto `launch_hidden.vbs`, so neither leaves a console window open. `launch.bat --hidden` shows a message box on failure instead of `pause`, which a hidden console can never answer. A first run (no `.venv`) still gets a visible console for the install.
+**Silent shortcuts:** `launch.py` points the Start Menu shortcut at `app_launcher.vbs` and migrates a sign-in shortcut that still runs `cmd /c launch.bat` onto `launch_hidden.vbs`, so neither leaves a console window open. `launch.bat --hidden` shows a message box on failure instead of `pause`, which a hidden console can never answer. A first run (no `.venv`) still gets a visible console for the install. The Start Menu entry opens the window by default; `open_window_from_start_menu` (Settings > System, on by default, Windows only) turns that off for the cold-start case only, because a click on an already-running app can only mean "show it". The decision is the app's (`/api/window/open`), not the VBScript's: the launcher just says whether it started the server.
 
 **Shortcut ownership:** `launch.py` only rewrites a Start Menu shortcut that already launches this checkout (or when none exists), and `core/icons.py` only re-icons shortcuts that do. A second clone or a git worktree must never take over the user's shortcut while the other checkout still exists.
 

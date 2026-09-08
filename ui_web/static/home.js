@@ -502,6 +502,11 @@ function _initSSE() {
     try { _onGlobalChatTitle(JSON.parse(e.data)); } catch {}
   });
   src.addEventListener('global_chat_start', () => {});
+  // The Free up space job reports as it goes; the dialog and the Storage card
+  // both follow it from here.
+  src.addEventListener('storage_job', e => {
+    try { _toolOnJobEvent(JSON.parse(e.data)); } catch {}
+  });
   // Resolving speakers anywhere in the app invalidates the attention slice in
   // app.js, and Home redraws from the store. Nothing to refetch here.
 }
@@ -818,23 +823,21 @@ function loadAnalytics() {
 
   _renderFirstRun(analytics, empty);
   _renderStatCards(analytics, booting);
-  _renderCadence(booting);
+  _renderActivity(booting);
   _renderOverview(booting);
   _renderNext();
   _renderAttention(needsAttention, count, empty, booting);
-  _renderActivityChart(
-    (data.activity && data.activity.length) ? data.activity : _dashDerivedActivity());
+  _renderStorage(booting);
   _renderPeople((data.people && data.people.length) ? data.people : _dashDerivedPeople());
   _renderReferencePanels(empty);
 }
 
 /* ── Repaint the pixel-sized charts when the dashboard changes size ──────────
- * The cadence and activity SVGs are drawn at their box's real size so labels
+ * The activity and storage SVGs are drawn at their box's real size so labels
  * never scale. One observer on the dashboard root repaints them (and rebuilds
  * the heatmap, whose label density depends on cell width) after a resize. */
 let _dashResizeObs = null;
 let _dashResizeTimer = null;
-let _dashLastActivity = null;
 
 function _dashObserveResize() {
   if (_dashResizeObs || typeof ResizeObserver === 'undefined') return;
@@ -862,9 +865,9 @@ function _dashObserveResize() {
 function _dashRepaint(root) {
   root = root || document.querySelector('.dash');
   if (!root || !root.clientWidth) return;
-  if (root.querySelector('.cad-svg')) _renderCadence(false);
+  if (root.querySelector('.act-svg')) _renderActivity(false);
   if (root.querySelector('.ov-heat-grid')) _renderOverview(false);
-  if (_dashLastActivity && root.querySelector('.act-svg')) _renderActivityChart(_dashLastActivity);
+  if (root.querySelector('.sto-svg')) _renderStorage(false);
 }
 
 /** A renderer that ran before its box had a width painted at a fallback size.
@@ -881,29 +884,6 @@ function _dashRetryPaint(attempt) {
     if (!root || !root.clientWidth) { _dashRetryPaint(attempt + 1); return; }
     _dashRepaint(root);
   }, 120);
-}
-
-/** Recorded minutes per local day for the last 14 days, from the sessions we
- *  already hold. /api/dashboard will replace this when it lands. */
-function _dashDerivedActivity() {
-  const days = [];
-  const byDay = new Map();
-  for (const s of _dashSessions) {
-    if (!s.started_at) continue;
-    const key = new Date(s.started_at + 'Z').toLocaleDateString('en-CA');
-    const cur = byDay.get(key) || { count: 0, seconds: 0 };
-    cur.count += 1;
-    cur.seconds += _dashDurationSec(s);
-    byDay.set(key, cur);
-  }
-  for (let i = 13; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const key = d.toLocaleDateString('en-CA');
-    const cur = byDay.get(key) || { count: 0, seconds: 0 };
-    days.push({ day: key, count: cur.count, seconds: Math.round(cur.seconds) });
-  }
-  return days;
 }
 
 /** People by meeting count over the last eight weeks, unresolved speech
@@ -1085,92 +1065,330 @@ function _homeActShort(dayKey) {
     .toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-/** E. Activity, last 14 days: recorded minutes per local day as an inline SVG
- *  histogram. Supporting, so it sits last on the page. */
-function _renderActivityChart(activity) {
+/* ── Knobs: small segmented controls whose choice is remembered ───────────────
+ * Shared by Activity and Storage. A knob is a radiogroup of buttons; the
+ * chosen value lives in a state object that is written to localStorage on
+ * every change and read back (validated against the allowed values, so a
+ * stale or hand-edited entry can never wedge the chart) on load. */
+
+function _homeLoadKnobs(key, defaults, allowed) {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(key) || 'null'); } catch (_) { saved = null; }
+  const out = { ...defaults };
+  if (saved && typeof saved === 'object') {
+    for (const k of Object.keys(defaults)) {
+      const options = allowed[k];
+      const ok = options ? options.some(o => o[0] === saved[k])
+                         : (typeof saved[k] === typeof defaults[k]);
+      if (ok) out[k] = saved[k];
+    }
+  }
+  return out;
+}
+
+function _homeSaveKnobs(key, state) {
+  try { localStorage.setItem(key, JSON.stringify(state)); } catch (_) {}
+}
+
+/** One segmented control. ``options`` is [[value, label], ...]; ``disabled``
+ *  a Set of values that cannot be chosen right now (still shown, so the row
+ *  does not jump). */
+function _homeKnobGroup(name, options, current, label, disabled) {
+  const btns = options.map(([val, text]) => {
+    const on = val === current;
+    const off = disabled && disabled.has(val);
+    return `<button type="button" class="dash-seg-btn${on ? ' is-on' : ''}" role="radio"`
+      + ` aria-checked="${on}" data-val="${escapeHtml(String(val))}"${off ? ' disabled' : ''}>${escapeHtml(text)}</button>`;
+  }).join('');
+  return `<div class="dash-seg" role="radiogroup" aria-label="${escapeHtml(label)}" data-knob="${name}">${btns}</div>`;
+}
+
+/** A single on/off knob, for Details. */
+function _homeKnobToggle(name, text, on, label) {
+  return `<button type="button" class="dash-seg-btn dash-seg-toggle${on ? ' is-on' : ''}" aria-pressed="${on}"`
+    + ` data-knob="${name}" data-val="${on ? '0' : '1'}" aria-label="${escapeHtml(label || text)}">${escapeHtml(text)}</button>`;
+}
+
+/** Delegated clicks for both knob bars; bound once per page. Arrow keys move
+ *  between the buttons of a group, so the radiogroup role is honest. */
+function _homeBindKnobs() {
+  for (const [id, onChange] of [['home-activity-knobs', _actOnKnob], ['home-storage-knobs', _stoOnKnob]]) {
+    const bar = document.getElementById(id);
+    if (!bar || bar.dataset.bound) continue;
+    bar.dataset.bound = '1';
+    bar.addEventListener('click', e => {
+      const btn = e.target.closest('.dash-seg-btn');
+      if (!btn || btn.disabled) return;
+      const group = btn.closest('.dash-seg');
+      const knob = (group || btn).dataset.knob;
+      onChange(knob, btn.dataset.val);
+    });
+    bar.addEventListener('keydown', e => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const group = e.target.closest('.dash-seg');
+      if (!group) return;
+      const btns = [...group.querySelectorAll('.dash-seg-btn:not([disabled])')];
+      const i = btns.indexOf(e.target);
+      if (i < 0) return;
+      e.preventDefault();
+      const next = btns[(i + (e.key === 'ArrowRight' ? 1 : btns.length - 1)) % btns.length];
+      next.focus();
+      onChange(group.dataset.knob, next.dataset.val);
+    });
+  }
+}
+
+/* ── Activity: one chart, three knobs, remembered ─────────────────────────────
+ * Meeting load (hours per week over 12 weeks) and Activity (minutes per day
+ * over 14 days) were two views of the same numbers. This is both, and the
+ * rest: what to measure (recorded time, meetings, average length), how far
+ * back (two weeks to everything) and how to group (day, week, month, or
+ * whatever fits the span). Everything derives from the sessions slice, so
+ * turning a knob never touches the network. */
+
+const _ACT_STORE_KEY = 'home-activity-v1';
+const _ACT_MEASURES = [['time', 'Time'], ['count', 'Meetings'], ['avg', 'Avg length']];
+const _ACT_SPANS = [['2w', '2w', 14], ['4w', '4w', 28], ['3m', '3m', 91], ['6m', '6m', 182],
+                    ['1y', '1y', 365], ['all', 'All', 0]];
+const _ACT_GROUPS = [['auto', 'Auto'], ['day', 'Day'], ['week', 'Week'], ['month', 'Month']];
+// The old Meeting load view: recorded hours per week over about twelve weeks.
+const _ACT_DEFAULTS = { measure: 'time', span: '3m', group: 'auto' };
+// More bars than this and nothing can be read; a grouping that would need
+// them steps up to the next unit instead.
+const _ACT_MAX_BARS = 110;
+
+let _actState = _homeLoadKnobs(_ACT_STORE_KEY, _ACT_DEFAULTS,
+  { measure: _ACT_MEASURES, span: _ACT_SPANS, group: _ACT_GROUPS });
+
+function _actOnKnob(knob, val) {
+  if (!(knob in _ACT_DEFAULTS) || _actState[knob] === val) return;
+  _actState = { ..._actState, [knob]: val };
+  _homeSaveKnobs(_ACT_STORE_KEY, _actState);
+  _renderActivity(false);
+}
+
+function _actBucketKey(d, unit) {
+  if (unit === 'day') return d.toLocaleDateString('en-CA');
+  if (unit === 'week') return _weekStartLocal(d).toLocaleDateString('en-CA');
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+/** Which unit ``group`` resolves to for a span of ``days``: Auto picks the
+ *  finest that fits, an explicit choice steps up when it would not. */
+function _actResolveUnit(group, days) {
+  let unit = group === 'auto' ? (days <= 35 ? 'day' : (days <= 200 ? 'week' : 'month')) : group;
+  if (unit === 'day' && days > _ACT_MAX_BARS) unit = 'week';
+  if (unit === 'week' && days / 7 > _ACT_MAX_BARS) unit = 'month';
+  return unit;
+}
+
+/** The chart's buckets for the current knobs, oldest first, gaps included, from
+ *  the sessions slice. {buckets:[{start, key, count, seconds}], unit, days}. */
+function _dashDerivedActivity(state) {
+  state = state || _actState;
+  const sessions = _dashSessions.filter(s => s.started_at);
+  const now = new Date();
+  const end = new Date(now);
+  end.setHours(23, 59, 59, 999);
+  const spanDef = _ACT_SPANS.find(o => o[0] === state.span) || _ACT_SPANS[2];
+  let start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  if (spanDef[2] > 0) {
+    start.setDate(start.getDate() - (spanDef[2] - 1));
+  } else {
+    let earliest = null;
+    for (const s of sessions) {
+      const d = new Date(s.started_at + 'Z');
+      if (!Number.isNaN(d.getTime()) && (!earliest || d < earliest)) earliest = d;
+    }
+    if (earliest) { start = new Date(earliest); start.setHours(0, 0, 0, 0); }
+  }
+  const days = Math.max(1, Math.round((end - start) / 86400000));
+  const unit = _actResolveUnit(state.group, days);
+  if (unit === 'week') start = _weekStartLocal(start);
+  if (unit === 'month') start = new Date(start.getFullYear(), start.getMonth(), 1);
+
+  const buckets = [];
+  const byKey = new Map();
+  const cursor = new Date(start);
+  while (cursor <= end && buckets.length < _ACT_MAX_BARS + 40) {
+    const b = { start: new Date(cursor), key: _actBucketKey(cursor, unit), count: 0, seconds: 0 };
+    buckets.push(b);
+    byKey.set(b.key, b);
+    if (unit === 'day') cursor.setDate(cursor.getDate() + 1);
+    else if (unit === 'week') cursor.setDate(cursor.getDate() + 7);
+    else cursor.setMonth(cursor.getMonth() + 1);
+  }
+  for (const s of sessions) {
+    const d = new Date(s.started_at + 'Z');
+    if (Number.isNaN(d.getTime()) || d < start || d > end) continue;
+    const b = byKey.get(_actBucketKey(d, unit));
+    if (!b) continue;
+    b.count += 1;
+    b.seconds += _dashDurationSec(s);
+  }
+  return { buckets, unit, days, spanLabel: spanDef[2] > 0 ? `last ${_actSpanWords(spanDef[0])}` : 'all time' };
+}
+
+function _actSpanWords(span) {
+  return { '2w': 'two weeks', '4w': 'four weeks', '3m': 'three months',
+           '6m': 'six months', '1y': 'twelve months' }[span] || span;
+}
+
+/** The value a bar stands for, in seconds for time and average length. */
+function _actValue(b, measure) {
+  if (measure === 'count') return b.count;
+  if (measure === 'avg') return b.count ? b.seconds / b.count : 0;
+  return b.seconds;
+}
+
+/** A round axis top for counts, so gridlines land on whole meetings. */
+function _actNiceCount(max) {
+  const steps = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 80, 100, 150, 200];
+  for (const st of steps) if (max <= st) return st;
+  return Math.ceil(max / 100) * 100;
+}
+
+/** Axis top and label formatter for the measure: minutes while the top is
+ *  under ninety minutes, hours above, whole meetings for counts. */
+function _actScale(measure, maxValue) {
+  if (measure === 'count') return { top: _actNiceCount(Math.max(maxValue, 1)), label: v => String(v) };
+  const maxMin = maxValue / 60;
+  if (maxMin <= 90) {
+    const top = _homeNiceMinutes(Math.max(maxMin, 1));
+    return { top: top * 60, label: v => _homeMinLabel(v / 60) };
+  }
+  const steps = [2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 30, 40, 50, 60, 80, 100, 150, 200];
+  const maxH = maxValue / 3600;
+  let topH = steps.find(st => maxH <= st);
+  if (!topH) topH = Math.ceil(maxH / 50) * 50;
+  return { top: topH * 3600, label: v => `${Number.isInteger(v / 3600) ? v / 3600 : (v / 3600).toFixed(1)}h` };
+}
+
+function _actBarLabel(b, unit, isCurrent) {
+  if (unit === 'day') return isCurrent ? 'Today' : _homeActShort(b.key);
+  if (unit === 'week') return isCurrent ? 'This wk' : b.start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  if (isCurrent) return 'This mo';
+  const thisYear = new Date().getFullYear() === b.start.getFullYear();
+  return b.start.toLocaleDateString(undefined, thisYear ? { month: 'short' } : { month: 'short', year: '2-digit' });
+}
+
+function _actBarTip(b, unit, measure) {
+  const when = unit === 'day' ? _homeActLong(b.key)
+    : unit === 'week' ? `Week of ${b.start.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
+    : b.start.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  const meetings = `${b.count} meeting${b.count === 1 ? '' : 's'}`;
+  const time = _dashHours(b.seconds) || '0m';
+  if (measure === 'avg') {
+    const avg = b.count ? (_dashHours(b.seconds / b.count) || '0m') : 'no meetings';
+    return `${when} · ${meetings} · avg ${avg}`;
+  }
+  return `${when} · ${meetings} · ${time}`;
+}
+
+function _renderActivityKnobs() {
+  const bar = document.getElementById('home-activity-knobs');
+  if (!bar) return;
+  // Groupings that would draw more bars than can be read are shown disabled;
+  // Auto is always available.
+  const spanDef = _ACT_SPANS.find(o => o[0] === _actState.span) || _ACT_SPANS[2];
+  const days = spanDef[2] > 0 ? spanDef[2] : _dashDerivedActivity({ ..._actState, group: 'month' }).days;
+  const disabled = new Set();
+  if (days > _ACT_MAX_BARS) disabled.add('day');
+  if (days / 7 > _ACT_MAX_BARS) disabled.add('week');
+  const html = _homeKnobGroup('measure', _ACT_MEASURES, _actState.measure, 'Measure')
+    + _homeKnobGroup('span', _ACT_SPANS.map(o => [o[0], o[1]]), _actState.span, 'How far back')
+    + _homeKnobGroup('group', _ACT_GROUPS, _actState.group, 'Group by', disabled);
+  if (bar.innerHTML !== html) _dashMorph(bar, html);
+}
+
+/** The hero chart: an inline SVG bar chart of the current knobs' buckets,
+ *  drawn at the box's real pixel size so labels never scale. */
+function _renderActivity(booting) {
   const chart = document.getElementById('home-activity-chart');
   const note = document.getElementById('home-activity-summary');
   const desc = document.getElementById('home-activity-desc');
   if (!chart) return;
-
-  activity = activity || [];
-  _dashLastActivity = activity;
-  if (note) note.textContent = activity.length ? 'Last 14 days' : '';
-
-  if (!activity.length) {
-    chart.innerHTML = '<p class="home-activity-empty">No recordings in the last two weeks.</p>';
-    if (desc) desc.textContent = '';
+  _renderActivityKnobs();
+  if (booting) {
+    chart.innerHTML = '<div class="home-activity-skel skeleton"></div>';
+    if (note) note.textContent = '';
     return;
   }
 
-  const today = new Date().toLocaleDateString('en-CA');
-  const maxMin = Math.max(...activity.map(a => (a.seconds || 0) / 60), 1);
-  const niceMax = _homeNiceMinutes(maxMin);
+  const { buckets, unit, spanLabel } = _dashDerivedActivity(_actState);
+  const measure = _actState.measure;
+  const totalCount = buckets.reduce((a, b) => a + b.count, 0);
+  const totalSeconds = buckets.reduce((a, b) => a + b.seconds, 0);
+  const unitWord = { day: 'day', week: 'week', month: 'month' }[unit];
+  if (!totalCount) {
+    chart.innerHTML = `<p class="home-activity-empty">No recordings in the ${spanLabel === 'all time' ? 'library yet' : spanLabel}. Widen the span, or record a meeting.</p>`;
+    if (note) note.textContent = '';
+    if (desc) desc.textContent = '';
+    return;
+  }
+  if (note) {
+    const what = measure === 'count' ? 'meetings' : measure === 'avg' ? 'average length' : 'recorded time';
+    note.textContent = `${totalCount} meeting${totalCount === 1 ? '' : 's'} · ${_dashHours(totalSeconds) || '0m'} · ${what} per ${unitWord}, ${spanLabel}`;
+  }
 
-  // Drawn at the box's real pixel size (see _renderCadence), so the labels
-  // stay 12 px whether the card is 500 px or 1500 px wide.
+  const values = buckets.map(b => _actValue(b, measure));
+  const scale = _actScale(measure, Math.max(...values, measure === 'count' ? 1 : 60));
+
   if (!chart.clientWidth) _dashRetryPaint();   // hidden right now: repaint once it has a size
-  const W = chart.clientWidth || 560;
-  const H = chart.clientHeight || 160;
-  const padL = 40, padR = 10, padT = 18, padB = 22;
+  const W = chart.clientWidth || 720;
+  const H = chart.clientHeight || 200;
+  const padL = 40, padR = 12, padT = 18, padB = 26;
   const innerW = W - padL - padR;
   const innerH = H - padT - padB;
-  const n = activity.length;
+  const n = buckets.length;
   const slot = innerW / n;
-  const barW = Math.max(6, Math.min(34, slot * 0.6));
+  const barW = Math.max(3, Math.min(48, slot * 0.62));
   const baseY = padT + innerH;
-  const yFor = min => baseY - (min / niceMax) * innerH;
-  // Wider slots earn a label under every day and a value above each bar.
-  const labelEvery = slot >= 48 ? 1 : (slot >= 30 ? 2 : 0);
-  const showValues = slot >= 44;
+  const yFor = v => baseY - (v / scale.top) * innerH;
+  // Wider slots earn a label under every bar and a value above each bar.
+  const labelEvery = slot >= 58 ? 1 : (slot >= 34 ? 2 : (slot >= 18 ? 4 : 0));
+  const showValues = slot >= 52;
 
   let grid = '';
-  for (const gm of [niceMax, niceMax / 2]) {
-    const y = yFor(gm);
+  for (const gv of [scale.top, scale.top / 2]) {
+    const y = yFor(gv);
     grid += `<line class="act-grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"></line>`;
-    grid += `<text class="act-ylabel" x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${_homeMinLabel(gm)}</text>`;
+    grid += `<text class="act-ylabel" x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${escapeHtml(scale.label(gv))}</text>`;
   }
   grid += `<line class="act-baseline" x1="${padL}" y1="${baseY}" x2="${W - padR}" y2="${baseY}"></line>`;
 
   const midIdx = Math.floor(n / 2);
   let bars = '', xlabels = '';
   const descParts = [];
-  let todayLabelled = false;
-  activity.forEach((a, i) => {
+  buckets.forEach((b, i) => {
     const cx = padL + slot * i + slot / 2;
-    const mins = (a.seconds || 0) / 60;
-    const h = mins > 0 ? Math.max(2, (mins / niceMax) * innerH) : 0;
-    const isToday = a.day === today;
-    const label = `${_homeActLong(a.day)} · ${a.count} meeting${a.count === 1 ? '' : 's'} · ${_dashHours(a.seconds || 0)}`;
-    descParts.push(label);
-    const cls = 'act-bar' + (mins > 0 ? '' : ' act-bar-empty') + (isToday ? ' is-today' : '');
-    const y = mins > 0 ? baseY - h : baseY - 2;
-    const drawH = mins > 0 ? h : 2;
-    bars += `<rect class="${cls}" x="${(cx - barW / 2).toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${drawH.toFixed(1)}" rx="2" tabindex="0" role="img" data-tip="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></rect>`;
-    if (showValues && mins > 0) {
-      bars += `<text class="act-vlabel" x="${cx.toFixed(1)}" y="${(y - 5).toFixed(1)}" text-anchor="middle">${_dashCompactHours(mins * 60)}</text>`;
+    const v = values[i];
+    const h = v > 0 ? Math.max(2, (v / scale.top) * innerH) : 0;
+    const isCurrent = i === n - 1;
+    const tip = _actBarTip(b, unit, measure);
+    descParts.push(tip);
+    const cls = 'act-bar' + (v > 0 ? '' : ' act-bar-empty') + (isCurrent ? ' is-current' : '');
+    const y = v > 0 ? baseY - h : baseY - 2;
+    const drawH = v > 0 ? h : 2;
+    bars += `<rect class="${cls}" x="${(cx - barW / 2).toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${drawH.toFixed(1)}" rx="${barW >= 8 ? 3 : 1}" tabindex="0" role="img" data-tip="${escapeHtml(tip)}" aria-label="${escapeHtml(tip)}"></rect>`;
+    if (showValues && v > 0) {
+      const shown = measure === 'count' ? String(b.count) : _dashCompactHours(v);
+      bars += `<text class="act-vlabel" x="${cx.toFixed(1)}" y="${(y - 5).toFixed(1)}" text-anchor="middle">${escapeHtml(shown)}</text>`;
     }
-    const labelIt = labelEvery ? (i % labelEvery === 0 || i === n - 1) : (i === 0 || i === n - 1 || i === midIdx);
+    const labelIt = labelEvery ? (i % labelEvery === 0 || isCurrent) : (i === 0 || i === midIdx || isCurrent);
     if (labelIt) {
-      const anchor = i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle');
-      const tx = i === 0 ? padL : (i === n - 1 ? W - padR : cx);
-      const txt = isToday ? 'Today' : _homeActShort(a.day);
-      if (isToday) todayLabelled = true;
-      xlabels += `<text class="act-xlabel" x="${tx.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${escapeHtml(txt)}</text>`;
+      const anchor = i === 0 ? 'start' : (isCurrent ? 'end' : 'middle');
+      const tx = i === 0 ? padL : (isCurrent ? W - padR : cx);
+      xlabels += `<text class="act-xlabel" x="${tx.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${escapeHtml(_actBarLabel(b, unit, isCurrent))}</text>`;
     }
   });
-  if (!todayLabelled) {
-    const ti = activity.findIndex(a => a.day === today);
-    if (ti >= 0) {
-      const cx = padL + slot * ti + slot / 2;
-      xlabels += `<text class="act-xlabel" x="${cx.toFixed(1)}" y="${H - 6}" text-anchor="middle">Today</text>`;
-    }
-  }
 
+  const title = `${measure === 'count' ? 'Meetings' : measure === 'avg' ? 'Average meeting length' : 'Recorded time'} per ${unitWord}, ${spanLabel}`;
   chart.innerHTML =
-    `<svg class="act-svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="group" aria-label="Recorded time per day, last 14 days">`
+    `<svg class="act-svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="group" aria-label="${escapeHtml(title)}">`
     + grid + bars + xlabels + '</svg>';
-  if (desc) desc.textContent = 'Recorded time per day, last 14 days. ' + descParts.join('. ') + '.';
+  if (desc) desc.textContent = `${title}. ${descParts.join('. ')}.`;
 }
 
 /** "45m", "1.5h", "12h": a value short enough to sit above a bar. */
@@ -1341,104 +1559,6 @@ function _renderStatCards(analytics, booting) {
     _statBacklogCard(backlog, cleanShare),
   ];
   el.innerHTML = cards.join('');
-}
-
-/* ── The cadence chart: recorded hours per week over the last 12 weeks ────────
- * The hero visual. An inline SVG bar chart, one measure, current week picked
- * out, hover per bar through the shared #dash tooltip. */
-
-function _homeNiceHours(maxH) {
-  const steps = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 30, 40, 50];
-  for (const s of steps) if (maxH <= s) return s;
-  return Math.ceil(maxH / 10) * 10;
-}
-function _homeHourLabel(h) {
-  return (Number.isInteger(h) ? h : h.toFixed(1)) + 'h';
-}
-function _weekLabelShort(ws) {
-  return ws.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
-
-function _renderCadence(booting) {
-  const chart = document.getElementById('home-cadence-chart');
-  const note = document.getElementById('home-cadence-note');
-  const desc = document.getElementById('home-cadence-desc');
-  if (!chart) return;
-  if (booting) {
-    chart.innerHTML = '<div class="home-cadence-skel skeleton"></div>';
-    if (note) note.textContent = '';
-    return;
-  }
-
-  const weeks = _dashWeekly(12);
-  const any = weeks.some(w => w.count > 0);
-  if (note) note.textContent = any ? 'Recorded hours per week, last 12 weeks' : '';
-  if (!any) {
-    chart.innerHTML = '<p class="home-cadence-empty">Record a few meetings and your weekly load shows up here.</p>';
-    if (desc) desc.textContent = '';
-    return;
-  }
-
-  const hoursArr = weeks.map(w => w.seconds / 3600);
-  const niceMax = _homeNiceHours(Math.max(...hoursArr, 0.5));
-
-  // Drawn at the box's real pixel size, so an axis label is 11 px on a 500 px
-  // card and 11 px on a 1500 px card. The SVG is absolutely positioned inside
-  // the chart box, so it never feeds back into the height it measures;
-  // _dashObserveResize repaints when the card changes size.
-  if (!chart.clientWidth) _dashRetryPaint();   // hidden right now: repaint once it has a size
-  const W = chart.clientWidth || 720;
-  const H = chart.clientHeight || 200;
-  const padL = 40, padR = 12, padT = 18, padB = 26;
-  const innerW = W - padL - padR;
-  const innerH = H - padT - padB;
-  const n = weeks.length;
-  const slot = innerW / n;
-  const barW = Math.max(10, Math.min(48, slot * 0.62));
-  const baseY = padT + innerH;
-  const yFor = h => baseY - (h / niceMax) * innerH;
-  // Wider slots earn a label under every week and a value above each bar.
-  const labelEvery = slot >= 58 ? 1 : (slot >= 34 ? 2 : 0);
-  const showValues = slot >= 52;
-
-  let grid = '';
-  for (const gh of [niceMax, niceMax / 2]) {
-    const y = yFor(gh);
-    grid += `<line class="cad-grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"></line>`;
-    grid += `<text class="cad-ylabel" x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${_homeHourLabel(gh)}</text>`;
-  }
-  grid += `<line class="cad-baseline" x1="${padL}" y1="${baseY}" x2="${W - padR}" y2="${baseY}"></line>`;
-
-  const midIdx = Math.floor(n / 2);
-  let bars = '', xlabels = '';
-  const descParts = [];
-  weeks.forEach((w, i) => {
-    const cx = padL + slot * i + slot / 2;
-    const hrs = w.seconds / 3600;
-    const h = hrs > 0 ? Math.max(2, (hrs / niceMax) * innerH) : 0;
-    const isCurrent = i === n - 1;
-    const label = `Week of ${_weekLabelShort(w.weekStart)} · ${w.count} meeting${w.count === 1 ? '' : 's'} · ${_dashHours(w.seconds) || '0m'}`;
-    descParts.push(label);
-    const cls = 'cad-bar' + (hrs > 0 ? '' : ' cad-bar-empty') + (isCurrent ? ' is-current' : '');
-    const y = hrs > 0 ? baseY - h : baseY - 2;
-    const drawH = hrs > 0 ? h : 2;
-    bars += `<rect class="${cls}" x="${(cx - barW / 2).toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${drawH.toFixed(1)}" rx="3" tabindex="0" role="img" data-tip="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></rect>`;
-    if (showValues && hrs > 0) {
-      bars += `<text class="cad-vlabel" x="${cx.toFixed(1)}" y="${(y - 5).toFixed(1)}" text-anchor="middle">${_dashCompactHours(w.seconds)}</text>`;
-    }
-    const labelIt = labelEvery ? (i % labelEvery === 0 || isCurrent) : (i === 0 || i === midIdx || isCurrent);
-    if (labelIt) {
-      const anchor = i === 0 ? 'start' : (isCurrent ? 'end' : 'middle');
-      const tx = i === 0 ? padL : (isCurrent ? W - padR : cx);
-      const txt = isCurrent ? 'This wk' : _weekLabelShort(w.weekStart);
-      xlabels += `<text class="cad-xlabel" x="${tx.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${escapeHtml(txt)}</text>`;
-    }
-  });
-
-  chart.innerHTML =
-    `<svg class="cad-svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="group" aria-label="Recorded hours per week, last 12 weeks">`
-    + grid + bars + xlabels + '</svg>';
-  if (desc) desc.textContent = 'Recorded hours per week, last 12 weeks. ' + descParts.join('. ') + '.';
 }
 
 /** Diarizer bookkeeping labels are not people, wherever the list came from. */
@@ -2081,6 +2201,910 @@ function _homeBindTips() {
   dash.addEventListener('focusout', _homeHideTip);
 }
 
+/* ── Storage: what the recordings cost on disk ────────────────────────────────
+ * Drawn from the storage slice (/api/dashboard/storage, core/disk_usage.py):
+ * bytes per kind, per meeting, per backup folder, and what belongs to no
+ * meeting any more. Four views (by type, by meeting, by month, by folder), a
+ * span, a top-N and a details table, all remembered in localStorage like the
+ * Activity knobs. The Free up space button opens the compression tool below. */
+
+const _STO_STORE_KEY = 'home-storage-v1';
+const _STO_VIEWS = [['type', 'By type'], ['meeting', 'By meeting'], ['month', 'By month'], ['folder', 'By folder']];
+const _STO_SPANS = [['all', 'All'], ['1y', '1y'], ['6m', '6m'], ['3m', '3m']];
+const _STO_SPAN_DAYS = { all: 0, '1y': 365, '6m': 182, '3m': 91 };
+const _STO_TOPS = [['8', 'Top 8'], ['15', 'Top 15'], ['30', 'Top 30']];
+const _STO_DEFAULTS = { view: 'type', span: 'all', top: '8', detail: false };
+const _STO_KIND_LABELS = { audio: 'Audio', video: 'Video', frames: 'Frames', backups: 'Backups',
+                           other: 'Other', unused: 'Unused' };
+const _STO_KIND_ORDER = ['audio', 'video', 'frames', 'backups', 'other', 'unused'];
+
+let _stoState = _homeLoadKnobs(_STO_STORE_KEY, _STO_DEFAULTS,
+  { view: _STO_VIEWS, span: _STO_SPANS, top: _STO_TOPS });
+
+function _stoOnKnob(knob, val) {
+  if (knob === 'detail') {
+    _stoState = { ..._stoState, detail: val === '1' };
+  } else if (knob in _STO_DEFAULTS && _stoState[knob] !== val) {
+    _stoState = { ..._stoState, [knob]: val };
+  } else {
+    return;
+  }
+  _homeSaveKnobs(_STO_STORE_KEY, _stoState);
+  _renderStorage(false);
+}
+
+/** "1.4 GB", "57.2 GB", "181 GB": 1024-based like the file manager, one
+ *  decimal until a hundred, none above. */
+function _fmtBytes(n) {
+  n = Number(n) || 0;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  const shown = i === 0 ? String(Math.round(v)) : (v >= 100 ? String(Math.round(v)) : v.toFixed(1));
+  return `${shown} ${units[i]}`;
+}
+
+function _stoDate(rec) {
+  const d = new Date(String(rec.started_at || '').replace(' ', 'T') + 'Z');
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function _stoInSpan(rec, span) {
+  const days = _STO_SPAN_DAYS[span] || 0;
+  if (!days) return true;
+  const d = _stoDate(rec);
+  return !!d && d.getTime() >= Date.now() - days * 86400000;
+}
+
+/** A meeting's bytes by kind. Tracks count as audio; fragments as other. */
+function _stoKinds(rec) {
+  return {
+    audio: (rec.audio_bytes || 0) + (rec.audio_tracks_bytes || 0),
+    video: rec.video_bytes || 0,
+    frames: rec.frames_bytes || 0,
+    backups: rec.backups_bytes || 0,
+    other: (rec.other_bytes || 0) + (rec.leftover_bytes || 0),
+  };
+}
+
+function _stoSum(kinds) {
+  return Object.values(kinds).reduce((a, b) => a + b, 0);
+}
+
+/** Bytes by kind for the whole folder (span "all"): the kinds the scan counted,
+ *  with orphaned files pulled out of their directory kind into "unused". */
+function _stoFolderKinds(report) {
+  const bk = report.by_kind || {};
+  const orphanBy = {};
+  for (const o of (report.orphans && report.orphans.items) || []) {
+    orphanBy[o.kind] = (orphanBy[o.kind] || 0) + (o.bytes || 0);
+  }
+  const at = k => ((bk[k] && bk[k].bytes) || 0);
+  return {
+    audio: Math.max(0, at('audio') - (orphanBy.audio || 0)),
+    video: Math.max(0, at('video') - (orphanBy.video || 0)),
+    frames: Math.max(0, at('frames') - (orphanBy.frames || 0)),
+    backups: at('backups'),
+    other: at('attachments') + at('database') + at('profiles') + at('tmp') + at('other'),
+    unused: (report.orphans && report.orphans.bytes) || 0,
+  };
+}
+
+function _stoSegments(kinds, total, tipPrefix) {
+  return _STO_KIND_ORDER.filter(k => kinds[k] > 0).map(k => {
+    const share = total ? kinds[k] / total : 0;
+    const tip = `${tipPrefix ? tipPrefix + ' · ' : ''}${_STO_KIND_LABELS[k]} · ${_fmtBytes(kinds[k])} · ${Math.round(share * 100)}%`;
+    return `<span class="sto-seg sto-k-${k}" style="flex-basis:${(share * 100).toFixed(2)}%" data-tip="${escapeHtml(tip)}" role="img" aria-label="${escapeHtml(tip)}"></span>`;
+  }).join('');
+}
+
+function _stoLegend(kinds, total, notes) {
+  const rows = _STO_KIND_ORDER.filter(k => kinds[k] > 0)
+    .sort((a, b) => kinds[b] - kinds[a])
+    .map(k => `<li class="sto-legend-row"><span class="sto-dot sto-k-${k}"></span>`
+      + `<span class="sto-legend-name">${_STO_KIND_LABELS[k]}</span>`
+      + `<span class="sto-legend-val">${_fmtBytes(kinds[k])}</span>`
+      + `<span class="sto-legend-share">${total ? Math.round(kinds[k] / total * 100) : 0}%</span>`
+      + (notes && notes[k] ? `<span class="sto-legend-note">${escapeHtml(notes[k])}</span>` : '')
+      + '</li>').join('');
+  return `<ul class="sto-legend">${rows}</ul>`;
+}
+
+/** The root folder a folder belongs to (subfolders fold into it). */
+function _stoRootOf(folderId, byId) {
+  let cur = byId.get(folderId);
+  let guard = 0;
+  while (cur && cur.parent_id && byId.has(cur.parent_id) && guard++ < 50) cur = byId.get(cur.parent_id);
+  return cur || null;
+}
+
+function _stoMonthKey(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; }
+
+/** A round axis top in bytes, on 1, 2, 5 steps of MB, GB or TB. */
+function _stoNiceBytes(max) {
+  if (max <= 0) return 1024 * 1024;
+  const steps = [1, 2, 5];
+  let unit = 1024 * 1024;
+  while (unit * 1000 < max) unit *= 1024;
+  for (let mult = 1; mult <= 1000; mult *= 10) {
+    for (const st of steps) {
+      if (max <= st * mult * unit) return st * mult * unit;
+    }
+  }
+  return max;
+}
+
+function _renderStorageKnobs(hasData) {
+  const bar = document.getElementById('home-storage-knobs');
+  if (!bar) return;
+  if (!hasData) { if (bar.innerHTML) bar.innerHTML = ''; return; }
+  let html = _homeKnobGroup('view', _STO_VIEWS, _stoState.view, 'View');
+  html += _homeKnobGroup('span', _STO_SPANS, _stoState.span, 'Meetings from');
+  if (_stoState.view === 'meeting') html += _homeKnobGroup('top', _STO_TOPS, _stoState.top, 'How many');
+  html += _homeKnobToggle('detail', 'Details', !!_stoState.detail, 'Show a table under the chart');
+  if (bar.innerHTML !== html) _dashMorph(bar, html);
+}
+
+function _renderStorage(booting) {
+  const chart = document.getElementById('home-storage-chart');
+  const detail = document.getElementById('home-storage-detail');
+  const note = document.getElementById('home-storage-note');
+  const summary = document.getElementById('home-storage-summary');
+  const button = document.getElementById('home-storage-free');
+  const desc = document.getElementById('home-storage-desc');
+  if (!chart) return;
+  const report = AppData.get('storage');
+  const status = AppData.status('storage');
+  if (booting || (!report && status !== 'error')) {
+    _renderStorageKnobs(false);
+    chart.innerHTML = '<div class="home-storage-skel skeleton"></div>';
+    if (detail) { detail.hidden = true; detail.innerHTML = ''; }
+    if (note) note.textContent = '';
+    if (summary) summary.textContent = '';
+    if (button) button.hidden = true;
+    return;
+  }
+  if (!report) {
+    _renderStorageKnobs(false);
+    chart.innerHTML = `<p class="home-storage-empty">Storage figures are unavailable right now${AppData.error('storage') ? ` (${escapeHtml(AppData.error('storage'))})` : ''}.</p>`;
+    if (detail) { detail.hidden = true; detail.innerHTML = ''; }
+    if (button) button.hidden = true;
+    return;
+  }
+  _renderStorageKnobs(true);
+  const view = _stoState.view;
+  const span = _stoState.span;
+  const sessions = (report.sessions || []).filter(r => _stoInSpan(r, span));
+  const spanWords = span === 'all' ? 'all time' : `last ${_actSpanWords(span === '1y' ? '1y' : span)}`;
+  let descText = '';
+
+  if (view === 'type') descText = _stoRenderType(chart, detail, report, sessions, span);
+  else if (view === 'meeting') descText = _stoRenderMeetings(chart, detail, report, sessions);
+  else if (view === 'month') descText = _stoRenderMonths(chart, detail, report, sessions);
+  else descText = _stoRenderFolders(chart, detail, report, sessions);
+
+  if (detail) detail.hidden = !_stoState.detail;
+  if (note) {
+    const total = span === 'all' ? report.totals.bytes : sessions.reduce((a, r) => a + _stoSum(_stoKinds(r)), 0);
+    const n = span === 'all' ? (report.sessions || []).length : sessions.length;
+    note.textContent = `${_fmtBytes(total)} · ${n} meeting${n === 1 ? '' : 's'} · ${spanWords}`;
+  }
+  if (summary) {
+    const parts = [];
+    if (report.disk) parts.push(`${_fmtBytes(report.disk.free)} free of ${_fmtBytes(report.disk.total)} on this drive`);
+    const wav = report.audio_formats && report.audio_formats.wav;
+    if (wav && wav.files) parts.push(`${wav.files} recording${wav.files === 1 ? '' : 's'} still uncompressed`);
+    if (report.orphans && report.orphans.bytes) parts.push(`${_fmtBytes(report.orphans.bytes)} in files that belong to no meeting`);
+    summary.textContent = parts.join(' · ');
+  }
+  if (button) button.hidden = false;
+  if (desc) desc.textContent = descText;
+}
+
+/* By type: one stacked bar of the whole folder and a legend. With a span it
+ * becomes the in-span meetings' own bytes, so the two can be compared. */
+function _stoRenderType(chart, detail, report, sessions, span) {
+  const kinds = span === 'all' ? _stoFolderKinds(report)
+    : sessions.reduce((acc, r) => { const k = _stoKinds(r); for (const key of Object.keys(k)) acc[key] = (acc[key] || 0) + k[key]; return acc; },
+                      { audio: 0, video: 0, frames: 0, backups: 0, other: 0 });
+  const total = _stoSum(kinds);
+  const af = report.audio_formats || {};
+  const tr = report.tracks || {};
+  const notes = {
+    audio: [af.wav && af.wav.files ? `${af.wav.files} WAV` : '', af.opus && af.opus.files ? `${af.opus.files} Opus` : '',
+            tr.wav && tr.wav.files ? `${tr.wav.files} WAV track${tr.wav.files === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · '),
+    backups: (report.backups || []).length ? `${report.backups.length} trim and split cop${report.backups.length === 1 ? 'y' : 'ies'}` : '',
+    unused: report.orphans && report.orphans.files ? `${report.orphans.files} file${report.orphans.files === 1 ? '' : 's'} from deleted meetings` : '',
+    other: 'database, attachments, caches',
+  };
+  if (span !== 'all') { delete notes.unused; }
+  if (!total) {
+    chart.innerHTML = '<p class="home-storage-empty">Nothing on disk for this span.</p>';
+    if (detail) detail.innerHTML = '';
+    return 'No storage used in this span.';
+  }
+  chart.innerHTML = `<div class="sto-type">`
+    + `<div class="sto-stack" role="group" aria-label="Disk use by type">${_stoSegments(kinds, total, '')}</div>`
+    + _stoLegend(kinds, total, notes) + '</div>';
+  if (detail) {
+    const bk = report.by_kind || {};
+    const files = k => k === 'unused' ? ((report.orphans && report.orphans.files) || 0)
+      : k === 'other' ? ['attachments', 'database', 'profiles', 'tmp', 'other'].reduce((a, kk) => a + ((bk[kk] && bk[kk].files) || 0), 0)
+      : ((bk[k] && bk[k].files) || 0);
+    const rows = _STO_KIND_ORDER.filter(k => kinds[k] > 0).sort((a, b) => kinds[b] - kinds[a]).map(k =>
+      `<tr><td><span class="sto-dot sto-k-${k}"></span>${_STO_KIND_LABELS[k]}</td>`
+      + `<td class="num">${span === 'all' ? files(k) : ''}</td><td class="num">${_fmtBytes(kinds[k])}</td>`
+      + `<td class="num">${Math.round(kinds[k] / total * 100)}%</td><td class="sto-td-note">${escapeHtml(notes[k] || '')}</td></tr>`).join('');
+    detail.innerHTML = `<table class="sto-table"><thead><tr><th>Kind</th><th class="num">Files</th><th class="num">Size</th><th class="num">Share</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+  return 'Disk use by type. ' + _STO_KIND_ORDER.filter(k => kinds[k] > 0)
+    .map(k => `${_STO_KIND_LABELS[k]} ${_fmtBytes(kinds[k])}`).join(', ') + '.';
+}
+
+function _stoAudioBadge(rec) {
+  if (!rec.audio_bytes) return '';
+  const fmt = rec.audio_format === 'opus' ? 'Opus' : 'WAV';
+  const cls = rec.audio_format === 'opus' ? 'sto-badge is-small' : 'sto-badge';
+  return `<span class="${cls}" title="${fmt === 'Opus' ? 'Compressed audio' : 'Uncompressed audio: Free up space can shrink it'}">${fmt}</span>`;
+}
+
+/* By meeting: the largest meetings, one stacked row each, linked. */
+function _stoRenderMeetings(chart, detail, report, sessions) {
+  const top = parseInt(_stoState.top, 10) || 8;
+  const rows = sessions.map(r => ({ rec: r, kinds: _stoKinds(r), bytes: _stoSum(_stoKinds(r)) }))
+    .filter(x => x.bytes > 0).sort((a, b) => b.bytes - a.bytes).slice(0, top);
+  if (!rows.length) {
+    chart.innerHTML = '<p class="home-storage-empty">No meeting in this span has media on disk.</p>';
+    if (detail) detail.innerHTML = '';
+    return 'No meetings with media in this span.';
+  }
+  const max = rows[0].bytes;
+  chart.innerHTML = `<ol class="sto-rows">` + rows.map(({ rec, kinds, bytes }) => {
+    const d = _stoDate(rec);
+    const when = d ? d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' }) : '';
+    const title = rec.title || 'Meeting';
+    const tip = `${title} · ${when} · ${_fmtBytes(bytes)}`;
+    return `<li class="sto-row">`
+      + `<a class="sto-row-name" href="/session?id=${encodeURIComponent(rec.id)}" data-nav title="${escapeHtml(title)}">${escapeHtml(title)}</a>`
+      + `<span class="sto-row-when">${escapeHtml(when)}</span>`
+      + `<div class="sto-bar" style="width:${(bytes / max * 100).toFixed(1)}%">${_stoSegments(kinds, bytes, tip)}</div>`
+      + `<span class="sto-row-val">${_fmtBytes(bytes)}</span>${_stoAudioBadge(rec)}</li>`;
+  }).join('') + '</ol>';
+  if (detail) {
+    detail.innerHTML = `<table class="sto-table"><thead><tr><th>Meeting</th><th>Recorded</th><th class="num">Audio</th><th class="num">Video</th><th class="num">Frames</th><th class="num">Backups</th><th class="num">Total</th></tr></thead><tbody>`
+      + rows.map(({ rec, kinds, bytes }) => {
+        const d = _stoDate(rec);
+        return `<tr><td class="sto-td-name"><a href="/session?id=${encodeURIComponent(rec.id)}" data-nav>${escapeHtml(rec.title || 'Meeting')}</a></td>`
+          + `<td>${d ? escapeHtml(d.toLocaleDateString()) : ''}</td>`
+          + `<td class="num">${_fmtBytes(kinds.audio)} ${_stoAudioBadge(rec)}</td><td class="num">${_fmtBytes(kinds.video)}</td>`
+          + `<td class="num">${_fmtBytes(kinds.frames)}</td><td class="num">${_fmtBytes(kinds.backups)}</td><td class="num">${_fmtBytes(bytes)}</td></tr>`;
+      }).join('') + '</tbody></table>';
+  }
+  return `The ${rows.length} largest meetings. ` + rows.map(x => `${x.rec.title || 'Meeting'} ${_fmtBytes(x.bytes)}`).join(', ') + '.';
+}
+
+/* By month: an inline SVG of stacked bars, one per month recorded, pixel-sized
+ * like the Activity chart and repainted by the same observer. */
+function _stoRenderMonths(chart, detail, report, sessions) {
+  const dated = sessions.map(r => ({ rec: r, d: _stoDate(r), kinds: _stoKinds(r) })).filter(x => x.d && _stoSum(x.kinds) > 0);
+  if (!dated.length) {
+    chart.innerHTML = '<p class="home-storage-empty">No meeting in this span has media on disk.</p>';
+    if (detail) detail.innerHTML = '';
+    return 'No meetings with media in this span.';
+  }
+  let first = new Date(Math.min(...dated.map(x => x.d.getTime())));
+  first = new Date(first.getFullYear(), first.getMonth(), 1);
+  const now = new Date();
+  const months = [];
+  const byKey = new Map();
+  const cursor = new Date(first);
+  while (cursor <= now && months.length < 240) {
+    const m = { start: new Date(cursor), key: _stoMonthKey(cursor), count: 0,
+                kinds: { audio: 0, video: 0, frames: 0, backups: 0, other: 0 } };
+    months.push(m); byKey.set(m.key, m);
+    cursor.setMonth(cursor.getMonth() + 1);
+  }
+  for (const x of dated) {
+    const m = byKey.get(_stoMonthKey(x.d));
+    if (!m) continue;
+    m.count += 1;
+    for (const k of Object.keys(x.kinds)) m.kinds[k] += x.kinds[k];
+  }
+  const totals = months.map(m => _stoSum(m.kinds));
+  const top = _stoNiceBytes(Math.max(...totals, 1));
+
+  if (!chart.clientWidth) _dashRetryPaint();
+  const W = chart.clientWidth || 560;
+  const H = chart.clientHeight || 190;
+  const padL = 46, padR = 10, padT = 14, padB = 24;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const n = months.length, slot = innerW / n;
+  const barW = Math.max(3, Math.min(40, slot * 0.64));
+  const baseY = padT + innerH;
+  const yFor = v => baseY - (v / top) * innerH;
+  const labelEvery = slot >= 44 ? 1 : (slot >= 24 ? 2 : (slot >= 14 ? 3 : 6));
+  let grid = '';
+  for (const gv of [top, top / 2]) {
+    const y = yFor(gv);
+    grid += `<line class="sto-grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"></line>`;
+    grid += `<text class="sto-ylabel" x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${escapeHtml(_fmtBytes(gv))}</text>`;
+  }
+  grid += `<line class="sto-baseline" x1="${padL}" y1="${baseY}" x2="${W - padR}" y2="${baseY}"></line>`;
+  let bars = '', xlabels = '';
+  months.forEach((m, i) => {
+    const cx = padL + slot * i + slot / 2;
+    const total = totals[i];
+    const label = m.start.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    const tip = `${label} · ${m.count} meeting${m.count === 1 ? '' : 's'} · ${_fmtBytes(total)}` +
+      (total ? ' · ' + _STO_KIND_ORDER.filter(k => m.kinds[k] > 0).map(k => `${_STO_KIND_LABELS[k]} ${_fmtBytes(m.kinds[k])}`).join(', ') : '');
+    let y = baseY;
+    if (total > 0) {
+      for (const k of _STO_KIND_ORDER) {
+        const v = m.kinds[k] || 0;
+        if (!v) continue;
+        const h = Math.max(1, (v / top) * innerH);
+        y -= h;
+        bars += `<rect class="sto-bar-seg sto-k-${k}" x="${(cx - barW / 2).toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}"></rect>`;
+      }
+      bars += `<rect class="sto-hit" x="${(cx - slot / 2).toFixed(1)}" y="${padT}" width="${slot.toFixed(1)}" height="${innerH}" tabindex="0" role="img" data-tip="${escapeHtml(tip)}" aria-label="${escapeHtml(tip)}"></rect>`;
+    } else {
+      bars += `<rect class="sto-bar-seg sto-bar-empty" x="${(cx - barW / 2).toFixed(1)}" y="${baseY - 2}" width="${barW.toFixed(1)}" height="2"></rect>`;
+    }
+    if (i % labelEvery === 0 || i === n - 1) {
+      const anchor = i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle');
+      const tx = i === 0 ? padL : (i === n - 1 ? W - padR : cx);
+      const thisYear = m.start.getFullYear() === now.getFullYear();
+      const txt = m.start.toLocaleDateString(undefined, thisYear ? { month: 'short' } : { month: 'short', year: '2-digit' });
+      xlabels += `<text class="sto-xlabel" x="${tx.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${escapeHtml(txt)}</text>`;
+    }
+  });
+  chart.innerHTML = `<svg class="sto-svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="group" aria-label="Disk use per month recorded">${grid}${bars}${xlabels}</svg>`;
+  if (detail) {
+    detail.innerHTML = `<table class="sto-table"><thead><tr><th>Month</th><th class="num">Meetings</th><th class="num">Audio</th><th class="num">Video</th><th class="num">Other</th><th class="num">Total</th></tr></thead><tbody>`
+      + months.slice().reverse().filter(m => m.count).map((m, i) =>
+        `<tr><td>${escapeHtml(m.start.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }))}</td><td class="num">${m.count}</td>`
+        + `<td class="num">${_fmtBytes(m.kinds.audio)}</td><td class="num">${_fmtBytes(m.kinds.video)}</td>`
+        + `<td class="num">${_fmtBytes(m.kinds.frames + m.kinds.backups + m.kinds.other)}</td><td class="num">${_fmtBytes(_stoSum(m.kinds))}</td></tr>`).join('')
+      + '</tbody></table>';
+  }
+  return 'Disk use per month recorded. ' + months.filter(m => m.count).map(m =>
+    `${m.start.toLocaleDateString(undefined, { month: 'short', year: 'numeric' })} ${_fmtBytes(_stoSum(m.kinds))}`).join(', ') + '.';
+}
+
+/* By folder: root folders (subfolders fold into their root) and Unfiled. */
+function _stoRenderFolders(chart, detail, report, sessions) {
+  const byId = new Map((report.folders || []).map(f => [f.id, f]));
+  const groups = new Map();
+  for (const r of sessions) {
+    const kinds = _stoKinds(r);
+    const bytes = _stoSum(kinds);
+    const root = r.folder_id ? _stoRootOf(r.folder_id, byId) : null;
+    const key = root ? root.id : '__unfiled';
+    const g = groups.get(key) || { name: root ? root.name : 'Unfiled', count: 0, bytes: 0,
+                                    kinds: { audio: 0, video: 0, frames: 0, backups: 0, other: 0 } };
+    g.count += 1;
+    g.bytes += bytes;
+    for (const k of Object.keys(kinds)) g.kinds[k] += kinds[k];
+    groups.set(key, g);
+  }
+  const rows = [...groups.values()].filter(g => g.bytes > 0).sort((a, b) => b.bytes - a.bytes);
+  if (!rows.length) {
+    chart.innerHTML = '<p class="home-storage-empty">No meeting in this span has media on disk.</p>';
+    if (detail) detail.innerHTML = '';
+    return 'No meetings with media in this span.';
+  }
+  const max = rows[0].bytes;
+  chart.innerHTML = `<ol class="sto-rows sto-rows-folders">` + rows.map(g => {
+    const tip = `${g.name} · ${g.count} meeting${g.count === 1 ? '' : 's'} · ${_fmtBytes(g.bytes)}`;
+    return `<li class="sto-row"><span class="sto-row-name" title="${escapeHtml(g.name)}">${escapeHtml(g.name)}</span>`
+      + `<span class="sto-row-when">${g.count} mtg${g.count === 1 ? '' : 's'}</span>`
+      + `<div class="sto-bar" style="width:${(g.bytes / max * 100).toFixed(1)}%">${_stoSegments(g.kinds, g.bytes, tip)}</div>`
+      + `<span class="sto-row-val">${_fmtBytes(g.bytes)}</span></li>`;
+  }).join('') + '</ol>';
+  if (detail) {
+    detail.innerHTML = `<table class="sto-table"><thead><tr><th>Folder</th><th class="num">Meetings</th><th class="num">Audio</th><th class="num">Video</th><th class="num">Other</th><th class="num">Total</th></tr></thead><tbody>`
+      + rows.map(g => `<tr><td>${escapeHtml(g.name)}</td><td class="num">${g.count}</td><td class="num">${_fmtBytes(g.kinds.audio)}</td>`
+        + `<td class="num">${_fmtBytes(g.kinds.video)}</td><td class="num">${_fmtBytes(g.kinds.frames + g.kinds.backups + g.kinds.other)}</td>`
+        + `<td class="num">${_fmtBytes(g.bytes)}</td></tr>`).join('') + '</tbody></table>';
+  }
+  return 'Disk use by folder. ' + rows.map(g => `${g.name} ${_fmtBytes(g.bytes)}`).join(', ') + '.';
+}
+
+/* ── Free up space: the compression tool ──────────────────────────────────────
+ * A dialog over Home (the overlay lives in index.html) that prices a run
+ * against /api/storage/plan as the user changes scope and formats, starts it
+ * with /api/storage/compress, and follows it through the storage_job SSE
+ * event. The format choices are remembered; the scope is not, because "all
+ * meetings" is the safe thing to start from every time. */
+
+const _TOOL_STORE_KEY = 'home-storage-tool-v1';
+const _TOOL_DEFAULT_OPTIONS = {
+  audio: { enabled: true, preset: 'voice_32', tracks: true },
+  video: { enabled: false, preset: 'av1_balanced', downscale: false, hardware: true },
+  backups: { enabled: true },
+  orphans: { enabled: false },
+  list: { sort: 'date' },        // the Chosen meetings list: 'date' (newest first) or 'size'
+};
+const _TOOL_LIST_SORTS = [['date', 'Newest'], ['size', 'Largest']];
+const _TOOL_AUDIO_PRESETS = [
+  ['voice_24', 'Smallest, 24 kbps'], ['voice_32', 'Recommended, 32 kbps'],
+  ['voice_48', 'Higher, 48 kbps'], ['voice_64', 'Highest, 64 kbps'],
+];
+const _TOOL_VIDEO_PRESETS = [
+  ['av1_small', 'AV1, smallest', 'av1'], ['av1_balanced', 'AV1, balanced', 'av1'],
+  ['hevc', 'HEVC (H.265)', 'hevc'], ['h264', 'H.264, most compatible', 'h264'],
+];
+const _TOOL_SCOPES = [['all', 'All meetings'], ['older', 'Older than'], ['range', 'Date range'],
+                      ['sessions', 'Chosen meetings'], ['folders', 'Folders']];
+const _TOOL_KIND_WORDS = { audio: 'Audio', video: 'Video', backup: 'Backups', orphan: 'Unused files' };
+
+function _toolLoadOptions() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(_TOOL_STORE_KEY) || 'null'); } catch (_) { saved = null; }
+  const out = {};
+  for (const group of Object.keys(_TOOL_DEFAULT_OPTIONS)) {
+    out[group] = { ..._TOOL_DEFAULT_OPTIONS[group], ...((saved && saved[group]) || {}) };
+  }
+  if (!_TOOL_AUDIO_PRESETS.some(p => p[0] === out.audio.preset)) out.audio.preset = 'voice_32';
+  if (!_TOOL_VIDEO_PRESETS.some(p => p[0] === out.video.preset)) out.video.preset = 'av1_balanced';
+  if (!_TOOL_LIST_SORTS.some(o => o[0] === out.list.sort)) out.list.sort = 'date';
+  // Deletion is never remembered as on: it is a decision for each run.
+  out.orphans.enabled = false;
+  return out;
+}
+
+const _tool = {
+  open: false,
+  scope: { mode: 'all', days: 90, start: '', end: '', session_ids: new Set(), folder_ids: new Set() },
+  options: _toolLoadOptions(),
+  plan: null, planning: false, planSeq: 0, planTimer: null,
+  job: null, lastFull: 0, filter: '',
+};
+
+function _toolSaveOptions() {
+  try { localStorage.setItem(_TOOL_STORE_KEY, JSON.stringify(_tool.options)); } catch (_) {}
+}
+
+function _toolBody() { return document.getElementById('storage-tool-body'); }
+
+function _toolScopePayload() {
+  const sc = _tool.scope;
+  const out = { mode: sc.mode };
+  if (sc.mode === 'older') out.days = Number(sc.days) || 90;
+  if (sc.mode === 'range') { out.start = sc.start; out.end = sc.end; }
+  if (sc.mode === 'sessions') out.session_ids = [...sc.session_ids];
+  if (sc.mode === 'folders') out.folder_ids = _toolExpandFolders([...sc.folder_ids]);
+  return out;
+}
+
+/** Chosen folders plus every folder under them. */
+function _toolExpandFolders(ids) {
+  const folders = AppData.get('folders') || [];
+  const children = new Map();
+  for (const f of folders) {
+    if (!children.has(f.parent_id)) children.set(f.parent_id, []);
+    children.get(f.parent_id).push(f.id);
+  }
+  const out = new Set();
+  const stack = [...ids];
+  while (stack.length) {
+    const id = stack.pop();
+    if (out.has(id)) continue;
+    out.add(id);
+    for (const c of children.get(id) || []) stack.push(c);
+  }
+  return [...out];
+}
+
+function _toolRequestBody() {
+  const o = _tool.options;
+  // The list's sort order is a dialog preference, not part of the run.
+  return { scope: _toolScopePayload(), audio: o.audio, video: o.video,
+           backups: o.backups, orphans: o.orphans };
+}
+
+function openStorageTool() {
+  const overlay = document.getElementById('storage-tool-overlay');
+  if (!overlay) return;
+  _tool.open = true;
+  overlay.classList.remove('hidden');
+  document.addEventListener('keydown', _toolOnKey);
+  _toolFetchJob().then(() => {
+    if (_tool.job && _tool.job.state === 'running') _toolRenderRun();
+    else { _toolRenderSetup(); _toolRequestPlan(); }
+  });
+}
+
+function closeStorageTool() {
+  const overlay = document.getElementById('storage-tool-overlay');
+  if (overlay) overlay.classList.add('hidden');
+  _tool.open = false;
+  document.removeEventListener('keydown', _toolOnKey);
+}
+
+function _toolOnKey(e) {
+  if (e.key === 'Escape') { e.preventDefault(); closeStorageTool(); }
+}
+
+async function _toolFetchJob() {
+  try {
+    const res = await fetch('/api/storage/compress', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    _tool.job = data.job;
+    _tool.caps = data.capabilities || _tool.caps;
+    _tool.lastFull = Date.now();
+  } catch (_) {}
+}
+
+/* ── the setup form ── */
+
+function _toolRenderSetup() {
+  const body = _toolBody();
+  if (!body) return;
+  const sc = _tool.scope;
+  const o = _tool.options;
+  const caps = _tool.caps || {};
+  const hw = caps.hardware || {};
+  const anyHw = Object.values(hw).some(Boolean);
+  const videoOk = caps.video || {};
+  const scopeBtns = _TOOL_SCOPES.map(([val, text]) =>
+    `<button type="button" class="dash-seg-btn${sc.mode === val ? ' is-on' : ''}" role="radio" aria-checked="${sc.mode === val}" onclick="_toolScopeMode('${val}')">${text}</button>`).join('');
+  body.innerHTML = `
+    <div class="tool-section">
+      <div class="tool-label">Which meetings</div>
+      <div class="dash-seg tool-scope" role="radiogroup" aria-label="Which meetings">${scopeBtns}</div>
+      <div class="tool-scope-sub" id="storage-tool-scope-sub">${_toolScopeSubHtml()}</div>
+    </div>
+    <div class="tool-section">
+      <div class="tool-label">What to do</div>
+      <div class="tool-what">
+        <label class="tool-row">
+          <input type="checkbox" ${o.audio.enabled ? 'checked' : ''} onchange="_toolOption('audio', 'enabled', this.checked)">
+          <span class="tool-row-main"><span class="tool-row-title">Re-encode audio to Opus</span>
+            <span class="tool-row-desc">The recorder keeps audio as WAV, about 345 MB an hour. Opus for speech is about 14 MB an hour and sounds the same. Transcripts, chapters and speakers are untouched.</span></span>
+          <select class="tool-select" ${o.audio.enabled ? '' : 'disabled'} onchange="_toolOption('audio', 'preset', this.value)" aria-label="Audio quality">
+            ${_TOOL_AUDIO_PRESETS.map(([v, t]) => `<option value="${v}"${o.audio.preset === v ? ' selected' : ''}>${t}</option>`).join('')}
+          </select>
+        </label>
+        <label class="tool-row tool-row-sub">
+          <input type="checkbox" ${o.audio.tracks ? 'checked' : ''} ${o.audio.enabled ? '' : 'disabled'} onchange="_toolOption('audio', 'tracks', this.checked)">
+          <span class="tool-row-main"><span class="tool-row-title">Include the separate mic and desktop tracks</span></span>
+        </label>
+        <label class="tool-row">
+          <input type="checkbox" ${o.video.enabled ? 'checked' : ''} ${caps.ffmpeg === false ? 'disabled' : ''} onchange="_toolOption('video', 'enabled', this.checked)">
+          <span class="tool-row-main"><span class="tool-row-title">Re-encode screen recordings</span>
+            <span class="tool-row-desc">The video is H.264 already, so the gain is smaller: AV1 roughly halves it, HEVC saves about a third. The file keeps its name; only the codec inside changes.</span></span>
+          <select class="tool-select" ${o.video.enabled ? '' : 'disabled'} onchange="_toolOption('video', 'preset', this.value)" aria-label="Video format">
+            ${_TOOL_VIDEO_PRESETS.map(([v, t, codec]) => `<option value="${v}"${o.video.preset === v ? ' selected' : ''}${videoOk[codec] === false ? ' disabled' : ''}>${t}</option>`).join('')}
+          </select>
+        </label>
+        <div class="tool-row tool-row-sub tool-row-inline">
+          <label class="tool-inline"><input type="checkbox" ${o.video.hardware ? 'checked' : ''} ${o.video.enabled && anyHw ? '' : 'disabled'} onchange="_toolOption('video', 'hardware', this.checked)"> Use the graphics card${anyHw ? '' : ' (not available here)'}</label>
+          <label class="tool-inline"><input type="checkbox" ${o.video.downscale ? 'checked' : ''} ${o.video.enabled ? '' : 'disabled'} onchange="_toolOption('video', 'downscale', this.checked)"> Reduce 4K to 1440p</label>
+        </div>
+        <label class="tool-row">
+          <input type="checkbox" ${o.backups.enabled ? 'checked' : ''} onchange="_toolOption('backups', 'enabled', this.checked)">
+          <span class="tool-row-main"><span class="tool-row-title">Re-encode trim and split backup copies</span>
+            <span class="tool-row-desc">The original audio kept for undo, in the same Opus quality. Undo still works.</span></span>
+        </label>
+        <label class="tool-row">
+          <input type="checkbox" ${o.orphans.enabled ? 'checked' : ''} onchange="_toolOption('orphans', 'enabled', this.checked)">
+          <span class="tool-row-main"><span class="tool-row-title">Remove files that belong to no meeting</span>
+            <span class="tool-row-desc">Media left behind by deleted meetings and encoder fragments, when they are more than six hours old. This deletes files; it is off unless you turn it on, every time.</span></span>
+        </label>
+      </div>
+    </div>
+    <div class="tool-section tool-estimate" id="storage-tool-estimate" aria-live="polite">${_toolEstimateHtml()}</div>
+    <div class="tool-actions">
+      <button type="button" class="btn btn-secondary" onclick="closeStorageTool()">Cancel</button>
+      <button type="button" class="btn btn-primary tool-run-btn" id="storage-tool-run" onclick="runStorageTool()" ${_toolRunDisabled() ? 'disabled' : ''}>${_toolRunLabel()}</button>
+    </div>`;
+}
+
+function _toolScopeSubHtml() {
+  const sc = _tool.scope;
+  if (sc.mode === 'older') {
+    return `<label class="tool-inline">Meetings recorded more than
+      <select class="tool-select" onchange="_toolScopeField('days', this.value)" aria-label="Older than">
+        ${[30, 60, 90, 180, 365].map(d => `<option value="${d}"${Number(sc.days) === d ? ' selected' : ''}>${d} days</option>`).join('')}
+      </select> ago</label>`;
+  }
+  if (sc.mode === 'range') {
+    return `<div class="tool-inline-row">
+      <label class="tool-inline">From <input type="date" class="tool-date" value="${escapeHtml(sc.start)}" onchange="_toolScopeField('start', this.value)"></label>
+      <label class="tool-inline">To <input type="date" class="tool-date" value="${escapeHtml(sc.end)}" onchange="_toolScopeField('end', this.value)"></label>
+      <span class="tool-hint">Leave one empty for no bound.</span></div>`;
+  }
+  if (sc.mode === 'sessions') {
+    const sort = _tool.options.list.sort;
+    const sortBtns = _TOOL_LIST_SORTS.map(([val, text]) =>
+      `<button type="button" class="dash-seg-btn${sort === val ? ' is-on' : ''}" role="radio" aria-checked="${sort === val}" onclick="_toolListSort('${val}')">${text}</button>`).join('');
+    return `<div class="tool-list-head">
+        <input type="search" class="tool-search" placeholder="Filter meetings" value="${escapeHtml(_tool.filter)}" oninput="_toolFilter(this.value)" aria-label="Filter meetings">
+        <div class="dash-seg tool-sort" role="radiogroup" aria-label="Sort meetings by">${sortBtns}</div>
+        <button type="button" class="tool-link" onclick="_toolSelectShown(true)">Select shown</button>
+        <button type="button" class="tool-link" onclick="_toolSelectShown(false)">Clear</button>
+        <span class="tool-hint" id="storage-tool-picked">${sc.session_ids.size} chosen</span>
+      </div>
+      <ol class="tool-list" id="storage-tool-list">${_toolSessionRows()}</ol>`;
+  }
+  if (sc.mode === 'folders') {
+    const folders = (AppData.get('folders') || []).slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    if (!folders.length) return '<p class="tool-hint">No folders yet.</p>';
+    const depth = new Map();
+    const byId = new Map(folders.map(f => [f.id, f]));
+    const depthOf = f => { let d = 0, cur = f; while (cur && cur.parent_id && byId.has(cur.parent_id) && d < 20) { cur = byId.get(cur.parent_id); d++; } return d; };
+    folders.forEach(f => depth.set(f.id, depthOf(f)));
+    return `<ol class="tool-list">${folders.map(f =>
+      `<li class="tool-item" style="padding-left:${8 + depth.get(f.id) * 16}px"><label><input type="checkbox" ${sc.folder_ids.has(f.id) ? 'checked' : ''} onchange="_toolToggleFolder('${escapeHtml(f.id)}', this.checked)"> ${escapeHtml(f.name)}</label></li>`).join('')}</ol>
+      <p class="tool-hint">A folder includes the folders inside it.</p>`;
+  }
+  return '<p class="tool-hint">Every meeting in the library.</p>';
+}
+
+function _toolSessionRows() {
+  const report = AppData.get('storage');
+  const sizes = new Map(((report && report.sessions) || []).map(r => [r.id, _stoSum(_stoKinds(r))]));
+  const q = _tool.filter.trim().toLowerCase();
+  const rows = (_dashSessions || []).filter(s => s.started_at && (!q || String(s.title || '').toLowerCase().includes(q)));
+  if (!rows.length) return '<li class="tool-hint">No meetings match.</li>';
+  // The sessions slice is newest first already; "Largest" puts the meetings
+  // with the most on disk at the top, ties and unknown sizes by date.
+  if (_tool.options.list.sort === 'size') {
+    rows.sort((a, b) => (sizes.get(b.id) || 0) - (sizes.get(a.id) || 0));
+  }
+  return rows.map(s => {
+    const d = new Date(s.started_at + 'Z');
+    const when = Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString();
+    return `<li class="tool-item"><label><input type="checkbox" ${_tool.scope.session_ids.has(s.id) ? 'checked' : ''} onchange="_toolToggleSession('${escapeHtml(s.id)}', this.checked)">`
+      + `<span class="tool-item-title">${escapeHtml(s.title || 'Meeting')}</span><span class="tool-item-when">${escapeHtml(when)}</span>`
+      + `<span class="tool-item-size">${sizes.has(s.id) ? _fmtBytes(sizes.get(s.id)) : ''}</span></label></li>`;
+  }).join('');
+}
+
+function _toolScopeMode(mode) {
+  if (_tool.scope.mode === mode) return;
+  _tool.scope.mode = mode;
+  _toolRenderSetup();
+  _toolRequestPlan();
+}
+function _toolScopeField(field, value) {
+  _tool.scope[field] = value;
+  _toolRequestPlan();
+}
+function _toolToggleSession(id, on) {
+  if (on) _tool.scope.session_ids.add(id); else _tool.scope.session_ids.delete(id);
+  const picked = document.getElementById('storage-tool-picked');
+  if (picked) picked.textContent = `${_tool.scope.session_ids.size} chosen`;
+  _toolRequestPlan();
+}
+function _toolSelectShown(on) {
+  const q = _tool.filter.trim().toLowerCase();
+  for (const s of _dashSessions || []) {
+    if (!s.started_at || (q && !String(s.title || '').toLowerCase().includes(q))) continue;
+    if (on) _tool.scope.session_ids.add(s.id); else _tool.scope.session_ids.delete(s.id);
+  }
+  const list = document.getElementById('storage-tool-list');
+  if (list) list.innerHTML = _toolSessionRows();
+  const picked = document.getElementById('storage-tool-picked');
+  if (picked) picked.textContent = `${_tool.scope.session_ids.size} chosen`;
+  _toolRequestPlan();
+}
+function _toolToggleFolder(id, on) {
+  if (on) _tool.scope.folder_ids.add(id); else _tool.scope.folder_ids.delete(id);
+  _toolRequestPlan();
+}
+function _toolFilter(text) {
+  _tool.filter = text || '';
+  const list = document.getElementById('storage-tool-list');
+  if (list) list.innerHTML = _toolSessionRows();
+}
+function _toolListSort(sort) {
+  if (!_TOOL_LIST_SORTS.some(o => o[0] === sort) || _tool.options.list.sort === sort) return;
+  _tool.options.list.sort = sort;
+  _toolSaveOptions();
+  const sub = document.getElementById('storage-tool-scope-sub');
+  if (sub) sub.innerHTML = _toolScopeSubHtml();
+}
+function _toolOption(group, key, value) {
+  _tool.options[group][key] = value;
+  _toolSaveOptions();
+  _toolRenderSetup();     // dependent controls enable and disable with their parent
+  _toolRequestPlan();
+}
+
+/* ── pricing ── */
+
+function _toolRequestPlan() {
+  clearTimeout(_tool.planTimer);
+  _tool.planTimer = setTimeout(_toolFetchPlan, 250);
+}
+
+async function _toolFetchPlan() {
+  const seq = ++_tool.planSeq;
+  _tool.planning = true;
+  _toolRenderEstimate();
+  try {
+    const res = await fetch('/api/storage/plan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_toolRequestBody()),
+    });
+    const data = await res.json();
+    if (seq !== _tool.planSeq) return;
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    _tool.plan = data;
+    _tool.caps = data.capabilities || _tool.caps;
+  } catch (e) {
+    if (seq !== _tool.planSeq) return;
+    _tool.plan = { error: (e && e.message) || 'could not price the run' };
+  } finally {
+    if (seq === _tool.planSeq) { _tool.planning = false; _toolRenderEstimate(); }
+  }
+}
+
+function _toolRunDisabled() {
+  const p = _tool.plan;
+  return _tool.planning || !p || p.error || !(p.totals && p.totals.files) || p.running
+    || (_tool.caps && _tool.caps.ffmpeg === false);
+}
+
+function _toolRunLabel() {
+  const p = _tool.plan;
+  if (_tool.caps && _tool.caps.ffmpeg === false) return 'ffmpeg is not available';
+  if (!p || p.error) return 'Free up space';
+  if (p.running) return 'A run is in progress';
+  if (!(p.totals && p.totals.files)) return 'Nothing to do';
+  return `Free up about ${_fmtBytes(p.totals.saved)}`;
+}
+
+function _toolEstimateHtml() {
+  const p = _tool.plan;
+  if (_tool.planning && !p) return '<p class="tool-hint">Working out what this would save…</p>';
+  if (!p) return '';
+  if (p.error) return `<p class="tool-warn">Could not price the run: ${escapeHtml(p.error)}</p>`;
+  const t = p.totals || {};
+  if (!t.files) {
+    const why = p.skipped && p.skipped.already ? 'Everything in this scope is compressed already.' : 'Nothing in this scope matches what is switched on.';
+    return `<p class="tool-hint">${why}</p>`;
+  }
+  const kinds = Object.entries(p.by_kind || {}).map(([k, v]) => {
+    const what = _TOOL_KIND_WORDS[k] || k;
+    const unit = k === 'audio' || k === 'video' ? 'meeting' : (k === 'backup' ? 'folder' : 'file');
+    const after = k === 'orphan' ? 'removed' : `about ${_fmtBytes(v.after)} after`;
+    return `<li><span class="tool-est-kind">${what}</span><span>${v.files} ${unit}${v.files === 1 ? '' : 's'} · ${_fmtBytes(v.before)} now · ${after}</span></li>`;
+  }).join('');
+  const notes = [];
+  if (p.skipped && p.skipped.busy) notes.push(`${p.skipped.busy} in use right now and skipped`);
+  if (p.skipped && p.skipped.young) notes.push(`${p.skipped.young} too recent to remove safely`);
+  if (p.skipped && p.skipped.already) notes.push(`${p.skipped.already} already compressed`);
+  const o = _tool.options;
+  const hw = (_tool.caps && _tool.caps.hardware) || {};
+  const codec = (_TOOL_VIDEO_PRESETS.find(v => v[0] === o.video.preset) || [])[2];
+  if (o.video.enabled && p.by_kind && p.by_kind.video) {
+    notes.push(o.video.hardware && hw[codec] ? 'Video uses the graphics card, so it is quick'
+      : 'Video is encoded in software, which is slow: expect roughly real time for 4K screen video');
+  }
+  return `<div class="tool-est-main"><strong>Frees about ${_fmtBytes(t.saved)}</strong>`
+    + `<span>${t.files} file${t.files === 1 ? '' : 's'} · ${_fmtBytes(t.before)} now · about ${_fmtBytes(t.after)} after</span></div>`
+    + `<ul class="tool-est-kinds">${kinds}</ul>`
+    + (notes.length ? `<p class="tool-hint">${escapeHtml(notes.join(' · '))}</p>` : '')
+    + (_tool.planning ? '<p class="tool-hint">Updating…</p>' : '');
+}
+
+function _toolRenderEstimate() {
+  const est = document.getElementById('storage-tool-estimate');
+  if (est) est.innerHTML = _toolEstimateHtml();
+  const run = document.getElementById('storage-tool-run');
+  if (run) { run.disabled = _toolRunDisabled(); run.textContent = _toolRunLabel(); }
+}
+
+/* ── running ── */
+
+async function runStorageTool() {
+  const run = document.getElementById('storage-tool-run');
+  if (run) run.disabled = true;
+  try {
+    const res = await fetch('/api/storage/compress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_toolRequestBody()),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    _tool.job = data.job;
+    _tool.lastFull = Date.now();
+    _tool.scope.session_ids.clear();
+    _toolRenderRun();
+  } catch (e) {
+    uiToast({ message: `Could not start: ${(e && e.message) || 'unknown error'}`, kind: 'error' });
+    if (run) run.disabled = _toolRunDisabled();
+  }
+}
+
+async function cancelStorageTool() {
+  try {
+    await fetch('/api/storage/compress/cancel', { method: 'POST' });
+  } catch (_) {}
+  await _toolFetchJob();
+  if (_tool.open) _toolRenderRun();
+}
+
+function _toolItemRow(i) {
+  const icon = { done: 'fa-check', running: 'fa-spinner fa-spin', failed: 'fa-triangle-exclamation',
+                 skipped: 'fa-minus', cancelled: 'fa-ban', pending: 'fa-clock' }[i.status] || 'fa-clock';
+  const what = _TOOL_KIND_WORDS[i.kind] || i.kind;
+  let right = '';
+  if (i.status === 'done') right = i.kind === 'orphan' ? `${_fmtBytes(i.before)} removed` : `${_fmtBytes(i.before)} → ${_fmtBytes(i.after)}`;
+  else if (i.status === 'running') right = `${Math.round((i.progress || 0) * 100)}%`;
+  else if (i.error) right = i.error;
+  else right = _fmtBytes(i.before);
+  return `<li class="tool-job-item is-${i.status}"><i class="fa-solid ${icon}" aria-hidden="true"></i>`
+    + `<span class="tool-job-kind">${what}</span><span class="tool-job-title" title="${escapeHtml(i.title || '')}">${escapeHtml(i.title || '')}</span>`
+    + `<span class="tool-job-right">${escapeHtml(right)}</span></li>`;
+}
+
+function _toolRenderRun() {
+  const body = _toolBody();
+  const job = _tool.job;
+  if (!body || !job) return;
+  const running = job.state === 'running';
+  const total = job.total || 0;
+  const done = job.done || 0;
+  const cur = job.current;
+  const frac = total ? (done + (cur ? (cur.progress || 0) : 0)) / total : 0;
+  const head = running ? 'Freeing space…'
+    : job.state === 'done' ? `Freed ${_fmtBytes(job.saved)}`
+    : job.state === 'cancelled' ? `Stopped after freeing ${_fmtBytes(job.saved)}`
+    : `Stopped by a problem${job.error ? `: ${job.error}` : ''}`;
+  const sub = running
+    ? `${done} of ${total} file${total === 1 ? '' : 's'} · ${_fmtBytes(job.saved)} saved so far`
+    : `${done} of ${total} done${job.failed ? ` · ${job.failed} could not be changed` : ''}`;
+  const current = cur && running
+    ? `<div class="tool-current">${_TOOL_KIND_WORDS[cur.kind] || cur.kind} · ${escapeHtml(cur.title || '')} · ${Math.round((cur.progress || 0) * 100)}%</div>` : '';
+  const items = (job.items || []).map(_toolItemRow).join('');
+  body.innerHTML = `
+    <div class="tool-run">
+      <div class="tool-run-head"><strong>${escapeHtml(head)}</strong><span>${escapeHtml(sub)}</span></div>
+      <div class="tool-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(frac * 100)}">
+        <div class="tool-progress-fill${running ? '' : ' is-final'}" style="width:${(frac * 100).toFixed(1)}%"></div>
+      </div>
+      ${current}
+      <ol class="tool-job-items">${items || '<li class="tool-hint">Nothing was queued.</li>'}</ol>
+      <div class="tool-actions">
+        ${running ? '<button type="button" class="btn btn-secondary" onclick="cancelStorageTool()">Stop after this file</button>' : ''}
+        <button type="button" class="btn ${running ? 'btn-secondary' : 'btn-primary'}" onclick="${running ? 'closeStorageTool()' : '_toolBackToSetup()'}">${running ? 'Close, keep going' : 'Done'}</button>
+      </div>
+    </div>`;
+  const list = body.querySelector('.tool-job-items');
+  const active = list && list.querySelector('.is-running');
+  if (active && typeof active.scrollIntoView === 'function') active.scrollIntoView({ block: 'nearest' });
+}
+
+function _toolBackToSetup() {
+  _tool.job = null;
+  closeStorageTool();
+}
+
+/** storage_job SSE: a compact snapshot while running, then the final one.
+ *  Every couple of seconds (and at the end) the full item list is re-read. */
+function _toolOnJobEvent(snap) {
+  if (!snap || !snap.id) return;
+  const prev = _tool.job && _tool.job.id === snap.id ? _tool.job : null;
+  _tool.job = { ...(prev || {}), ...snap, items: (prev && prev.items) || (snap.items || []) };
+  const finished = snap.state !== 'running';
+  if (finished || Date.now() - _tool.lastFull > 2000) {
+    _toolFetchJob().then(() => { if (_tool.open) _toolRenderRun(); });
+  } else if (_tool.open) {
+    _toolRenderRun();
+  }
+  if (finished) {
+    AppData.invalidate(['storage'], 'storage_job');
+    if (!_tool.open && snap.state === 'done' && typeof uiToast === 'function') {
+      uiToast({ message: `Free up space finished: ${_fmtBytes(snap.saved)} freed.`, kind: 'success' });
+    }
+  }
+}
+
 /* ── The Home view's lifecycle ────────────────────────────────────────────── */
 
 Views.register('home', {
@@ -2088,8 +3112,10 @@ Views.register('home', {
     // Renders from the store; only an idle slice reaches the network.
     AppData.load('analytics');
     AppData.load('calendarStatus');
+    AppData.load('storage');
     AppData.load('calendarEvents', { key: _homeWeekRange().rangeKey });
     _homeBindTips();
+    _homeBindKnobs();
     _homeStartNextClock();
     loadAnalytics();
   },
@@ -2099,7 +3125,7 @@ Views.register('home', {
   },
 });
 
-AppData.subscribe(['analytics', 'sessions', 'attention', 'calendarStatus', 'calendarEvents'], () => {
+AppData.subscribe(['analytics', 'sessions', 'attention', 'calendarStatus', 'calendarEvents', 'storage'], () => {
   if (Views.current === 'home') loadAnalytics();
 });
 

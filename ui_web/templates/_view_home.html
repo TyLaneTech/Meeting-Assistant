@@ -57,17 +57,23 @@
       <div class="dash-next-body" id="dash-next-body"></div>
     </section>
 
-    <!-- Band 2. The hero row: meeting load over 12 weeks on the left, the
-         needs-attention queue on the right, its height tied to the chart. -->
+    <!-- Band 2. The hero row: Activity on the left (one chart, with knobs for
+         what it measures, how far back it looks and how it groups; the choices
+         persist in localStorage), the needs-attention queue on the right, its
+         height tied to the chart. Meeting load and the old 14-day Activity
+         histogram were two views of the same numbers; this is both of them. -->
     <div class="dash-grid" id="dash-grid">
 
-      <section class="dash-cell dash-cadence" aria-labelledby="home-cadence-title">
-        <div class="dash-section-head">
-          <h2 class="dash-section-title" id="home-cadence-title">Meeting load</h2>
-          <span class="dash-section-note" id="home-cadence-note"></span>
+      <section class="dash-cell dash-activity" id="dash-activity" aria-labelledby="home-activity-title">
+        <div class="dash-section-head dash-section-head-knobs">
+          <div class="dash-section-lead">
+            <h2 class="dash-section-title" id="home-activity-title">Activity</h2>
+            <span class="dash-section-note" id="home-activity-summary"></span>
+          </div>
+          <div class="dash-knobs" id="home-activity-knobs" role="group" aria-label="Activity chart options"></div>
         </div>
-        <div class="home-cadence-chart" id="home-cadence-chart"></div>
-        <p class="visually-hidden" id="home-cadence-desc"></p>
+        <div class="home-activity-chart" id="home-activity-chart"></div>
+        <p class="visually-hidden" id="home-activity-desc"></p>
       </section>
 
       <section class="dash-cell dash-attention" id="dash-attention" aria-labelledby="dash-attention-headline">
@@ -80,10 +86,13 @@
 
     </div>
 
-    <!-- Band 3. Your patterns on the left (when you meet, then recent activity),
-         the people you meet with on the right. The two stacked charts on the
-         left run to about the height of the People list, so the columns balance
-         instead of one card stretching past its content. -->
+    <!-- Band 3. Your patterns on the left (when you meet, then what the
+         recordings cost on disk), the people you meet with on the right. The
+         two stacked cards on the left run to about the height of the People
+         list, so the columns balance instead of one card stretching past its
+         content. Storage reads the storage slice (/api/dashboard/storage); its
+         knobs persist in localStorage like Activity's, and its Free up space
+         button opens the compression tool. -->
     <div class="dash-grid dash-mid" id="dash-mid">
 
       <div class="dash-col">
@@ -96,13 +105,24 @@
           <p class="visually-hidden" id="dash-overview-desc"></p>
         </section>
 
-        <section class="dash-cell" aria-labelledby="home-activity-title">
-          <div class="dash-section-head">
-            <h2 class="dash-section-title" id="home-activity-title">Activity</h2>
-            <span class="dash-section-note" id="home-activity-summary"></span>
+        <section class="dash-cell dash-storage" id="dash-storage" aria-labelledby="home-storage-title">
+          <div class="dash-section-head dash-section-head-knobs">
+            <div class="dash-section-lead">
+              <h2 class="dash-section-title" id="home-storage-title">Storage</h2>
+              <span class="dash-section-note" id="home-storage-note"></span>
+            </div>
+            <div class="dash-knobs" id="home-storage-knobs" role="group" aria-label="Storage chart options"></div>
           </div>
-          <div class="home-activity-chart" id="home-activity-chart"></div>
-          <p class="visually-hidden" id="home-activity-desc"></p>
+          <div class="home-storage-chart" id="home-storage-chart"></div>
+          <div class="home-storage-detail" id="home-storage-detail" hidden></div>
+          <div class="home-storage-foot">
+            <span class="dash-section-note" id="home-storage-summary"></span>
+            <button type="button" class="btn btn-secondary home-storage-free" id="home-storage-free"
+                    onclick="openStorageTool()" hidden>
+              <i class="fa-solid fa-broom"></i> Free up space
+            </button>
+          </div>
+          <p class="visually-hidden" id="home-storage-desc"></p>
         </section>
       </div>
 

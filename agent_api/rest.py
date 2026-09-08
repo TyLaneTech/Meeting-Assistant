@@ -43,6 +43,7 @@ from agent_api.context import AgentContext
 from capture_video import capture_live_frame, extract_frame, find_ffmpeg
 from capture_video.ffmpeg_util import subprocess_no_window_flag
 from core import calendar_feed, config, log, paths, recording_request, settings, storage
+from core import media as media
 from ml import text_embeddings
 
 bp = Blueprint("agent_api", __name__, url_prefix="/api/agent/v1")
@@ -1036,7 +1037,7 @@ def meeting_speakers(session_id: str):
 def meeting_media(session_id: str):
     if not _session_or_none(session_id):
         return _err(f"Meeting '{session_id}' not found.", 404)
-    wav = paths.audio_dir() / f"{session_id}.wav"
+    audio = media.audio_path(session_id)
     mp4, live = _frame_sources(session_id)
     base = f"{_ctx.server_url}{_PREFIX}/meetings/{session_id}"
     shots_dir = paths.screenshots_dir() / session_id
@@ -1067,8 +1068,9 @@ def meeting_media(session_id: str):
         }
     return jsonify({
         "session_id": session_id,
-        "audio": ({**(helpers.wav_info(wav) or {}), "url": f"{base}/audio"}
-                  if wav.exists() else None),
+        "audio": ({**(media.audio_info(audio, ffmpeg=find_ffmpeg()) or {}),
+                   "url": f"{base}/audio"}
+                  if audio is not None else None),
         "video": video,
         "screenshots": [
             {**f, "url": f"{base}/screenshots/{f['name']}"}
@@ -1297,17 +1299,20 @@ def meeting_frames(session_id: str):
 
 @bp.route("/meetings/<session_id>/audio")
 def meeting_audio(session_id: str):
-    wav = paths.audio_dir() / f"{session_id}.wav"
-    if not wav.exists():
+    audio = media.audio_path(session_id)
+    if audio is None:
         return _err("No audio recording exists for this meeting.", 404)
-    return send_file(str(wav), mimetype="audio/wav", conditional=True)
+    return send_file(str(audio), mimetype=media.audio_mime(audio), conditional=True)
 
 
 @bp.route("/meetings/<session_id>/audio/clip")
 def meeting_audio_clip(session_id: str):
-    wav = paths.audio_dir() / f"{session_id}.wav"
-    if not wav.exists():
+    if not media.has_audio(session_id):
         return _err("No audio recording exists for this meeting.", 404)
+    # Clips are cut from PCM: the recorder's WAV, or a decode of an Opus session.
+    wav = media.pcm_wav_path(session_id)
+    if wav is None:
+        return _err("The recording's audio could not be decoded for clipping.", 500)
     args = request.args
     start = helpers.parse_timestamp(args.get("start"))
     if start is None:
