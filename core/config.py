@@ -77,6 +77,14 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 # functions in ml/speaker_db.py, ml/batch_transcriber.py and core/network.py).
 # It is idempotent and cheap once torchaudio is loaded, so calling it on every
 # path is fine. If you add a fifth pyannote import, call it there too.
+#
+# One thing the import-time version was doing that nobody had written down: it
+# put all of PyTorch on the main thread before any other thread existed. The
+# first launch without it had four model loaders take the first `import torch`
+# together, and the process died with an access violation. app.py's
+# _preload_torch() now does that first import (and calls this) on the main
+# thread before the server or the loaders exist. Do not import torch from a
+# second thread before it has run.
 _shims_applied = False
 
 

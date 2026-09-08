@@ -1630,12 +1630,59 @@ def update_session_embedding(session_id: str) -> None:
         storage.save_session_embedding(session_id, text_embeddings.embedding_to_bytes(vec))
 
 
+_torch_preloaded = False
+
+
+def _preload_torch() -> None:
+    """Import PyTorch, and torchaudio with its shims, on this thread, alone.
+
+    The four model loaders run on threads started back to back, and each one
+    reaches for torch within milliseconds: the diarizer through
+    best_torch_device(), the fingerprint DB directly, text embeddings through
+    sentence-transformers, and whisper brings its own CUDA runtime up through
+    ctranslate2 in the same instant. For years none of that was the first
+    import of torch, because core.config imported torchaudio at module level,
+    so all of PyTorch was on the main thread before any other thread existed.
+    apply_torchaudio_shims() made that lazy (the tray icon was paying 1.2 s for
+    it), and the first launch after showed what the eager import had been
+    quietly guaranteeing. Four threads took the first import together; one was
+    handed the half-built module object (``module 'torch' has no attribute
+    'cuda'``), two got ``WinError 1114`` on c10.dll, and the process died with
+    an access violation, exit code 3221225477, on two launches in a row
+    (2026-09-08).
+
+    So the first import is single-threaded again, just later than it used to
+    be: main() calls this after the tray is up and the second-instance
+    handshake has passed, before the server or a single loader thread exists.
+    _start_background_initializers() calls it too, as a guard that costs
+    nothing once torch is in: whoever starts the loaders must never let them
+    be the first import. Never raises. A torch that cannot import is each
+    loader's own problem to report, exactly as before.
+    """
+    global _torch_preloaded
+    if _torch_preloaded:
+        return
+    _torch_preloaded = True
+    try:
+        import torch  # noqa: F401
+    except Exception as e:      # ImportError, or the OSError a broken DLL raises
+        log.warn("models", f"PyTorch failed to import: {e}")
+        return
+    try:
+        config.apply_torchaudio_shims()
+    except Exception as e:
+        log.warn("models", f"torchaudio failed to import: {e}")
+
+
 def _start_background_initializers() -> None:
     global _startup_init_started
     with _startup_init_lock:
         if _startup_init_started:
             return
         _startup_init_started = True
+    # Before any of the threads below exists. See _preload_torch: they must not
+    # be the first thing in the process to import PyTorch.
+    _preload_torch()
     threading.Thread(target=_load_model, daemon=True).start()
     threading.Thread(target=_load_diarizer, daemon=True).start()
     threading.Thread(target=_load_fingerprint_db, daemon=True).start()
@@ -10634,6 +10681,13 @@ def main() -> None:
         log.warn("app", "First-run setup required - browser will open to configure API keys.")
     log.info("app", f"Meeting Assistant starting at {url}")
     _sync_shortcut_icon_async()
+
+    # PyTorch, once, on this thread, while nothing else can want it: after the
+    # handshake (a second instance exits without paying for it) and before the
+    # server, so no request thread and no loader thread can take part in the
+    # first import. About 1.2 s, which is where that time was spent before the
+    # tray moved ahead of the imports. See _preload_torch for the crash.
+    _preload_torch()
 
     # Start Flask in a daemon thread so the main thread is free for the tray
     flask_thread = threading.Thread(

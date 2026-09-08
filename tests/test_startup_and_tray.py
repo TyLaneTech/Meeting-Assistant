@@ -6,10 +6,16 @@ nothing happened. The Startup toggle read the shortcut file and called that
 seven seconds to appear on a headless app, which reads as hung; and a port
 probe spent two seconds asking Windows about proxies for 127.0.0.1.
 
+And the one the tray speedup broke: with core.config no longer importing
+torchaudio at module level, the four model loaders became the first import of
+PyTorch, all at once, and the app crashed on launch. The last section here pins
+the order that keeps that first import single-threaded.
+
 Source assertions plus the settings defaults, which import without the ML
 stack. The timings themselves are in the commit message, not here: a test that
 asserts wall-clock startup would fail on a busy machine for no good reason.
 """
+import re
 from pathlib import Path
 
 from core import settings
@@ -209,3 +215,70 @@ def test_only_the_icon_being_shown_is_decoded():
     assert "_STATE_SLOT.get(state)" in body
     assert "_icons[state] = img" in body
     assert "for state, slot in" not in body
+
+
+# ── PyTorch is imported once, alone, before the loaders ──────────────────────
+
+def _main_body() -> str:
+    body = APP_PY[APP_PY.index("def main() -> None:"):]
+    return body[:body.index('if __name__ == "__main__":\n    main()')]
+
+
+def test_torch_is_imported_on_the_main_thread_before_the_server_exists():
+    """The eager torchaudio import had been guaranteeing this for years: torch
+    on the main thread before any other thread existed. The launch after it
+    went lazy handed one loader a half-built torch module, two others got
+    WinError 1114 on c10.dll, and the process died with an access violation
+    (0f470a4, 2026-09-08). Twice in a row, so not a fluke."""
+    main = _main_body()
+    assert "_preload_torch()" in main
+    at = main.index("_preload_torch()")
+    # A second instance exits at the handshake without paying 1.2 s for torch.
+    assert main.index("_handshake_existing_instance(url)") < at
+    # Before the server: no request thread can join the first import either.
+    assert at < main.index("flask_thread = threading.Thread(")
+    assert at < main.index("_start_background_initializers()")
+
+
+def test_whoever_starts_the_loaders_preloads_first():
+    """The guard, for the day main() is reordered or the initializers get a
+    second caller. Free once torch is in."""
+    body = _fn(APP_PY, "def _start_background_initializers(", "def _level_push_loop(")
+    at = body.index("_preload_torch()")
+    for loader in ("_load_model", "_load_diarizer", "_load_fingerprint_db",
+                   "_load_text_embeddings"):
+        start = f"threading.Thread(target={loader}, daemon=True).start()"
+        assert start in body, loader
+        assert at < body.index(start), f"{loader} starts before torch is imported"
+
+
+def test_the_preload_is_the_old_import_and_never_raises():
+    body = _fn(APP_PY, "def _preload_torch(", "def _start_background_initializers(")
+    assert "import torch" in body
+    assert "config.apply_torchaudio_shims()" in body    # torchaudio too, as before
+    assert "except Exception" in body                    # a broken DLL is an OSError
+    code = body.split('"""')[2]                          # the body, not the story
+    assert not re.search(r"^[ ]+raise", code, re.M)
+    # Idempotent: main() and the initializers both call it.
+    assert "if _torch_preloaded:" in body
+    assert APP_PY.count("\n    _preload_torch()") == 2   # the calls, not the def
+
+
+def test_no_loader_thread_is_started_at_import_time():
+    """Every loader start is inside a function that runs after the preload.
+    A module-level start would run while app.py is still importing, before
+    main() gets the chance."""
+    import ast
+    tree = ast.parse(APP_PY)
+    loaders = {"_load_model", "_load_diarizer", "_load_fingerprint_db",
+               "_load_text_embeddings"}
+    for node in tree.body:                # module level only
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                for kw in sub.keywords:
+                    if kw.arg == "target" and isinstance(kw.value, ast.Name):
+                        assert kw.value.id not in loaders, (
+                            f"{kw.value.id} is started at import time")
+
