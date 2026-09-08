@@ -4,7 +4,10 @@
 Gives MCP clients (Claude Desktop, Claude Code, Codex, and anything else that
 speaks the Model Context Protocol) first-class tools over the user's Meeting
 Assistant: meetings, diarized transcripts, summaries, notes, chapters, video
-frames, audio clips, search, folders, speakers, settings, and logs.
+frames, audio clips, search, folders, speakers, settings, and logs, plus the
+tools to organise the library (folders, bulk moves) and to identify and
+label the speakers in recordings with voice, text, calendar and screen
+evidence.
 
 Zero dependencies: pure Python stdlib, so it runs with any Python 3.10+
 interpreter (the app's venv is ideal but not required). It talks to the
@@ -42,7 +45,7 @@ import urllib.request
 from pathlib import Path
 
 SERVER_NAME = "meeting-assistant"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 _ROOT = Path(__file__).parent
 
@@ -397,11 +400,41 @@ TOOLS: list[dict] = [
     _tool(
         "create_folder",
         "Create a new folder, optionally nested under a parent (id, name, "
-        "or path). Use update_meeting to move meetings into it.",
+        "or path). Use move_meetings (many) or update_meeting (one) to file "
+        "meetings into it.",
         {"name": {"type": "string"},
          "parent": {"type": "string", "description":
                     "Parent folder id/name/path (optional, top-level if omitted)."}},
         ["name"],
+    ),
+    _tool(
+        "update_folder",
+        "Rename a folder and/or move it under another folder (or to the top "
+        "level). folder accepts an id, name or path; parent accepts the same, "
+        "or null for the top level. A folder is never moved into its own "
+        "sub-tree, and nothing is deleted. Use it with create_folder and "
+        "move_meetings to reshape how the library is organised.",
+        {"folder": {"type": "string",
+                    "description": "The folder to change: id, name or path."},
+         "name": {"type": "string", "description": "New name (optional)."},
+         "parent": {"type": ["string", "null"], "description":
+                    "New parent folder id/name/path, or null for the top level "
+                    "(optional)."}},
+        ["folder"],
+    ),
+    _tool(
+        "move_meetings",
+        "Move several meetings into one folder in a single call, or unfile "
+        "them with folder=null. A meeting lives in at most one folder, so "
+        "this is how a library gets organised: list_meetings or "
+        "search_meetings to choose, create_folder if needed, then "
+        "move_meetings. Reports which ids moved, which were already there and "
+        "which do not exist. Never deletes.",
+        {"meeting_ids": {"type": "array", "items": {"type": "string"},
+                         "description": "Session ids to move (1-500)."},
+         "folder": {"type": ["string", "null"], "description":
+                    "Target folder id, name or path; null unfiles."}},
+        ["meeting_ids", "folder"],
     ),
     _tool(
         "list_speakers",
@@ -419,6 +452,205 @@ TOOLS: list[dict] = [
         {"speaker": {"type": "string",
                      "description": "Speaker id or (partial) name."}},
         ["speaker"],
+    ),
+    _tool(
+        "list_meetings_needing_speakers",
+        "The speaker work queue: meetings that still have unnamed speakers "
+        "('Speaker 3') with real talk time, or whose speaker count disagrees "
+        "with the calendar invite. Newest first, with the usual folder/date "
+        "filters, so you can work through one folder or one week at a time. "
+        "Each entry carries attention {unresolved, found, expected}. Start "
+        "here when asked to name, fix or clean up speakers, then call "
+        "review_meeting_speakers on each meeting.",
+        {**_filter_props(),
+         "reason": {"type": "string", "enum": ["any", "unresolved", "mismatch"],
+                    "default": "any", "description":
+                    "any: every meeting needing work; unresolved: unnamed "
+                    "speakers only; mismatch: speaker count differs from the "
+                    "calendar (over-split or under-split voices)."},
+         "limit": {"type": "integer", "default": 25},
+         "offset": {"type": "integer", "default": 0}},
+    ),
+    _tool(
+        "review_meeting_speakers",
+        "The evidence pack for naming a meeting's speakers, in one call. For "
+        "every speaker key: status (named / unnamed / minor / noise / me), "
+        "talk time and words; the lines most likely to identify them "
+        "(self-introductions flagged); names other people call them "
+        "('thanks, Dana'); the closest Voice Library profiles with similarity "
+        "and a verdict (strong / clear / possible / weak / none, the app's own "
+        "live thresholds); how close the voice is to the other keys in the "
+        "meeting (likely_same_voice means the diarizer split one person); and "
+        "the moments to pull screen frames from when there is a recording. "
+        "Also the calendar's attendees (and which are already assigned), the "
+        "attention state, and disclosures saying how far each kind of "
+        "evidence can be trusted: read them before deciding. By default the "
+        "unnamed speakers get the full evidence and everyone else one compact "
+        "line under 'others' (with closest_other, the key their voice is "
+        "nearest to); pass speaker_key to focus on one speaker, or "
+        "include_named=true for the full evidence on every speaker. "
+        "include_matches=false skips the voice work (fast). The first review "
+        "of a compressed meeting can take a minute while its audio is decoded.",
+        {"meeting_id": _MID,
+         "speaker_key": {"type": "string", "description":
+                         "Focus on one speaker key, e.g. 'Speaker 3' (optional)."},
+         "include_matches": {"type": "boolean", "default": True,
+                             "description": "Consult the voice library and "
+                                            "compute in-meeting proximity."},
+         "include_named": {"type": "boolean", "default": False,
+                           "description": "Full evidence for already named "
+                                          "speakers too (large on long meetings)."},
+         "quotes": {"type": "integer", "default": 4,
+                    "description": "Identifying lines per speaker (1-12)."}},
+        ["meeting_id"],
+    ),
+    _tool(
+        "get_speaker_frames",
+        "Screen-recording frames from moments a given speaker was talking, "
+        "returned as images captioned with what they were saying. Use them to "
+        "read the meeting window: a highlighted or outlined tile, a 'Name is "
+        "speaking' banner, or a presenter name says who the voice is. "
+        "Highlights can lag the audio by a second or two, so weigh several "
+        "frames, and fetch frames for an already named speaker as well to "
+        "learn the layout. Needs the meeting to have a screen recording "
+        "(has_video).",
+        {"meeting_id": _MID,
+         "speaker_key": {"type": "string",
+                         "description": "Diarizer key from review_meeting_speakers."},
+         "count": {"type": "integer", "default": 3,
+                   "description": "Frames, 1-6."},
+         "width": {"type": "integer", "default": 768,
+                   "description": "Max image width in px (160-1280)."}},
+        ["meeting_id", "speaker_key"],
+    ),
+    _tool(
+        "label_speaker",
+        "Apply a decision about one or more speaker keys in a meeting. Exactly "
+        "one action per call: name (a person's name; links or creates their "
+        "Voice Library profile), profile_id (link an existing profile by id, "
+        "the safest form after a library match), same_as (this key is the "
+        "same voice as another key in this meeting: merges them under that "
+        "speaker's name), noise=true (not a person: crosstalk, music, a bad "
+        "fragment), or reset=true (back to the diarizer default, unlinked). "
+        "The change lands in this meeting only, shows in the app at once, and "
+        "never touches other meetings. reinforce=true also trains the voice "
+        "profile on this audio: set it only when the identity is certain (the "
+        "user confirmed it, a self-introduction, a name on screen), never on "
+        "a voice match alone. Always pass evidence: one sentence saying why; "
+        "it is logged. Label only on strong evidence (see the review's "
+        "disclosures); report weaker cases to the user instead of guessing. "
+        "The owner's own microphone speaker cannot be relabelled.",
+        {"meeting_id": _MID,
+         "speaker_keys": {"type": "array", "items": {"type": "string"},
+                          "description": "One or more keys, e.g. ['Speaker 3', "
+                                         "'Speaker 7'] (from review_meeting_speakers)."},
+         "name": {"type": "string", "description": "Assign this person."},
+         "profile_id": {"type": "string", "description":
+                        "Link this Voice Library profile (its name is used)."},
+         "same_as": {"type": "string", "description":
+                     "Another key in this meeting that is the same voice."},
+         "noise": {"type": "boolean"},
+         "reset": {"type": "boolean"},
+         "reinforce": {"type": "boolean", "default": False},
+         "evidence": {"type": "string", "description":
+                      "Why you are confident, in one sentence."}},
+        ["meeting_id", "speaker_keys"],
+    ),
+    _tool(
+        "relabel_segment",
+        "Reattribute one transcript line to another speaker in the same "
+        "meeting (speaker_key), or give that single line a one-off name. For "
+        "the odd line the diarizer handed to the wrong person; to rename a "
+        "whole speaker use label_speaker. Segment ids come from "
+        "get_transcript(format='json') or the quotes in "
+        "review_meeting_speakers.",
+        {"meeting_id": _MID,
+         "segment_id": {"type": "integer"},
+         "speaker_key": {"type": "string",
+                         "description": "The speaker this line belongs to."},
+         "name": {"type": "string", "description":
+                  "A one-off label for the line instead of a key."},
+         "reinforce": {"type": "boolean", "default": False}},
+        ["meeting_id", "segment_id"],
+    ),
+    _tool(
+        "get_speaker_profile",
+        "One Voice Library profile in depth: name, how many voice samples it "
+        "holds, the meetings it appears in (recent ones listed), whether it "
+        "is the owner's own profile, other profiles whose voice is confusable "
+        "with it, and how many meeting labels carry its name without being "
+        "linked to it. Accepts an id or (partial) name; an ambiguous name "
+        "returns candidates.",
+        {"speaker": {"type": "string",
+                     "description": "Profile id or (partial) name."}},
+        ["speaker"],
+    ),
+    _tool(
+        "rename_speaker_profile",
+        "Rename a Voice Library profile. Every meeting label linked to it "
+        "follows, so this fixes a misspelled name everywhere at once. Refuses "
+        "a name another profile already has (merge them instead) and never "
+        "renames the owner's own profile. Confirm with the user first.",
+        {"profile_id": {"type": "string"},
+         "name": {"type": "string", "description": "The corrected name."}},
+        ["profile_id", "name"],
+    ),
+    _tool(
+        "merge_speaker_profiles",
+        "Fold one Voice Library profile into another when two profiles are "
+        "the same person (a duplicate name, or a pair the user confirms). "
+        "Voice samples and every meeting label move to keep_id; the other "
+        "profile is removed. IRREVERSIBLE: call once without confirm to see "
+        "what would move, show that to the user, and pass confirm=true only "
+        "after they agree. The owner's own profile is never merged.",
+        {"keep_id": {"type": "string", "description": "The profile to keep."},
+         "merge_id": {"type": "string", "description": "The profile to fold in."},
+         "confirm": {"type": "boolean", "default": False}},
+        ["keep_id", "merge_id"],
+    ),
+    _tool(
+        "get_voice_library_health",
+        "Read-only report on the Voice Library: duplicate profiles (same "
+        "name), profiles whose voice samples look like another person's, "
+        "split profiles that hold two voices, and confusable pairs. Nothing "
+        "is changed. Use it to explain a doubtful voice match or to propose "
+        "merges (merge_speaker_profiles) to the user.",
+    ),
+    _tool(
+        "plan_speaker_relabel",
+        "Plan a bulk rename of a speaker name across meetings (a misspelling "
+        "or 'Speaker 3' to a real name) WITHOUT changing anything. Returns a "
+        "plan token, a summary of every meeting and label that would change, "
+        "and warnings (voice-profile merges, hand-set lines that will not "
+        "change). Show the plan to the user; after they confirm, call "
+        "apply_speaker_relabel with the token. scope='session' with "
+        "meeting_id limits it to one meeting; the folder/date filters limit "
+        "a library-wide plan.",
+        {"from_name": {"type": "string"},
+         "to_name": {"type": "string"},
+         "scope": {"type": "string", "enum": ["library", "session"],
+                   "default": "library"},
+         "meeting_id": {"type": "string",
+                        "description": "Required when scope is 'session'."},
+         "match": {"type": "string", "enum": ["exact", "contains"],
+                   "default": "exact"},
+         **_filter_props()},
+        ["from_name", "to_name"],
+    ),
+    _tool(
+        "apply_speaker_relabel",
+        "Apply a plan from plan_speaker_relabel, only after the user has "
+        "confirmed that exact plan. Tokens are single use and expire after "
+        "ten minutes; the response lists what changed.",
+        {"token": {"type": "string"},
+         "confirm": {"type": "boolean", "description": "Must be true."}},
+        ["token", "confirm"],
+    ),
+    _tool(
+        "cancel_speaker_relabel",
+        "Drop a planned relabel so its token can never be applied.",
+        {"token": {"type": "string"}},
+        ["token"],
     ),
     _tool(
         "get_ai_chats",
@@ -566,8 +798,14 @@ def _get_started() -> list[dict]:
         "  export_meeting (whole thing as markdown, optionally saved to a file)",
         "- See/hear it: get_frame / get_frames (screen recording images),",
         "  get_audio_clip (WAV file), get_meeting_media (inventory)",
-        "- Write back (additive only): append_meeting_notes, add_chapter,",
-        "  update_meeting (rename/move), create_folder",
+        "- Write back (additive only): append_meeting_notes, add_chapter",
+        "- Organise: update_meeting (rename/move one), move_meetings (many),",
+        "  create_folder, update_folder (rename/move a folder). Nothing deletes.",
+        "- Speakers: list_meetings_needing_speakers -> review_meeting_speakers",
+        "  -> get_speaker_frames (see the screen) -> label_speaker / relabel_segment;",
+        "  the library: get_speaker_profile, rename_speaker_profile,",
+        "  merge_speaker_profiles (confirm), get_voice_library_health,",
+        "  plan_speaker_relabel -> apply_speaker_relabel (confirm) / cancel",
         "- Operate the app: get_app_info, get_live_status (live transcript tail),",
         "  get_logs, get_settings / update_settings, get_ai_chats,",
         "  start_recording / stop_recording (opt-in)",
@@ -583,13 +821,27 @@ def _get_started() -> list[dict]:
         "4. Deep-dive a long meeting without blowing context -> "
         "export_meeting(save_to_file=true) -> read/grep the file locally.",
         "5. Live meeting -> get_live_status, then poll with after_segment_id.",
+        "6. 'Name the speakers in my recent meetings' -> list_meetings_needing_speakers",
+        "   -> review_meeting_speakers per meeting -> for each unnamed key weigh the",
+        "   evidence: a self-introduction, a 'strong'/'clear' library match, or a",
+        "   screen frame that names them (get_speaker_frames) is enough to",
+        "   label_speaker; 'possible' plus one consistent calendar attendee is enough",
+        "   when you say so in evidence; keys with likely_same_voice get same_as;",
+        "   anything weaker goes back to the user as a question, never a guess.",
+        "   Set reinforce only when the identity is certain.",
+        "7. 'Organise my meetings by client' -> list_folders -> create_folder /",
+        "   update_folder for the structure -> search or list to pick meetings ->",
+        "   move_meetings.",
         "",
         "## Conventions",
         "- meeting_id = session_id (UUID) returned by every listing/search tool.",
         "- Timestamps accept seconds (90.5) or clock strings ('1:30', '01:02:03')",
         "  and are on the meeting/transcript timeline; video offset is handled.",
         "- Folder/date/speaker filters combine on every browse/search tool.",
-        "- Nothing here can delete meetings, folders, or notes.",
+        "- Nothing here can delete meetings, folders, or notes. The one irreversible",
+        "  action is merge_speaker_profiles, which needs confirm=true.",
+        "- Speaker labels are per meeting and visible in the app at once; every",
+        "  label_speaker call should carry evidence text.",
     ]
     return _text("\n".join(lines))
 
@@ -630,6 +882,119 @@ def call_tool(name: str, a: dict) -> tuple[list[dict], bool]:
     if name == "create_folder":
         body = {"name": a.get("name"), "parent": a.get("parent")}
         return _json_text(_http("POST", "/folders", body=body)), False
+
+    if name == "update_folder":
+        resolved = _http("GET", "/folders/resolve", {"q": a.get("folder")})
+        if not resolved.get("resolved"):
+            return _json_text(resolved), True
+        fid = resolved["folder"]["id"]
+        body = {}
+        if a.get("name") is not None:
+            body["name"] = a["name"]
+        if "parent" in a:
+            body["parent"] = a["parent"]
+        return _json_text(_http("PATCH", f"/folders/{fid}", body=body)), False
+
+    if name == "move_meetings":
+        body = {"meeting_ids": a.get("meeting_ids") or [], "folder": a.get("folder")}
+        return _json_text(_http("POST", "/meetings/move", body=body)), False
+
+    if name == "list_meetings_needing_speakers":
+        params = {**_filters(a), "reason": a.get("reason"),
+                  "limit": a.get("limit", 25), "offset": a.get("offset")}
+        return _json_text(_http("GET", "/speakers/queue", params)), False
+
+    if name == "review_meeting_speakers":
+        mid = a.get("meeting_id")
+        params = {"speaker_key": a.get("speaker_key"),
+                  "matches": a.get("include_matches", True),
+                  "quotes": a.get("quotes"),
+                  "detail": "all" if a.get("include_named") else None}
+        return _json_text(_http("GET", f"/meetings/{mid}/speakers/review", params,
+                                timeout=600)), False
+
+    if name == "get_speaker_frames":
+        mid = a.get("meeting_id")
+        key = urllib.parse.quote(str(a.get("speaker_key") or ""), safe="")
+        params = {"count": max(1, min(6, int(a.get("count") or 3))),
+                  "width": max(160, min(1280, int(a.get("width") or 768)))}
+        result = _http("GET", f"/meetings/{mid}/speakers/{key}/frames", params,
+                       timeout=120)
+        content: list[dict] = [{"type": "text", "text": (
+            f"Frames while {result.get('speaker_name')} ({result.get('speaker_key')}) "
+            f"was talking. {result.get('how_to_read', '')}")}]
+        ok_count = 0
+        for fr in result.get("frames", []):
+            said = fr.get("text") or ""
+            if fr.get("jpeg_base64"):
+                ok_count += 1
+                content.append({"type": "image", "data": fr["jpeg_base64"],
+                                "mimeType": "image/jpeg"})
+                content.append({"type": "text", "text":
+                                f"^ {fr['t']}s (turn {fr.get('start')}s to "
+                                f"{fr.get('end')}s): \"{said}\""})
+            else:
+                content.append({"type": "text", "text":
+                                f"(no frame at {fr['t']}s: {fr.get('note') or 'not extractable'})"})
+        if not ok_count:
+            return content + [{"type": "text", "text":
+                               "No frames could be extracted for this speaker."}], True
+        return content, False
+
+    if name == "label_speaker":
+        mid = a.get("meeting_id")
+        body = {"speaker_keys": a.get("speaker_keys") or [],
+                "reinforce": bool(a.get("reinforce")),
+                "evidence": a.get("evidence")}
+        for src, dst in (("name", "name"), ("profile_id", "global_id"),
+                         ("same_as", "same_as"), ("noise", "noise"), ("reset", "reset")):
+            if a.get(src):
+                body[dst] = a[src]
+        return _json_text(_http("POST", f"/meetings/{mid}/speakers/label",
+                                body=body, timeout=120)), False
+
+    if name == "relabel_segment":
+        mid = a.get("meeting_id")
+        seg = int(a.get("segment_id") or 0)
+        body = {"speaker_key": a.get("speaker_key"), "name": a.get("name"),
+                "reinforce": bool(a.get("reinforce"))}
+        return _json_text(_http("POST", f"/meetings/{mid}/segments/{seg}/speaker",
+                                body=body)), False
+
+    if name == "get_speaker_profile":
+        spec = urllib.parse.quote(str(a.get("speaker") or ""), safe="")
+        return _json_text(_http("GET", f"/speakers/{spec}")), False
+
+    if name == "rename_speaker_profile":
+        pid = urllib.parse.quote(str(a.get("profile_id") or ""), safe="")
+        return _json_text(_http("PATCH", f"/speakers/{pid}",
+                                body={"name": a.get("name")})), False
+
+    if name == "merge_speaker_profiles":
+        keep = urllib.parse.quote(str(a.get("keep_id") or ""), safe="")
+        body = {"source_id": a.get("merge_id"), "confirm": bool(a.get("confirm"))}
+        return _json_text(_http("POST", f"/speakers/{keep}/merge", body=body,
+                                timeout=120)), False
+
+    if name == "get_voice_library_health":
+        return _json_text(_http("GET", "/speakers/library/health", timeout=120)), False
+
+    if name == "plan_speaker_relabel":
+        body = {**_filters(a), "from_name": a.get("from_name"),
+                "to_name": a.get("to_name"), "scope": a.get("scope") or "library",
+                "session_id": a.get("meeting_id"), "match": a.get("match") or "exact"}
+        body = {k: v for k, v in body.items() if v is not None}
+        return _json_text(_http("POST", "/speakers/relabel/plan", body=body,
+                                timeout=120)), False
+
+    if name == "apply_speaker_relabel":
+        body = {"token": a.get("token"), "confirm": bool(a.get("confirm"))}
+        return _json_text(_http("POST", "/speakers/relabel/apply", body=body,
+                                timeout=600)), False
+
+    if name == "cancel_speaker_relabel":
+        return _json_text(_http("POST", "/speakers/relabel/cancel",
+                                body={"token": a.get("token")})), False
 
     if name == "list_meetings":
         params = {**_filters(a), "limit": a.get("limit", 25),
@@ -831,7 +1196,10 @@ _INSTRUCTIONS = (
     "Call get_started first if you have not used these tools before. "
     "meeting_id values come from list_meetings/search_meetings. Timestamps "
     "accept seconds or 'M:SS' and follow the transcript timeline. All data "
-    "is local and private to the user; nothing here can delete their data."
+    "is local and private to the user; nothing here can delete their data. "
+    "To name speakers: list_meetings_needing_speakers, then "
+    "review_meeting_speakers (read its disclosures), then label_speaker with "
+    "evidence text; never label on a weak voice match alone."
 )
 
 

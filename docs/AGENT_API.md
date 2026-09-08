@@ -4,7 +4,10 @@ The machine-facing interface to Meeting Assistant. It gives AI agents (Claude
 Desktop, Claude Code, Codex, or any script) direct, structured access to
 everything the app knows: recorded meetings with diarized transcripts, AI
 summaries, chapters, user notes, screen-recording frames, audio, hybrid
-search, folders, speakers, app settings, logs, and live recording state.
+search, folders, speakers, app settings, logs, and live recording state. It
+also lets an agent organise the library (folders, bulk moves) and identify
+and label the speakers in recordings from voice, text, calendar and screen
+evidence (section 8).
 
 There are two front doors to the same capability set:
 
@@ -122,16 +125,25 @@ non-default app URL (e.g. `http://127.0.0.1:7000`).
 | `get_audio_clip` | Cut a WAV clip (max 15 min) to a local file. |
 | `get_meeting_media` | Audio/video tech info, screenshots, note attachments with URLs. |
 | `update_meeting` | Rename or move to a folder (never deletes). |
+| `move_meetings` | File many meetings into one folder, or unfile them, in one call. |
 | `append_meeting_notes` | Append a block to the Notes pane (strictly additive). |
 | `add_chapter` | Add a titled timestamp marker. |
-| `list_folders` / `create_folder` | Folder tree with paths + counts; create new folders. |
+| `list_folders` / `create_folder` / `update_folder` | Folder tree with paths + counts; create, rename and move folders. |
 | `list_speakers` / `get_speaker_meetings` | Voice-library roster; every meeting a person appears in. |
+| `list_meetings_needing_speakers` | The speaker work queue: meetings with unnamed speakers, or a speaker count that disagrees with the calendar. |
+| `review_meeting_speakers` | One meeting's evidence pack: identifying quotes, name hints, calendar attendees, voice-library matches with verdicts, in-meeting proximity, frame moments, disclosures. |
+| `get_speaker_frames` | Screen frames from moments a speaker was talking, as images. |
+| `label_speaker` | Name a speaker, link a profile, merge same-voice keys, flag noise, or reset. Per meeting; evidence text is logged. |
+| `relabel_segment` | Reattribute one transcript line to another speaker. |
+| `get_speaker_profile` / `rename_speaker_profile` / `merge_speaker_profiles` | Profile detail; rename everywhere at once; fold duplicates together (confirm required). |
+| `get_voice_library_health` | Read-only report: duplicates, foreign samples, split profiles, confusable pairs. |
+| `plan_speaker_relabel` / `apply_speaker_relabel` / `cancel_speaker_relabel` | Bulk rename across meetings: plan, confirm, apply. |
 | `get_ai_chats` | Global Chat conversations (list or one conversation's messages). |
 | `get_live_status` | Recording state; live transcript tail with an incremental cursor. |
 | `get_app_info` | Version, uptime, models, AI config, library counts, storage usage. |
 | `get_logs` | App logs with level/tag/substring filters. |
 | `get_settings` / `update_settings` | Read settings + schema; validated writes. |
-| `start_recording` / `stop_recording` | Opt-in only (off by default; see section 8). |
+| `start_recording` / `stop_recording` | Opt-in only (off by default; see section 9). |
 
 The server also exposes this guide as an MCP resource
 (`meeting-assistant://docs/agent-guide`).
@@ -186,8 +198,9 @@ Log tags you will see: `app`, `recording`, `whisper`, `transcriber`,
 | Endpoint | Notes |
 |---|---|
 | `GET /meetings` | Newest first. Shared filters + `limit` (default 50) / `offset`. Items carry `session_id`, title, times, `duration_min`, folder path, speakers, summary preview, `has_audio` / `has_video` / `has_notes`. |
-| `GET /meetings/{id}` | Bundle. Default parts: summary, chapters, speakers (talk-time stats), notes (markdown), media flags. `?include=transcript,chat,summary_history` or `?include=all`. |
+| `GET /meetings/{id}` | Bundle. Default parts: summary, chapters, speakers (talk-time stats), notes (markdown), media flags. `?include=transcript,chat,summary_history,calendar,attention` or `?include=all`. |
 | `PATCH /meetings/{id}` | Body: `{"title": "...", "folder": "id|name|path|null"}`. |
+| `POST /meetings/move` | Body: `{"meeting_ids": [...], "folder": "id|name|path|null"}`. Up to 500 ids; reports `moved`, `already_there`, `missing`. |
 | `GET /meetings/{id}/transcript` | See section 5. |
 | `GET /meetings/{id}/summary` | Latest AI summary + revision count. |
 | `GET /meetings/{id}/notes` | Notes as markdown + plain text (+ `?raw=1` for the Quill Delta) and note attachments. |
@@ -195,7 +208,11 @@ Log tags you will see: `app`, `recording`, `whisper`, `transcriber`,
 | `GET /meetings/{id}/chapters` | `[{id, start_time, title}]`. |
 | `POST /meetings/{id}/chapters` | Body: `{"title": "...", "start_time": 90}`. |
 | `GET /meetings/{id}/chat` | Per-meeting AI chat history (tool calls parsed). |
-| `GET /meetings/{id}/speakers` | Per-speaker `segment_count`, `talk_seconds`, `word_count`, voice-library link. |
+| `GET /meetings/{id}/speakers` | Per-speaker `status` (`named`, `unnamed`, `minor`, `noise`, `me`), `segment_count`, `talk_seconds`, `word_count`, voice-library link. |
+| `GET /meetings/{id}/speakers/review` | The evidence pack for naming speakers (section 8). Params: `speaker_key`, `detail` (`unnamed` default, or `all`), `matches` (default true), `quotes`, `top_k`. |
+| `GET /meetings/{id}/speakers/{key}/frames` | Frames from moments that speaker talked (JSON, base64). Params: `count` (1-6), `width`. |
+| `POST /meetings/{id}/speakers/label` | One action: `name`, `global_id`, `same_as`, `noise`, or `reset`, for `speaker_keys`. Plus `reinforce` (default false) and `evidence`. |
+| `POST /meetings/{id}/segments/{segment_id}/speaker` | Body: `{"speaker_key": "..."}` or `{"name": "..."}`, optional `reinforce`. One line only. |
 | `GET /meetings/{id}/export` | Whole meeting as markdown (`?format=json` for the raw package; `?save_to_file=1` writes to `<data>/tmp/agent_exports/` and returns the path). |
 
 ### Media
@@ -252,9 +269,18 @@ app start; `semantic_ready: false` in responses (or a 503 for
 |---|---|
 | `GET /folders` | Full tree: id, name, parent, path, direct + recursive session counts. |
 | `POST /folders` | `{"name": "...", "parent": "id|name|path"}`. |
+| `PATCH /folders/{id}` | `{"name": "...", "parent": "id|name|path|null"}`. Rename and/or move; a folder is never moved into its own sub-tree. |
 | `GET /folders/resolve?q=` | Resolve fuzzy folder wording; returns the match or candidates. |
 | `GET /speakers` | Voice-library roster with per-speaker session counts and last-seen. |
+| `GET /speakers/queue` | Meetings that still need speaker work, newest first. Shared filters plus `reason=any|unresolved|mismatch`, `limit`, `offset`. |
+| `GET /speakers/{id_or_name}` | One profile in depth: voice samples, meetings, `is_me`, `confusable_with`, labels carrying the name without a link. |
+| `PATCH /speakers/{id}` | `{"name": "..."}`. Renames the profile and every linked label; refuses a name another profile holds. |
+| `POST /speakers/{id}/merge` | `{"source_id": "...", "confirm": true}`. Folds another profile into this one. Irreversible; without `confirm` it only describes what would move. |
 | `GET /speakers/{id_or_name}/meetings` | All meetings featuring the person (+ `segments_by_speaker`). Ambiguous names return candidates with counts. |
+| `GET /speakers/library/health` | Read-only: duplicate profiles, foreign samples, split profiles, confusable pairs. |
+| `POST /speakers/relabel/plan` | `{"from_name", "to_name", "scope": "library|session", "session_id", "match": "exact|contains"}` + shared filters. Returns a single-use `token` (10 minutes) and the plan. |
+| `POST /speakers/relabel/apply` | `{"token": "...", "confirm": true}`. |
+| `POST /speakers/relabel/cancel` | `{"token": "..."}`. |
 | `GET /chats` | Global Chat conversations (cross-meeting AI chats in the app). |
 | `GET /chats/{conversation_id}` | One conversation's messages. |
 
@@ -280,7 +306,7 @@ Notes:
 | Endpoint | Notes |
 |---|---|
 | `GET /live` | If recording: session id/title, `elapsed_sec`, transcript tail (`after_segment_id` cursor + `limit`), `last_segment_id`, chapters, current summary, audio levels. If idle: `latest_session_id`. |
-| `POST /recording/start` | Opt-in (section 8). Body `{"confirm": true}`. Sends a start command to the app window (the page performs the start, so a headless start would silently lose the device selection); a window is opened only if none takes the command. |
+| `POST /recording/start` | Opt-in (section 9). Body `{"confirm": true}`. Sends a start command to the app window (the page performs the start, so a headless start would silently lose the device selection); a window is opened only if none takes the command. |
 | `POST /recording/stop` | Opt-in. Body `{"confirm": true}`. Finalization (cleanup, auto-title) continues asynchronously. |
 
 ---
@@ -387,9 +413,114 @@ read the file, or slice with `start`/`end`.
 2. `GET /system/logs?level=warn&limit=100`, then filter by `tag=whisper`,
    `tag=diarizer`, or `tag=recording`.
 
+**"Organise my meetings by client"**
+
+1. `GET /folders` to see the tree; `POST /folders` for what is missing, or
+   `PATCH /folders/{id}` to rename or re-parent what exists.
+2. Choose meetings with `GET /meetings?...` or `GET /search?q=...`.
+3. `POST /meetings/move` with the ids and the target folder. Open app tabs
+   refresh on their own.
+
+**"Name the speakers in my recent meetings"**
+
+See section 8. In short: `GET /speakers/queue?within_days=14`, then per
+meeting `GET /meetings/{id}/speakers/review`, then
+`POST /meetings/{id}/speakers/label` for each speaker the evidence settles.
+
 ---
 
-## 8. Recording control (opt-in)
+## 8. Speaker identification
+
+Diarization gives every voice in a recording a key (`Speaker 3`). Naming the
+keys is the one part of the record the app cannot finish on its own, and it
+is what this section is for. The tools give an agent the same evidence a
+person uses in the Speakers dialog, gathered into one answer, and a label
+action that is byte for byte the dialog's own rename.
+
+**The loop**
+
+1. `GET /speakers/queue` (MCP: `list_meetings_needing_speakers`) lists the
+   meetings that still have an unnamed speaker with real talk time, or whose
+   speaker count disagrees with the calendar's attendee count. Filters apply,
+   so work one folder or one week at a time.
+2. `GET /meetings/{id}/speakers/review` (`review_meeting_speakers`) returns,
+   per speaker key:
+   - `status`: `named`, `unnamed` (generic name, enough speech to matter),
+     `minor` (generic and below the attention thresholds: a fragment or a
+     diarizer phantom), `noise`, or `me` (the owner's microphone).
+   - `quotes`: the lines most likely to say who this is, with
+     `self_introduction: true` on "this is Priya" / "I'm Marcus" lines.
+   - `name_hints`: names other people appear to call this speaker ("thanks,
+     Dana" right after a turn, "... Dana?" right before one), with the lines.
+   - `library_matches`: the closest Voice Library profiles, each with
+     `similarity`, and a `verdict` for the best one: `strong` (what the app
+     applies on its own live), `clear` (a clear lead over the best
+     differently named runner-up), `possible` (only ever suggested to the
+     user), `weak`, `none`. `already_in_this_meeting_as` flags a profile that
+     is already another key here.
+   - `proximity`: similarity to every other key in the meeting;
+     `likely_same_voice` marks pairs the Cleanup tab would cluster, which
+     means the diarizer split one person.
+   - `frame_moments`: timestamps to pull a screen frame from.
+   - The meeting's `calendar` (attendees, who is already assigned,
+     `unassigned_people`, the expected speaker count), its `attention` state,
+     and `disclosures`: plain statements of how far each kind of evidence can
+     be trusted. Read them.
+
+   By default `speakers` holds the full evidence for the unnamed speakers and
+   `others` lists everyone else in one line each with `closest_other` (the key
+   their voice is nearest to). A long meeting can have seventy keys, most of
+   them fragments of a few people, so the default keeps the answer readable;
+   `speaker_key` focuses on one speaker of any status and `detail=all` gives
+   the full evidence for every speaker but the owner.
+3. `GET /meetings/{id}/speakers/{key}/frames` (`get_speaker_frames`) shows the
+   meeting window while that speaker talks: the highlighted tile, a "Name is
+   speaking" banner, or a presenter name. Highlights can lag the audio, so
+   weigh several frames, and pull frames for an already named speaker to
+   learn the layout.
+4. `POST /meetings/{id}/speakers/label` (`label_speaker`) applies one action:
+   `name` (links or creates the person's profile), `global_id` (link an
+   exact profile, the safest form after a library match), `same_as` (this key
+   is another key's voice: merges them under that name), `noise: true`, or
+   `reset: true`. Pass `evidence`: one sentence saying why; it is logged.
+5. The odd line the diarizer handed to the wrong person:
+   `POST /meetings/{id}/segments/{segment_id}/speaker`.
+
+**What is enough evidence**
+
+- Label when there is a self-introduction, a `strong` or `clear` library
+  match, or a screen frame that names the speaker.
+- `possible` plus exactly one consistent unassigned calendar attendee is
+  enough when the evidence text says so.
+- Two keys with `likely_same_voice` get `same_as`, not two people.
+- Anything weaker goes back to the user as a question. A wrong name is worse
+  than a missing one: it shows in transcripts and summaries, and it can teach
+  the Voice Library the wrong voice.
+
+**Reinforcement.** A label always links the profile so the library knows the
+appearance, but the speaker's audio is only added to the profile (training
+it) when `reinforce: true` is passed. Set it only when the identity is
+certain: the user confirmed it, a self-introduction, or a name on screen.
+Never on a voice match alone; the match came from that same profile.
+
+**The Voice Library itself.** `GET /speakers/{id}` describes a profile
+(`confusable_with` says which other profiles sound alike, so a match between
+those two is uncertain); `PATCH /speakers/{id}` renames it everywhere at
+once; `POST /speakers/{id}/merge` folds a duplicate into it after the user
+confirms (irreversible; without `confirm` it only describes what would move);
+`GET /speakers/library/health` is the read-only hygiene report. A bulk rename
+across meetings goes through `POST /speakers/relabel/plan`, the user's
+confirmation, then `POST /speakers/relabel/apply` with the token.
+
+**What the API never does here.** The owner's own microphone speaker (`me`)
+is never relabelled, and their profile is never linked to, renamed or merged.
+Every label is per meeting; other meetings change only through the plan /
+apply relabel or a profile rename, both of which say what they will touch
+first. Speaker labels are reversible with `reset`.
+
+---
+
+## 9. Recording control (opt-in)
 
 Agents must not be able to silently record people. Therefore:
 
@@ -409,21 +540,24 @@ loud that recording is starting/stopping.
 
 ---
 
-## 9. Security and privacy
+## 10. Security and privacy
 
 - Loopback only: the Flask server binds `127.0.0.1`; nothing is exposed to
   the network.
 - Optional bearer token (`agent_api_token`) and a master kill switch
   (`agent_api_enabled`) in Settings > Agent API.
 - The Agent API performs no destructive operations: no endpoint deletes
-  meetings, folders, notes, or files. Notes writes are append-only.
+  meetings, folders, notes, or files. Notes writes are append-only. Speaker
+  labels are per meeting and reversible (`reset`). The one irreversible
+  action is merging two voice profiles, which requires `confirm: true` and
+  describes what would move when called without it.
 - Secrets (API keys, the token itself) are masked in every response.
 - Meeting content is personal data: keep it local, quote only what the task
   needs.
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -435,9 +569,13 @@ loud that recording is starting/stopping.
 | Frame 422 | Timestamp beyond the end of the video (response includes the video duration). |
 | Empty transcript | Meeting recorded before transcription was working, or still being reanalyzed; check `GET /system/logs?tag=reanalysis`. |
 | MCP tools missing in client | Run `python mcp_server.py --selftest`; verify the client config paths and that the command uses an absolute interpreter path. |
+| Review says `library.ready: false` | The voice model is not loaded (no HuggingFace key, or still loading after start). Text, calendar and screen evidence still work; voice matching and proximity do not. |
+| Label returns 403 | The key is the owner's own microphone speaker, or the target is their profile. Neither is relabelled through the API. |
+| Label returns 409 (reanalysing) | The meeting's transcript is being rebuilt; wait for `reanalysis_done` and review again. |
+| Review is slow the first time | A compressed (Opus) meeting is decoded once for voice extraction, then cached. |
 
 ---
 
-*Version 1.0.0. Served live (with your real base URL substituted) at
+*Version 1.1.0. Served live (with your real base URL substituted) at
 `GET /api/agent/v1/docs`. Implementation: `agent_api/` package +
 `mcp_server.py`; developer notes in `AGENT.md`.*

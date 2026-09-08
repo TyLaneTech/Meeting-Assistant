@@ -17,7 +17,7 @@ MCP clients. Human-facing documentation: docs/AGENT_API.md (also served at
 GET /api/agent/v1/docs).
 """
 
-API_VERSION = "1.0.0"
+API_VERSION = "1.1.0"
 
 from agent_api.context import AgentContext            # noqa: E402
 from agent_api.rest import bp, register_agent_api     # noqa: E402

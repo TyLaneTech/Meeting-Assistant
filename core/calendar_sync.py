@@ -225,6 +225,13 @@ def _load_candidates(session_id: str) -> dict:
         return {}
 
 
+def load_candidates(session_id: str) -> dict:
+    """The resolution candidates as the Agent API reads them: the meeting's
+    calendar fields, the attendee candidates and any hand-fed speaker hints,
+    or an empty dict when there is no file or it is unreadable."""
+    return _load_candidates(session_id)
+
+
 def merge_candidates(session_id: str, instance, match: dict) -> bool:
     """Fold the calendar's meeting fields and attendees into the candidates file.
 

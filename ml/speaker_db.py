@@ -646,6 +646,18 @@ class SpeakerFingerprintDB:
             return None
         return float(np.dot(embedding, _blob_to_emb(row["centroid"])))
 
+    def get_centroid(self, global_id: str) -> np.ndarray | None:
+        """One profile's L2-normalised centroid, or None when it has no voice
+        samples (the Me profile, or a profile created from a name alone)."""
+        with _conn(self._db_path) as c:
+            row = c.execute(
+                "SELECT centroid FROM global_speakers WHERE id = ?",
+                (global_id,),
+            ).fetchone()
+        if row is None or row["centroid"] is None:
+            return None
+        return _blob_to_emb(row["centroid"])
+
     # ── Session linking ───────────────────────────────────────────────────────
 
     def link_session_speaker(

@@ -7609,17 +7609,19 @@ def delete_session(session_id: str):
     return jsonify({"ok": True})
 
 
-@app.route("/api/segments/<int:seg_id>/label", methods=["PATCH"])
-def update_segment_label(seg_id: int):
-    """Set a per-segment label override (one-off rename)."""
-    data = request.get_json(silent=True) or {}
-    label = (data.get("label") or "").strip()
-    if not label:
-        return jsonify({"error": "label is required"}), 400
-    storage.save_segment_label_override(seg_id, label)
+def _relabel_segment(seg_id: int, label: str, source_override: "str | None", *,
+                     train: bool = True) -> "dict | None":
+    """Pin one transcript line to a speaker: the label override, the optional
+    key reassignment, the live redirect, the voice-library training pass and
+    the Obsidian re-export.
 
-    # Persist speaker-key reassignment if provided
-    source_override = (data.get("source_override") or "").strip() or None
+    The body of PATCH /api/segments/<id>/label past request validation,
+    shared with the Agent API so a correction made by an agent is the same
+    operation as one clicked in the transcript. ``train`` False skips the
+    training pass (the agent's default: a guess must not teach the library).
+    Returns the segment row afterwards, or None when it does not exist.
+    """
+    storage.save_segment_label_override(seg_id, label)
     storage.save_segment_source_override(seg_id, source_override)
 
     # A reassignment of a live speaker's recent output sticks: future segments
@@ -7630,7 +7632,7 @@ def update_segment_label(seg_id: int):
             _maybe_update_live_redirect(seg_now, source_override)
 
     # Train voice library from this correction (skip for noise labels)
-    if fingerprint_db.ready and label != _NOISE_LABEL:
+    if train and fingerprint_db.ready and label != _NOISE_LABEL:
         def _train_from_override():
             seg = storage.get_segment(seg_id)
             if not seg:
@@ -7661,6 +7663,19 @@ def update_segment_label(seg_id: int):
     seg_row = storage.get_segment(seg_id)
     if seg_row:
         obsidian.queue_export(seg_row["session_id"])
+    return seg_row
+
+
+@app.route("/api/segments/<int:seg_id>/label", methods=["PATCH"])
+def update_segment_label(seg_id: int):
+    """Set a per-segment label override (one-off rename)."""
+    data = request.get_json(silent=True) or {}
+    label = (data.get("label") or "").strip()
+    if not label:
+        return jsonify({"error": "label is required"}), 400
+    # Persist speaker-key reassignment if provided
+    source_override = (data.get("source_override") or "").strip() or None
+    _relabel_segment(seg_id, label, source_override)
     return jsonify({"ok": True})
 
 
@@ -7700,6 +7715,8 @@ def _patch_session_speakers(
     color: "str | None" = None,
     *,
     queue_summary: bool = True,
+    global_id: "str | None" = None,
+    train_profile: bool = True,
 ) -> list:
     """Rename and/or recolor speaker keys in one session.
 
@@ -7708,7 +7725,11 @@ def _patch_session_speakers(
     summary refresh, the voice-profile auto-link, and the Obsidian re-export.
     The bulk-relabel agent calls this so a chat-driven rename is byte for
     byte the same operation as one typed into the UI. Set queue_summary
-    False to batch the summary refresh yourself.
+    False to batch the summary refresh yourself. ``global_id`` names the exact
+    voice profile to link (the Agent API passes it, so a duplicate-named
+    profile is never picked up by name); ``train_profile`` False links the
+    profile without extracting embeddings from this audio, for a label whose
+    identity is not certain enough to teach the library.
 
     Returns the updated speaker dicts. Inputs are assumed validated.
     """
@@ -7761,9 +7782,11 @@ def _patch_session_speakers(
     # For every speaker key that now has a user-assigned name (not a default
     # "Speaker N"), ensure a global profile exists and the key is linked to it.
     if fingerprint_db._ready and name and not _is_default_speaker_name(name):
-        def _sync_voice_profile(sid, keys, label, col):
+        def _sync_voice_profile(sid, keys, label, col, gid_hint, train):
             try:
-                profile = fingerprint_db.find_by_name(label)
+                profile = fingerprint_db.get_global_speaker(gid_hint) if gid_hint else None
+                if profile is None:
+                    profile = fingerprint_db.find_by_name(label)
                 if profile is None:
                     gid = fingerprint_db.create_global_speaker(label, col)
                     global_color = col
@@ -7788,6 +7811,8 @@ def _patch_session_speakers(
                         "session_id": sid, "speaker_key": k,
                         "global_id": gid, "name": label,
                     })
+                if not train:
+                    return
                 # Extract embeddings to strengthen the profile
                 for k in keys:
                     # Try live accumulator first
@@ -7823,7 +7848,7 @@ def _patch_session_speakers(
         _fp_executor.submit(
             _sync_voice_profile,
             session_id, [s["speaker_key"] for s in updated_speakers],
-            name, color,
+            name, color, global_id, train_profile,
         )
     # ── End auto-link ──────────────────────────────────────────────────────────
 
@@ -7895,6 +7920,32 @@ def get_speaker_clusters(session_id: str):
         return jsonify({"error": str(e)}), 500
 
 
+def _apply_speaker_corrections(session_id: str, proposed: list, noise_keys: list) -> dict:
+    """Apply cleanup decisions (relink, unlink, noise) and tell every open tab.
+
+    The body of POST /api/sessions/<id>/speaker_clusters/apply past request
+    validation, shared with the Agent API so its noise and reset actions are
+    the same operation as the Cleanup tab's Save.
+    """
+    result = fingerprint_db.apply_cluster_corrections(
+        session_id, proposed, noise_keys=noise_keys,
+    )
+    # Push a state refresh so the live UI picks up the new labels.
+    with _state_lock:
+        if _state["session_id"] == session_id:
+            for sp in storage.list_speaker_profiles(session_id):
+                _state["speaker_labels"][sp["speaker_key"]] = sp["name"]
+    for sp in storage.list_speaker_profiles(session_id):
+        _push("speaker_label", {
+            "session_id": session_id,
+            "speaker_key": sp["speaker_key"],
+            "name": sp["name"],
+            "color": sp["color"],
+        })
+    _push("attention_changed", storage.attention_summary())
+    return result
+
+
 @app.route("/api/sessions/<session_id>/speaker_clusters/apply", methods=["POST"])
 def apply_speaker_clusters(session_id: str):
     """Apply user's cleanup decisions and retrain affected library profiles."""
@@ -7908,28 +7959,11 @@ def apply_speaker_clusters(session_id: str):
         return jsonify({"error": "clusters must be a list"}), 400
 
     try:
-        result = fingerprint_db.apply_cluster_corrections(
-            session_id, proposed, noise_keys=noise_keys,
-        )
+        result = _apply_speaker_corrections(session_id, proposed, noise_keys)
     except Exception as e:
         log.error("fingerprint", f"apply_cluster_corrections failed: {e}")
         import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-    # Push a state refresh so the live UI picks up the new labels.
-    with _state_lock:
-        if _state["session_id"] == session_id:
-            for sp in storage.list_speaker_profiles(session_id):
-                _state["speaker_labels"][sp["speaker_key"]] = sp["name"]
-
-    for sp in storage.list_speaker_profiles(session_id):
-        _push("speaker_label", {
-            "session_id": session_id,
-            "speaker_key": sp["speaker_key"],
-            "name": sp["name"],
-            "color": sp["color"],
-        })
-
     return jsonify({"ok": True, **result})
 
 
@@ -9249,6 +9283,26 @@ def fp_create_speaker():
     return jsonify({"ok": True, "global_id": gid}), 201
 
 
+def _rename_profile(global_id: str, name: "str | None" = None, color=...) -> dict:
+    """Rename or recolour a voice profile and refresh every label linked to it.
+
+    The body of PATCH /api/fingerprint/speakers/<id> past request validation,
+    shared with the Agent API. Returns the profile's resolved {name, color}.
+    """
+    resolved = fingerprint_db.rename_global_speaker(global_id, name=name, color=color)
+    if resolved:
+        for label in fingerprint_db.get_linked_labels(global_id):
+            sid = label["session_id"]
+            with _state_lock:
+                if _state.get("session_id") == sid:
+                    _state["speaker_labels"][label["speaker_key"]] = resolved["name"]
+            _push("speaker_label", {
+                "session_id": sid, "speaker_key": label["speaker_key"],
+                "name": resolved["name"], "color": resolved["color"],
+            })
+    return resolved or {}
+
+
 @app.route("/api/fingerprint/speakers/<global_id>", methods=["PATCH"])
 def fp_update_speaker(global_id: str):
     if not fingerprint_db.ready:
@@ -9261,18 +9315,7 @@ def fp_update_speaker(global_id: str):
         color = _normalize_speaker_color(data.get("color")) if "color" in data else ...
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    resolved = fingerprint_db.rename_global_speaker(global_id, name=name or None, color=color)
-    # Push SSE updates to all linked sessions
-    if resolved:
-        for label in fingerprint_db.get_linked_labels(global_id):
-            sid = label["session_id"]
-            with _state_lock:
-                if _state.get("session_id") == sid:
-                    _state["speaker_labels"][label["speaker_key"]] = resolved["name"]
-            _push("speaker_label", {
-                "session_id": sid, "speaker_key": label["speaker_key"],
-                "name": resolved["name"], "color": resolved["color"],
-            })
+    _rename_profile(global_id, name=name or None, color=color)
     return jsonify({"ok": True})
 
 
@@ -10652,6 +10695,16 @@ register_agent_api(app, AgentContext(
     push_event=_push,
     server_url=_server_url,
     app_started_at=_APP_STARTED_AT,
+    # Speakers and organisation: every write goes through the UI's own path.
+    voice_library=fingerprint_db,
+    label_speaker=lambda sid, keys, name, color, gid, train: _patch_session_speakers(
+        sid, keys, name, color, global_id=gid, train_profile=train),
+    apply_speaker_corrections=_apply_speaker_corrections,
+    relabel_segment=_relabel_segment,
+    rename_profile=_rename_profile,
+    merge_profiles=_apply_profile_merge,
+    relabel_deps=_relabel_deps,
+    me_profile_id=lambda: fingerprint_db._me_id or settings.get("me_speaker_global_id") or None,
 ))
 
 

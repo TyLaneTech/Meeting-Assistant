@@ -316,7 +316,7 @@ Full conversational interface with access to the complete transcript, summary, a
 
 External AI agents (Claude Desktop, Claude Code, Codex, custom scripts) can query the app directly instead of working from manual exports:
 
-- **MCP server** (`mcp_server.py`): a dependency-free stdio server exposing ~26 tools: browse/search meetings (hybrid keyword + semantic + exact substring), pull diarized transcripts in five formats, grab screen-recording frames at any timestamp (returned as images), cut audio clips, read/write notes and chapters, inspect app logs and settings, and tail a live recording.
+- **MCP server** (`mcp_server.py`): a dependency-free stdio server exposing 40 tools: browse/search meetings (hybrid keyword + semantic + exact substring), pull diarized transcripts in five formats, grab screen-recording frames at any timestamp (returned as images), cut audio clips, read/write notes and chapters, organise the library (folders, bulk moves), identify and label speakers from voice, text, calendar and screen evidence, manage the Voice Library, inspect app logs and settings, and tail a live recording.
 - **REST API** (`http://localhost:6969/api/agent/v1`): the same capabilities over plain HTTP, with an OpenAPI 3.1 spec at `/openapi.json` and full self-serving docs at `/docs`.
 
 Setup is one click: open **Settings > Agent API** and press **Run setup** for Claude Desktop, Claude Code, or Codex; the app writes the client's config itself (merging with and backing up anything already there). Copyable snippets remain as a fallback, alongside an access-token option and the recording-control opt-in (off by default; agents can never delete data).

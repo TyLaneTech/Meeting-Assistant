@@ -1409,6 +1409,14 @@ def get_session_attention(session_id: str) -> dict | None:
         return _attention_by_session(conn)[session_id]
 
 
+def attention_by_session() -> dict[str, dict]:
+    """The needs-attention state of every session in one pass: {session_id:
+    compute_attention(...)}. One query for the whole library, so a caller
+    listing the queue does not recompute it per row."""
+    with _conn() as conn:
+        return _attention_by_session(conn)
+
+
 def attention_summary() -> dict:
     with _conn() as conn:
         attention = _attention_by_session(conn).values()
@@ -1570,6 +1578,30 @@ def rename_folder(folder_id: str, name: str) -> None:
         conn.execute(
             "UPDATE folders SET name=?, updated_at=? WHERE id=?",
             (name.strip(), _now(), folder_id),
+        )
+
+
+def get_folder(folder_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT id, name, sort_order, parent_id, created_at FROM folders WHERE id = ?",
+            (folder_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_folder_parent(folder_id: str, parent_id: str | None) -> None:
+    """Move a folder under another folder (or to the top level with None),
+    placing it last among its new siblings. Callers check for cycles: a folder
+    must not become its own descendant."""
+    with _conn() as conn:
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM folders WHERE parent_id IS ?",
+            (parent_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE folders SET parent_id=?, sort_order=?, updated_at=? WHERE id=?",
+            (parent_id, max_order + 1, _now(), folder_id),
         )
 
 
@@ -2047,6 +2079,20 @@ def list_speaker_profiles(session_id: str) -> list[dict]:
             (session_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_speaker_labels_full(session_id: str) -> dict[str, dict]:
+    """Every speaker label row of a session, keyed by speaker_key, with the
+    voice-library link and the noise flag (which list_speaker_profiles omits)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT speaker_key, name, color, global_id, COALESCE(is_noise, 0) AS is_noise"
+            " FROM speaker_labels WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+    return {r["speaker_key"]: {"name": r["name"], "color": r["color"],
+                               "global_id": r["global_id"], "is_noise": bool(r["is_noise"])}
+            for r in rows}
 
 
 def save_speaker_label(

@@ -9,6 +9,13 @@ Code, Codex, custom scripts) rather than the browser UI:
 - Read the library: meetings, transcripts (5 formats), summaries, notes,
   chapters, chat history, speakers, folders, media, video frames, audio clips.
 - Search: hybrid keyword+semantic, plus raw substring scan.
+- Organise: rename/move folders, move meetings in bulk, rename meetings.
+- Speakers: the queue of meetings with unnamed speakers, an evidence pack per
+  meeting (quotes, calendar attendees, voice-library matches, in-meeting
+  proximity, frame moments), frames while a speaker talks, labelling (name,
+  profile link, same-voice merge, noise, reset), per-line reattribution,
+  voice-library profiles (detail, rename, confirmed merge, health) and the
+  plan / confirm / apply bulk relabel.
 - Operate: settings (schema'd + validated), logs, system info/stats/health,
   live-meeting tailing, opt-in recording control.
 
@@ -39,10 +46,12 @@ from flask import Blueprint, Response, g, jsonify, request, send_file
 
 from agent_api import API_VERSION
 from agent_api import helpers
+from agent_api import speakers as speaker_evidence
 from agent_api.context import AgentContext
+from ai import speaker_relabel
 from capture_video import capture_live_frame, extract_frame, find_ffmpeg
 from capture_video.ffmpeg_util import subprocess_no_window_flag
-from core import calendar_feed, config, log, paths, recording_request, settings, storage
+from core import attention, calendar_feed, config, log, paths, recording_request, settings, storage
 from core import media as media
 from ml import text_embeddings
 
@@ -264,10 +273,15 @@ def index():
                        "GET /system/stats", "GET /system/logs", "GET /system/logs/files",
                        "GET /system/logs/files/{name}", "GET /system/changelog"],
             "meetings": ["GET /meetings", "GET /meetings/{id}", "PATCH /meetings/{id}",
+                         "POST /meetings/move",
                          "GET /meetings/{id}/transcript", "GET /meetings/{id}/summary",
                          "GET /meetings/{id}/notes", "POST /meetings/{id}/notes/append",
                          "GET /meetings/{id}/chapters", "POST /meetings/{id}/chapters",
                          "GET /meetings/{id}/chat", "GET /meetings/{id}/speakers",
+                         "GET /meetings/{id}/speakers/review",
+                         "GET /meetings/{id}/speakers/{speaker_key}/frames",
+                         "POST /meetings/{id}/speakers/label",
+                         "POST /meetings/{id}/segments/{segment_id}/speaker",
                          "GET /meetings/{id}/media", "GET /meetings/{id}/frame",
                          "GET /meetings/{id}/frames", "GET /meetings/{id}/audio",
                          "GET /meetings/{id}/audio/clip",
@@ -275,8 +289,15 @@ def index():
                          "GET /meetings/{id}/screenshots/{name}",
                          "GET /meetings/{id}/export"],
             "search": ["GET|POST /search", "GET /search/text"],
-            "folders": ["GET /folders", "POST /folders", "GET /folders/resolve"],
-            "speakers": ["GET /speakers", "GET /speakers/{id_or_name}/meetings"],
+            "folders": ["GET /folders", "POST /folders", "PATCH /folders/{id}",
+                        "GET /folders/resolve"],
+            "speakers": ["GET /speakers", "GET /speakers/queue",
+                         "GET /speakers/{id_or_name}", "PATCH /speakers/{id}",
+                         "POST /speakers/{id}/merge",
+                         "GET /speakers/{id_or_name}/meetings",
+                         "GET /speakers/library/health",
+                         "POST /speakers/relabel/plan", "POST /speakers/relabel/apply",
+                         "POST /speakers/relabel/cancel"],
             "chats": ["GET /chats", "GET /chats/{conversation_id}"],
             "settings": ["GET /settings", "GET /settings/schema", "PATCH /settings"],
             "live": ["GET /live"],
@@ -706,7 +727,7 @@ def meetings_list():
 
 _BUNDLE_DEFAULT = ("summary", "chapters", "speakers", "notes", "media")
 _BUNDLE_ALL = ("summary", "chapters", "speakers", "notes", "media",
-               "transcript", "chat", "summary_history")
+               "transcript", "chat", "summary_history", "calendar", "attention")
 
 
 @bp.route("/meetings/<session_id>")
@@ -768,6 +789,11 @@ def meeting_detail(session_id: str):
             segs, sess.get("speaker_labels"), _ctx.source_labels)
     if "chat" in include:
         out["chat_messages"] = _parse_chat_rows(sess.get("chat_messages", []))
+    if "calendar" in include:
+        rows = _speaker_rows(session_id, sess)
+        out["calendar"] = speaker_evidence.calendar_context(session_id, rows)
+    if "attention" in include:
+        out["attention"] = storage.get_session_attention(session_id)
     return jsonify(out)
 
 
@@ -1021,14 +1047,6 @@ def meeting_chat(session_id: str):
     messages = _parse_chat_rows(sess.get("chat_messages", []))
     return jsonify({"session_id": session_id, "count": len(messages),
                     "messages": messages})
-
-
-@bp.route("/meetings/<session_id>/speakers")
-def meeting_speakers(session_id: str):
-    if not _session_or_none(session_id):
-        return _err(f"Meeting '{session_id}' not found.", 404)
-    return jsonify({"session_id": session_id,
-                    "speakers": _resolved_speakers(session_id)})
 
 
 # ── Meetings: media ───────────────────────────────────────────────────────────
@@ -1603,27 +1621,9 @@ def speakers_list():
 
 @bp.route("/speakers/<spec>/meetings")
 def speaker_meetings(spec: str):
-    speakers = _ctx.list_global_speakers()
-    spec_l = spec.strip().lower()
-    matched = [s for s in speakers if s["id"] == spec]
-    if not matched:
-        matched = [s for s in speakers if s["name"].lower() == spec_l]
-    if not matched:
-        matched = [s for s in speakers if spec_l in s["name"].lower()]
-    if not matched:
-        return _err(f"No voice-library speaker matches '{spec}'. "
-                    "See GET /speakers for the roster.", 404)
-    if len(matched) > 1:
-        counts = storage.global_speaker_session_counts()
-        return _err(
-            f"'{spec}' matches {len(matched)} voice-library profiles. "
-            "Retry with one of the ids below (session_count shows which is "
-            "the active profile).", 409,
-            candidates=[{"id": s["id"], "name": s["name"],
-                         "session_count": counts.get(s["id"], {})
-                                                .get("session_count", 0)}
-                        for s in matched])
-    sp = matched[0]
+    sp, failed = _resolve_profile(spec)
+    if failed:
+        return failed
     sessions = _ctx.get_profile_sessions(sp["id"])
     labels = _ctx.folder_labels()
     metas = storage.get_sessions_meta([s["session_id"] for s in sessions])
@@ -1638,6 +1638,781 @@ def speaker_meetings(spec: str):
     return jsonify({"speaker": {"id": sp["id"], "name": sp["name"],
                                 "color": sp.get("color")},
                     "count": len(meetings), "meetings": meetings})
+
+
+# ── Organisation: folder edits and bulk moves ─────────────────────────────────
+
+def _folder_entry(folder_id: str) -> dict | None:
+    return next((f for f in storage.folder_tree() if f["id"] == folder_id), None)
+
+
+def _resolve_folder_spec(spec) -> tuple:
+    """(folder_id, path, error_response) for a folder id / name / path.
+    None, '', 'root' and '/' mean the top level (no folder)."""
+    if spec in (None, "", "root", "/"):
+        return None, None, None
+    filters = _ctx.scope_filters({"folder": str(spec), "include_subfolders": False})
+    if filters["error"]:
+        return None, None, _folder_error(filters)
+    return filters["folder_ids"][0], filters["label"], None
+
+
+@bp.route("/folders/<folder_id>", methods=["PATCH"])
+def folders_update(folder_id: str):
+    """Rename a folder and/or move it under another folder (or to the top)."""
+    folder = storage.get_folder(folder_id)
+    if not folder:
+        return _err(f"Folder '{folder_id}' not found. Call GET /folders for ids.", 404)
+    body = request.get_json(silent=True) or {}
+    changed: dict = {}
+    if "name" in body:
+        name = (body.get("name") or "").strip()
+        if not name:
+            return _err("Folder name must be a non-empty string.")
+        storage.rename_folder(folder_id, name)
+        changed["name"] = name
+    if "parent" in body or "parent_id" in body:
+        spec = body.get("parent_id") if "parent_id" in body else body.get("parent")
+        new_parent, parent_path, failed = _resolve_folder_spec(spec)
+        if failed:
+            return failed
+        if new_parent == folder_id or (
+                new_parent and new_parent in storage.folder_with_descendants(folder_id)):
+            return _err("A folder cannot be moved into itself or into one of its own "
+                        "sub-folders.", 409)
+        if new_parent != folder.get("parent_id"):
+            storage.set_folder_parent(folder_id, new_parent)
+        changed["parent_id"] = new_parent
+        changed["parent_path"] = parent_path
+    if not changed:
+        return _err("Nothing to update. Supported fields: name, parent (a folder id, "
+                    "name or path, or null for the top level).")
+    _ctx.push_event("library_changed", {"reason": "folder_updated", "folder_id": folder_id})
+    log.info("agent", f"Folder {folder_id[:8]} updated via Agent API: "
+                      f"{', '.join(changed)}")
+    return jsonify({"ok": True, "folder": _folder_entry(folder_id), "changed": changed})
+
+
+@bp.route("/meetings/move", methods=["POST"])
+def meetings_move():
+    """Move many meetings into one folder (or out of every folder) at once."""
+    body = request.get_json(silent=True) or {}
+    raw_ids = body.get("meeting_ids") or body.get("session_ids") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+    ids = list(dict.fromkeys(str(i).strip() for i in raw_ids if str(i).strip()))
+    if not ids:
+        return _err("Pass meeting_ids: a list of session ids to move.")
+    if len(ids) > 500:
+        return _err("Move at most 500 meetings per call.", 413)
+    if "folder" not in body and "folder_id" not in body:
+        return _err("Pass folder: a folder id, name or path, or null to unfile "
+                    "the meetings.")
+    spec = body.get("folder_id") if "folder_id" in body else body.get("folder")
+    fid, path, failed = _resolve_folder_spec(spec)
+    if failed:
+        return failed
+    metas = storage.get_sessions_meta(ids)
+    known = [i for i in ids if i in metas]
+    missing = [i for i in ids if i not in metas]
+    if not known:
+        return _err("None of those meeting ids exist.", 404, missing=missing)
+    already = [i for i in known if metas[i].get("folder_id") == fid]
+    to_move = [i for i in known if i not in already]
+    storage.bulk_set_folder(to_move, fid)
+    if to_move:
+        _ctx.push_event("library_changed", {"reason": "meetings_moved",
+                                            "count": len(to_move), "folder_id": fid})
+        log.info("agent", f"Moved {len(to_move)} meeting(s) to "
+                          f"{path or 'no folder'} via Agent API")
+    return jsonify({
+        "ok": True,
+        "folder_id": fid,
+        "folder_path": path,
+        "count": len(to_move),
+        "moved": to_move,
+        "already_there": already,
+        "missing": missing,
+    })
+
+
+# ── Speakers: identify and label ──────────────────────────────────────────────
+# Read side: the queue of meetings with unnamed speakers, and one meeting's
+# evidence pack (agent_api/speakers.py). Write side: every change goes through
+# the callable app.py wired in, which is the UI's own code path for the same
+# action, so an agent's label is byte for byte a user's label.
+
+def _library():
+    return _ctx.voice_library
+
+
+def _library_ready() -> bool:
+    lib = _library()
+    return bool(lib is not None and getattr(lib, "ready", False))
+
+
+def _me_id() -> str | None:
+    try:
+        return _ctx.me_profile_id() if _ctx.me_profile_id else None
+    except Exception:
+        return None
+
+
+def _needs(capability: str, fn):
+    """A 501 when app.py did not wire a write capability (a partial context)."""
+    if fn is None:
+        return _err(f"This server did not wire '{capability}', so the operation is "
+                    "unavailable here.", 501)
+    return None
+
+
+def _session_busy(session_id: str) -> str | None:
+    """'recording' or 'reanalyzing' when the app is working on this session."""
+    st = _ctx.status_payload() or {}
+    if st.get("session_id") != session_id:
+        return None
+    if st.get("is_reanalyzing"):
+        return "reanalyzing"
+    if st.get("recording"):
+        return "recording"
+    return None
+
+
+def _speaker_rows(session_id: str, sess: dict) -> list[dict]:
+    return speaker_evidence.speaker_rows(
+        session_id, sess.get("segments", []), _ctx.source_labels, _me_id())
+
+
+_ME_REFUSAL = ("That speaker is the owner's own microphone (Me). It is never relabelled "
+               "through the Agent API; the owner's name is set in Settings.")
+
+
+@bp.route("/speakers/queue")
+def speakers_queue():
+    """Meetings that still need speaker work, newest first.
+
+    A meeting is listed while it has an unnamed speaker with real talk time or
+    its speaker count disagrees with the calendar's attendee count; naming or
+    merging speakers removes it. The shared folder / date / speaker filters
+    apply, so an agent can work one folder or one week at a time.
+    """
+    args = _params()
+    filters = _ctx.scope_filters(_filters_input(args))
+    if filters["error"]:
+        return _folder_error(filters)
+    ids = storage.list_session_ids(
+        folder_ids=filters["folder_ids"], start=filters["start"],
+        end=filters["end"], speaker=filters["speaker"])
+    attention_map = storage.attention_by_session()
+    reason = (args.get("reason") or "any").strip().lower()
+    if reason not in ("any", "unresolved", "mismatch"):
+        return _err("reason must be any (default), unresolved, or mismatch.")
+    picked = []
+    for sid in ids:
+        att = attention_map.get(sid)
+        if not att or not att.get("needs"):
+            continue
+        if reason == "unresolved" and not att.get("unresolved"):
+            continue
+        if reason == "mismatch" and "speaker_count_mismatch" not in (att.get("reasons") or []):
+            continue
+        picked.append(sid)
+    limit = max(1, min(200, _as_int(args.get("limit"), 25)))
+    offset = max(0, _as_int(args.get("offset"), 0))
+    page = picked[offset:offset + limit]
+    labels = _ctx.folder_labels(filters["folders"])
+    metas = storage.get_sessions_meta(page)
+    notes_set = storage.sessions_have_notes(page)
+    items = []
+    for sid in page:
+        if sid not in metas:
+            continue
+        item = _meeting_item(metas[sid], labels, notes_set, summary_chars=160)
+        item["attention"] = attention_map[sid]
+        items.append(item)
+    return jsonify({
+        "total": len(picked),
+        "offset": offset,
+        "limit": limit,
+        "count": len(items),
+        "scope": filters["desc"].removeprefix(" in ") or "all meetings",
+        "library_ready": _library_ready(),
+        "meetings": items,
+        "next_step": "For each meeting: GET /meetings/{id}/speakers/review, weigh the "
+                     "evidence, then POST /meetings/{id}/speakers/label. Report "
+                     "anything you could not settle instead of guessing.",
+    })
+
+
+@bp.route("/meetings/<session_id>/speakers/review")
+def meeting_speakers_review(session_id: str):
+    """The evidence pack for naming a meeting's speakers."""
+    if not storage.get_session_times(session_id):
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    args = request.args
+    key = (args.get("speaker_key") or "").strip() or None
+    include_matches = helpers.parse_bool(args.get("matches"), True)
+    quote_count = max(1, min(12, _as_int(args.get("quotes"), 4)))
+    top_k = max(1, min(10, _as_int(args.get("top_k"), 5)))
+    detail = (args.get("detail") or "unnamed").strip().lower()
+    if detail not in ("unnamed", "all"):
+        return _err("detail must be unnamed (default) or all.")
+    lib = _library()
+    wav = None
+    if include_matches and _library_ready() and media.has_audio(session_id):
+        # The voice backfill reads PCM. For an Opus meeting this decodes it once
+        # into the cache (a minute or two for a long recording, then free).
+        wav = media.pcm_wav_path(session_id)
+    mp4, live = _frame_sources(session_id)
+    has_video = mp4.exists() or bool(live and live.get("live_video_path"))
+    out = speaker_evidence.review(
+        session_id, library=lib, source_labels=_ctx.source_labels, me_id=_me_id(),
+        speaker_key=key, include_matches=include_matches, quote_count=quote_count,
+        top_k=top_k, wav_path=wav, has_video=has_video, detail=detail)
+    if out is None:
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    if out.get("error") == "unknown_speaker":
+        return _err(f"No speaker '{key}' in this meeting.", 404, speakers=out["speakers"])
+    base = f"{_ctx.server_url}{_PREFIX}/meetings/{session_id}"
+    out["links"] = {
+        "frames": f"{base}/speakers/<speaker_key>/frames",
+        "label": f"{base}/speakers/label",
+        "transcript_for_speaker": f"{base}/transcript?speaker=<speaker_key>&format=text",
+        "audio_clip": f"{base}/audio/clip?start=<t>&end=<t>",
+    }
+    out["next_step"] = (
+        "Decide per unnamed speaker: a self-introduction, a 'strong' or 'clear' library "
+        "match, or a screen frame that names them is enough to label; 'possible' plus a "
+        "consistent calendar attendee is enough when you say so in evidence; anything "
+        "weaker goes back to the user as a question. Merge same-voice keys with same_as.")
+    return jsonify(out)
+
+
+@bp.route("/meetings/<session_id>/speakers/<speaker_key>/frames")
+def meeting_speaker_frames(session_id: str, speaker_key: str):
+    """Screen frames from moments this speaker was talking."""
+    sess = _session_or_none(session_id)
+    if not sess:
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    mp4, live, unavailable = _frame_availability(session_id)
+    if unavailable:
+        return unavailable
+    by_key = speaker_evidence.segments_by_key(sess.get("segments", []))
+    segs = by_key.get(speaker_key)
+    if not segs:
+        return _err(f"No speaker '{speaker_key}' in this meeting.", 404,
+                    speakers=sorted(by_key))
+    args = request.args
+    count = max(1, min(6, _as_int(args.get("count"), 3)))
+    width = max(160, min(1280, _as_int(args.get("width"), 768)))
+    offset = settings.get_video_offset(session_id)
+    frames = []
+    for m in speaker_evidence.moments(segs, count):
+        entry = dict(m)
+        if m["t"] < offset:
+            entry.update(ok=False, jpeg_base64=None, source=None, video_t=None,
+                         note="Before the screen recording started.")
+            frames.append(entry)
+            continue
+        jpeg, video_t, source = _frame_at(session_id, m["t"], width, False)
+        entry.update(ok=bool(jpeg), video_t=round(video_t, 2), source=source,
+                     jpeg_base64=base64.b64encode(jpeg).decode() if jpeg else None)
+        frames.append(entry)
+    labels = sess.get("speaker_labels") or {}
+    return jsonify({
+        "session_id": session_id,
+        "speaker_key": speaker_key,
+        "speaker_name": labels.get(speaker_key) or _ctx.source_labels.get(speaker_key, speaker_key),
+        "width": width,
+        "video_offset_sec": offset,
+        "count": len(frames),
+        "frames": frames,
+        "how_to_read": "Each frame is the screen a moment into one of this speaker's "
+                       "longer turns. Look for the highlighted or outlined tile, a "
+                       "'Name is speaking' banner, or a presenter name. Highlights can "
+                       "lag the audio by a second or two, so weigh several frames, and "
+                       "fetch frames for an already named speaker to learn the layout.",
+    })
+
+
+@bp.route("/meetings/<session_id>/speakers", methods=["GET"])
+def meeting_speakers(session_id: str):
+    sess = _session_or_none(session_id)
+    if not sess:
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    rows = _speaker_rows(session_id, sess)
+    return jsonify({"session_id": session_id, "speakers": rows,
+                    "unnamed": sum(1 for r in rows if r["status"] == "unnamed"),
+                    "review_url": f"{_ctx.server_url}{_PREFIX}/meetings/{session_id}"
+                                  f"/speakers/review"})
+
+
+@bp.route("/meetings/<session_id>/speakers/label", methods=["POST"])
+def meeting_speakers_label(session_id: str):
+    """Name a speaker, link a voice profile, merge split keys, flag noise, or
+    reset to the diarizer's default. One action per call."""
+    sess = _session_or_none(session_id)
+    if not sess:
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    body = request.get_json(silent=True) or {}
+    raw_keys = body.get("speaker_keys")
+    if raw_keys is None:
+        raw_keys = [body.get("speaker_key")]
+    if isinstance(raw_keys, str):
+        raw_keys = [raw_keys]
+    keys = list(dict.fromkeys(str(k).strip() for k in (raw_keys or []) if k and str(k).strip()))
+    if not keys:
+        return _err("Pass speaker_key or speaker_keys: the key(s) to label, from "
+                    "GET /meetings/{id}/speakers/review.")
+    rows = _speaker_rows(session_id, sess)
+    by_key = {r["speaker_key"]: r for r in rows}
+    unknown = [k for k in keys if k not in by_key]
+    if unknown:
+        return _err(f"Unknown speaker key(s): {', '.join(unknown)}.", 404,
+                    speakers=[{"speaker_key": r["speaker_key"], "name": r["name"],
+                               "status": r["status"]} for r in rows])
+    if any(by_key[k]["is_me"] for k in keys):
+        return _err(_ME_REFUSAL, 403)
+    if _session_busy(session_id) == "reanalyzing":
+        return _err("This meeting is being reanalysed; its speakers are about to be "
+                    "rebuilt. Try again when it finishes.", 409)
+
+    kinds = set()
+    for field in ("name", "global_id", "same_as", "noise", "reset"):
+        if body.get(field):
+            kinds.add("assign" if field in ("name", "global_id") else field)
+    if len(kinds) != 1:
+        return _err("Choose exactly one action: name and/or global_id (assign a person), "
+                    "same_as (the same voice as another speaker in this meeting), "
+                    "noise: true, or reset: true.")
+    action = kinds.pop()
+    reinforce = helpers.parse_bool(body.get("reinforce"), False)
+    evidence = (body.get("evidence") or "").strip()[:500]
+    lib = _library()
+    lib_ready = _library_ready()
+    me_id = _me_id()
+    profile: dict | None = None
+    profile_created = False
+    result: dict = {}
+
+    if action in ("noise", "reset"):
+        blocked = _needs("apply_speaker_corrections", _ctx.apply_speaker_corrections)
+        if blocked:
+            return blocked
+        if action == "noise":
+            result = _ctx.apply_speaker_corrections(session_id, [], keys) or {}
+        else:
+            result = _ctx.apply_speaker_corrections(
+                session_id, [{"global_id": None, "member_keys": keys}], []) or {}
+    else:
+        blocked = _needs("label_speaker", _ctx.label_speaker)
+        if blocked:
+            return blocked
+        name = color = gid = None
+        if action == "same_as":
+            other = str(body.get("same_as") or "").strip()
+            if other not in by_key:
+                return _err(f"same_as names an unknown speaker key '{other}'.", 404,
+                            speakers=sorted(by_key))
+            if other in keys:
+                return _err("same_as must name a different speaker than the one(s) "
+                            "being labelled.")
+            target = by_key[other]
+            if target["is_me"]:
+                return _err(_ME_REFUSAL, 403)
+            if target["is_generic"] or target["status"] == "noise":
+                return _err(f"Speaker '{other}' has no name yet ({target['name']}). Name "
+                            "it first, or label both keys with the same name in one "
+                            "call.", 409)
+            name, color, gid = target["name"], target.get("color"), target.get("global_id")
+            if gid and lib is not None:
+                profile = lib.get_global_speaker(gid) or None
+        else:
+            gid = (str(body.get("global_id") or "")).strip() or None
+            name = (str(body.get("name") or "")).strip() or None
+            if gid:
+                if lib is None:
+                    return _needs("voice_library", None)
+                profile = lib.get_global_speaker(gid)
+                if not profile:
+                    return _err(f"No voice-library profile '{gid}'. See GET /speakers.", 404)
+                if me_id and gid == me_id:
+                    return _err("That is the owner's own voice profile; desktop speakers "
+                                "are never linked to it here.", 403)
+                if name and speaker_evidence.norm_name(name) != speaker_evidence.norm_name(profile["name"]):
+                    return _err(f"name '{name}' does not match profile '{gid}' "
+                                f"('{profile['name']}'). Pass one or the other.", 409)
+                name, color = profile["name"], profile.get("color")
+            else:
+                if attention.is_generic_speaker_name(name):
+                    return _err(f"'{name}' is a placeholder, not a person. Use reset: true "
+                                "to return a speaker to its diarizer default.")
+                if lib_ready:
+                    existing = lib.find_by_name(name)
+                    if existing and me_id and existing["id"] == me_id:
+                        return _err("That is the owner's own name and voice profile; "
+                                    "desktop speakers are never linked to it here.", 403)
+                    if existing:
+                        profile, gid = existing, existing["id"]
+                    else:
+                        gid = lib.create_global_speaker(name)
+                        profile = lib.get_global_speaker(gid)
+                        profile_created = True
+        updated = _ctx.label_speaker(session_id, keys, name, color, gid, reinforce) or []
+        result = {"labels": updated}
+
+    log.info("agent", f"Speaker {action} via Agent API in {session_id[:8]}: "
+                      f"{', '.join(keys)}" + (f" ({evidence})" if evidence else ""))
+    after = {r["speaker_key"]: r for r in _speaker_rows(session_id, sess)}
+    notes = []
+    if action == "assign" or action == "same_as":
+        if not lib_ready:
+            notes.append("The voice library is not loaded, so the name applies to this "
+                         "meeting only and no profile was linked.")
+        elif reinforce:
+            notes.append("reinforce was set: this speaker's audio is being added to the "
+                         "profile in the background.")
+        else:
+            notes.append("The profile is linked without training on this audio; pass "
+                         "reinforce: true only when the identity is certain.")
+        if _session_busy(session_id) == "recording":
+            notes.append("This meeting is recording; the label applies live as well.")
+    if action == "noise":
+        notes.append("Noise speakers are hidden from the transcript's speaker list and "
+                     "no longer count as unnamed.")
+    if action == "reset":
+        notes.append("The speaker is back to its diarizer default and unlinked from "
+                     "any profile; its voice samples stay with the meeting.")
+    return jsonify({
+        "ok": True,
+        "session_id": session_id,
+        "action": action,
+        "speaker_keys": keys,
+        "speakers": [after[k] for k in keys if k in after],
+        "profile": ({"global_id": profile.get("id"), "name": profile.get("name"),
+                     "created": profile_created} if profile else None),
+        "reinforce": reinforce if action in ("assign", "same_as") else None,
+        "evidence": evidence or None,
+        "attention": storage.get_session_attention(session_id),
+        "result": result,
+        "notes": notes,
+    })
+
+
+@bp.route("/meetings/<session_id>/segments/<int:segment_id>/speaker", methods=["POST"])
+def meeting_segment_speaker(session_id: str, segment_id: int):
+    """Reattribute one transcript line to another speaker in the meeting, or
+    give it a one-off label. For the odd misattributed line, not for renaming
+    a speaker (that is POST .../speakers/label)."""
+    seg = storage.get_segment(segment_id)
+    if not seg or seg.get("session_id") != session_id:
+        return _err(f"Segment {segment_id} is not part of meeting '{session_id}'.", 404)
+    blocked = _needs("relabel_segment", _ctx.relabel_segment)
+    if blocked:
+        return blocked
+    sess = _session_or_none(session_id)
+    body = request.get_json(silent=True) or {}
+    target_key = (str(body.get("speaker_key") or "")).strip() or None
+    name = (str(body.get("name") or "")).strip() or None
+    if not target_key and not name:
+        return _err("Pass speaker_key (an existing speaker in this meeting) or name "
+                    "(a one-off label for this line).")
+    rows = _speaker_rows(session_id, sess)
+    by_key = {r["speaker_key"]: r for r in rows}
+    if target_key:
+        if target_key not in by_key:
+            return _err(f"Unknown speaker key '{target_key}'.", 404, speakers=sorted(by_key))
+        label = by_key[target_key]["name"]
+    else:
+        label = name
+    reinforce = helpers.parse_bool(body.get("reinforce"), False)
+    train = bool(reinforce and not attention.is_generic_speaker_name(label)
+                 and not (target_key and by_key[target_key]["is_me"]))
+    row = _ctx.relabel_segment(segment_id, label, target_key, train=train)
+    if not row:
+        return _err("The segment vanished while it was being updated.", 409)
+    log.info("agent", f"Segment {segment_id} reattributed via Agent API to "
+                      f"{target_key or label!r} in {session_id[:8]}")
+    return jsonify({
+        "ok": True,
+        "session_id": session_id,
+        "segment": helpers.transcript_rows([row], sess.get("speaker_labels"),
+                                           _ctx.source_labels)[0],
+        "reinforce": train,
+        "note": "Only this line changed. Its speaker label wins over the speaker's "
+                "name, so a later rename of the speaker leaves it as set here.",
+    })
+
+
+# ── Speakers: the voice library ───────────────────────────────────────────────
+
+def _resolve_profile(spec: str):
+    """(profile, error_response) for a voice-library id or (partial) name."""
+    speakers = _ctx.list_global_speakers()
+    spec_l = spec.strip().lower()
+    matched = [s for s in speakers if s["id"] == spec]
+    if not matched:
+        matched = [s for s in speakers if s["name"].lower() == spec_l]
+    if not matched:
+        matched = [s for s in speakers if spec_l in s["name"].lower()]
+    if not matched:
+        return None, _err(f"No voice-library speaker matches '{spec}'. "
+                          "See GET /speakers for the roster.", 404)
+    if len(matched) > 1:
+        counts = storage.global_speaker_session_counts()
+        return None, _err(
+            f"'{spec}' matches {len(matched)} voice-library profiles. "
+            "Retry with one of the ids below (session_count shows which is "
+            "the active profile).", 409,
+            candidates=[{"id": s["id"], "name": s["name"],
+                         "session_count": counts.get(s["id"], {}).get("session_count", 0)}
+                        for s in matched])
+    return matched[0], None
+
+
+@bp.route("/speakers/library/health")
+def speakers_library_health():
+    """Duplicate, confusable and polluted profiles: the same report as the
+    Voice Library's maintenance pass, read-only."""
+    lib = _library()
+    if lib is None:
+        return _needs("voice_library", None)
+    try:
+        report = lib.library_health()
+    except Exception as e:
+        return _err(f"Could not compute the library report: {e}", 500)
+    report["read_only"] = True
+    report["note"] = ("Nothing here was changed. Same-name duplicates are merged by the "
+                      "app's own weekly maintenance; use POST /speakers/{id}/merge for "
+                      "a pair the user confirms, and treat 'confusable' pairs as a "
+                      "reason to doubt a voice match between those two people.")
+    return jsonify(report)
+
+
+@bp.route("/speakers/<spec>")
+def speaker_profile(spec: str):
+    """One voice-library profile in depth."""
+    sp, failed = _resolve_profile(spec)
+    if failed:
+        return failed
+    lib = _library()
+    full = (lib.get_global_speaker(sp["id"]) if lib is not None else None) or sp
+    counts = storage.global_speaker_session_counts().get(sp["id"], {})
+    me_id = _me_id()
+    sessions = _ctx.get_profile_sessions(sp["id"]) or []
+    metas = storage.get_sessions_meta([s["session_id"] for s in sessions[:12]])
+    recent = []
+    for info in sessions[:12]:
+        meta = metas.get(info["session_id"])
+        if meta:
+            recent.append({"session_id": info["session_id"], "title": meta["title"],
+                           "started_at": meta["started_at"],
+                           "speaker_keys": info.get("speaker_keys"),
+                           "segments": info.get("seg_count")})
+    confusable = []
+    if lib is not None and getattr(lib, "ready", False) and sp["id"] != me_id:
+        try:
+            cent = lib.get_centroid(sp["id"])
+            if cent is not None:
+                for m in lib.find_matches(cent, exclude_global_ids={sp["id"]}, top_k=5,
+                                          min_similarity=speaker_evidence.CONFUSABLE_SIM):
+                    confusable.append({"global_id": m["global_id"], "name": m["name"],
+                                       "similarity": m["similarity"]})
+        except Exception:
+            confusable = []
+    same_name = [r for r in storage.find_speaker_labels_by_name(sp["name"], match="exact")
+                 if r.get("global_id") != sp["id"]]
+    return jsonify({
+        "profile": {"global_id": sp["id"], "name": sp["name"], "color": sp.get("color"),
+                    "created_at": full.get("created_at"), "updated_at": full.get("updated_at")},
+        "is_me": sp["id"] == me_id,
+        "voice_samples": full.get("emb_count", 0),
+        "session_count": counts.get("session_count", 0),
+        "last_seen": counts.get("last_seen"),
+        "recent_meetings": recent,
+        "confusable_with": confusable,
+        "labels_with_this_name_not_linked": len(same_name),
+        "links": {"meetings": f"{_ctx.server_url}{_PREFIX}/speakers/{sp['id']}/meetings"},
+        "note": ("confusable_with lists profiles whose voice is close to this one; a "
+                 "match to either is uncertain between them. labels_with_this_name_not_"
+                 "linked counts meeting labels spelled like this profile but linked to "
+                 "another or no profile; POST /speakers/relabel/plan can unify them."),
+    })
+
+
+@bp.route("/speakers/<global_id>", methods=["PATCH"])
+def speaker_profile_update(global_id: str):
+    """Rename a voice-library profile; every meeting label linked to it follows."""
+    lib = _library()
+    if lib is None:
+        return _needs("voice_library", None)
+    blocked = _needs("rename_profile", _ctx.rename_profile)
+    if blocked:
+        return blocked
+    profile = lib.get_global_speaker(global_id)
+    if not profile:
+        return _err(f"No voice-library profile '{global_id}'. See GET /speakers.", 404)
+    if _me_id() and global_id == _me_id():
+        return _err("That is the owner's own profile; their name is changed in Settings, "
+                    "under the Me speaker.", 403)
+    body = request.get_json(silent=True) or {}
+    name = (str(body.get("name") or "")).strip()
+    if not name:
+        return _err("Pass name: the profile's new name.")
+    if attention.is_generic_speaker_name(name):
+        return _err(f"'{name}' is a placeholder, not a name.")
+    clash = lib.find_by_name(name)
+    if clash and clash["id"] != global_id:
+        return _err(f"A profile named '{name}' already exists ({clash['id']}). Merge the "
+                    "two with POST /speakers/{keep_id}/merge instead of creating a "
+                    "duplicate by renaming.", 409, existing_profile_id=clash["id"])
+    before = profile["name"]
+    resolved = _ctx.rename_profile(global_id, name=name) or {}
+    linked = lib.get_linked_labels(global_id) or []
+    log.info("agent", f"Profile {global_id[:8]} renamed via Agent API: "
+                      f"{before!r} to {name!r} ({len(linked)} label(s))")
+    return jsonify({"ok": True, "profile": {"global_id": global_id,
+                                            "name": resolved.get("name", name),
+                                            "color": resolved.get("color")},
+                    "previous_name": before, "labels_updated": len(linked),
+                    "meetings_affected": len({r["session_id"] for r in linked})})
+
+
+@bp.route("/speakers/<global_id>/merge", methods=["POST"])
+def speaker_profile_merge(global_id: str):
+    """Fold one voice profile into another. Irreversible; confirm is required."""
+    lib = _library()
+    if lib is None:
+        return _needs("voice_library", None)
+    blocked = _needs("merge_profiles", _ctx.merge_profiles)
+    if blocked:
+        return blocked
+    if not getattr(lib, "ready", False):
+        return _err("The voice library model is not loaded; merges wait until it is.", 503)
+    body = request.get_json(silent=True) or {}
+    source = (str(body.get("source_id") or body.get("merge_id") or "")).strip()
+    if not source:
+        return _err("Pass source_id: the profile to merge into this one.")
+    keep = lib.get_global_speaker(global_id)
+    merge = lib.get_global_speaker(source)
+    if not keep:
+        return _err(f"No voice-library profile '{global_id}'.", 404)
+    if not merge:
+        return _err(f"No voice-library profile '{source}'.", 404)
+    if source == global_id:
+        return _err("source_id must differ from the profile being kept.")
+    me_id = _me_id()
+    if me_id and me_id in (global_id, source):
+        return _err("The owner's own profile is never merged through the Agent API.", 403)
+    if not body.get("confirm"):
+        return _err(
+            f"Merging moves {merge.get('emb_count', 0)} voice sample(s) and every meeting "
+            f"label from '{merge['name']}' into '{keep['name']}' and removes the "
+            f"'{merge['name']}' profile. This cannot be undone from the app. Show that "
+            "to the user and pass confirm: true once they agree.", 400,
+            keep={"global_id": global_id, "name": keep["name"],
+                  "voice_samples": keep.get("emb_count", 0)},
+            merge={"global_id": source, "name": merge["name"],
+                   "voice_samples": merge.get("emb_count", 0)})
+    resolved = _ctx.merge_profiles(global_id, source) or {}
+    after = lib.get_global_speaker(global_id) or keep
+    linked = lib.get_linked_labels(global_id) or []
+    log.info("agent", f"Profiles merged via Agent API: {merge['name']!r} ({source[:8]}) "
+                      f"into {keep['name']!r} ({global_id[:8]})")
+    return jsonify({"ok": True,
+                    "kept": {"global_id": global_id, "name": resolved.get("name", after.get("name")),
+                             "voice_samples": after.get("emb_count", 0)},
+                    "merged_away": {"global_id": source, "name": merge["name"]},
+                    "labels_now_linked": len(linked)})
+
+
+# ── Speakers: bulk relabel (plan, confirm, apply) ─────────────────────────────
+
+@bp.route("/speakers/relabel/plan", methods=["POST"])
+def speakers_relabel_plan():
+    """Describe a library-wide (or one-meeting) rename without changing anything."""
+    blocked = _needs("relabel_deps", _ctx.relabel_deps)
+    if blocked:
+        return blocked
+    body = _params()
+    from_name = (str(body.get("from_name") or "")).strip()
+    to_name = (str(body.get("to_name") or "")).strip()
+    if not from_name or not to_name:
+        return _err("Pass from_name and to_name.")
+    match = (str(body.get("match") or "exact")).strip().lower()
+    if match not in speaker_relabel.MATCH_MODES:
+        return _err(f"match must be one of: {', '.join(speaker_relabel.MATCH_MODES)}.")
+    scope = (str(body.get("scope") or "library")).strip().lower()
+    if scope not in speaker_relabel.SCOPES:
+        return _err(f"scope must be one of: {', '.join(speaker_relabel.SCOPES)}.")
+    if scope == "session":
+        sid = (str(body.get("session_id") or body.get("meeting_id") or "")).strip()
+        if not sid:
+            return _err("scope 'session' needs session_id.")
+        if not storage.get_session_times(sid):
+            return _err(f"Meeting '{sid}' not found.", 404)
+        session_ids = [sid]
+    else:
+        filters = _ctx.scope_filters(_filters_input(body))
+        if filters["error"]:
+            return _folder_error(filters)
+        session_ids = _ctx.scoped_session_ids(filters)
+    try:
+        plan = speaker_relabel.build_plan(from_name, to_name, scope, session_ids, match,
+                                          deps=_ctx.relabel_deps())
+    except ValueError as e:
+        return _err(str(e), 400)
+    if not plan["sessions"] and not plan.get("profile_only"):
+        return jsonify({"matched": 0, "token": None, "summary": plan["summary"],
+                        "warnings": plan["warnings"],
+                        "next_step": "Nothing matched. Check the spelling against "
+                                     "GET /speakers before trying again; do not guess."})
+    token = speaker_relabel.mint_token(plan, None)
+    card = speaker_relabel.plan_card(plan, token)
+    card["matched"] = plan["key_count"]
+    card["expires_in_sec"] = speaker_relabel.TOKEN_TTL_SEC
+    card["next_step"] = ("Nothing has changed. Show the summary and every warning to the "
+                         "user; once they confirm, POST /speakers/relabel/apply with this "
+                         "token and confirm: true (the token is single use and expires).")
+    return jsonify(card)
+
+
+@bp.route("/speakers/relabel/apply", methods=["POST"])
+def speakers_relabel_apply():
+    blocked = _needs("relabel_deps", _ctx.relabel_deps)
+    if blocked:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    token = (str(body.get("token") or "")).strip()
+    if not token:
+        return _err("Pass the token from POST /speakers/relabel/plan.")
+    if not body.get("confirm"):
+        return _err("Pass confirm: true, and only after the user approved this exact "
+                    "plan.")
+    try:
+        result = speaker_relabel.apply_plan(token, current_request_id=None,
+                                            confirmed_by="agent_api",
+                                            deps=_ctx.relabel_deps())
+    except ValueError as e:
+        return _err(str(e), 409,
+                    applied_session_ids=list(getattr(e, "applied_session_ids", ()) or ()))
+    log.info("agent", f'Relabel applied via Agent API: "{result["from_name"]}" to '
+                      f'"{result["to_name"]}" ({result["key_count"]} label(s) in '
+                      f'{result["session_count"]} meeting(s), {result["strategy"]})')
+    _ctx.push_event("library_changed", {"reason": "speakers_relabelled",
+                                        "count": result.get("session_count", 0)})
+    return jsonify({"ok": True, **result})
+
+
+@bp.route("/speakers/relabel/cancel", methods=["POST"])
+def speakers_relabel_cancel():
+    body = request.get_json(silent=True) or {}
+    token = (str(body.get("token") or "")).strip()
+    cancelled = bool(token) and speaker_relabel.cancel(token)
+    return jsonify({"ok": True, "cancelled": cancelled,
+                    "note": "Plan dropped; nothing was changed." if cancelled else
+                            "No pending plan matched that token (already applied, "
+                            "cancelled, or expired); nothing was changed."})
 
 
 # ── Global AI chats ───────────────────────────────────────────────────────────

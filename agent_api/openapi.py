@@ -120,6 +120,16 @@ def build_spec(server_url: str) -> dict:
         "Resolve a fuzzy folder reference to a real folder", "",
         [_q("q", "Folder id, (partial) name, or path.", required=True)],
         tags=["folders"]))
+    add("/folders/{folder_id}", "patch", _op(
+        "Rename a folder and/or move it under another folder",
+        "parent accepts a folder id, name or path, or null for the top level. "
+        "A folder is never moved into its own sub-tree. Nothing is deleted.",
+        [_p("folder_id", "Folder id from /folders.")],
+        body={"type": "object", "properties": {
+            "name": {"type": "string"},
+            "parent": {"type": ["string", "null"],
+                       "description": "New parent id/name/path, or null for top level."},
+        }}, tags=["folders"]))
 
     # Meetings
     add("/meetings", "get", _op(
@@ -132,8 +142,19 @@ def build_spec(server_url: str) -> dict:
     add("/meetings/{session_id}", "get", _op(
         "One meeting as a bundle",
         "Default parts: summary, chapters, speakers, notes, media. "
-        "?include=all adds transcript, chat, summary_history.",
+        "?include=all adds transcript, chat, summary_history, calendar "
+        "(attendees and expected speaker count) and attention (unnamed "
+        "speaker state).",
         [_SID, _q("include", "Comma list or 'all'.")], tags=["meetings"]))
+    add("/meetings/move", "post", _op(
+        "Move many meetings into one folder, or unfile them",
+        "Reports moved, already_there and missing ids. Nothing is deleted.",
+        body={"type": "object", "required": ["meeting_ids", "folder"], "properties": {
+            "meeting_ids": {"type": "array", "items": {"type": "string"},
+                            "description": "1-500 session ids."},
+            "folder": {"type": ["string", "null"],
+                       "description": "Folder id/name/path, or null to unfile."},
+        }}, tags=["meetings"]))
     add("/meetings/{session_id}", "patch", _op(
         "Rename a meeting or move it between folders", "",
         [_SID],
@@ -191,8 +212,64 @@ def build_spec(server_url: str) -> dict:
     add("/meetings/{session_id}/chat", "get",
         _op("AI chat history for this meeting", "", [_SID], tags=["meetings"]))
     add("/meetings/{session_id}/speakers", "get", _op(
-        "Per-speaker stats: talk time, segments, words, voice-library link",
-        "", [_SID], tags=["meetings"]))
+        "Per-speaker stats with a status",
+        "Every effective speaker key with name, status (named, unnamed, minor, "
+        "noise, me), talk time, segments, words and the voice-library link.",
+        [_SID], tags=["speakers"]))
+    add("/meetings/{session_id}/speakers/review", "get", _op(
+        "The evidence pack for naming a meeting's speakers",
+        "Per speaker: status and stats, identifying quotes (self-introductions "
+        "flagged), names others call them, closest voice-library profiles with "
+        "a verdict (strong/clear/possible/weak/none), similarity to the other "
+        "keys in the meeting (likely_same_voice), frame moments; plus the "
+        "calendar's attendees, the attention state and disclosures on how far "
+        "each kind of evidence can be trusted. The first review of an Opus "
+        "meeting decodes its audio once, which can take a minute.",
+        [_SID,
+         _q("speaker_key", "Focus on one speaker (others summarised)."),
+         _q("detail", "unnamed (default: full evidence for unnamed speakers, one "
+                      "compact line each for the rest under others) or all."),
+         _q("matches", "Consult the voice library (default true).", "boolean"),
+         _q("quotes", "Identifying lines per speaker, 1-12 (default 4).", "integer"),
+         _q("top_k", "Library candidates per speaker, 1-10 (default 5).", "integer")],
+        tags=["speakers"]))
+    add("/meetings/{session_id}/speakers/{speaker_key}/frames", "get", _op(
+        "Screen frames from moments this speaker was talking (JSON, base64)",
+        "Picks the speaker's longest turns spread across the meeting, a moment "
+        "into each; use the frames to read the meeting window (highlighted "
+        "tile, 'Name is speaking', presenter name).",
+        [_SID, _p("speaker_key", "Diarizer key, e.g. 'Speaker 3'."),
+         _q("count", "Frames, 1-6 (default 3).", "integer"),
+         _q("width", "Max width in px (default 768).", "integer")],
+        tags=["speakers"]))
+    add("/meetings/{session_id}/speakers/label", "post", _op(
+        "Label speaker keys: name, profile link, same-voice merge, noise, reset",
+        "Exactly one action per call. The change lands in this meeting only "
+        "and goes through the app's own rename path (visible immediately). "
+        "reinforce also trains the voice profile: certain identities only. "
+        "The owner's microphone speaker is refused (403).",
+        [_SID],
+        body={"type": "object", "properties": {
+            "speaker_keys": {"type": "array", "items": {"type": "string"}},
+            "speaker_key": {"type": "string", "description": "Single-key form."},
+            "name": {"type": "string", "description": "Assign this person."},
+            "global_id": {"type": "string",
+                          "description": "Link this voice-library profile (its name is used)."},
+            "same_as": {"type": "string",
+                        "description": "Another key in this meeting that is the same voice."},
+            "noise": {"type": "boolean"},
+            "reset": {"type": "boolean"},
+            "reinforce": {"type": "boolean", "default": False},
+            "evidence": {"type": "string", "description": "Why; logged."},
+        }}, tags=["speakers"]))
+    add("/meetings/{session_id}/segments/{segment_id}/speaker", "post", _op(
+        "Reattribute one transcript line to another speaker, or label just that line",
+        "", [_SID, _p("segment_id", "Segment id from the JSON transcript.")],
+        body={"type": "object", "properties": {
+            "speaker_key": {"type": "string"},
+            "name": {"type": "string", "description": "One-off label instead of a key."},
+            "reinforce": {"type": "boolean", "default": False},
+        }}, tags=["speakers"]))
     add("/meetings/{session_id}/media", "get", _op(
         "Media inventory: audio/video tech info, screenshots, attachments",
         "", [_SID], tags=["media"]))
@@ -284,6 +361,57 @@ def build_spec(server_url: str) -> dict:
     add("/speakers/{spec}/meetings", "get", _op(
         "Every meeting a speaker appears in", "",
         [_p("spec", "Speaker id or (partial) name.")], tags=["speakers"]))
+    add("/speakers/queue", "get", _op(
+        "Meetings that still need speaker work, newest first",
+        "Listed while a meeting has an unnamed speaker with real talk time or "
+        "its speaker count disagrees with the calendar. Shared filters apply.",
+        _FILTERS + [_q("reason", "any (default), unresolved, or mismatch."),
+                    _q("limit", "Page size (default 25, max 200).", "integer"),
+                    _q("offset", "Pagination offset.", "integer")],
+        tags=["speakers"]))
+    add("/speakers/library/health", "get", _op(
+        "Read-only voice-library report: duplicates, foreign samples, split "
+        "profiles, confusable pairs", tags=["speakers"]))
+    add("/speakers/{spec}", "get", _op(
+        "One voice-library profile in depth",
+        "Samples, meetings, whether it is the owner's profile, confusable "
+        "profiles, labels carrying its name without a link.",
+        [_p("spec", "Speaker id or (partial) name.")], tags=["speakers"]))
+    add("/speakers/{spec}", "patch", _op(
+        "Rename a voice-library profile (every linked label follows)",
+        "Refuses a name another profile holds (merge instead) and the owner's profile.",
+        [_p("spec", "Profile id.")],
+        body={"type": "object", "required": ["name"],
+              "properties": {"name": {"type": "string"}}}, tags=["speakers"]))
+    add("/speakers/{spec}/merge", "post", _op(
+        "Merge another profile into this one (irreversible, confirm required)",
+        "Without confirm the response describes what would move.",
+        [_p("spec", "Profile id to keep.")],
+        body={"type": "object", "required": ["source_id"], "properties": {
+            "source_id": {"type": "string", "description": "Profile to fold in."},
+            "confirm": {"type": "boolean"},
+        }}, tags=["speakers"]))
+    add("/speakers/relabel/plan", "post", _op(
+        "Plan a bulk speaker rename without changing anything",
+        "Returns a single-use token (10 minutes), the per-meeting plan and "
+        "warnings. Apply only after the user confirms.",
+        body={"type": "object", "required": ["from_name", "to_name"], "properties": {
+            "from_name": {"type": "string"}, "to_name": {"type": "string"},
+            "scope": {"type": "string", "enum": ["library", "session"]},
+            "session_id": {"type": "string"},
+            "match": {"type": "string", "enum": ["exact", "contains"]},
+            "folder": {"type": "string"}, "within_days": {"type": "integer"},
+            "start_date": {"type": "string"}, "end_date": {"type": "string"},
+        }}, tags=["speakers"]))
+    add("/speakers/relabel/apply", "post", _op(
+        "Apply a planned relabel", "",
+        body={"type": "object", "required": ["token", "confirm"], "properties": {
+            "token": {"type": "string"}, "confirm": {"type": "boolean"}}},
+        tags=["speakers"]))
+    add("/speakers/relabel/cancel", "post", _op(
+        "Drop a planned relabel", "",
+        body={"type": "object", "required": ["token"],
+              "properties": {"token": {"type": "string"}}}, tags=["speakers"]))
     add("/chats", "get", _op("Global (cross-meeting) AI chat conversations",
                              tags=["chats"]))
     add("/chats/{conversation_id}", "get", _op(

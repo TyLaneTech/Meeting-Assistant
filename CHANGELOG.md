@@ -45,7 +45,7 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
-## Added a Storage view and a Free up space tool, and made Activity one chart (2026-09-08)
+## Added a Storage view, a Free up space tool, and speaker identification for AI assistants, and made Activity one chart (2026-09-08)
 
 ### Home
 
@@ -64,13 +64,24 @@ word. If a bullet needs more than two of these, it is two bullets.
   - **Trim and split backup copies** are re-encoded too, and undo still works
   - **Files that belong to no meeting**, and fragments encoders left behind, can be removed. That switch is off unless you turn it on, every time, and only files older than six hours are touched
 - Each file is checked before it replaces the original, a meeting that is recording or being reanalysed is skipped, and a file that is open in a player is left as it was and reported
+  - Everything the tool changed is recorded, so the Storage card can say what is compressed and a second run skips it
 - Progress shows file by file while it runs, you can stop after the current file, and closing the window lets it carry on
 
 ### Recordings list
 
 - **Folders start closed.** A folder you have not opened stays folded instead of every folder unfolding itself in a fresh browser. Open one and it stays open; opening a recording still unfolds the folder it is in
 
-> Everything the tool changed is recorded, so the Storage card can say what is compressed and a second run skips it.
+### Agent API
+
+- **Name the speakers from an AI assistant.** Claude Desktop, Claude Code and Codex can now work through the recordings that still have unnamed speakers: a queue lists them (the same recordings as `Needs attention`), a review gathers the evidence for each voice (what they said, who the calendar invited, the closest Voice Library matches and how clear they are, whether two detected speakers are really one person), screen frames show who was highlighted while they spoke, and a label tool applies the name the same way the `Speakers` dialog does
+  - Every label is per meeting and shows in the app at once. The assistant is told how far each kind of evidence can be trusted and asked to state its reason, which is written to the log
+  - A voice profile is only trained on the speaker's audio when the assistant marks the identity as certain, so a guess cannot pollute the library
+  - Your own microphone speaker can never be relabelled this way
+- **Fix one line** the diarizer gave to the wrong person, **rename a Voice Library profile** everywhere at once, **merge two profiles** that are the same person (after you confirm), and read the library's **health report**
+- **Bulk renames** across meetings use the same plan, confirm and apply steps as `Ask your meetings`
+- **Organise the library**: rename and move folders, and file many meetings into a folder in one call. Open tabs refresh on their own when an assistant changes something
+
+> Nothing in the Agent API deletes recordings, folders or notes. The one irreversible action, merging two voice profiles, needs an explicit confirmation. The switches in `Settings > Agent API` (on, off, access token) cover these tools too.
 
 ## Added a Join button, reworked Next on Home, folded the recording bar into the top bar, and sped up startup (2026-09-08)
 

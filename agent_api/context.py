@@ -74,3 +74,36 @@ class AgentContext:
     server_url: str = "http://localhost:6969"
     app_started_at: float = 0.0
     extra: dict = field(default_factory=dict)
+
+    # ── Speakers and organisation (optional: a context without them still
+    #    mounts the read-only API; the routes that need one answer 501) ──────
+    voice_library: Any = None
+    """app's SpeakerFingerprintDB (ml/speaker_db.py). ``ready`` says whether
+    the embedding model is loaded; its SQL-only methods work regardless."""
+
+    label_speaker: "Callable[..., list] | None" = None
+    """(session_id, speaker_keys, name, color, global_id, train) -> updated
+    speaker dicts. app._patch_session_speakers: the UI's own rename path
+    (live merge detection, SSE, summary refresh, voice-profile link)."""
+
+    apply_speaker_corrections: "Callable[[str, list, list], dict] | None" = None
+    """(session_id, clusters, noise_keys) -> result. The Cleanup tab's Save:
+    relink, unlink back to 'Speaker N', or flag as noise."""
+
+    relabel_segment: "Callable[..., Any] | None" = None
+    """(segment_id, label, source_override, train=bool) -> segment row.
+    Pins one transcript line to a speaker, as clicking it in the UI does."""
+
+    rename_profile: "Callable[..., dict] | None" = None
+    """(global_id, name=..., color=...) -> {name, color}. Renames a voice
+    profile and every label linked to it."""
+
+    merge_profiles: "Callable[[str, str], dict] | None" = None
+    """(keep_id, merge_id) -> {name, color}. app._apply_profile_merge."""
+
+    relabel_deps: "Callable[[], Any] | None" = None
+    """() -> ai.speaker_relabel.RelabelDeps wired to the real storage and
+    voice library, for the plan / apply bulk relabel pair."""
+
+    me_profile_id: "Callable[[], Any] | None" = None
+    """() -> the owner's own voice-profile id, or None."""

@@ -5488,6 +5488,14 @@ function connectSSE(afterSegId = 0) {
     AppData.invalidate(['sessions', 'attention', 'analytics'], 'speaker_label');
   });
 
+  // The Agent API renamed or moved folders or meetings, or relabelled speakers
+  // across meetings: the recordings list, the folder tree and the charts that
+  // count them are stale. refreshSidebar() is the canonical "list changed".
+  src.addEventListener('library_changed', () => {
+    refreshSidebar();
+    AppData.invalidate(['analytics', 'attention'], 'library_changed');
+  });
+
   src.addEventListener('attention_changed', () => {
     AppData.invalidate(['sessions', 'attention', 'analytics'], 'attention_changed');
   });
