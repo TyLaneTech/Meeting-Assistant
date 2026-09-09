@@ -45,7 +45,10 @@ def test_click_launcher_asks_the_app_to_open_its_window():
     app = _read("app.py")
     assert '@app.route("/api/window/open", methods=["POST"])' in app
     handler = app[app.index("def open_window"):app.index("def get_startup")]
-    assert "browser.open_app_window(" in handler
+    # The shortcut shows the app: it raises the window that is already open and
+    # only opens one when there is none. Both live behind app_window.show().
+    assert "app_window.show(" in handler
+    assert "browser.open_app_window(" not in handler
 
 
 def test_hidden_launcher_never_pauses():

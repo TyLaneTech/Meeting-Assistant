@@ -27,7 +27,7 @@ import sys
 import threading
 import webbrowser  # noqa: F401  (kept for fallback / compatibility)
 
-from core import browser
+from core import app_window
 from core import recording_request
 from pathlib import Path
 from typing import Callable, Optional
@@ -193,7 +193,9 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
     stop_url = f"{base}/api/recording/stop"
 
     def _open_session(_arg: str) -> None:
-        browser.open_app_window(session_url)
+        # The window the user already has is raised and sent to the meeting,
+        # so a toast never leaves a second one behind it.
+        app_window.show(session_url, reason="toast:quiet")
 
     def _stop_recording(_arg: str) -> None:
         try:
@@ -205,7 +207,7 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
             urllib.request.urlopen(req, timeout=5).read()
         except Exception as e:
             log.warn("notify", f"Stop-from-toast failed: {e}")
-        browser.open_app_window(session_url)
+        app_window.show(session_url, reason="toast:quiet-stop")
 
     return notify(
         "Still in the meeting?",
@@ -281,11 +283,12 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
         "toast:autostart", f"{app_name} meeting detected")
 
     def _open(_arg: str) -> None:
-        # Focus the app window the user already has (the installed PWA) rather
-        # than opening a second one. No autostart: the recording is already
-        # being requested, and a still-pending command reaches this window over
-        # SSE the moment it connects.
-        browser.open_app_window(session_url, prefer_pwa=True)
+        # Raise the app window the user already has rather than opening a
+        # second one, and leave it on whatever page it is showing: the
+        # recording is already being requested, and a still-pending command
+        # reaches this window over SSE the moment it connects.
+        app_window.show(session_url, prefer_pwa=True, navigate=False,
+                        reason="toast:autostarted")
 
     def _stop(_arg: str) -> None:
         try:

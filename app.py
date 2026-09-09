@@ -42,6 +42,7 @@ import numpy as np
 
 from core import log as log
 from core import browser as browser
+from core import app_window as app_window
 from core import calendar_feed as calendar_feed
 from core import calendar_sync as calendar_sync
 from core import calendar_events_api as calendar_events_api
@@ -467,7 +468,8 @@ def _notify_start_failed(source: str, reason: str) -> None:
 
     def _open(_arg: str) -> None:
         try:
-            browser.open_app_window(f"{_server_url}/session", prefer_pwa=True)
+            app_window.show(f"{_server_url}/session", prefer_pwa=True,
+                            navigate=False, reason="toast:start-failed")
         except Exception as e:
             log.warn("record", f"Opening the app window from the toast failed: {e}")
 
@@ -499,6 +501,13 @@ _start_coordinator = recording_request.StartRequestCoordinator(
     on_failure=_notify_start_failed,
 )
 recording_request.set_default(_start_coordinator)
+
+# The same rule for every other click that means "show me the app": the tray,
+# a toast, the Start Menu shortcut. core/app_window.py raises the window that is
+# open and sends it where the click was going, and only opens one when there is
+# nothing to raise. Unconfigured it opens a window like it always did, so this
+# call is what puts it in charge.
+app_window.configure(push=_push, client_count=_connected_client_count)
 
 
 def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
@@ -3313,12 +3322,13 @@ def _startup_lnk_path() -> Path:
 
 @app.route("/api/window/open", methods=["POST"])
 def open_window():
-    """Open (or focus) the app window.
+    """Show the app window: raise the open one, or open one when there is none.
 
     app_launcher.vbs, which the Start Menu shortcut runs, calls this once the
-    server answers, so the window logic (installed PWA, then a chromeless
-    --app window, then the default browser) lives in core/browser.py alone
-    instead of being repeated in VBScript with hardcoded paths and ids.
+    server answers, so the window logic (raise what is open, then the installed
+    PWA, then a chromeless --app window, then the default browser) lives in
+    core/app_window.py alone instead of being repeated in VBScript with
+    hardcoded paths and ids.
 
     The launcher says whether it was the one that started the server
     (``cold_start``). On a cold start the window is the app's decision, not
@@ -3345,8 +3355,12 @@ def open_window():
         if why:
             log.info("app", f"Start Menu launch: not opening a window here, {why}")
             return jsonify({"ok": True, "app_window": False, "opened": False, "reason": why})
-    opened = browser.open_app_window(f"{_server_url}{path}", prefer_pwa=(path == "/"))
-    return jsonify({"ok": True, "app_window": bool(opened), "opened": True})
+    # A bare "/" is the shortcut saying "show me the app", so a window that is
+    # already open is raised where it stands rather than sent home.
+    how = app_window.show(f"{_server_url}{path}", prefer_pwa=(path == "/"),
+                          navigate=(path != "/"), reason="start menu")
+    return jsonify({"ok": True, "app_window": how != "browser",
+                    "opened": how != "focused", "focused": how == "focused"})
 
 
 @app.route("/api/settings/startup")

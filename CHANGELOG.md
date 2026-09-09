@@ -70,6 +70,14 @@ word. If a bullet needs more than two of these, it is two bullets.
 ### Recordings list
 
 - **Folders start closed.** A folder you have not opened stays folded instead of every folder unfolding itself in a fresh browser. Open one and it stays open; opening a recording still unfolds the folder it is in
+- **The date headings tell you the day.** `Today` and `Yesterday` are now followed by the seven days before them, each under its own name (`Sunday`, `Saturday`, and so on), then `Last Week`, then one heading a month. The single `This Week` pile is gone
+  - A month from an earlier year carries the year, so `August` and `August 2025` are never the same heading
+
+### The app window
+
+- **One window, not a new one every time.** The tray icon, a notification and the Start Menu shortcut now bring the window you already have to the front. A day of clicking notifications used to leave a row of identical windows behind it
+  - A click that has somewhere to go, like `Settings...` on the tray menu, takes that window there instead of opening a second one to show it
+  - Clicking the tray icon during a recording brings the window forward and leaves it on the meeting
 
 ### Agent API
 

@@ -3428,7 +3428,9 @@ function _renderSidebar() {
       if (!filterActive) {
         ungrouped.sort((a, b) => b.started_at.localeCompare(a.started_at));
       }
-      const groups = groupByDate(ungrouped);
+      const groups = groupByDate(ungrouped, {
+        oldestFirst: filterActive && _sidebarFilter.sortBy === 'date_asc',
+      });
       for (const [label, items] of groups) {
         const groupEl = document.createElement('div');
         groupEl.className = 'session-group';
@@ -4479,30 +4481,66 @@ async function retitleFolder(folderId, folderName) {
   }
 }
 
-function groupByDate(sessions) {
-  const now   = new Date();
-  const today = dateKey(now);
-  const yest  = dateKey(new Date(now - 864e5));
-  const weekAgo = new Date(now - 7 * 864e5);
-
-  const map = new Map();
-  for (const s of sessions) {
-    const d   = new Date(s.started_at + 'Z');
-    const key = dateKey(d);
-    let label;
-    if (key === today)       label = 'Today';
-    else if (key === yest)   label = 'Yesterday';
-    else if (d >= weekAgo)   label = 'This Week';
-    else                     label = d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
-
-    if (!map.has(label)) map.set(label, []);
-    map.get(label).push(s);
-  }
-  return map;
+/**
+ * Whole calendar days from `d` to `now`, in local time. Rounding absorbs the
+ * 23 and 25 hour days daylight saving produces, so a boundary never lands an
+ * hour early or late; a clock-skewed future timestamp comes back negative.
+ */
+function calendarDaysAgo(d, now) {
+  const then  = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((today - then) / 864e5);
 }
 
-function dateKey(d) {
-  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+/**
+ * The date header a recording sits under in the sidebar, coarsening with age:
+ *
+ *   Today, Yesterday          the two most recent days
+ *   Monday ... Sunday         the seven days before those, one header a day
+ *   Last Week                 the seven days before those
+ *   August / August 2025      everything older, a header per calendar month
+ *
+ * The named days are seven consecutive ones, so each weekday name is used at
+ * most once and a header is never ambiguous. Months in the current year read
+ * bare; earlier years carry the year, which is the only thing separating one
+ * August from the next.
+ */
+function sessionGroupLabel(d, now) {
+  const days = calendarDaysAgo(d, now);
+  if (days <= 0)  return 'Today';
+  if (days === 1) return 'Yesterday';
+  if (days <= 8)  return d.toLocaleDateString(undefined, { weekday: 'long' });
+  if (days <= 15) return 'Last Week';
+  return d.toLocaleDateString(undefined, d.getFullYear() === now.getFullYear()
+    ? { month: 'long' }
+    : { month: 'long', year: 'numeric' });
+}
+
+/**
+ * Bucket sessions under their date headers, newest header first (or oldest
+ * first, for the sort that asks for it).
+ *
+ * The headers are ordered here rather than left to arrive with the sessions,
+ * because a filter sorted by title or by length hands them over in an order
+ * that has nothing to do with dates, and Today, Last Week and August scattered
+ * through each other read as a bug. The order inside a header is untouched, so
+ * the chosen sort still holds where it can be seen.
+ */
+function groupByDate(sessions, { oldestFirst = false } = {}) {
+  const now = new Date();
+  const groups = new Map();
+  for (const s of sessions) {
+    const d = new Date(s.started_at + 'Z');
+    const label = sessionGroupLabel(d, now);
+    let group = groups.get(label);
+    if (!group) groups.set(label, group = { at: d.getTime(), items: [] });
+    group.items.push(s);
+  }
+  // A header covers one unbroken stretch of days, so any member of it dates
+  // the whole header against the others.
+  const ordered = [...groups.entries()].sort(
+    (a, b) => oldestFirst ? a[1].at - b[1].at : b[1].at - a[1].at);
+  return new Map(ordered.map(([label, group]) => [label, group.items]));
 }
 
 function formatSessionMeta(s) {
@@ -5102,6 +5140,17 @@ function connectSSE(afterSegId = 0) {
   _sseSource = src;
 
   src.addEventListener('status', e => onStatus(JSON.parse(e.data)));
+
+  // The desktop asking this window to go somewhere, so a tray item or a toast
+  // with a destination can raise the window that is already open instead of
+  // opening a second one to show it. Same router a click goes through, so the
+  // destination behaves exactly as it does when it arrives in the URL.
+  // See core/app_window.py.
+  src.addEventListener('navigate', e => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    if (d && d.url) navigateTo(d.url);
+  });
 
   // Loud, persistent banner when the desktop/call audio is not being captured
   // (dead loopback). This must never pass unnoticed again (2026-09-01).

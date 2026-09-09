@@ -139,7 +139,10 @@ def test_a_cold_start_from_the_start_menu_is_the_apps_call():
     assert 'settings.get("open_window_on_launch", False)' in handler
     assert "config.needs_setup(" in handler
     decision = handler.index('if body.get("cold_start"):')
-    assert decision < handler.index("browser.open_app_window(")
+    assert decision < handler.index("app_window.show(")
+    # A warm click on a bare "/" raises the open window where it stands, so a
+    # click during a meeting does not send that window home.
+    assert 'navigate=(path != "/")' in handler
     # Declining is still a 200: the launcher's Chrome fallback is for a server
     # without the route, not for an app that chose the tray.
     assert 'jsonify({"ok": True, "app_window": False, "opened": False' in handler

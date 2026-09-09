@@ -6,6 +6,9 @@ depends on (context/ui-overhaul-2026-09.md sections 3.1 to 3.4).
 """
 import json
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import jinja2
@@ -176,6 +179,177 @@ def test_sidebar_folders_default_to_closed():
     sub = js[js.index("async function createSubfolder("):js.index("refreshSidebar();", js.index("async function createSubfolder("))]
     assert "_sidebarExpanded.add(parentId)" in sub
     assert js.count("_saveFolderState();") == 4
+
+
+# ── Sidebar date headers coarsen with age ────────────────────────────────────
+
+_GROUP_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function grab(name) {
+  const m = src.match(new RegExp('\\nfunction ' + name + '\\([\\s\\S]*?\\n\\}'));
+  if (!m) { throw new Error('FAIL: ' + name + ' not found in app.js'); }
+  return m[0];
+}
+eval(grab('calendarDaysAgo'));
+eval(grab('sessionGroupLabel'));
+
+// Tuesday 8 September 2026, mid-afternoon.
+const now = new Date(2026, 8, 8, 15, 20);
+const back = n => new Date(2026, 8, 8 - n, 10, 30);
+
+const labels = [];
+for (let i = 0; i <= 20; i++) labels.push(sessionGroupLabel(back(i), now));
+
+// A weekday header names the day it holds, and the seven of them are seven
+// different days, so no name is used twice.
+const weekdays = [];
+for (let i = 2; i <= 8; i++) {
+  weekdays.push([sessionGroupLabel(back(i), now),
+                 back(i).toLocaleDateString(undefined, { weekday: 'long' })]);
+}
+
+// The boundaries are calendar days, not 24 hour blocks.
+const edges = {
+  midnightToday: sessionGroupLabel(new Date(2026, 8, 8, 0, 1), now),
+  lateYesterday: sessionGroupLabel(new Date(2026, 8, 7, 23, 59), now),
+  future: sessionGroupLabel(new Date(2026, 8, 9, 8, 0), now),
+};
+
+// Spring forward: two calendar days that are 47 hours apart still read as two.
+const springNow = new Date(2026, 2, 10, 12, 0);
+const springThen = new Date(2026, 2, 8, 12, 0);
+const dst = {
+  shifts: springThen.getTimezoneOffset() !== springNow.getTimezoneOffset(),
+  label: sessionGroupLabel(springThen, springNow),
+  expect: springThen.toLocaleDateString(undefined, { weekday: 'long' }),
+};
+
+const older = new Date(2025, 11, 14, 10, 0);
+console.log(JSON.stringify({
+  labels, weekdays, edges, dst,
+  priorYear: sessionGroupLabel(older, now),
+  priorYearBareMonth: older.toLocaleDateString(undefined, { month: 'long' }),
+  priorYearWithYear: older.toLocaleDateString(undefined,
+    { month: 'long', year: 'numeric' }),
+  sameYear: sessionGroupLabel(new Date(2026, 6, 14, 10, 0), now),
+  sameYearBareMonth: new Date(2026, 6, 14, 10, 0)
+    .toLocaleDateString(undefined, { month: 'long' }),
+}));
+"""
+
+
+def test_sidebar_date_headers_go_today_yesterday_weekdays_last_week_months():
+    """Today, Yesterday, then a header per day for the seven days before those,
+    then Last Week, then a header per month. Months in the current year are
+    bare; earlier ones carry the year, which is all that separates one August
+    from the next."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "groups.js"
+        path.write_text(_GROUP_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(STATIC / "app.js")],
+                             capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+
+    labels = got["labels"]
+    assert labels[0] == "Today"
+    assert labels[1] == "Yesterday"
+    # Seven consecutive days, seven distinct weekday names, each naming its day.
+    assert len(set(labels[2:9])) == 7
+    for label, weekday in got["weekdays"]:
+        assert label == weekday, (label, weekday)
+    assert "Today" not in labels[2:] and "Yesterday" not in labels[2:]
+    # The week before that is one group, and then the months start.
+    assert labels[9:16] == ["Last Week"] * 7
+    assert set(labels[16:]) == {"August"}
+
+    edges = got["edges"]
+    assert edges["midnightToday"] == "Today"
+    assert edges["lateYesterday"] == "Yesterday"
+    # A clock-skewed future stamp sits with today rather than off the top.
+    assert edges["future"] == "Today"
+
+    if got["dst"]["shifts"]:
+        assert got["dst"]["label"] == got["dst"]["expect"]
+
+    assert got["sameYear"] == got["sameYearBareMonth"]
+    assert got["priorYear"] == got["priorYearWithYear"]
+    assert got["priorYear"] != got["priorYearBareMonth"]
+
+
+_ORDER_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function grab(name) {
+  const m = src.match(new RegExp('\\nfunction ' + name + '\\([\\s\\S]*?\\n\\}'));
+  if (!m) { throw new Error('FAIL: ' + name + ' not found in app.js'); }
+  return m[0];
+}
+eval(grab('calendarDaysAgo'));
+eval(grab('sessionGroupLabel'));
+eval(grab('groupByDate'));
+
+// Four recordings, one to a header, handed over in an order no date sort
+// would ever produce (this is what "Longest first" or "Title A to Z" does).
+const now = new Date();
+const at = back => {
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - back, 12, 0);
+  return { id: 'd' + back, started_at: d.toISOString().replace('Z', '') };
+};
+const jumbled = [at(12), at(45), at(0), at(3)];
+
+const headers = list => [...list.keys()];
+console.log(JSON.stringify({
+  newestFirst: headers(groupByDate(jumbled)),
+  oldestFirst: headers(groupByDate(jumbled, { oldestFirst: true })),
+  insideKept: [...groupByDate([at(3), at(0), { id: 'also-today',
+    started_at: new Date(now.getFullYear(), now.getMonth(), now.getDate(), 8, 0)
+      .toISOString().replace('Z', '') }]).values()]
+    .map(items => items.map(s => s.id)),
+}));
+"""
+
+
+def test_sidebar_date_headers_stay_in_date_order_under_any_sort():
+    """A filter sorted by title or by length hands the recordings over in an
+    order that has nothing to do with dates. The headers still have to read
+    Today, then the days, then the months."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "order.js"
+        path.write_text(_ORDER_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(STATIC / "app.js")],
+                             capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+
+    assert got["newestFirst"][0] == "Today"
+    assert got["newestFirst"][2] == "Last Week"
+    assert len(got["newestFirst"]) == 4
+    assert got["oldestFirst"] == got["newestFirst"][::-1]
+    # Only the headers are reordered. Inside one, the incoming order stands.
+    assert got["insideKept"] == [["d0", "also-today"], ["d3"]]
+
+    js = _read(STATIC / "app.js")
+    assert "oldestFirst: filterActive && _sidebarFilter.sortBy === 'date_asc'" in js
+
+
+def test_the_sidebar_groups_ungrouped_recordings_through_one_labeller():
+    js = _read(STATIC / "app.js")
+    # One place decides a header, and the sidebar goes through it.
+    assert js.count("function sessionGroupLabel(") == 1
+    assert js.count("sessionGroupLabel(") == 2   # the definition and one caller
+    assert "const label = sessionGroupLabel(d, now);" in js
+    assert "const groups = groupByDate(ungrouped, {" in js
+    # The old three-bucket grouping (Today, Yesterday, This Week, month) is gone.
+    assert "'This Week'" not in js
+    assert "function dateKey(" not in js
 
 
 def test_the_sidebar_says_recordings_not_sessions(rendered):

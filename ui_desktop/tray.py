@@ -13,7 +13,7 @@ import threading
 import urllib.request
 import webbrowser  # noqa: F401  (kept for fallback / compatibility)
 
-from core import browser
+from core import app_window
 from core import recording_request
 from pathlib import Path
 from typing import Callable
@@ -399,18 +399,22 @@ class MeetingTray:
     # ── Menu callbacks ────────────────────────────────────────────────────────
 
     def _open_browser(self, icon=None, item=None) -> None:
-        # Prefer the installed app: this opens or FOCUSES the window the user
-        # already has pinned instead of adding a second one. The two items
-        # below keep the plain form because an --app-id launch cannot carry a
-        # query string.
-        browser.open_app_window(self._url, prefer_pwa=True)
+        # Clicking the tray icon means "show me the app", so the window the
+        # user already has is raised where it stands: a click while a meeting
+        # is being recorded must not send that window home. Only when there is
+        # nothing to raise is a window opened, the installed PWA first so it
+        # docks under the taskbar pin.
+        app_window.show(self._url, prefer_pwa=True, navigate=False, reason="tray")
 
     def _open_settings(self, icon=None, item=None) -> None:
-        browser.open_app_window(f"{self._url}/session?settings=1")
+        # These two carry a destination, so the open window is sent there over
+        # SSE rather than a second one being opened to show it.
+        app_window.show(f"{self._url}/session?settings=1", reason="tray settings")
 
     def _check_updates(self, icon=None, item=None) -> None:
-        """Open the web UI with the settings panel on the System tab to check for updates."""
-        browser.open_app_window(f"{self._url}/session?settings=1&section=system")
+        """Show the web UI with the settings panel on the System tab to check for updates."""
+        app_window.show(f"{self._url}/session?settings=1&section=system",
+                        reason="tray updates")
 
     def _restart_server(self, icon=None, item=None) -> None:
         """Restart the server via the API.
