@@ -1733,6 +1733,86 @@ def reset_session_transcript(session_id: str) -> None:
         )
 
 
+def snapshot_session_transcript(session_id: str) -> dict:
+    """Everything :func:`reset_session_transcript` is about to delete.
+
+    Deliberately narrower than the trim/split snapshot: reanalysis rebuilds the
+    transcript and the speaker rows and nothing else, so restoring anything
+    else (a summary, chat) would undo edits made while the pass was running.
+    Carries ``global_id``, the Voice Library link, which the session view's
+    ``speaker_profiles`` omits.
+    """
+    with _conn() as conn:
+        segments = conn.execute(
+            "SELECT text, source, start_time, end_time, label_override, "
+            "source_override, created_at FROM transcript_segments "
+            "WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        speakers = conn.execute(
+            "SELECT speaker_key, name, color, global_id FROM speaker_labels "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+    return {
+        "session_id": session_id,
+        "segments": [dict(r) for r in segments],
+        "speaker_labels": [dict(r) for r in speakers],
+    }
+
+
+def restore_session_transcript(session_id: str, snapshot: dict) -> int:
+    """Put back what :func:`reset_session_transcript` deleted. Returns rows.
+
+    The exact inverse, including the search index: reanalysis clears the
+    transcript before it has a replacement, so an interrupted pass leaves the
+    meeting empty unless this can put the old one back.
+    """
+    segments = (snapshot or {}).get("segments") or []
+    speakers = (snapshot or {}).get("speaker_labels") or []
+    with _conn() as conn:
+        conn.execute("DELETE FROM transcript_segments WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+        conn.execute(
+            "DELETE FROM search_fts WHERE session_id = ? AND kind = 'segment'",
+            (session_id,),
+        )
+        for seg in segments:
+            cur = conn.execute(
+                "INSERT INTO transcript_segments "
+                "(session_id, text, source, start_time, end_time, label_override, "
+                "source_override, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    seg.get("text", ""),
+                    seg.get("source", "loopback"),
+                    float(seg.get("start_time") or 0.0),
+                    float(seg.get("end_time") or 0.0),
+                    seg.get("label_override"),
+                    seg.get("source_override"),
+                    seg.get("created_at") or _now(),
+                ),
+            )
+            text = seg.get("text", "")
+            if text and text.strip():
+                try:
+                    conn.execute(
+                        "INSERT INTO search_fts (session_id, source_id, kind, text) "
+                        "VALUES (?, ?, 'segment', ?)",
+                        (session_id, cur.lastrowid, text),
+                    )
+                except Exception:
+                    pass
+        for sp in speakers:
+            conn.execute(
+                "INSERT INTO speaker_labels (session_id, speaker_key, name, color, global_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, sp.get("speaker_key"), sp.get("name") or "",
+                 sp.get("color"), sp.get("global_id")),
+            )
+    return len(segments)
+
+
 def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
     """Replace a session's transcript/speaker/chat/summary state from a snapshot."""
     session = snapshot or {}

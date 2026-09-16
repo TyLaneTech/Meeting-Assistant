@@ -1692,6 +1692,10 @@ const state = {
   isTesting:      false,
   isViewingPast:  false,
   isReanalyzing:  false,
+  // The meeting stopped but the transcriber is still working through audio it
+  // had not caught up with. Segments keep arriving for that session, so the
+  // transcript view must keep appending them the way it does for a reanalysis.
+  isDrainingBacklog: false,
   sessionHasAudio: false,
   aiChatBusy:     false,
   modelReady:     false,
@@ -5155,12 +5159,22 @@ function connectSSE(afterSegId = 0) {
   // Loud, persistent banner when the desktop/call audio is not being captured
   // (dead loopback). This must never pass unnoticed again (2026-09-01).
   src.addEventListener('capture_alert', e => { try { _showCaptureAlert(JSON.parse(e.data)); } catch (_) {} });
+  src.addEventListener('transcription_backlog', e => { try { _showTranscriptionBacklog(JSON.parse(e.data)); } catch (_) {} });
+  // A rolled-back reanalysis put the previous transcript back: reload it so the
+  // view stops showing the empty rebuild it was watching.
+  src.addEventListener('reanalysis_rolled_back', e => {
+    try {
+      const d = JSON.parse(e.data);
+      uiToast({ message: `The reanalysis did not finish. That meeting's previous transcript (${d.segments} segments) has been put back.`, kind: 'warn' });
+      if (d.session_id && d.session_id === state.sessionId) loadSession(d.session_id);
+    } catch (_) {}
+  });
 
   src.addEventListener('transcript', e => {
     const d = JSON.parse(e.data);
     if (d.session_id && d.session_id !== state.sessionId) return;
     if (d.seg_id) _lastLiveSegId = Math.max(_lastLiveSegId, d.seg_id);
-    if (!state.isViewingPast || state.isReanalyzing) {
+    if (!state.isViewingPast || state.isReanalyzing || state.isDrainingBacklog) {
       // source_override arrives when a manual reassignment is sticking to
       // this diarizer key (see source_redirect); render as the target speaker.
       appendTranscript(d.text, d.source_override || d.source || 'loopback',
@@ -5172,7 +5186,7 @@ function connectSSE(afterSegId = 0) {
   src.addEventListener('transcript_update', e => {
     const d = JSON.parse(e.data);
     if (d.session_id && d.session_id !== state.sessionId) return;
-    if ((!state.isViewingPast || state.isReanalyzing) && d.seg_id) {
+    if ((!state.isViewingPast || state.isReanalyzing || state.isDrainingBacklog) && d.seg_id) {
       const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
       if (seg) {
         // Source changed (e.g. noise reclaimed as real speaker) - full re-render
@@ -18832,13 +18846,34 @@ function _finishBulkLoad() {
 
 async function confirmShutdown() {
   closeMenu();
+  // A reanalysis has already cleared the transcript it is rebuilding, so
+  // quitting under one is destructive in a way stopping a recording is not.
+  // The server refuses it too; this is the explanation, not the guard.
+  if (state.isReanalyzing) {
+    const confirmed = await uiConfirm({
+      title: 'Quit while a meeting is being reanalyzed?',
+      message: 'That meeting’s transcript is being rebuilt right now. Quitting stops the rebuild and puts the previous transcript back, so the reanalysis will have to be run again.',
+      confirmLabel: 'Quit anyway', danger: true,
+    });
+    if (confirmed) doShutdown(true);
+    return;
+  }
   if (!state.isRecording) { doShutdown(); return; }
   const confirmed = await uiConfirm({ title: 'Quit Meeting Assistant?', message: 'A recording is in progress. Quitting stops it and closes Meeting Assistant.', confirmLabel: 'Stop and quit', danger: true });
   if (confirmed) doShutdown();
 }
 
-async function doShutdown() {
-  await fetch('/api/shutdown', { method: 'POST' }).catch(() => {});
+async function doShutdown(force) {
+  const resp = await fetch('/api/shutdown', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force: !!force }),
+  }).catch(() => null);
+  if (resp && !resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    uiToast({ message: err.error || 'Could not quit right now.', kind: 'warn' });
+    return;
+  }
   const screen = _showTransitionScreen('Meeting Assistant has quit', 'You can close this tab.');
   // Freeze the animation after a moment for a calm stopped state
   setTimeout(() => screen.stop(), 3000);
@@ -20078,6 +20113,68 @@ function _showCaptureAlert(d) {
 
 function _clearCaptureAlert() {
   const bar = document.getElementById('capture-alert-bar');
+  if (bar) bar.style.display = 'none';
+}
+
+// How far behind transcription is, when that is far enough to matter. Driven by
+// the server's transcription_backlog event. A pipeline slower than real time
+// used to give no sign at all: the meeting looked healthy for its whole length
+// and the transcript simply stopped partway through. This is amber, not red,
+// because nothing is lost while it is up - the recording is complete and the
+// backlog is still being worked through.
+function _showTranscriptionBacklog(d) {
+  const pending = Number(d && d.pending_sec) || 0;
+  const draining = !!(d && d.draining);
+  const dropped = Number(d && d.dropped_chunks) || 0;
+  state.isDrainingBacklog = draining;
+  if (!draining && pending < 60 && !dropped) { _clearTranscriptionBacklog(); return; }
+
+  const mins = Math.max(1, Math.round(pending / 60));
+  let msg;
+  if (draining) {
+    msg = pending > 0
+      ? `Still transcribing the last ${mins} min of that meeting. You can keep using the app; the transcript fills in as it goes.`
+      : 'Finishing transcription…';
+  } else if (dropped) {
+    // The feed overran: that audio never reached the transcriber, so only a
+    // reanalysis can put those spans in the transcript. The recording itself
+    // is complete either way.
+    msg = `Transcription cannot keep up with this recording, so parts of it are being skipped. The audio is still being saved in full - reanalyze the meeting afterwards to transcribe all of it.`;
+  } else {
+    msg = `Transcription is ${mins} min behind the recording. It will catch up after you stop.`;
+  }
+
+  let bar = document.getElementById('transcription-backlog-bar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'transcription-backlog-bar';
+    bar.style.cssText = [
+      'position:fixed', 'bottom:0', 'left:0', 'right:0', 'z-index:99998',
+      // Not var(--yellow): its dark-theme value (#d29922) is too light to
+      // carry white text. This is the light-theme amber, fixed, in both.
+      'background:#9a6700', 'color:#fff', 'padding:9px 16px',
+      'font:600 13px/1.45 system-ui,-apple-system,sans-serif', 'display:flex',
+      'align-items:center', 'gap:12px', 'box-shadow:0 -2px 12px rgba(0,0,0,.35)',
+    ].join(';');
+    const icon = document.createElement('span');
+    icon.innerHTML = '<i class="fa-solid fa-hourglass-half"></i>';
+    const txt = document.createElement('span');
+    txt.id = 'transcription-backlog-text';
+    txt.style.flex = '1';
+    const x = document.createElement('button');
+    x.textContent = '×';
+    x.setAttribute('aria-label', 'Dismiss');
+    x.style.cssText = 'background:transparent;border:0;color:#fff;font-size:20px;cursor:pointer;line-height:1;padding:0 4px';
+    x.addEventListener('click', _clearTranscriptionBacklog);
+    bar.append(icon, txt, x);
+    document.body.appendChild(bar);
+  }
+  document.getElementById('transcription-backlog-text').textContent = msg;
+  bar.style.display = 'flex';
+}
+
+function _clearTranscriptionBacklog() {
+  const bar = document.getElementById('transcription-backlog-bar');
   if (bar) bar.style.display = 'none';
 }
 

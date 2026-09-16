@@ -39,6 +39,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1293,8 +1295,168 @@ def handle(msg: dict) -> None:
     _reply(req_id, error={"code": -32601, "message": f"Method not found: {method}"})
 
 
+# ── Client-death watchdog ─────────────────────────────────────────────────────
+#
+# serve() exits on a clean stdin EOF, which is how a well-behaved MCP client
+# shuts a stdio server down. That is not enough on Windows. When the client is
+# force-killed (Task Manager, taskkill /F, a crashed editor host), a sibling
+# process that inherited the write end of our stdin pipe holds it open, so the
+# pipe never breaks, readline() blocks forever, and we are left running with a
+# dead parent until the machine reboots. Waiting on the client's process handle
+# closes that hole: the instant it goes, so do we.
+#
+# Under a uv-created venv on Windows, .venv\Scripts\python.exe is a trampoline
+# that runs the real interpreter as its child, so the MCP client is our
+# grandparent, not our parent. We detect that exactly (sys.executable is the
+# trampoline, sys._base_executable the image actually running) and step up one
+# level, rather than guessing our way up the tree past anything Python-shaped:
+# an MCP client that is itself a Python process must be watched, not walked
+# through.
+
+
+def _process_table() -> tuple[dict[int, int], dict[int, str]]:
+    """Snapshot of every process: {pid: parent_pid} and {pid: exe name}.
+
+    Windows only; returns empty dicts if the snapshot is unavailable.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x0002
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+    MAX_PATH = 260
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * MAX_PATH)]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32First.argtypes = [wintypes.HANDLE,
+                                   ctypes.POINTER(PROCESSENTRY32)]
+    k32.Process32Next.argtypes = [wintypes.HANDLE,
+                                  ctypes.POINTER(PROCESSENTRY32)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE:
+        return {}, {}
+    parent_of: dict[int, int] = {}
+    name_of: dict[int, str] = {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        ok = k32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            parent_of[pid] = int(entry.th32ParentProcessID)
+            name_of[pid] = entry.szExeFile.decode("mbcs", "replace").lower()
+            ok = k32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return parent_of, name_of
+
+
+def _launched_by_trampoline() -> bool:
+    """True when sys.executable is a launcher that runs the real interpreter as
+    a child process, which is how uv builds a venv on Windows. Our parent is
+    then that launcher and the MCP client sits one level above it."""
+    base = getattr(sys, "_base_executable", None)
+    if not base:
+        return False
+    return os.path.normcase(base) != os.path.normcase(sys.executable)
+
+
+def _client_pids() -> list[int]:
+    """The PIDs whose death means our MCP client is gone. Windows only."""
+    parent_of, name_of = _process_table()
+    if not parent_of:
+        return []
+    # PID 0 and 4 are the idle and System processes: the top of the tree.
+    ppid = parent_of.get(os.getpid(), 0)
+    if ppid in (0, 4):
+        return []
+    pids = [ppid]
+    launcher = os.path.basename(sys.executable).lower()
+    if _launched_by_trampoline() and name_of.get(ppid, "") == launcher:
+        grandparent = parent_of.get(ppid, 0)
+        if grandparent not in (0, 4, ppid):
+            pids.append(grandparent)
+    return pids
+
+
+def _wait_for_client_death_windows() -> None:
+    """Block until any watched ancestor exits, then take the process down."""
+    import ctypes
+    from ctypes import wintypes
+
+    SYNCHRONIZE = 0x00100000
+    INFINITE = 0xFFFFFFFF
+
+    pids = _client_pids()
+    if not pids:
+        return
+
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.WaitForMultipleObjects.argtypes = [wintypes.DWORD,
+                                           ctypes.POINTER(wintypes.HANDLE),
+                                           wintypes.BOOL, wintypes.DWORD]
+    handles = [h for h in (k32.OpenProcess(SYNCHRONIZE, False, pid)
+                           for pid in pids) if h]
+    if not handles:
+        return
+    block = (wintypes.HANDLE * len(handles))(*handles)
+    k32.WaitForMultipleObjects(len(handles), block, False, INFINITE)
+    _log("MCP client exited; shutting down")
+    os._exit(0)
+
+
+def _wait_for_client_death_posix() -> None:
+    """Exit once we are reparented away from the client that spawned us.
+
+    uv uses a symlinked interpreter rather than a trampoline on POSIX, so our
+    immediate parent is the client. When it dies we are reparented to init or
+    launchd and getppid() changes.
+    """
+    original = os.getppid()
+    while True:
+        time.sleep(5)
+        if os.getppid() != original:
+            _log("MCP client exited; shutting down")
+            os._exit(0)
+
+
+def _start_client_watchdog() -> None:
+    """Start the watchdog in the background. Never fatal: a server that cannot
+    watch its client is still a working server."""
+    target = (_wait_for_client_death_windows if os.name == "nt"
+              else _wait_for_client_death_posix)
+
+    def run() -> None:
+        try:
+            target()
+        except Exception as e:
+            _log(f"client watchdog unavailable: {e}")
+
+    threading.Thread(target=run, name="client-watchdog", daemon=True).start()
+
+
+# ── Serve ─────────────────────────────────────────────────────────────────────
+
 def serve() -> None:
     _log(f"serving stdio; app expected at {BASE}")
+    _start_client_watchdog()
     while True:
         line = sys.stdin.buffer.readline()
         if not line:

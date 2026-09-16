@@ -469,6 +469,47 @@ class _StreamAccumulator:
             self.on_flush(buf, start_t, end_t)
 
 
+# How much un-transcribed audio the feed may hold before the capture side has
+# to drop chunks. The queue holds raw PCM: at 48 kHz / CHUNK_SIZE 512 that is
+# ~94 items a second, each carrying the mixed chunk plus the per-source mic and
+# desktop chunks, so roughly 310 KB of backlog per second of audio. 15 minutes
+# is about 280 MB, which is the most a desktop app should hold hostage; an
+# unbounded queue on a sub-real-time pipeline grew past a gigabyte on a long
+# meeting and risked taking the whole process down with it.
+#
+# Reaching the cap is a real fault, not a tuning knob: the WAV is written
+# before the queue is fed (capture_audio/windows.py), so the audio survives and
+# a reanalysis rebuilds it, but the live transcript loses that span. Drops are
+# counted and surfaced rather than swallowed.
+MAX_QUEUE_SECONDS = 15 * 60
+
+
+class TranscriptionQueue(queue.Queue):
+    """The transcriber's feed: bounded, and it counts what it could not hold.
+
+    ``queue.Queue()`` with no maxsize gave a consumer that runs slower than
+    real time nowhere to fail: the backlog just grew, invisibly, until Stop
+    threw it away. A bound turns that into a number someone can see.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize=maxsize)
+        self.dropped = 0
+
+    def put_nowait(self, item):
+        try:
+            super().put_nowait(item)
+        except queue.Full:
+            self.dropped += 1
+            raise
+
+
+def make_audio_queue(sample_rate: int = 48_000) -> TranscriptionQueue:
+    """A feed bounded at ``MAX_QUEUE_SECONDS`` of audio for this sample rate."""
+    per_second = max(1.0, sample_rate / Transcriber.CHUNK_SIZE)
+    return TranscriptionQueue(maxsize=int(MAX_QUEUE_SECONDS * per_second))
+
+
 class Transcriber:
     TARGET_RATE = 16_000
     CHUNK_SIZE = 512           # Must match AudioCapture.CHUNK_SIZE
@@ -484,6 +525,15 @@ class Transcriber:
         self.diarizer = None   # StreamingDiarizer | None, set via load_diarizer()
         self.is_running = False
         self._thread: threading.Thread | None = None
+        # Drain: the capture has stopped but the queue still holds audio nobody
+        # has transcribed yet. The loop keeps consuming while this is set and
+        # exits once the queue runs dry, instead of dropping the backlog on the
+        # floor the moment is_running goes false. _drain_done is what callers
+        # wait on; it starts set so a transcriber that never drained is not
+        # something to wait for.
+        self._draining = False
+        self._drain_done = threading.Event()
+        self._drain_done.set()
         self.sample_rate: int | None = None
         self.channels: int | None = None
         # Per-speaker prompt context (label -> recent transcript text), fed
@@ -639,11 +689,14 @@ class Transcriber:
 
     def start(self, sample_rate: int, channels: int, next_speaker_label: int = 1) -> None:
         # Stop any previous loop that's still running (e.g. if the cleanup
-        # thread from a prior stop_recording hasn't finished yet).
+        # thread from a prior stop_recording hasn't finished yet), including a
+        # drain the new recording is taking the queue away from.
+        self.cancel_drain()
         if self._thread is not None and self._thread.is_alive():
             self.is_running = False
             self._thread.join(timeout=5)
             self._thread = None
+        self._drain_done.set()
         self.sample_rate = sample_rate
         self.channels = channels
         self._contexts.clear()
@@ -656,12 +709,93 @@ class Transcriber:
         diar = "with diarization" if self.diarizer else "no diarization"
         log.info("transcriber", f"Started ({diar}, {sample_rate} Hz)")
 
+    @property
+    def pending_seconds(self) -> float:
+        """Seconds of captured audio waiting in the feed, un-transcribed."""
+        per_second = (self.sample_rate or 48_000) / self.CHUNK_SIZE
+        if per_second <= 0:
+            return 0.0
+        return self.audio_queue.qsize() / per_second
+
+    @property
+    def is_draining(self) -> bool:
+        return self._draining
+
+    @property
+    def dropped_chunks(self) -> int:
+        """Chunks the capture could not hand over because the feed was full."""
+        return int(getattr(self.audio_queue, "dropped", 0))
+
     def stop(self) -> None:
+        """Stop the consumer now, discarding anything still queued.
+
+        For the end of a recording use :meth:`begin_drain` instead: this drops
+        the backlog, which on a pipeline slower than real time is the tail of
+        the meeting. Kept immediate for the force-quit and takeover paths,
+        where the alternative is hanging the exit.
+        """
+        self.cancel_drain()
         self.is_running = False
         if self._thread:
             self._thread.join(timeout=12)
             self._thread = None
         log.info("transcriber", "Stopped.")
+
+    def begin_drain(self) -> float:
+        """Finish the queued backlog, then stop. Returns immediately.
+
+        Call this only once the capture has stopped, so the queue is finite and
+        will actually run dry. The loop keeps pulling until the queue is empty,
+        then flushes and exits; :meth:`await_drain` waits for that. Nothing
+        blocks here, because the backlog can be longer than the meeting on a
+        slow machine and the Stop button must not wait for it.
+        """
+        if self._thread is None or not self._thread.is_alive():
+            # Nothing consuming: the queue would never empty on its own.
+            self.is_running = False
+            self._draining = False
+            self._drain_done.set()
+            self._thread = None
+            return 0.0
+        pending = self.pending_seconds
+        self._drain_done.clear()
+        self._draining = True
+        self.is_running = False
+        if pending >= 1.0:
+            log.warn("transcriber",
+                     f"Draining {pending / 60:.1f} min of audio the live "
+                     f"transcription never caught up with")
+        return pending
+
+    def cancel_drain(self) -> float:
+        """Abandon a running drain and say what it cost. Returns the seconds of
+        backlog given up.
+
+        A new recording needs the feed and the models now, and the abandoned
+        meeting's audio is on disk either way, so the tail is recoverable by
+        reanalysing it. Losing it silently is what this is here to prevent.
+        """
+        if not self._draining:
+            return 0.0
+        left = self.pending_seconds
+        self._draining = False
+        self._drain_done.set()
+        if left >= 1.0:
+            log.warn("transcriber",
+                     f"Drain abandoned with {left / 60:.1f} min still queued; "
+                     f"reanalyse that meeting to recover its tail")
+        return left
+
+    def await_drain(self, timeout: float | None = None) -> bool:
+        """Block until a drain started by :meth:`begin_drain` has finished.
+
+        Returns True when the backlog was transcribed, False on timeout. Safe
+        to call when no drain is running (returns True at once).
+        """
+        finished = self._drain_done.wait(timeout=timeout)
+        if finished and self._thread is not None and not self._thread.is_alive():
+            self._thread = None
+        return finished
 
     def unload(self) -> None:
         """Release the Whisper engine and diarizer to reclaim memory.
@@ -673,7 +807,9 @@ class Transcriber:
         capture is running (a wrong unload destroys a live transcription;
         a missed one only keeps memory held). Idempotent.
         """
-        if self.is_running:
+        if self.is_running or self._draining:
+            # Draining counts as running: the loop is still feeding Whisper the
+            # backlog, and clearing self.model under it kills the tail.
             log.warn("transcriber", "unload() called while running; ignored")
             return
         had_models = self.model is not None or self.diarizer is not None
@@ -1118,13 +1254,32 @@ class Transcriber:
         self.model = make_engine("small", "cpu", "int8")
         log.info("whisper", "CPU fallback ready.")
 
+    def _finish_drain(self) -> None:
+        """Release anyone waiting on ``await_drain``. Runs on the loop thread
+        however the loop ended, including a stop that cut a drain short."""
+        self._draining = False
+        self._drain_done.set()
+
     def _loop(self) -> None:
         """Dispatch to the two-stream ("mic = Me") loop when a Me label is
-        configured, else the legacy single mixed-stream loop."""
-        if self.me_label:
-            self._loop_two_stream()
-        else:
-            self._loop_legacy()
+        configured, else the legacy single mixed-stream loop.
+
+        The finally is load-bearing: ``await_drain`` blocks on ``_drain_done``,
+        so a loop that died on an unhandled exception would hang the stop's
+        deferred tail (the title, the export, the chapters pass) for the life
+        of the process rather than just losing the backlog.
+        """
+        try:
+            if self.me_label:
+                self._loop_two_stream()
+            else:
+                self._loop_legacy()
+        except Exception:
+            log.error("transcriber", "Transcription loop died:")
+            traceback.print_exc()
+            raise
+        finally:
+            self._finish_drain()
 
     def _loop_two_stream(self) -> None:
         """Route per-source PCM (5-tuples from the capture mixer) into two
@@ -1172,7 +1327,7 @@ class Transcriber:
         desktop = _mk(lambda buf, s, e: self._transcribe(
             buf, "loopback", start_time=s, end_time=e))
 
-        while self.is_running:
+        while self.is_running or self._draining:
             try:
                 item = self.audio_queue.get(timeout=0.5)
                 if isinstance(item, tuple) and len(item) >= 5:
@@ -1201,6 +1356,10 @@ class Transcriber:
                 # Genuine audio gap - flush both streams.
                 mic.flush()
                 desktop.flush()
+                if self._draining:
+                    # The capture has stopped and the queue has run dry, so
+                    # this gap is the end of the backlog, not a pause.
+                    break
 
         # Final flush on shutdown.
         mic.flush()
@@ -1236,7 +1395,7 @@ class Transcriber:
             first_offset = -1
             last_offset  = -1
 
-        while self.is_running:
+        while self.is_running or self._draining:
             try:
                 item = self.audio_queue.get(timeout=0.5)
                 if isinstance(item, tuple) and len(item) >= 3:
@@ -1276,6 +1435,10 @@ class Transcriber:
             except queue.Empty:
                 # Queue dried up (genuine audio gap) - flush whatever we have
                 _flush()
+                if self._draining:
+                    # Draining after the capture stopped: a dry queue is the
+                    # end of the backlog, so we are done.
+                    break
 
         # Final flush
         _flush()

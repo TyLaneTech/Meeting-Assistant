@@ -45,6 +45,60 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Fixed long meetings losing the end of their transcript (2026-09-11)
+
+### Recording
+
+- **A meeting that transcribes slower than it records no longer loses its ending.**
+  On a slower computer, or with a large transcription model, the app can fall behind
+  the recording. That backlog used to be thrown away the moment you pressed `Stop`,
+  so an hour-long meeting could end up with only its first forty minutes written
+  down, with nothing on screen to say so
+  - Pressing `Stop` now finishes the backlog instead of discarding it. The recording
+    ends straight away as before and the transcript keeps filling in behind it
+  - **The meeting's title, chapters and vault export now wait for that to finish**,
+    so they describe the whole meeting rather than the part that was transcribed by
+    the time you stopped
+- **A warning appears while transcription is falling behind**, with how far behind it
+  is, and again while the backlog finishes after you stop. The app used to give no
+  sign at all
+  - *Starting another recording ends the previous one's catch-up, because the new
+    meeting needs the same hardware.* Reanalyze the earlier meeting to fill it in
+
+### Reanalyzing
+
+- **Reanalyzing a meeting can no longer destroy its transcript.** Reanalysis clears
+  the old transcript before building the new one, so anything that interrupted it
+  left the meeting empty with no way back. The old transcript is now kept until the
+  new one is finished, and put back if the pass does not get there
+  - This includes quitting, restarting, or the app being killed part-way through.
+    An interrupted rebuild is undone the next time the app starts
+- **Opening the app again during a reanalysis no longer kills it.** A second launch
+  used to be told the running app was idle and shut it down mid-rebuild. It now
+  reports that a meeting is being reanalyzed and leaves it alone
+  - `Quit` and `Restart` ask first for the same reason
+
+> Nothing recorded was ever at risk in any of this: the audio is saved separately and
+> was always complete. **Reanalyzing a meeting rebuilds a transcript that was cut
+> short**, which is worth doing for any older meeting that stops before the end.
+
+## Fixed AI assistant connections left running after a crash (2026-09-10)
+
+### Agent API
+
+- **An AI assistant that crashes or is force-quit no longer leaves its connection
+  running.** Every assistant you connect through `Settings > Agent API` (Claude
+  Desktop, Claude Code, Codex, a code editor) runs a small background helper for as
+  long as it is open. Closing the assistant normally always shut its helper down,
+  but killing it could leave the helper stranded until the computer restarted
+  - **Nothing was recorded or sent by a stranded helper.** It has no access of its
+    own and only passes on requests from an assistant that is no longer running
+  - **They were easy to miss.** Each one sat idle on almost no memory, so the only
+    sign was a long list of them in `Task Manager`
+
+> An assistant that is still open keeps its helper on purpose, so **one helper per
+> open assistant, editor window or terminal session** is normal and not a leak.
+
 ## Added a Storage view, a Free up space tool, and speaker identification for AI assistants, and made Activity one chart (2026-09-08)
 
 ### Home

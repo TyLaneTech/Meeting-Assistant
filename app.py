@@ -62,6 +62,7 @@ from ui_desktop import notifications as notifications
 from core import meeting_detect as meeting_detect
 from core import obsidian_export as obsidian
 from core import paths as paths
+from core import reanalysis_guard as reanalysis_guard
 from core import recording_request as recording_request
 from core import settings as settings
 from core import storage as storage
@@ -232,6 +233,7 @@ from ml.transcriber import (
     WHISPER_PRESETS,
     Transcriber,
     get_cuda_available,
+    make_audio_queue,
 )
 from agent_api import AgentContext, register_agent_api
 
@@ -269,7 +271,10 @@ ai = AIAssistant(
 )
 log.info("ai", f"Provider: {ai.provider}, model: {ai.model}")
 
-_audio_queue: queue.Queue = queue.Queue()
+# Bounded, and it counts what it had to drop. An unbounded feed let a pipeline
+# slower than real time build a backlog nobody could see and Stop threw away
+# (see ml/transcriber.MAX_QUEUE_SECONDS).
+_audio_queue = make_audio_queue()
 _transcriber = Transcriber(
     _audio_queue,
     lambda text, source, st=0.0, et=0.0: _on_segment(text, source, st, et),
@@ -1695,6 +1700,11 @@ def _start_background_initializers() -> None:
     # Before any of the threads below exists. See _preload_torch: they must not
     # be the first thing in the process to import PyTorch.
     _preload_torch()
+    # Before the model threads: a transcript left deleted by a reanalysis that
+    # was killed mid-rebuild is put back now, so the meeting is whole by the
+    # time anything can be opened. Cheap (a glob over the backup folders) and
+    # it must not wait on a model load.
+    _rollback_interrupted_reanalyses()
     threading.Thread(target=_load_model, daemon=True).start()
     threading.Thread(target=_load_diarizer, daemon=True).start()
     threading.Thread(target=_load_fingerprint_db, daemon=True).start()
@@ -1704,6 +1714,83 @@ def _start_background_initializers() -> None:
     # visit. Non-blocking; if the network is slow/unreachable the fallback
     # static lists are used until the fetch completes.
     threading.Thread(target=_get_all_models_live, daemon=True).start()
+
+
+# How far behind live transcription has to fall before the user is told. Below
+# this it is ordinary pipeline latency (Whisper runs a few seconds behind the
+# microphone by design); above it the pipeline is not keeping up and the gap
+# will grow for the rest of the meeting.
+_BACKLOG_WARN_SECONDS = 90.0
+# How often the backlog is re-pushed. Slow: this is a number that moves over
+# minutes, and the SSE stream already carries levels at 12 fps.
+_BACKLOG_POLL_SEC = 5.0
+
+
+def _drain_watch_transcription(session_id: str | None) -> None:
+    """Report drain progress over SSE until the backlog is gone.
+
+    The drain can outlast the meeting on a slow machine, and the app spent that
+    whole time saying nothing while the tail was discarded. One event every few
+    seconds is what makes it a visible phase instead of silence.
+    """
+    def _watch() -> None:
+        while _transcriber.is_draining:
+            pending = _transcriber.pending_seconds
+            _push("transcription_backlog", {
+                "session_id": session_id, "pending_sec": round(pending, 1),
+                "draining": True,
+            })
+            if not _transcriber.await_drain(timeout=_BACKLOG_POLL_SEC):
+                continue
+            break
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+def _backlog_push_loop() -> None:
+    """Warn while live transcription is falling behind the recording.
+
+    A pipeline slower than real time produced no feedback at all: the meeting
+    looked healthy for 74 minutes and the transcript stopped at 40. The backlog
+    is the one number that makes that visible while it can still be acted on.
+    """
+    warned = False
+    while True:
+        time.sleep(_BACKLOG_POLL_SEC)
+        with _state_lock:
+            is_rec = _state["is_recording"]
+            sid = _state["session_id"]
+        if not is_rec:
+            # Take a live warning down when the recording ends, but never while
+            # a drain is running: the drain owns the banner from that point and
+            # takes it down itself when the backlog is gone.
+            if warned and not _transcriber.is_draining:
+                _push("transcription_backlog", {
+                    "session_id": sid, "pending_sec": 0.0, "draining": False,
+                })
+            warned = False
+            continue
+        pending = _transcriber.pending_seconds
+        dropped = _transcriber.dropped_chunks
+        if pending < _BACKLOG_WARN_SECONDS and not dropped:
+            if warned:
+                _push("transcription_backlog", {
+                    "session_id": sid, "pending_sec": round(pending, 1),
+                    "draining": False,
+                })
+                warned = False
+            continue
+        if not warned:
+            log.warn("transcriber",
+                     f"Live transcription is {pending / 60:.1f} min behind the "
+                     f"recording and is not keeping up")
+        warned = True
+        _push("transcription_backlog", {
+            "session_id": sid, "pending_sec": round(pending, 1),
+            "dropped_chunks": dropped, "draining": False,
+        })
+
+
+threading.Thread(target=_backlog_push_loop, daemon=True).start()
 
 
 def _level_push_loop() -> None:
@@ -2729,12 +2816,18 @@ def start_recording():
         if not _recording_cleanup_done.wait(timeout=15):
             log.warn("recording", "Previous cleanup did not finish in 15 s, starting anyway")
 
+        # A drain from the previous meeting loses to a new recording: it needs
+        # this queue and these models now. Cancelled before the queue is
+        # emptied below, so the warning can still see what it cost.
+        _transcriber.cancel_drain()
+
         # Drain stale audio from a previous session
         while not _audio_queue.empty():
             try:
                 _audio_queue.get_nowait()
             except queue.Empty:
                 break
+        _audio_queue.dropped = 0   # this meeting's overruns, not the last one's
 
         body = request.get_json(silent=True) or {}
         title             = body.get("title")
@@ -3101,6 +3194,7 @@ def stop_recording():
     # must not do it on the Flask request handler thread or the server hangs.
     _recording_cleanup_done.clear()
     def _cleanup() -> None:
+        _drain_seconds = 0.0
         try:
             if capture:
                 # Joins threads and finalizes the mixed WAV (what playback and
@@ -3109,7 +3203,17 @@ def stop_recording():
                 # the button spent saying "Stopping…", and nothing in the UI
                 # waits on those tracks.
                 capture.stop(encode_per_source=False)
-            _transcriber.stop()
+            # The capture has stopped, so the feed is finite and will run dry:
+            # hand the transcriber what it has not caught up with yet instead
+            # of dropping it. Non-blocking, because on a pipeline slower than
+            # real time the backlog can outlast the meeting and the UI must
+            # leave "Stopping…" now. The deferred tail below waits for it.
+            _drain_seconds = _transcriber.begin_drain()
+            if _drain_seconds >= _BACKLOG_WARN_SECONDS:
+                _push("transcription_backlog", {
+                    "session_id": sid, "pending_sec": round(_drain_seconds, 1),
+                    "draining": True,
+                })
             # Stop screen recording if active
             if _screen_recorder.is_recording:
                 _screen_recorder.stop()
@@ -3121,7 +3225,13 @@ def stop_recording():
             if sid:
                 storage.end_session(sid)
                 seg_count = len(_state.get("segments", []))
-                log.info("recording", f"Stopped - session {sid} ({seg_count} segments)")
+                # Say what is still outstanding. This line used to report only
+                # what had been transcribed, which read as a healthy finish
+                # while the backlog was being discarded.
+                tail = (f", {_drain_seconds / 60:.1f} min still transcribing"
+                        if _drain_seconds >= _BACKLOG_WARN_SECONDS else "")
+                log.info("recording",
+                         f"Stopped - session {sid} ({seg_count} segments{tail})")
             _push_status({"recording": False, "session_id": sid})
         finally:
             # Streams, transcriber, video and the session row are all settled,
@@ -3136,15 +3246,43 @@ def stop_recording():
             # recording touching the same temp WAVs.
             if capture:
                 capture.finalize_per_source_tracks()
+            # Everything below describes the whole meeting (the title, the
+            # vault export, the authoritative chapters pass), so it waits for
+            # the backlog to finish rather than describing the part that
+            # happened to be transcribed by the time Stop was pressed. Nothing
+            # a new recording needs is behind this gate: it is already past
+            # _recording_cleanup_done.
+            title_transcript = transcript_snapshot
+            if _drain_seconds >= _BACKLOG_WARN_SECONDS:
+                _drain_watch_transcription(sid)
+                # Bounded, generously. A drain runs at the pipeline's own rate
+                # (0.56x on the machine this was diagnosed on, so ~1.8x the
+                # backlog); ten times that is slack, not a deadline. The cap
+                # exists so a loop thread that died cannot strand this one for
+                # the life of the process.
+                if not _transcriber.await_drain(
+                        timeout=max(600.0, _drain_seconds * 10)):
+                    log.warn("recording",
+                             f"Gave up waiting for transcription of {sid}; "
+                             f"reanalyse it to fill in the rest")
+                _push("transcription_backlog", {
+                    "session_id": sid, "pending_sec": 0.0, "draining": False,
+                })
+                # The transcript grew while we waited; title from all of it.
+                sess = storage.get_session(sid) if sid else None
+                if sess and sess.get("segments"):
+                    title_transcript = _build_transcript(
+                        sess["segments"], sess.get("speaker_labels") or {})
+                log.info("recording", f"Transcription finished for session {sid}")
             # Auto-title: use full formatted transcript (with speaker labels) for better context.
             # Skip entirely if the user has manually renamed the session — their title wins.
-            if sid and (transcript_snapshot or plain_snapshot).strip():
+            if sid and (title_transcript or plain_snapshot).strip():
                 if storage.is_title_user_set(sid):
                     log.info("recording", f"Skipping auto-title for {sid}: user-set title is locked")
                 else:
                     ctx = storage.get_title_generation_context(sid)
                     title = ai.generate_title(
-                        transcript_snapshot or plain_snapshot,
+                        title_transcript or plain_snapshot,
                         context=ctx,
                         system_prompt=settings.get("title_system_prompt") or None,
                     )
@@ -8386,6 +8524,53 @@ def _start_reanalysis_thread(target, session_id: str, args: tuple):
         return False
 
 
+def _rollback_reanalysis(session_id: str, why: str) -> bool:
+    """Put back the transcript a reanalysis deleted but never replaced.
+
+    Biased towards restoring. A spurious rollback costs the user a rebuild they
+    can run again; a missed one leaves a meeting empty with the only copy of
+    its transcript already deleted. The one case that is never restored is an
+    empty snapshot, which would wipe a good rebuild to put nothing back.
+    """
+    snapshot = reanalysis_guard.load(session_id)
+    if snapshot is None:
+        return False
+    segments = snapshot.get("segments") or []
+    if not segments:
+        reanalysis_guard.clear(session_id)
+        return False
+    try:
+        restored = storage.restore_session_transcript(session_id, snapshot)
+    except Exception as exc:  # noqa: BLE001 - a failed rollback must not crash the caller
+        log.error("reanalysis",
+                  f"Could not roll back session {session_id[:8]}: {exc}")
+        return False
+    reanalysis_guard.clear(session_id)
+    log.warn("reanalysis",
+             f"Rolled back session {session_id[:8]} to its {restored} saved "
+             f"segments ({why})")
+    _push("transcript_reset", {"session_id": session_id})
+    _push("reanalysis_rolled_back", {
+        "session_id": session_id, "segments": restored, "reason": why,
+    })
+    return True
+
+
+def _rollback_interrupted_reanalyses() -> None:
+    """Startup sweep: a guard file means a pass started and never finished.
+
+    The process was killed mid-rebuild (the takeover handshake used to answer
+    "idle" during a reanalysis and accept a shutdown), so the transcript on
+    disk is empty or half-written and the snapshot is the good copy.
+    """
+    for session_id in reanalysis_guard.pending_session_ids():
+        try:
+            _rollback_reanalysis(session_id, "a previous reanalysis was interrupted")
+        except Exception as exc:  # noqa: BLE001 - never block startup on this
+            log.warn("reanalysis",
+                     f"Rollback sweep skipped {session_id[:8]}: {exc}")
+
+
 def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                     num_speakers: int | None = None,
                     max_speakers: int | None = None) -> bool:
@@ -8399,6 +8584,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
     a reanalysis need to know whether the transcript was actually rebuilt.
     """
     ok = False
+    guarded = False
     try:
         # The recorder's WAV, or a decode of the Opus the Free up space tool
         # left in its place. Resolved here on the worker, because decoding a
@@ -8408,6 +8594,19 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
         if pcm is None:
             raise RuntimeError("The recording's audio could not be read (is ffmpeg installed?)")
         wav_path = str(pcm)
+
+        # Snapshot before anything is deleted. The rebuild below writes its
+        # replacement incrementally, so until it reports success this file is
+        # the only copy of the transcript that exists. It doubles as the marker
+        # a hard kill leaves behind: startup rolls back whatever it finds.
+        #
+        # Scope is the transcript and its speaker rows, which is what an
+        # interrupted pass destroys irrecoverably. The voiceprint embeddings
+        # cleared just below are derived data: a later successful reanalysis
+        # recomputes them from the audio, so they are not worth carrying in a
+        # snapshot that has to be written before every pass.
+        guarded = reanalysis_guard.begin(
+            session_id, storage.snapshot_session_transcript(session_id))
 
         # Remove old session embeddings from Speaker Library and recompute centroids
         if fingerprint_db.ready:
@@ -8513,11 +8712,17 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                      f"falling back to real-time pipeline")
             _transcriber.process_wav_file(wav_path)
 
+        # The transcript is rebuilt: the snapshot has nothing left to protect,
+        # and leaving it would make the next startup roll a good pass back.
+        reanalysis_guard.clear(session_id)
+        guarded = False
         _push("reanalysis_done", {"session_id": session_id})
         ok = True
     except Exception as e:
         log.error("reanalysis", f"{e}")
         import traceback; traceback.print_exc()
+        if guarded:
+            _rollback_reanalysis(session_id, "the pass failed")
         _push("reanalysis_error", {"session_id": session_id, "error": str(e)})
     finally:
         with _state_lock:
@@ -10285,6 +10490,7 @@ def _force_quit(delay: float = 0) -> None:
         sid      = _state.get("session_id")
         capture  = _state.get("audio_capture")
         test_cap = _state.get("test_capture")
+        reanalyzing = bool(_state.get("is_reanalyzing"))
         _state["is_recording"]  = False
         _state["is_testing"]    = False
         _state["audio_capture"] = None
@@ -10292,6 +10498,15 @@ def _force_quit(delay: float = 0) -> None:
     finally:
         if got_lock:
             _state_lock.release()
+    # The reanalysis worker is a daemon thread: os._exit below kills it where
+    # it stands, with the old transcript already deleted. Put it back now
+    # rather than leaving the meeting empty until the next startup sweep finds
+    # it. Bounded work (one DB write) and it must never block the exit.
+    if reanalyzing and sid:
+        try:
+            _rollback_reanalysis(sid, "the app was quit mid-reanalysis")
+        except Exception:
+            pass
     try:
         if test_cap:
             test_cap.stop()
@@ -10324,21 +10539,54 @@ def _force_quit(delay: float = 0) -> None:
     os._exit(0)
 
 
+def _busy_reason() -> str:
+    """Why this instance must not be shut down under it, or "" when it may be.
+
+    A reanalysis counts. It holds no recording, but it has already deleted the
+    transcript it is rebuilding, so a takeover that kills it mid-pass destroys
+    the meeting; the handshake used to read is_recording alone and answer
+    "idle" straight through one.
+    """
+    with _state_lock:
+        if _state["is_recording"]:
+            return "recording"
+        if _state.get("is_reanalyzing"):
+            return "reanalyzing"
+    return ""
+
+
 @app.route("/api/instance-handshake", methods=["POST"])
 def instance_handshake():
     """Called by a new instance to check if it can take over."""
-    with _state_lock:
-        recording = _state["is_recording"]
-    if recording:
-        log.warn("app", "New instance attempted takeover — declined (recording active)")
+    reason = _busy_reason()
+    recording = reason == "recording"
+    if reason:
+        log.warn("app", f"New instance attempted takeover, declined ({reason} active)")
     else:
         log.info("app", "New instance requested takeover — yielding (idle)")
-    return jsonify({"recording": recording})
+    # "recording" is kept for an older instance that only knows that key; it
+    # must stay true-for-recording only, or that build would print the wrong
+    # reason. "busy" is what a current build reads.
+    return jsonify({"recording": recording, "busy": bool(reason), "reason": reason})
 
 
 @app.route("/api/shutdown", methods=["POST"])
 def shutdown():
-    """Gracefully stop recording (if active), remove tray, then exit."""
+    """Gracefully stop recording (if active), remove tray, then exit.
+
+    Refuses during a reanalysis unless the caller insists: the pass has already
+    cleared the transcript, and quitting under it leaves the meeting empty
+    until the next startup rolls it back. A recording is still stopped on
+    request (the UI confirms that one itself).
+    """
+    data = request.get_json(silent=True) or {}
+    if not data.get("force") and _busy_reason() == "reanalyzing":
+        log.warn("app", "Shutdown declined: a reanalysis is rebuilding a transcript")
+        return jsonify({
+            "ok": False, "busy": True, "reason": "reanalyzing",
+            "error": "A meeting is being reanalyzed. Quitting now would leave "
+                     "its transcript incomplete until the next start.",
+        }), 409
     # Small delay so the HTTP response reaches the browser before we exit.
     threading.Thread(target=_force_quit, args=(0.4,), daemon=True).start()
     return jsonify({"ok": True})
@@ -10411,6 +10659,7 @@ def restart():
             sid      = _state["session_id"]
             capture  = _state["audio_capture"]
             test_cap = _state["test_capture"]
+            reanalyzing = bool(_state.get("is_reanalyzing"))
             _state["is_recording"] = False
             _state["is_testing"]   = False
             _state["audio_capture"] = None
@@ -10420,6 +10669,13 @@ def restart():
         if capture:
             capture.stop()
         _transcriber.stop()
+        # Same reason as _force_quit: the reanalysis worker dies with the
+        # process, mid-rebuild, with the old transcript already deleted.
+        if reanalyzing and sid:
+            try:
+                _rollback_reanalysis(sid, "the app was restarted mid-reanalysis")
+            except Exception:
+                pass
         if sid:
             storage.end_session(sid)
         time.sleep(0.5)
@@ -10542,6 +10798,7 @@ def update_apply():
             sid      = _state["session_id"]
             capture  = _state["audio_capture"]
             test_cap = _state["test_capture"]
+            reanalyzing = bool(_state.get("is_reanalyzing"))
             _state["is_recording"] = False
             _state["is_testing"]   = False
             _state["audio_capture"] = None
@@ -10551,6 +10808,13 @@ def update_apply():
         if capture:
             capture.stop()
         _transcriber.stop()
+        # Same reason as _force_quit: the reanalysis worker dies with the
+        # process, mid-rebuild, with the old transcript already deleted.
+        if reanalyzing and sid:
+            try:
+                _rollback_reanalysis(sid, "the app was restarted mid-reanalysis")
+            except Exception:
+                pass
         if sid:
             storage.end_session(sid)
         time.sleep(0.5)  # let the HTTP response reach the browser
@@ -10741,11 +11005,21 @@ def _handshake_existing_instance(url: str) -> bool:
     except Exception:
         return True  # nothing listening — port is free
 
-    if data.get("recording"):
-        log.error("app", "Another instance is running and has an active recording. "
-                         "Aborting to avoid interrupting it.")
-        print("\n  *** Another Meeting Assistant instance is recording on this port. ***")
-        print("  *** Stop the recording first, or shut down the other instance.   ***\n")
+    # "busy" covers a reanalysis as well as a recording; "recording" alone is
+    # what an instance older than that change reports.
+    if data.get("busy") or data.get("recording"):
+        reason = data.get("reason") or "recording"
+        if reason == "reanalyzing":
+            log.error("app", "Another instance is rebuilding a meeting's transcript. "
+                             "Aborting to avoid destroying it.")
+            print("\n  *** Another Meeting Assistant instance is reanalyzing a meeting. ***")
+            print("  *** Starting now would leave that transcript incomplete.          ***")
+            print("  *** Wait for it to finish, then try again.                        ***\n")
+        else:
+            log.error("app", "Another instance is running and has an active recording. "
+                             "Aborting to avoid interrupting it.")
+            print("\n  *** Another Meeting Assistant instance is recording on this port. ***")
+            print("  *** Stop the recording first, or shut down the other instance.   ***\n")
         return False
 
     # Existing instance is idle — ask it to shut down
