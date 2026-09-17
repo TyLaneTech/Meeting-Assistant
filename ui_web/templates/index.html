@@ -644,7 +644,7 @@
 </div>
 
 <div class="overlay hidden" id="speaker-manager-overlay" onclick="closeSpeakerManagerOnOverlay(event)">
-  <div class="dialog speaker-manager-dialog">
+  <div class="dialog speaker-manager-dialog" role="dialog" aria-modal="true" aria-label="Speakers" tabindex="-1">
     <div class="speaker-manager-header">
       <div class="speaker-manager-headline">
         <h3 class="speaker-manager-title">Speakers</h3>
@@ -652,51 +652,10 @@
         <button class="icon-btn speaker-manager-close" onclick="closeSpeakerManager()" aria-label="Close speakers"><i class="fa-solid fa-xmark"></i></button>
       </div>
       <p class="speaker-manager-status" id="speaker-manager-status">Reading speaker stats…</p>
-      <ul class="speaker-manager-legend" id="speaker-manager-legend">
-        <li><i class="fa-regular fa-rectangle-list" aria-hidden="true"></i> <strong>Manage</strong> names and colours, and links to the Voice Library</li>
-        <li><i class="fa-solid fa-broom" aria-hidden="true"></i> <strong>Cleanup</strong> merges diarizer fragments into one person and names them, from the calendar invite or the Voice Library</li>
-      </ul>
-    </div>
-
-    <div class="speaker-manager-tabs" id="speaker-manager-tabs" role="tablist" aria-label="Speaker tools">
-      <button type="button" role="tab" id="speaker-tab-manage" aria-controls="speaker-pane-manage" aria-selected="true"
-              class="speaker-manager-tab active" data-tab="manage" onclick="switchSpeakerManagerTab('manage')">
-        <i class="fa-regular fa-rectangle-list" aria-hidden="true"></i> Manage
-      </button>
-      <button type="button" role="tab" id="speaker-tab-cleanup" aria-controls="speaker-pane-cleanup" aria-selected="false"
-              class="speaker-manager-tab" data-tab="cleanup" onclick="switchSpeakerManagerTab('cleanup')">
-        <i class="fa-solid fa-broom" aria-hidden="true"></i> Cleanup
-        <span class="speaker-manager-tab-badge" id="speaker-cleanup-badge" hidden></span>
-        <span class="speaker-manager-tab-dot" id="speaker-cleanup-dirty" title="Unsaved staged changes" hidden></span>
-      </button>
-    </div>
-
-    <span class="speaker-editor-hint" id="speaker-editor-hint">Click · Ctrl multi · Shift range</span>
-    <div class="speaker-manager-body" data-tab-view="manage" role="tabpanel" id="speaker-pane-manage" aria-labelledby="speaker-tab-manage">
-      <p class="speaker-commit-note">Edits here save as soon as you make them. Every save offers an Undo.</p>
-      <div class="speaker-color-grid" id="speaker-color-grid"></div>
-      <div class="speaker-manager-list" id="speaker-manager-list"></div>
-      <div class="speaker-editor">
-        <div class="speaker-editor-row">
-          <div class="speaker-editor-combo" id="speaker-name-combo"></div>
-          <span class="speaker-editor-unsaved" id="speaker-editor-unsaved" hidden>
-            <i class="fa-solid fa-circle" aria-hidden="true"></i> Unsaved
-          </span>
-        </div>
-        <div class="speaker-editor-actions">
-          <div class="left-actions">
-            <button class="speaker-manager-btn speaker-manager-btn-primary" id="speaker-save-btn" onclick="applySpeakerEditor()">Save changes</button>
-            <button class="speaker-manager-btn speaker-manager-btn-secondary" id="speaker-add-btn" onclick="createSpeakerProfile()"><i class="fa-solid fa-plus"></i> Add participant</button>
-            <button class="speaker-manager-btn speaker-manager-btn-ghost" id="speaker-unlink-btn" onclick="unlinkSelectedSpeakers()" hidden><i class="fa-solid fa-link-slash"></i> Unlink</button>
-            <button class="speaker-manager-btn speaker-manager-btn-ghost" onclick="clearSpeakerSelection()">Clear</button>
-          </div>
-          <button class="speaker-manager-btn speaker-manager-btn-ghost fp-lib-btn" onclick="openFingerprintPanel()" title="Manage cross-session voice profiles"><i class="fa-solid fa-waveform-lines"></i> Voice Library</button>
-        </div>
-      </div>
     </div>
 
     <!-- ── Cleanup view (drag-drop cluster rectification) ─────────────────── -->
-    <div class="speaker-cleanup-body" data-tab-view="cleanup" role="tabpanel" id="speaker-pane-cleanup" aria-labelledby="speaker-tab-cleanup" hidden>
+    <div class="speaker-cleanup-body" id="speaker-pane-cleanup">
       <p class="speaker-commit-note staged" id="cleanup-staged-banner">
         <i class="fa-regular fa-clock" aria-hidden="true"></i>
         Changes here are staged. Nothing is written until you click Apply.
@@ -720,6 +679,9 @@
           <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-confident-btn" onclick="applyConfidentCleanupMatches()" disabled title="Link every group whose top Voice Library match is highly confident">
             <i class="fa-solid fa-wand-magic-sparkles"></i> Auto-link
           </button>
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-ghost" id="cleanup-library-btn" onclick="openFingerprintPanel()" title="Manage cross-session voice profiles">
+            <i class="fa-solid fa-waveform-lines"></i> Voice Library
+          </button>
         </div>
       </div>
 
@@ -728,37 +690,41 @@
         <div class="cleanup-loading-text" id="cleanup-loading-text">Analyzing speakers…</div>
       </div>
 
-      <!-- Scroll viewport holds the cluster grid; drag-autoscroll targets this. -->
-      <div class="cleanup-scroll" id="cleanup-scroll">
-        <div class="cleanup-grid" id="cleanup-grid"></div>
+      <!-- Wrapper is the selection bar's positioning context: the bar floats over
+           the cards but stops short of the help text and the Apply footer. -->
+      <div class="cleanup-scroll-wrap">
+        <!-- Scroll viewport holds the cluster grid; drag-autoscroll targets this. -->
+        <div class="cleanup-scroll" id="cleanup-scroll">
+          <div class="cleanup-grid" id="cleanup-grid"></div>
 
-        <div class="cleanup-heatmap-wrap" id="cleanup-heatmap-wrap" hidden></div>
+          <div class="cleanup-heatmap-wrap" id="cleanup-heatmap-wrap" hidden></div>
 
-        <div class="cleanup-noise-section" id="cleanup-noise-section" hidden>
-          <button type="button" class="cleanup-noise-toggle" onclick="toggleCleanupNoiseExpanded()">
-            <i class="fa-solid fa-volume-xmark"></i>
-            <span id="cleanup-noise-count">0</span> marked as noise
-            <i class="fa-solid fa-chevron-down cleanup-noise-chevron" id="cleanup-noise-chevron"></i>
-          </button>
-          <div class="cleanup-noise-members" id="cleanup-noise-members" hidden></div>
+          <div class="cleanup-noise-section" id="cleanup-noise-section" hidden>
+            <button type="button" class="cleanup-noise-toggle" onclick="toggleCleanupNoiseExpanded()">
+              <i class="fa-solid fa-volume-xmark"></i>
+              <span id="cleanup-noise-count">0</span> marked as noise
+              <i class="fa-solid fa-chevron-down cleanup-noise-chevron" id="cleanup-noise-chevron"></i>
+            </button>
+            <div class="cleanup-noise-members" id="cleanup-noise-members" hidden></div>
+          </div>
         </div>
-      </div>
 
-      <!-- Floating selection action bar: appears when speakers are selected. -->
-      <div class="cleanup-selbar" id="cleanup-selbar" hidden>
-        <span class="cleanup-selbar-count" id="cleanup-selbar-count">0 selected</span>
-        <div class="cleanup-selbar-actions">
-          <button type="button" class="cleanup-selbar-btn primary" id="cleanup-selbar-assign" onclick="_cleanupSelectionAssign(event)"><i class="fa-solid fa-link"></i> Link to profile…</button>
-          <button type="button" class="cleanup-selbar-btn" onclick="_cleanupSelectionNewCluster()"><i class="fa-solid fa-layer-group"></i> Merge into new group</button>
-          <button type="button" class="cleanup-selbar-btn" id="cleanup-selbar-play" onclick="_cleanupSelectionPlay()"><i class="fa-solid fa-play"></i> Play</button>
-          <button type="button" class="cleanup-selbar-btn" id="cleanup-selbar-noise" onclick="_cleanupSelectionToggleNoise()"><i class="fa-solid fa-volume-xmark"></i> Noise</button>
-          <button type="button" class="cleanup-selbar-btn ghost" onclick="_cleanupClearSelection()">Clear</button>
+        <!-- Floating selection action bar: appears when speakers are selected. -->
+        <div class="cleanup-selbar" id="cleanup-selbar" hidden>
+          <span class="cleanup-selbar-count" id="cleanup-selbar-count">0 selected</span>
+          <div class="cleanup-selbar-actions">
+            <button type="button" class="cleanup-selbar-btn primary" id="cleanup-selbar-assign" onclick="_cleanupSelectionAssign(event)"><i class="fa-solid fa-link"></i> Link to profile…</button>
+            <button type="button" class="cleanup-selbar-btn" onclick="_cleanupSelectionNewCluster()"><i class="fa-solid fa-layer-group"></i> Merge into new group</button>
+            <button type="button" class="cleanup-selbar-btn" id="cleanup-selbar-play" onclick="_cleanupSelectionPlay()"><i class="fa-solid fa-play"></i> Play</button>
+            <button type="button" class="cleanup-selbar-btn" id="cleanup-selbar-noise" onclick="_cleanupSelectionToggleNoise()"><i class="fa-solid fa-volume-xmark"></i> Noise</button>
+            <button type="button" class="cleanup-selbar-btn ghost" onclick="_cleanupClearSelection()">Clear</button>
+          </div>
         </div>
-      </div>
+      </div><!-- .cleanup-scroll-wrap -->
 
       <div class="cleanup-help">
         <i class="fa-regular fa-circle-info"></i>
-        <span><strong>Click</strong> to select speakers (<em>Ctrl</em> multi · <em>Shift</em> range), then drag them as a group or use the bar below. <strong>Link to profile</strong> connects a speaker to a Voice Library profile so it is recognized in future meetings. <strong>Merge into</strong> a group combines diarizer fragments of one person. The <i class="fa-regular fa-circle-play"></i> button plays a speaker's voice.</span>
+        <span><strong>Click</strong> to select speakers (<em>Ctrl</em> multi · <em>Shift</em> range), then drag them as a group or use the selection bar. <strong>Link to profile</strong> connects a speaker to a Voice Library profile so it is recognized in future meetings. <strong>Merge into</strong> a group combines diarizer fragments of one person. The <i class="fa-regular fa-circle-play"></i> button plays a speaker's voice.</span>
       </div>
 
       <!-- Sticky commit footer: the only place staged cleanup edits get written. -->

@@ -1799,6 +1799,21 @@ class SpeakerFingerprintDB:
             touched_profiles.add(gid)
             created.append({"global_id": gid, "name": new_name})
 
+        # Pass 1b: an explicit colour on a cluster that already has a profile is
+        # a recolour of that profile, the same write the Voice Library's own
+        # colour grid makes, so the person keeps one colour everywhere. Runs on
+        # its own connection before pass 2 opens one; pass 2 then reads the new
+        # colour back out for every label row it writes.
+        for cluster in proposed:
+            gid = cluster.get("global_id")
+            color = (cluster.get("color") or "").strip()
+            if not gid or not color:
+                continue
+            row = self.get_global_speaker(gid)
+            if row and (row.get("color") or "") != color:
+                self.rename_global_speaker(gid, color=color)
+                touched_profiles.add(gid)
+
         # Pass 2: relink members + migrate unlabeled embeddings → speaker_embeddings.
         with _conn(self._db_path) as c:
             for cluster in proposed:

@@ -2494,11 +2494,6 @@ body.video-fullscreen .playback-bar {
 .tn-pill-noise { font-style: italic; }
 .tn-pill-noise i { margin-right: 3px; font-size: 0.8em; }
 .tn-pill.tn-pill-solo { box-shadow: 0 0 0 2px currentColor; }
-.src-speaker.speaker-selected {
-  outline: 2px solid currentColor;
-  outline-offset: 2px;
-  box-shadow: 0 0 0 3px rgba(255,255,255,0.06);
-}
 .src-speaker.speaker-linked::after {
   content: '\f0c1';  /* fa-link */
   font-family: "Font Awesome 7 Pro";
@@ -2812,119 +2807,12 @@ body.video-fullscreen .playback-bar {
   margin-left: auto;
 }
 #speaker-manager-overlay .speaker-manager-close:hover { color: var(--fg); }
-
-#speaker-manager-overlay .speaker-manager-body {
-  display: flex;
-  flex-direction: column;
-}
-
-/* Speaker list */
-#speaker-manager-overlay .speaker-manager-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  max-height: 74vh;
-  min-height: 56px;
-  overflow-y: auto;
-  padding: 8px 10px;
-}
-#speaker-manager-overlay .speaker-manager-list::-webkit-scrollbar { width: 4px; }
-#speaker-manager-overlay .speaker-manager-list::-webkit-scrollbar-track { background: transparent; }
-#speaker-manager-overlay .speaker-manager-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-#speaker-manager-overlay .speaker-manager-empty {
-  padding: 18px 12px;
-  color: var(--fg-subtle);
-  text-align: center;
-  font-size: 12px;
-  border: 1px dashed rgba(255,255,255,0.09);
-  border-radius: var(--radius-sm);
-}
-
-#speaker-manager-overlay .speaker-row {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  padding: 7px 9px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--fg);
-  cursor: pointer;
-  text-align: left;
-  transition: border-color .1s, background .1s;
-}
-#speaker-manager-overlay .speaker-row:hover {
-  border-color: var(--border);
-  background: var(--surface2);
-}
-#speaker-manager-overlay .speaker-row.selected {
-  border-color: rgba(88,166,255,0.35);
-  background: rgba(88,166,255,0.08);
-}
-
 #speaker-manager-overlay .speaker-row-swatch {
   width: 10px;
   height: 10px;
   border-radius: 50%;
   flex-shrink: 0;
 }
-#speaker-manager-overlay .speaker-row-main {
-  flex: 1;
-  min-width: 0;
-}
-#speaker-manager-overlay .speaker-row-name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--fg);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-#speaker-manager-overlay .speaker-row-meta {
-  font-size: 10px;
-  color: var(--fg-subtle);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 1px;
-}
-#speaker-manager-overlay .speaker-row-count {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--fg-muted);
-  flex-shrink: 0;
-}
-#speaker-manager-overlay .speaker-row-linked {
-  font-size: 10px;
-  color: var(--green, #00b464);
-  opacity: 0.8;
-  flex-shrink: 0;
-  margin-right: 6px;
-}
-#speaker-manager-overlay .speaker-row-play {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  color: var(--fg-muted);
-  background: var(--surface2, rgba(255,255,255,0.06));
-  border: 1px solid var(--border);
-  cursor: pointer;
-  font-size: 10px;
-  transition: color .1s, background .1s, border-color .1s;
-}
-#speaker-manager-overlay .speaker-row-play:hover { color: var(--fg); filter: brightness(1.15); }
-#speaker-manager-overlay .speaker-row-play.playing {
-  color: #fff;
-  background: var(--accent-dim, #2f6feb);
-  border-color: var(--accent, #58a6ff);
-}
-
 /* ── Reanalyze dialog (per-meeting speaker-count dial) ── */
 #reanalyze-dialog { z-index: 1300; }
 #reanalyze-dialog .reanalyze-dialog {
@@ -2965,82 +2853,6 @@ body.video-fullscreen .playback-bar {
 .reanalyze-btn:hover { filter: brightness(1.1); }
 .reanalyze-btn-primary { color: #fff; background: var(--accent-dim); border-color: var(--accent); }
 
-/* Inline editor at the bottom */
-#speaker-manager-overlay .speaker-editor {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 12px 10px 20px;
-  border-radius: 9px;
-  /* border-bottom: 1px solid var(--border); */
-  background: #12161c;
-}
-
-#speaker-manager-overlay .speaker-editor-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-#speaker-manager-overlay .speaker-editor-input {
-  flex: 1;
-  /* margin-bottom: 10px; */
-  min-width: 0;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--fg);
-  padding: 6px 10px;
-  font: inherit;
-  font-size: 13px;
-  outline: none;
-}
-#speaker-manager-overlay .speaker-editor-input::placeholder { color: var(--fg-subtle); }
-#speaker-manager-overlay .speaker-editor-input:focus {
-  border-color: var(--accent-dim);
-  box-shadow: 0 0 0 2px rgba(88,166,255,0.1);
-}
-
-/* Compact color strip */
-#speaker-manager-overlay .speaker-color-grid {
-  display: flex;
-  gap: 5px;
-  margin-inline: 60px;
-  margin-block: 7px 3px;
-  justify-content: space-around;
-  align-items: center;
-  flex-shrink: 0;
-}
-#speaker-manager-overlay .speaker-color-btn {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  border: 2px solid transparent;
-  cursor: pointer;
-  padding: 0;
-  transition: transform .1s, border-color .1s;
-}
-#speaker-manager-overlay .speaker-color-btn:hover { transform: scale(1.25); }
-#speaker-manager-overlay .speaker-color-btn.active {
-  border-color: rgba(255,255,255,0.85);
-  transform: scale(1.15);
-}
-
-/* Action row */
-#speaker-manager-overlay .speaker-editor-actions {
-  display: flex;
-  /* margin-top: 20px; */
-  align-items: center;
-  padding-inline: 2px;
-  justify-content: space-between;
-  /* gap: 6px; */
-}
-.left-actions {
-    display: flex;
-    gap: 6px;
-}
-
 .speaker-manager-btn {
   appearance: none;
   border: 1px solid var(--border);
@@ -3077,13 +2889,6 @@ body.video-fullscreen .playback-bar {
   color: var(--fg);
   border-color: var(--border);
   background: rgba(255,255,255,0.05);
-}
-
-#speaker-manager-overlay .speaker-editor-hint {
-  /* margin-left: auto; */
-  font-size: 10px;
-  color: var(--fg-subtle);
-  /* white-space: nowrap; */
 }
 
 /* Highlight sibling badges during global rename */
@@ -5430,7 +5235,6 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
 }
 .model-picker-chat-wrap { margin-right: 0; }
 
-
 /* ── CustomSelect widget ─────────────────────────────────────────── */
 .cs-trigger {
   width: 100%;
@@ -5538,8 +5342,6 @@ select#ai-model-sel { max-width: 200px; cursor: pointer; }
   background: var(--surface3);
 }
 
-
-.speaker-editor-label {font-size: large;font-weight: 600;}
 
 .speaker-manager-title-wrap {
     text-align-last: left;
@@ -5894,46 +5696,10 @@ img#shutdown-icon.brand-icon {
 
 /* ── Speaker cleanup view (drag-drop cluster rectification) ──────────────── */
 #speaker-manager-overlay .speaker-manager-dialog {
-  /* Expand a bit so cluster grid has room without feeling cramped. */
-  width: min(720px, calc(100vw - 28px));
+  /* Cluster cards are the whole dialog now, so give them the room. */
+  width: min(1200px, calc(100vw - 28px));
 }
-.speaker-manager-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--border);
-}
-.speaker-manager-tab {
-  position: relative;
-  appearance: none;
-  background: transparent;
-  border: 0;
-  color: var(--fg-muted);
-  padding: 8px 12px 9px;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.speaker-manager-tab:hover { color: var(--fg); }
-.speaker-manager-tab.active {
-  color: var(--fg);
-  border-bottom-color: var(--accent, #58a6ff);
-}
-.speaker-manager-tab-badge {
-  background: var(--accent, #58a6ff);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 600;
-  border-radius: 999px;
-  padding: 1px 6px;
-  min-width: 16px;
-  text-align: center;
-}
+#speaker-manager-overlay .speaker-manager-dialog:focus { outline: none; }
 #speaker-manager-overlay .speaker-cleanup-body {
   display: flex;
   flex-direction: column;
@@ -5943,6 +5709,16 @@ img#shutdown-icon.brand-icon {
   overflow: hidden;          /* inner #cleanup-scroll owns the scrolling */
   position: relative;        /* anchor for the floating selection bar */
   text-align: left;
+}
+/* Positioning context for the floating selection bar. Anchoring the bar to the
+   pane put it over the Apply footer, which is exactly where people looked for
+   Apply while a speaker was selected. */
+.cleanup-scroll-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 #cleanup-scroll {
   flex: 1 1 auto;
@@ -5983,7 +5759,7 @@ img#shutdown-icon.brand-icon {
   min-width: 0;
 }
 .cleanup-stats strong { color: var(--fg); font-weight: 600; }
-.cleanup-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.cleanup-actions { display: flex; gap: 4px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
 .cleanup-actions .speaker-manager-btn { padding: 4px 8px; font-size: 11px; }
 
 .cleanup-loading {
@@ -6040,6 +5816,51 @@ img#shutdown-icon.brand-icon {
   flex-shrink: 0;
   border: 1px solid rgba(255,255,255,0.08);
 }
+/* The header swatch opens the colour picker, so it reads as a control. */
+.cleanup-swatch-btn {
+  appearance: none;
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.cleanup-swatch-btn:hover:not(:disabled) {
+  transform: scale(1.18);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--fg) 22%, transparent);
+}
+.cleanup-swatch-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cleanup-swatch-btn:disabled { cursor: default; opacity: 0.75; }
+
+/* Colour picker popover: same shell as the profile picker, palette instead
+   of a list. */
+.cleanup-color-picker { width: 232px; }
+.cleanup-color-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 6px;
+  padding: 10px;
+}
+.cleanup-color-grid .speaker-color-btn {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  padding: 0;
+  cursor: pointer;
+  transition: transform .1s, border-color .1s;
+}
+.cleanup-color-grid .speaker-color-btn:hover { transform: scale(1.2); }
+.cleanup-color-grid .speaker-color-btn.active {
+  border-color: rgba(255,255,255,0.85);
+  transform: scale(1.12);
+}
+.cleanup-color-grid .speaker-color-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.cleanup-color-picker .cleanup-picker-subtitle { border-bottom: 0; }
 .cleanup-cluster-name {
   flex: 1;
   min-width: 0;
@@ -6367,11 +6188,6 @@ img#shutdown-icon.brand-icon {
 
 /* ═══ Speaker cleanup v2 polish ═══════════════════════════════════════════ */
 
-/* Give the dialog room to breathe while the cleanup tab is active. */
-#speaker-manager-overlay .speaker-manager-dialog.cleanup-active {
-  width: min(1200px, calc(100vw - 28px));
-}
-
 /* Idle prompt inside the floating video popup (so it's never a dead box). */
 .cleanup-video-idle {
   position: absolute; inset: 0;
@@ -6509,7 +6325,7 @@ img#shutdown-icon.brand-icon {
 
 /* ── Floating selection action bar ── */
 .cleanup-selbar {
-  position: absolute; left: 12px; right: 12px; bottom: 12px;
+  position: absolute; left: 2px; right: 10px; bottom: 10px;
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px;
   background: var(--surface3); border: 1px solid var(--accent, #58a6ff);
@@ -6850,12 +6666,6 @@ img#shutdown-icon.brand-icon {
 }
 .fp-bulk-actions.hidden { display: none; }
 .fp-bulk-btn { font-size: .72rem; padding: 3px 7px; flex: 1; }
-
-/* "Voice Library" button in speaker manager */
-.fp-lib-btn {font-size: 0.9em;padding: 3px 8px;}
-
-/* Speaker manager fragment hint styling */
-.speaker-row-meta { font-size: .72rem; }
 
 /* ── Sidebar resize handle ──────────────────────────────────────────────────── */
 .sidebar-resize-handle {
@@ -8040,7 +7850,6 @@ button#analytics-btn.active {
     font-size: 10px;
 }
 
-
 .session-menu-item i {color: #ffffff8f;}
 
 .session-menu-item:hover i {
@@ -8764,7 +8573,6 @@ button.sf-section-label.sf-section-toggle:hover .sf-section-chevron { color: var
     to   { opacity: 1; transform: translateY(0); }
 }
 
-
 .sidebar-search-wrap:focus-within i.sidebar-search-icon {
     color: var(--border);
 }
@@ -8886,7 +8694,6 @@ button#transcript-filter-btn.open {
     transition: 0.15s;
 }
 
-
 .sidebar-search-wrap:focus-within i.fa-brain {
     color: var(--accent);
     transition: 0.25s ease;
@@ -8923,7 +8730,6 @@ img.chat-tool-thumb {
   margin-left: -4px;
   gap: 5px;
 }
-
 
 button {
     outline: none !important;
@@ -9153,7 +8959,6 @@ button {
 }
 
 /* ── Global Chat Area ─────────────────────────────────────────────────────── */
-
 
 /* Conversation sidebar */
 .home-conv-sidebar {
@@ -9447,7 +9252,6 @@ button {
   border-radius: 2px;
   transition: width .5s cubic-bezier(.4,0,.2,1);
 }
-
 
 div#home-search-results.hidden {
     display: none;
@@ -9854,7 +9658,6 @@ button#viz-autodetect-btn:hover {
     to   { opacity: 1; transform: translateX(-50%) translateY(0); }
 }
 
-
 #import-drop-overlay.hidden {
     display: none;
 }
@@ -9873,12 +9676,9 @@ button#upload-audio-btn {
     margin-right: -7px;
 }
 
-
 .folder-active-ancestor > .folder-header {
     background: var(--surface2);
 }
-
-
 
 .folder-active-ancestor > .folder-header .folder-name {
     color: var(--accent);
@@ -9906,7 +9706,6 @@ button#upload-audio-btn {
 .expanded > .folder-header {
     background: var(--surface2);
 }
-
 
 .sidebar-folder.expanded > .folder-body {
     padding-top: 2px;
@@ -10485,11 +10284,9 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
     color: var(--fg);
 }
 
-
 .ql-snow.ql-toolbar button:hover .ql-stroke, .ql-snow .ql-toolbar button:hover .ql-stroke, .ql-snow.ql-toolbar button:focus .ql-stroke, .ql-snow .ql-toolbar button:focus .ql-stroke, .ql-snow.ql-toolbar button.ql-active .ql-stroke, .ql-snow .ql-toolbar button.ql-active .ql-stroke, .ql-snow.ql-toolbar .ql-picker-label:hover .ql-stroke, .ql-snow .ql-toolbar .ql-picker-label:hover .ql-stroke, .ql-snow.ql-toolbar .ql-picker-label.ql-active .ql-stroke, .ql-snow .ql-toolbar .ql-picker-label.ql-active .ql-stroke, .ql-snow.ql-toolbar .ql-picker-item:hover .ql-stroke, .ql-snow .ql-toolbar .ql-picker-item:hover .ql-stroke, .ql-snow.ql-toolbar .ql-picker-item.ql-selected .ql-stroke, .ql-snow .ql-toolbar .ql-picker-item.ql-selected .ql-stroke, .ql-snow.ql-toolbar button:hover .ql-stroke-miter, .ql-snow .ql-toolbar button:hover .ql-stroke-miter, .ql-snow.ql-toolbar button:focus .ql-stroke-miter, .ql-snow .ql-toolbar button:focus .ql-stroke-miter, .ql-snow.ql-toolbar button.ql-active .ql-stroke-miter, .ql-snow .ql-toolbar button.ql-active .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-label:hover .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-label:hover .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-label.ql-active .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-label.ql-active .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-item:hover .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-item:hover .ql-stroke-miter, .ql-snow.ql-toolbar .ql-picker-item.ql-selected .ql-stroke-miter, .ql-snow .ql-toolbar .ql-picker-item.ql-selected .ql-stroke-miter {
     stroke: var(--accent) !important;
 }
-
 
 /* ══ Chapters feature ═══════════════════════════════════════════════════════ */
 
@@ -11246,7 +11043,6 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   margin-bottom: 16px;
 }
 
-
 .cal-controls {
   display: flex;
   align-items: center;
@@ -11351,7 +11147,6 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   color: #fff;
   font-weight: 600;
 }
-
 
 .cal-day-items {
   display: flex;
@@ -11505,7 +11300,7 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   flex-shrink: 0;
 }
 
-/* ── Speakers modal shell (header, legend, tab badges, commit notes) ─────── */
+/* ── Speakers modal shell (header, status line, commit note) ─────────────── */
 
 #speaker-manager-overlay .speaker-manager-header {
   display: flex;
@@ -11530,36 +11325,13 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   text-overflow: ellipsis;
 }
 .speaker-manager-meeting[hidden] { display: none; }
-.speaker-manager-status {
+#speaker-manager-overlay .speaker-manager-status {
   margin: 0;
   font-size: 12px;
   color: var(--fg-muted);
   text-align: left;
 }
-.speaker-manager-status.has-attention { color: var(--yellow); }
-.speaker-manager-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  margin: 2px 0 0;
-  padding: 0;
-  list-style: none;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--fg-subtle);
-  text-align: left;
-}
-.speaker-manager-legend li { display: inline-flex; align-items: center; gap: 5px; }
-.speaker-manager-legend strong { color: var(--fg-muted); font-weight: 600; }
-.speaker-manager-legend i { width: 12px; text-align: center; opacity: 0.8; }
-
-.speaker-manager-tab-badge.attn { background: var(--yellow); color: var(--bg); }
-.speaker-manager-tab-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--yellow);
-}
+#speaker-manager-overlay .speaker-manager-status.has-attention { color: var(--yellow); }
 
 .cal-detail-item-actions {
   display: flex;
@@ -11586,13 +11358,8 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   .cal-chip,
   .home-conv-sidebar.conv-animated { transition: none; }
 }
-.speaker-manager-tab-dot {
-  flex-shrink: 0;
-}
-.speaker-manager-tab-dot[hidden] { display: none; }
-
-/* One-line statement of each tab's commit model. */
-.speaker-commit-note {
+/* One-line statement of the Cleanup surface's commit model. */
+#speaker-manager-overlay .speaker-commit-note {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -11605,50 +11372,11 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   font-size: 11px;
   text-align: left;
 }
-.speaker-commit-note.staged {
+#speaker-manager-overlay .speaker-commit-note.staged {
   border-color: color-mix(in srgb, var(--yellow) 45%, var(--border));
   color: var(--fg);
 }
-.speaker-commit-note.staged i { color: var(--yellow); }
-
-/* Manage editor: unsaved marker beside the name combobox. */
-.speaker-editor-combo { flex: 1; min-width: 0; }
-.speaker-editor-unsaved {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-  font-size: 11px;
-  color: var(--yellow);
-}
-.speaker-editor-unsaved[hidden] { display: none; }
-.speaker-editor-unsaved i { font-size: 6px; }
-#speaker-save-btn.is-dirty {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--yellow) 35%, transparent);
-}
-
-/* The speaker row is a container; selection and play are sibling buttons, so
-   neither is nested inside the other. */
-#speaker-manager-overlay .speaker-row-select {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  flex: 1;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-  text-align: left;
-}
-#speaker-manager-overlay .speaker-row-select:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: var(--radius-sm);
-}
-
+#speaker-manager-overlay .speaker-commit-note.staged i { color: var(--yellow); }
 /* Cleanup sticky commit footer: the only place staged edits get written. */
 .cleanup-footer {
   position: sticky;

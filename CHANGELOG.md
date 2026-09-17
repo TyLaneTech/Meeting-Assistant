@@ -45,6 +45,35 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Reworked the Speakers window into one screen (2026-09-17)
+
+> Your saved speakers and voice profiles are untouched. This changes where the
+> controls live, not what they do.
+
+### Speakers
+
+- **The `Apply` button is no longer hidden behind the selection bar.** Selecting a
+  speaker used to slide a bar over the bottom of the window, covering `Apply` and
+  `Reset`, which made it look as though the changes could not be saved. The bar now
+  floats above the speaker cards and stops short of that row, so `Apply` is always
+  in view
+- **The `Manage` tab is gone and the tabs with it.** Everything it did, naming a
+  speaker, linking one to the Voice Library, playing a sample, is on the one screen
+  you already use, so the window opens straight onto it
+  - **Pick a speaker's colour by clicking the coloured square** beside their name.
+    That was the last thing only `Manage` could do
+  - The colour is staged like every other change here: the cards update as you pick,
+    and nothing is written until you press `Apply`
+  - A speaker linked to a Voice Library profile keeps one colour everywhere, so
+    changing it here changes it in every meeting that person appears in. A group
+    with no name yet has nowhere to keep a colour, so its square stays greyed out
+    until you name it or link it
+- **`Voice Library` moved into the toolbar**, next to `Auto-link`
+- **Removed `Add participant`.** It only ever added a name with nothing attached to
+  it. To bring someone new in, select their lines in the transcript and reassign
+  them to a new name, or create the profile in `Voice Library`
+
+
 ## Fixed long meetings losing the end of their transcript (2026-09-11)
 
 ### Recording

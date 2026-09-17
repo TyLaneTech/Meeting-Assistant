@@ -5651,8 +5651,6 @@ function connectSSE(afterSegId = 0) {
     // and old pills/profiles would otherwise linger with count=0 until refresh.
     _speakerLabels = {};
     _speakerProfiles = {};
-    _selectedSpeakerKeys = [];
-    _speakerSelectionAnchor = null;
     Object.keys(_speakerColors).forEach(k => delete _speakerColors[k]);
     _speakerColorIdx = 0;
     _manualNoiseKeys = new Set();
@@ -6161,7 +6159,6 @@ function onStatus(d) {
       }
       _updateBrandIcons(true);
       if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
-      if (_pendingSpeakerProfiles.length) _flushPendingSpeakers(d.session_id);
       // During a live recording the reserved "me" key is THIS instance's own
       // mic audio, so link it locally for the "(You)" badge. (When viewing a
       // past/imported session, links come from the server instead, so foreign
@@ -6510,17 +6507,12 @@ const _speakerColors = {};
 let _speakerProfiles = {};
 let _lastLiveSegId   = 0;   // highest seg_id received from live transcript events
 var _sseSource       = null;  // var so home.js can access it
-let _selectedSpeakerKeys = [];
-let _speakerSelectionAnchor = null;
-let _speakerDraftName = '';
-let _speakerDraftColor = '';
 
 // Transcript segment multi-select (Ctrl/Shift+click on badges)
 let _transcriptSelectedSegs = new Set(); // Set of .transcript-segment DOM elements
 let _transcriptSelectionAnchor = null;
 
 // Speakers added before a session exists; flushed to the API on session start
-let _pendingSpeakerProfiles = [];
 const _NOISE_LABEL = '[Noise]';
 const _NOISE_COLOR = '#6e7681';   // muted gray
 
@@ -6964,34 +6956,6 @@ function _speakerOptionNames(currentName = '', excludeKey = '') {
   return names;
 }
 
-function _highlightSelectedSpeakerBadges() {
-  const selected = new Set(_selectedSpeakerKeys);
-  for (const seg of _segmentRegistry) {
-    const badge = seg.querySelector('.src-badge.src-speaker');
-    if (badge) badge.classList.toggle('speaker-selected', selected.has(badge.dataset.speakerKey));
-  }
-}
-
-function _syncSpeakerDraftFromSelection() {
-  if (_selectedSpeakerKeys.length === 0) {
-    _speakerDraftName = '';
-    _speakerDraftColor = '';
-    return;
-  }
-
-  const profiles = _selectedSpeakerKeys.map(key => _ensureSpeakerProfile(key)).filter(Boolean);
-  if (!profiles.length) {
-    _speakerDraftName = '';
-    _speakerDraftColor = '';
-    return;
-  }
-
-  const firstName = profiles[0].name || '';
-  const firstColor = profiles[0].color || speakerColor(profiles[0].speaker_key);
-  _speakerDraftName = profiles.every(p => (p.name || '') === firstName) ? firstName : '';
-  _speakerDraftColor = profiles.every(p => (p.color || speakerColor(p.speaker_key)) === firstColor) ? firstColor : '';
-}
-
 // Group speaker profiles by display name so that diart fragments of the same
 // physical person collapse into a single manager row.
 function _groupProfilesByName(profiles) {
@@ -7043,118 +7007,19 @@ function _partitionSpeakerGroupsByNoise(groups) {
 }
 
 // Select all speaker_keys belonging to a group, with range/toggle support.
-function _setGroupSelection(group, { toggle = false, range = false } = {}) {
-  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
-  const anchorGroupIdx = groups.findIndex(g => g.speakerKeys.includes(_speakerSelectionAnchor));
-  const clickedGroupIdx = groups.findIndex(g => g.speakerKeys[0] === group.speakerKeys[0]);
-
-  if (range && anchorGroupIdx !== -1 && clickedGroupIdx !== -1) {
-    const [from, to] = anchorGroupIdx < clickedGroupIdx
-      ? [anchorGroupIdx, clickedGroupIdx]
-      : [clickedGroupIdx, anchorGroupIdx];
-    _selectedSpeakerKeys = groups.slice(from, to + 1).flatMap(g => g.speakerKeys);
-  } else if (toggle) {
-    const allSelected = group.speakerKeys.every(k => _selectedSpeakerKeys.includes(k));
-    if (allSelected) {
-      _selectedSpeakerKeys = _selectedSpeakerKeys.filter(k => !group.speakerKeys.includes(k));
-    } else {
-      const newKeys = group.speakerKeys.filter(k => !_selectedSpeakerKeys.includes(k));
-      _selectedSpeakerKeys = [..._selectedSpeakerKeys, ...newKeys];
-    }
-    _speakerSelectionAnchor = group.speakerKeys[0];
-  } else {
-    // Plain click: toggle if already the sole selection, otherwise select
-    const allSelected = group.speakerKeys.every(k => _selectedSpeakerKeys.includes(k));
-    if (allSelected && _selectedSpeakerKeys.length === group.speakerKeys.length) {
-      _selectedSpeakerKeys = [];
-    } else {
-      _selectedSpeakerKeys = [...group.speakerKeys];
-    }
-    _speakerSelectionAnchor = group.speakerKeys[0];
-  }
-
-  if (!range) _speakerSelectionAnchor = group.speakerKeys[0];
-  if (range && anchorGroupIdx === -1) _speakerSelectionAnchor = group.speakerKeys[0];
-  _syncSpeakerDraftFromSelection();
-  _highlightSelectedSpeakerBadges();
-  renderSpeakerManager();
-}
-
-function _setSpeakerSelection(speakerKey, { toggle = false, range = false } = {}) {
-  const orderedKeys = _getSortedSpeakerProfiles().map(profile => profile.speaker_key);
-
-  if (range && _speakerSelectionAnchor) {
-    const start = orderedKeys.indexOf(_speakerSelectionAnchor);
-    const end = orderedKeys.indexOf(speakerKey);
-    if (start !== -1 && end !== -1) {
-      const [from, to] = start < end ? [start, end] : [end, start];
-      _selectedSpeakerKeys = orderedKeys.slice(from, to + 1);
-    } else {
-      _selectedSpeakerKeys = [speakerKey];
-    }
-  } else if (toggle) {
-    if (_selectedSpeakerKeys.includes(speakerKey)) {
-      _selectedSpeakerKeys = _selectedSpeakerKeys.filter(key => key !== speakerKey);
-    } else {
-      _selectedSpeakerKeys = [..._selectedSpeakerKeys, speakerKey];
-    }
-    _speakerSelectionAnchor = speakerKey;
-  } else {
-    // Plain click: toggle if already selected
-    if (_selectedSpeakerKeys.length === 1 && _selectedSpeakerKeys[0] === speakerKey) {
-      _selectedSpeakerKeys = [];
-    } else {
-      _selectedSpeakerKeys = [speakerKey];
-    }
-    _speakerSelectionAnchor = speakerKey;
-  }
-
-  if (!range && !toggle) _speakerSelectionAnchor = speakerKey;
-  if (range && !_speakerSelectionAnchor) _speakerSelectionAnchor = speakerKey;
-  _syncSpeakerDraftFromSelection();
-  _highlightSelectedSpeakerBadges();
-  renderSpeakerManager();
-}
-
-/* Deterministic landing. Cleanup is a bulk-repair surface and is never the
- * surprise destination: open on Resolve when something actually needs a name,
- * otherwise Manage. An explicit tab argument always wins, and within one
- * session view we return to whatever tab the user last chose. */
-function _speakerManagerInitialTab(explicitTab) {
-  if (explicitTab) return explicitTab;
-  if (_speakerModalLastTab && _speakerModalStatsSession === state.sessionId) return _speakerModalLastTab;
-  // Cleanup is the landing tab: merging diarizer fragments is the first job
-  // on almost every recording, and Resolve only makes sense once it is done.
-  // A caller that wants another tab passes it explicitly.
-  return 'cleanup';
-}
-
-function openSpeakerManager(tabArg) {
-  // Tolerate being wired straight to an event handler.
-  // 'resolve' is accepted for older callers: that tab was folded into Cleanup.
-  const tab = ['manage', 'cleanup'].includes(tabArg) ? tabArg : (tabArg === 'resolve' ? 'cleanup' : null);
+/* The Speakers modal is one surface: Cleanup. The Manage tab was retired once
+ * its only job that Cleanup could not already do, picking a speaker's colour,
+ * moved onto the colour square in each group header. Callers still pass a tab
+ * name; it is accepted and ignored so older entry points keep working. */
+function openSpeakerManager() {
   document.getElementById('speaker-manager-overlay').classList.remove('hidden');
-  _syncSpeakerDraftFromSelection();
-  renderSpeakerManager();
-  const landing = _speakerManagerInitialTab(tab);
-  switchSpeakerManagerTab(landing, { remember: !!tab });
-  _speakerModalFocusTab(landing);
-  // Stats arrive after the first paint and feed the tab badges. The landing
-  // tab is never changed underneath the user once it is showing.
+  // Load (or reload) whenever there's no state or it's stale for another session.
+  if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();
+  _cleanupVideoSyncToggleBtn();
+  _cleanupSyncFooter();
+  _speakerModalFocus();
+  // Stats arrive after the first paint and feed the header's status line.
   refreshSpeakerModalHeader();
-}
-
-// The badge means ONE thing: how many speaker groups the Cleanup tab holds.
-// Until the clusters load there is no honest number, so the badge stays hidden
-// rather than showing an unlinked-speaker count that changes meaning a moment
-// later. _cleanupUpdateBadge owns it from then on.
-function _cleanupPaintQuickBadge() {
-  const badge = document.getElementById('speaker-cleanup-badge');
-  if (!badge) return;
-  if (_cleanupState && _cleanupState.sessionId === state.sessionId) { _cleanupUpdateBadge(); return; }
-  badge.hidden = true;
-  badge.textContent = '';
-  badge.title = '';
 }
 
 function closeSpeakerManager() {
@@ -7180,7 +7045,6 @@ function closeSpeakerManagerOnOverlay(event) {
 
 let _cleanupState = null;
 // { sessionId, clusters: [...], noiseKeys: Set, library: [...], thresholds, originalSnapshot, dirty }
-let _cleanupActiveTab = 'manage';
 let _cleanupDragKeys = [];            // speaker_keys currently being dragged (multi-select aware)
 let _cleanupExpandedKeys = new Set();
 let _cleanupNoiseExpanded = false;
@@ -7192,7 +7056,7 @@ let _cleanupPlayQueueState = null;    // sequential audio/video player: { btn, s
 let _cleanupPicker = null;            // open assignment popover element, or null
 let _cleanupStagedToast = null;       // "changes still staged" reminder, so it can be dismissed
 
-// The staged-changes reminder must not outlive the modal: its Apply action
+// Any staged-changes reminder must not outlive the modal: its Apply action
 // would otherwise write edits the user has since discarded.
 function _dismissCleanupStagedToast() {
   if (_cleanupStagedToast && typeof _cleanupStagedToast.dismiss === 'function') {
@@ -7201,60 +7065,8 @@ function _dismissCleanupStagedToast() {
   _cleanupStagedToast = null;
 }
 
-function switchSpeakerManagerTab(tab, opts) {
-  const remember = !opts || opts.remember !== false;
-  // Leaving Cleanup does NOT discard staged edits (they live in _cleanupState
-  // until Apply), so a blocking confirm here would be a lie. Say plainly that
-  // they are still unwritten and offer the commit.
-  if (_cleanupActiveTab === 'cleanup' && tab !== 'cleanup' && _cleanupState && _cleanupState.dirty) {
-    const pending = Math.max(_cleanupPendingChangeCount(), 1);
-    _cleanupStagedToast = uiToast({
-      message: `${_plural(pending, 'cleanup change is', 'cleanup changes are')} still staged. Nothing is written until you click Apply.`,
-      kind: 'warn',
-      id: 'cleanup-staged-reminder',
-      action: {
-        label: 'Apply now',
-        onClick: () => {
-          // Recheck: "Close and discard" clears the dirty flag but leaves the
-          // staged state in place, and this toast can outlive that click.
-          if (!_cleanupState || !_cleanupState.dirty) {
-            uiToast({ message: 'Those cleanup changes were discarded.', kind: 'info', id: 'cleanup-staged-reminder' });
-            return;
-          }
-          switchSpeakerManagerTab('cleanup');
-          applySpeakerCleanup();
-        },
-      },
-    });
-  }
-  _cleanupActiveTab = tab;
-  if (remember) _speakerModalLastTab = tab;
-  // Leaving the current tab: stop any voice sample it was playing.
-  stopSpeakerVoice();
-  document.querySelectorAll('.speaker-manager-tab').forEach(b => {
-    const on = b.dataset.tab === tab;
-    b.classList.toggle('active', on);
-    b.setAttribute('aria-selected', on ? 'true' : 'false');
-  });
-  document.querySelectorAll('[data-tab-view]').forEach(el => {
-    el.hidden = el.dataset.tabView !== tab;
-  });
-  // Cleanup is card-heavy and needs far more room than the compact Manage
-  // list: widen the dialog (and let it grow taller) for it.
-  const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
-  if (dialog) dialog.classList.toggle('cleanup-active', tab === 'cleanup');
-  if (tab === 'cleanup') {
-    // Load (or reload) whenever there's no state or it's stale for another session.
-    if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();
-    _cleanupVideoSyncToggleBtn();
-    _cleanupSyncFooter();
-  } else {
-    _cleanupClosePicker();
-  }
-}
-
 function openSpeakerCleanupTab() {
-  openSpeakerManager('cleanup');
+  openSpeakerManager();
 }
 
 async function loadSpeakerClusters(force = false) {
@@ -7287,7 +7099,6 @@ async function loadSpeakerClusters(force = false) {
     _cleanupState.calendar = await _cleanupReadCandidates(candResp);
     if (loading) loading.hidden = true;
     renderSpeakerClusters();
-    _cleanupUpdateBadge();
     _cleanupSyncFooter();
   } catch (e) {
     grid.innerHTML = `<div class="cleanup-help">Couldn't load clusters: ${e.message}</div>`;
@@ -7401,6 +7212,7 @@ function _cleanupBuildState(payload) {
       global_id: c.global_id || null,
       name:      c.name || '',
       new_name:  c.new_name || '',
+      color:     c.color || null,
     };
   });
 
@@ -7416,16 +7228,6 @@ function _cleanupBuildState(payload) {
     originalSnapshot: snapshot,
     dirty: false,
   };
-}
-
-// The Cleanup badge counts GROUPS, matching what the tab actually shows.
-function _cleanupUpdateBadge() {
-  const badge = document.getElementById('speaker-cleanup-badge');
-  if (!badge || !_cleanupState) return;
-  const groups = _cleanupState.clusters.filter(c => c.members.length).length;
-  badge.hidden = groups === 0;
-  badge.textContent = String(groups);
-  badge.title = `${_plural(groups, 'speaker group', 'speaker groups')} in this meeting`;
 }
 
 function _cleanupMarkDirty() {
@@ -7568,7 +7370,6 @@ function renderSpeakerClusters() {
   }
 
   _cleanupRenderSelectionBar();
-  _cleanupUpdateBadge();
   _cleanupSyncFooter();
   _cleanupWireGridAutoscroll();
 }
@@ -7723,9 +7524,25 @@ function _cleanupRenderCluster(cluster) {
   const header = document.createElement('div');
   header.className = 'cleanup-cluster-header';
 
-  const swatch = document.createElement('span');
-  swatch.className = 'cleanup-cluster-swatch';
+  // The swatch is the colour control. A group with neither a profile nor a
+  // typed name has nothing to hang a colour on, so its swatch stays inert
+  // until it is named: the palette colour it shows is assigned, not chosen.
+  const named = !!(cluster.global_id || (cluster.new_name || '').trim());
+  const swatch = document.createElement('button');
+  swatch.type = 'button';
+  swatch.className = 'cleanup-cluster-swatch cleanup-swatch-btn';
   swatch.style.background = accent;
+  if (named) {
+    swatch.title = 'Change this speaker\u2019s colour';
+    swatch.setAttribute('aria-label', `Change the colour for ${cluster.name || cluster.new_name}`);
+    swatch.addEventListener('click', e => {
+      e.stopPropagation();
+      _cleanupOpenColorPicker(swatch, cluster);
+    });
+  } else {
+    swatch.disabled = true;
+    swatch.title = 'Name this speaker, or link it to a profile, to choose a colour';
+  }
   header.appendChild(swatch);
 
   const nameWrap = document.createElement('div');
@@ -8290,6 +8107,60 @@ function _cleanupUnassignCluster(cluster) {
   cluster.color = null;
   cluster._dropped_suggestions = new Set();
   _cleanupClosePicker();
+  _cleanupMarkDirty();
+  renderSpeakerClusters();
+}
+
+/* ── Group colour picker ────────────────────────────────────────────────────
+ * Opened from the colour square in a group header. Staged like every other
+ * Cleanup edit: the cards repaint at once, the footer counts it, and Apply is
+ * what writes it. For a group linked to a Voice Library profile the colour
+ * belongs to that profile, so it follows the person into every meeting, which
+ * is what the Voice Library's own colour grid already does.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+function _cleanupOpenColorPicker(anchorEl, cluster) {
+  _cleanupClosePicker();
+  const pop = document.createElement('div');
+  pop.className = 'cleanup-picker cleanup-color-picker';
+
+  const head = document.createElement('div');
+  head.className = 'cleanup-picker-subtitle';
+  const who = cluster.name || cluster.new_name || 'this speaker';
+  head.innerHTML = `<i class="fa-solid fa-palette"></i> <span>Colour for <strong>${escapeHtml(who)}</strong>` +
+    (cluster.global_id ? ', everywhere this profile appears' : '') + '</span>';
+  pop.appendChild(head);
+
+  const grid = document.createElement('div');
+  grid.className = 'cleanup-color-grid';
+  const current = String(cluster.color || '').toLowerCase();
+  _SPEAKER_PALETTE.forEach(color => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'speaker-color-btn' + (current === color.toLowerCase() ? ' active' : '');
+    btn.style.backgroundColor = color;
+    btn.title = `Use ${color}`;
+    btn.setAttribute('aria-label', `Use colour ${color}`);
+    btn.addEventListener('click', () => _cleanupSetClusterColor(cluster, color));
+    grid.appendChild(btn);
+  });
+  pop.appendChild(grid);
+
+  document.body.appendChild(pop);
+  _cleanupPicker = pop;
+  _cleanupPositionPicker(pop, anchorEl);
+  document.addEventListener('mousedown', _cleanupPickerOutside, true);
+  document.addEventListener('keydown', _cleanupPickerKey, true);
+  grid.querySelector('.speaker-color-btn.active, .speaker-color-btn')?.focus();
+}
+
+function _cleanupSetClusterColor(cluster, color) {
+  _cleanupClosePicker();
+  if ((cluster.color || null) === color) return;
+  cluster.color = color;
+  // The pills carry their own colour from the last save, so a staged change
+  // has to reach them too or the preview only half happens.
+  cluster.members.forEach(m => { m.color = color; });
   _cleanupMarkDirty();
   renderSpeakerClusters();
 }
@@ -9305,8 +9176,7 @@ function _cleanupVideoEnsureDragWired() {
 // (`_cleanupPlayCurrent`), which seeks the muted popup video alongside the WAV
 // whenever the popup is open. Screen recordings frequently have no audio track,
 // so the WAV is always the authoritative clock. (The old _cleanupPlaySegment
-// monkey-patch and the switchSpeakerManagerTab wrapper were folded in there and
-// into switchSpeakerManagerTab respectively.)
+// monkey-patch was folded in there.)
 
 // Dirty guard - both for page unload and for the modal close handler.
 window.addEventListener('beforeunload', e => {
@@ -10687,14 +10557,6 @@ async function _fpMatchGoToSessions(speakerName, anchorEl) {
   setTimeout(() => document.addEventListener('mousedown', dismiss), 0);
 }
 
-function clearSpeakerSelection() {
-  _selectedSpeakerKeys = [];
-  _speakerSelectionAnchor = null;
-  _syncSpeakerDraftFromSelection();
-  _highlightSelectedSpeakerBadges();
-  renderSpeakerManager();
-}
-
 /* ── Transcript segment multi-select ─────────────────────────────────────── */
 
 function _toggleTranscriptSegSelection(segEl, { range = false } = {}) {
@@ -11086,16 +10948,16 @@ function _bulkReassignSelectedTo(name) {
 }
 
 /* === SPEAKER-MODAL-SHELL START ===========================================
- * One shell for the Speakers modal: a shared header (meeting + status line +
- * tab legend), tab badges, deterministic landing, and the single voice-sample
- * player every tab routes through. Everything below is scoped to the modal.
+ * The Speakers modal's shell: the header (meeting + status line) and the
+ * single voice-sample player. The modal is one surface, Cleanup; the Manage
+ * tab was retired once its colour picker moved onto the group headers.
  * ========================================================================= */
 
 // ── One voice-sample player for the whole modal ─────────────────────────────
-// Manage, Cleanup and Resolve used to each carry their own <audio> and their
-// own play/stop bookkeeping, so two samples could overlap. playSpeakerVoice is
-// now the single owner: one private <audio>, one cancellation token, one
-// "playing" button at a time.
+// The modal's tabs used to each carry their own <audio> and their own play/stop
+// bookkeeping, so two samples could overlap. playSpeakerVoice is the single
+// owner: one private <audio>, one cancellation token, one "playing" button at
+// a time.
 let _voiceSampleAudio = null;
 let _voicePlayToken = 0;
 let _voicePlayButton = null;
@@ -11269,12 +11131,6 @@ async function playSpeakerVoice(opts) {
 window.playSpeakerVoice = playSpeakerVoice;
 window.stopSpeakerVoice = stopSpeakerVoice;
 
-function playManageSpeakerVoice(keys, btn, ev) {
-  if (ev) ev.stopPropagation();
-  return playSpeakerVoice({ speakerKeys: keys, button: btn });
-}
-
-
 /* ── Shared modal header, status line and tab badges ────────────────────────
  * All three tabs describe the same set of speakers, so the header states that
  * set once using the product definition of "needs attention" (core/attention.py):
@@ -11286,7 +11142,6 @@ function playManageSpeakerVoice(keys, btn, ev) {
 
 let _speakerModalStats = null;      // { total, named, unresolved, fragments }
 let _speakerModalStatsSession = null;
-let _speakerModalLastTab = null;    // remembered per session view
 let _speakerModalStatsToken = 0;
 
 function _speakerAttentionThresholds() {
@@ -11333,7 +11188,7 @@ function _speakerStatusText(stats) {
   return parts.length ? `${head}: ${parts.join(', ')}` : head;
 }
 
-/** Repaint the meeting title, the status line and both tab badges. */
+/** Repaint the meeting title and the status line. */
 function _paintSpeakerModalHeader() {
   const meetingEl = document.getElementById('speaker-manager-meeting');
   if (meetingEl) {
@@ -11351,13 +11206,6 @@ function _paintSpeakerModalHeader() {
     statusEl.textContent = _speakerStatusText(_speakerModalStats);
     statusEl.classList.toggle('has-attention', !!(_speakerModalStats && _speakerModalStats.unresolved));
   }
-  _paintSpeakerTabBadges();
-}
-
-function _paintSpeakerTabBadges() {
-  _cleanupPaintQuickBadge();
-  const dirtyDot = document.getElementById('speaker-cleanup-dirty');
-  if (dirtyDot) dirtyDot.hidden = !(_cleanupState && _cleanupState.dirty);
 }
 
 /** Reload the shared stats for the current session, then repaint. */
@@ -11408,6 +11256,7 @@ function _cleanupPendingChangeCount() {
       global_id: cluster.global_id || null,
       name:      cluster.name || '',
       new_name:  cluster.new_name || '',
+      color:     cluster.color || null,
     };
     if (!identityBefore) {
       // A group created during this edit only counts on its own when it has
@@ -11415,7 +11264,8 @@ function _cleanupPendingChangeCount() {
       if (identityNow.global_id || identityNow.new_name) changed += 1;
     } else if (identityBefore.global_id !== identityNow.global_id
             || identityBefore.name !== identityNow.name
-            || identityBefore.new_name !== identityNow.new_name) {
+            || identityBefore.new_name !== identityNow.new_name
+            || identityBefore.color !== identityNow.color) {
       changed += 1;
     }
   }
@@ -11449,263 +11299,6 @@ function _cleanupSyncFooter() {
       : '<i class="fa-solid fa-check"></i> Apply';
   }
   if (resetBtn) resetBtn.disabled = !dirty;
-  const dirtyDot = document.getElementById('speaker-cleanup-dirty');
-  if (dirtyDot) dirtyDot.hidden = !dirty;
-}
-
-/* ── Voice Library combobox (Manage tab) ─────────────────────────────────── */
-
-let _voiceProfiles = [];            // [{ id, name, color, emb_count }]
-let _voiceProfilesLoaded = false;
-let _mgrNameCombo = null;           // uiCombobox controller for the Manage editor
-let _mgrCommittedName = '';         // last value written to the server
-
-async function _loadVoiceProfiles(force = false) {
-  if (_voiceProfilesLoaded && !force) return _voiceProfiles;
-  try {
-    const r = await fetch('/api/fingerprint/speakers');
-    const data = await r.json();
-    _voiceProfiles = Array.isArray(data) ? data : [];
-    _voiceProfilesLoaded = true;
-  } catch (_) { _voiceProfiles = []; }
-  if (_mgrNameCombo) _mgrNameCombo.setItems(_voiceComboItems());
-  return _voiceProfiles;
-}
-
-function _voiceComboItems() {
-  // list_global_speakers exposes emb_count (voice samples on file), not a
-  // meeting count, so the row says what the number actually is.
-  return _voiceProfiles
-    .filter(p => p && p.name)
-    .map(p => ({
-      id: p.id,
-      label: p.name,
-      color: p.color || null,
-      sublabel: _plural(Number(p.emb_count) || 0, 'voice sample', 'voice samples'),
-    }));
-}
-
-function _mgrSetUnsaved(dirty) {
-  const el = document.getElementById('speaker-editor-unsaved');
-  if (el) el.hidden = !dirty;
-  const save = document.getElementById('speaker-save-btn');
-  if (save) save.classList.toggle('is-dirty', !!dirty);
-}
-
-function _mgrRefreshUnsaved() {
-  const typed = (_mgrNameCombo ? _mgrNameCombo.getValue() : '').trim();
-  _mgrSetUnsaved(!!_selectedSpeakerKeys.length && typed !== (_mgrCommittedName || '').trim());
-}
-
-// True while the user is actually typing in the Manage name field. Background
-// re-renders (a new transcript segment, a speaker_label or fingerprint event)
-// call renderSpeakerManager, and blindly resyncing the field there would move
-// _mgrCommittedName up to the uncommitted draft, which silently swallows the
-// pending rename on the next change event.
-function _mgrNameFieldIsFocused() {
-  return !!(_mgrNameCombo && document.activeElement === _mgrNameCombo.input);
-}
-
-/** Build (once) the Manage name combobox and keep its value in sync. */
-function _mgrEnsureNameCombo() {
-  const mount = document.getElementById('speaker-name-combo');
-  if (!mount) return null;
-  if (_mgrNameCombo) return _mgrNameCombo;
-  if (typeof window.uiCombobox !== 'function') return null;
-  _mgrNameCombo = uiCombobox({
-    mount,
-    placeholder: 'Speaker name, or pick a Voice Library profile',
-    ariaLabel: 'Speaker name or Voice Library profile',
-    emptyText: 'No Voice Library profiles yet. Type a name to use it.',
-    allowTyped: true,
-    typedLabel: 'Use typed name',
-    items: _voiceComboItems(),
-    onInput: value => { _speakerDraftName = value; _mgrRefreshUnsaved(); },
-    onSelect: (item, meta) => {
-      _speakerDraftName = item.label;
-      if (meta.typed) {
-        // Enter on "Use typed name" is a commit, not a stage. The combobox
-        // preventDefaults that Enter, so the native change event never fires
-        // and a second press would otherwise be needed to save.
-        _mgrCommitTypedName();
-        return;
-      }
-      linkSelectedSpeakersToProfile(item.id, item.label);
-    },
-  });
-  // Enter and blur-after-change both commit, so Manage behaves like Resolve:
-  // an edit you finish is an edit that is saved (with an Undo toast).
-  _mgrNameCombo.input.addEventListener('change', _mgrCommitTypedName);
-  _loadVoiceProfiles();
-  return _mgrNameCombo;
-}
-
-/** Write the typed name through, or just refresh the indicator when there is
- *  nothing new to save. Shared by Enter, blur-after-change and Save changes. */
-function _mgrCommitTypedName() {
-  const typed = (_mgrNameCombo ? _mgrNameCombo.getValue() : '').trim();
-  if (!typed || !_selectedSpeakerKeys.length || typed === (_mgrCommittedName || '').trim()) {
-    _mgrRefreshUnsaved();
-    return;
-  }
-  applySpeakerEditor();
-}
-
-/** Snapshot the selected rows so an Undo toast can put them back. */
-function _mgrSnapshotSelection() {
-  return _selectedSpeakerKeys.map(key => {
-    const p = _speakerProfiles[key] || {};
-    return { speaker_key: key, name: p.name || '', color: p.color || speakerColor(key) };
-  });
-}
-
-async function _mgrRestoreSnapshot(snapshot) {
-  if (!state.sessionId || !snapshot || !snapshot.length) return;
-  for (const row of snapshot) {
-    try {
-      const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ speaker_keys: [row.speaker_key], name: row.name, color: row.color }),
-      });
-      const data = await resp.json();
-      if (resp.ok) (data.speakers || []).forEach(applySpeakerProfileUpdate);
-    } catch (_) { /* best effort */ }
-  }
-  _syncSpeakerDraftFromSelection();
-  renderSpeakerManager();
-  onSpeakerDataChanged();
-}
-
-function _mgrToastSaved(message, snapshot) {
-  uiToast({
-    message,
-    kind: 'success',
-    id: 'speaker-manage-save',
-    action: { label: 'Undo', onClick: () => _mgrRestoreSnapshot(snapshot) },
-  });
-}
-
-/**
- * Link every selected speaker key to a Voice Library profile, then take the
- * profile's name. The link endpoint applies the profile name and colour itself
- * when apply_name is set (app.py fp_link_session_speaker), so no extra PATCH.
- */
-async function linkSelectedSpeakersToProfile(globalId, profileName) {
-  if (!state.sessionId) { uiToast({ message: 'Load a meeting first.', kind: 'warn' }); return; }
-  if (!_selectedSpeakerKeys.length) {
-    uiToast({ message: 'Select at least one speaker row first.', kind: 'warn' });
-    return;
-  }
-  const snapshot = _mgrSnapshotSelection();
-  const keys = [..._selectedSpeakerKeys];
-  // Full prior binding per key, not just "was it linked": re-linking a speaker
-  // that already pointed at another profile has to be undoable back to THAT
-  // profile, otherwise Undo restores the name but leaves the voice binding on
-  // the new one.
-  const linksBefore = keys.map(k => ({ key: k, link: _sessionLinks[k] || null }));
-  const profileColor = (_voiceProfiles.find(p => p.id === globalId) || {}).color || null;
-  let failed = 0;
-  for (const key of keys) {
-    try {
-      const resp = await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ speaker_key: key, global_id: globalId, apply_name: true }),
-      });
-      if (!resp.ok) { failed += 1; continue; }
-      _sessionLinks[key] = { global_id: globalId, name: profileName };
-      // apply_name makes the server write the profile's name AND colour
-      // (app.py fp_link_session_speaker); mirror both locally so the row does
-      // not keep the old swatch until the next reload.
-      const update = { speaker_key: key, name: profileName };
-      if (profileColor) update.color = profileColor;
-      applySpeakerProfileUpdate(update);
-    } catch (_) { failed += 1; }
-  }
-  _updateLinkedBadges();
-  _mgrCommittedName = profileName;
-  _syncSpeakerDraftFromSelection();
-  renderSpeakerManager();
-  onSpeakerDataChanged();
-  if (failed) {
-    uiToast({ message: `Could not link ${_plural(failed, 'speaker', 'speakers')} to ${profileName}.`, kind: 'error' });
-    return;
-  }
-  uiToast({
-    message: `Linked ${_plural(keys.length, 'speaker', 'speakers')} to ${profileName}.`,
-    kind: 'success',
-    id: 'speaker-manage-save',
-    action: {
-      label: 'Undo',
-      onClick: async () => {
-        for (const row of linksBefore) {
-          try {
-            await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link/${encodeURIComponent(row.key)}`, { method: 'DELETE' });
-          } catch (_) {}
-          delete _sessionLinks[row.key];
-          if (!row.link || !row.link.global_id) continue;
-          // Was bound to a different profile before: put that binding back.
-          try {
-            await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ speaker_key: row.key, global_id: row.link.global_id }),
-            });
-            _sessionLinks[row.key] = row.link;
-          } catch (_) {}
-        }
-        _updateLinkedBadges();
-        await _mgrRestoreSnapshot(snapshot);
-      },
-    },
-  });
-}
-
-/** Drop the Voice Library binding for the selected rows (names are kept). */
-async function unlinkSelectedSpeakers() {
-  if (!state.sessionId) return;
-  const keys = _selectedSpeakerKeys.filter(k => _sessionLinks[k]);
-  if (!keys.length) { uiToast({ message: 'No linked speaker selected.', kind: 'warn' }); return; }
-  const ok = await uiConfirm({
-    title: 'Unlink from the Voice Library?',
-    message: `${_plural(keys.length, 'speaker', 'speakers')} will keep the current name but stop being recognised by voice in future meetings.`,
-    details: keys,
-    confirmLabel: 'Unlink',
-  });
-  if (!ok) return;
-  const previous = keys.map(k => ({ key: k, link: _sessionLinks[k] }));
-  for (const key of keys) {
-    try {
-      await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link/${encodeURIComponent(key)}`, { method: 'DELETE' });
-      delete _sessionLinks[key];
-    } catch (_) { /* leave the badge in place if it failed */ }
-  }
-  _updateLinkedBadges();
-  renderSpeakerManager();
-  uiToast({
-    message: `Unlinked ${_plural(keys.length, 'speaker', 'speakers')}.`,
-    kind: 'success',
-    id: 'speaker-manage-save',
-    action: {
-      label: 'Undo',
-      onClick: async () => {
-        for (const row of previous) {
-          if (!row.link || !row.link.global_id) continue;
-          try {
-            await fetch(`/api/fingerprint/sessions/${encodeURIComponent(state.sessionId)}/link`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ speaker_key: row.key, global_id: row.link.global_id }),
-            });
-            _sessionLinks[row.key] = row.link;
-          } catch (_) {}
-        }
-        _updateLinkedBadges();
-        renderSpeakerManager();
-      },
-    },
-  });
 }
 
 /* ── Modal chrome: Escape to close, focus on open ────────────────────────── */
@@ -11724,293 +11317,16 @@ document.addEventListener('keydown', e => {
   closeSpeakerManager();
 });
 
-/** Put the caret somewhere useful the moment the modal lands on a tab. */
-function _speakerModalFocusTab(tab) {
+/** Move focus into the dialog on open so Tab and Escape behave, without
+ *  landing on a destructive control. The dialog carries tabindex="-1". */
+function _speakerModalFocus() {
   window.setTimeout(() => {
     if (!_speakerModalIsOpen()) return;
-    if (tab === 'manage') {
-      const combo = document.querySelector('#speaker-name-combo .ui-combobox-input');
-      if (combo) { combo.focus(); return; }
-    }
-    document.getElementById(`speaker-tab-${tab}`)?.focus();
+    document.querySelector('#speaker-manager-overlay .speaker-manager-dialog')?.focus();
   }, 0);
 }
 
 /* === SPEAKER-MODAL-SHELL END ============================================= */
-
-function renderSpeakerManager() {
-  const listEl = document.getElementById('speaker-manager-list');
-  const colorGridEl = document.getElementById('speaker-color-grid');
-  const hintEl = document.getElementById('speaker-editor-hint');
-  if (!listEl || !colorGridEl || !hintEl) return;
-
-  const profiles = _getSortedSpeakerProfiles().filter(p => p.speaker_key !== _NOISE_LABEL);
-  const groups = _groupProfilesByName(profiles);
-  const selectedGroupCount = groups.filter(g => g.speakerKeys.some(k => _selectedSpeakerKeys.includes(k))).length;
-
-  // Name field is a combobox over the Voice Library, not a bare datalist: the
-  // first row uses whatever you typed, the rest bind this speaker to a saved
-  // voice profile so it is recognised in future meetings.
-  const combo = _mgrEnsureNameCombo();
-  if (combo) {
-    // Only overwrite the field when the user is NOT mid-edit.
-    // renderSpeakerManager runs on every new transcript segment and on every
-    // speaker_label / fingerprint event while the modal is open; resyncing
-    // there would discard whatever is being typed. The indicator itself is
-    // derived from (typed vs committed), so it is always safe to recompute.
-    if (!_mgrNameFieldIsFocused()) {
-      combo.setValue(_speakerDraftName);
-      _mgrCommittedName = _speakerDraftName;
-    }
-    _mgrRefreshUnsaved();
-  }
-
-  colorGridEl.innerHTML = '';
-  _SPEAKER_PALETTE.forEach(color => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'speaker-color-btn' + (_speakerDraftColor === color ? ' active' : '');
-    btn.title = `Use ${color}`;
-    btn.setAttribute('aria-label', `Use colour ${color}`);
-    btn.style.backgroundColor = color;
-    btn.addEventListener('click', async () => {
-      _speakerDraftColor = color;
-      // Manage is a direct-edit surface: the colour writes straight through,
-      // exactly like the name field, and the toast carries the Undo.
-      if (_selectedSpeakerKeys.length && state.sessionId) {
-        const snapshot = _mgrSnapshotSelection();
-        const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ speaker_keys: _selectedSpeakerKeys, color }),
-        });
-        const data = await resp.json();
-        if (resp.ok) {
-          (data.speakers || []).forEach(applySpeakerProfileUpdate);
-          _mgrToastSaved(`Colour saved for ${_plural(snapshot.length, 'speaker', 'speakers')}.`, snapshot);
-        } else {
-          uiToast({ message: data.error || 'Could not save the colour.', kind: 'error' });
-        }
-      }
-      renderSpeakerManager();
-    });
-    colorGridEl.appendChild(btn);
-  });
-
-  const unlinkBtn = document.getElementById('speaker-unlink-btn');
-  if (unlinkBtn) unlinkBtn.hidden = !_selectedSpeakerKeys.some(k => _sessionLinks[k]);
-
-  if (selectedGroupCount === 0) {
-    hintEl.textContent = 'Click a speaker row to edit it. Ctrl/Cmd-click or Shift-click for multi-select.';
-  } else if (selectedGroupCount === 1) {
-    hintEl.textContent = 'Assign a name, or pick a Voice Library profile to link this speaker to.';
-  } else {
-    hintEl.textContent = `Editing ${selectedGroupCount} speakers. Every change applies to all of them.`;
-  }
-
-  _paintSpeakerModalHeader();
-
-  listEl.innerHTML = '';
-  if (!groups.length) {
-    listEl.innerHTML = '<div class="speaker-manager-empty">Speaker rows will appear here once diarized speakers show up in the transcript.</div>';
-    return;
-  }
-
-  groups.forEach(group => {
-    // The row is a plain container with real <button> children. It used to be a
-    // <button> with an interactive span inside it, which is invalid HTML and
-    // gives screen readers one unusable control instead of two.
-    const row = document.createElement('div');
-    const isSelected = group.speakerKeys.some(k => _selectedSpeakerKeys.includes(k));
-    row.className = 'speaker-row' + (isSelected ? ' selected' : '');
-    row.dataset.speakerKeys = JSON.stringify(group.speakerKeys);
-
-    const selectBtn = document.createElement('button');
-    selectBtn.type = 'button';
-    selectBtn.className = 'speaker-row-select';
-    selectBtn.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
-    selectBtn.addEventListener('click', e => {
-      _setGroupSelection(group, {
-        toggle: e.ctrlKey || e.metaKey,
-        range: e.shiftKey,
-      });
-    });
-
-    const swatch = document.createElement('span');
-    swatch.className = 'speaker-row-swatch';
-    swatch.style.backgroundColor = group.color || speakerColor(group.speakerKeys[0]);
-
-    const main = document.createElement('div');
-    main.className = 'speaker-row-main';
-
-    const nameEl = document.createElement('div');
-    nameEl.className = 'speaker-row-name';
-    nameEl.textContent = group.name;
-
-    // Count active (non-noise) segments only, so this matches the filter chips
-    // and analytics. The key list below still shows every fragment key.
-    const count = group.speakerKeys.reduce((sum, k) => sum + (_isNoiseKey(k) ? 0 : _speakerBadgeCount(k)), 0);
-    const meta = document.createElement('div');
-    meta.className = 'speaker-row-meta';
-    if (group.custom && !count) {
-      meta.textContent = 'Saved participant';
-    } else if (group.speakerKeys.length === 1) {
-      const k = group.speakerKeys[0];
-      meta.innerHTML = `${k}${count ? ` <span class="session-meta-sep">|</span> ${count} segment${count === 1 ? '' : 's'}` : ''}`;
-    } else {
-      // Multiple diarizer fragments - show key list as muted subtext
-      const displayed = group.speakerKeys.slice(0, 3).join(', ');
-      const extra = group.speakerKeys.length > 3 ? ` +${group.speakerKeys.length - 3}` : '';
-      meta.innerHTML = `${displayed}${extra}${count ? ` <span class="session-meta-sep">|</span> ${count} segments` : ''}`;
-      meta.title = group.speakerKeys.join(', ');
-    }
-
-    const countEl = document.createElement('div');
-    countEl.className = 'speaker-row-count';
-    countEl.textContent = count ? `${count}` : 'saved';
-
-    main.appendChild(nameEl);
-    main.appendChild(meta);
-    selectBtn.appendChild(swatch);
-    selectBtn.appendChild(main);
-    row.appendChild(selectBtn);
-    // Play this speaker's voice (only when there are real segments to hear).
-    // A real sibling button: Enter and Space come free, no nesting.
-    if (count > 0) {
-      const playCtl = document.createElement('button');
-      playCtl.type = 'button';
-      playCtl.className = 'speaker-row-play';
-      playCtl.title = 'Play this speaker’s voice';
-      playCtl.setAttribute('aria-label', `Play ${group.name}`);
-      playCtl.innerHTML = '<i class="fa-solid fa-play"></i>';
-      playCtl.addEventListener('click', ev => playManageSpeakerVoice(group.speakerKeys, playCtl, ev));
-      row.appendChild(playCtl);
-    }
-    // Show linked indicator if any key in this group is linked to a global profile
-    const isLinked = group.speakerKeys.some(k => _sessionLinks[k]);
-    if (isLinked) {
-      const linkBadge = document.createElement('span');
-      linkBadge.className = 'speaker-row-linked';
-      linkBadge.innerHTML = '<i class="fa-solid fa-link"></i> Linked';
-      linkBadge.title = 'Linked to a voice library profile';
-      row.appendChild(linkBadge);
-    }
-    row.appendChild(countEl);
-    listEl.appendChild(row);
-  });
-}
-
-async function createSpeakerProfile() {
-  const name = (_mgrNameCombo ? _mgrNameCombo.getValue() : _speakerDraftName || '').trim();
-  if (!name) {
-    uiToast({ message: 'Assign a name first.', kind: 'warn' });
-    return;
-  }
-
-  if (!state.sessionId) {
-    // No session yet - store locally and flush when recording starts
-    const tempKey = `pre:${Date.now()}`;
-    const color = _speakerDraftColor || _SPEAKER_PALETTE[_speakerColorIdx % _SPEAKER_PALETTE.length];
-    _pendingSpeakerProfiles.push({ tempKey, name, color });
-    applySpeakerProfileUpdate({ speaker_key: tempKey, name, color });
-    if (_speakerProfiles[tempKey]) _speakerProfiles[tempKey].custom = true;
-    _selectedSpeakerKeys = [tempKey];
-    _speakerSelectionAnchor = tempKey;
-    _syncSpeakerDraftFromSelection();
-    renderSpeakerManager();
-    return;
-  }
-
-  const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name,
-      color: _speakerDraftColor || null,
-    }),
-  });
-  const data = await resp.json();
-  if (!resp.ok) {
-    uiToast({ message: data.error || 'Failed to add speaker', kind: 'error' });
-    return;
-  }
-
-  applySpeakerProfileUpdate(data.speaker);
-  _selectedSpeakerKeys = [data.speaker.speaker_key];
-  _speakerSelectionAnchor = data.speaker.speaker_key;
-  _syncSpeakerDraftFromSelection();
-  renderSpeakerManager();
-  onSpeakerDataChanged();
-  uiToast({ message: `Added participant "${name}".`, kind: 'success', id: 'speaker-manage-save' });
-}
-
-async function _flushPendingSpeakers(sessionId) {
-  if (!_pendingSpeakerProfiles.length) return;
-  const toFlush = [..._pendingSpeakerProfiles];
-  _pendingSpeakerProfiles = [];
-  for (const pending of toFlush) {
-    try {
-      const resp = await fetch(`/api/sessions/${sessionId}/speakers`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: pending.name, color: pending.color }),
-      });
-      const data = await resp.json();
-      if (resp.ok && data.speaker) {
-        // Replace the temp profile with the real one
-        delete _speakerProfiles[pending.tempKey];
-        delete _speakerColors[pending.tempKey];
-        if (_speakerLabels[pending.tempKey]) delete _speakerLabels[pending.tempKey];
-        _selectedSpeakerKeys = _selectedSpeakerKeys.filter(k => k !== pending.tempKey);
-        applySpeakerProfileUpdate(data.speaker);
-      }
-    } catch (e) {
-      console.warn('Failed to flush pending speaker:', pending.name, e);
-    }
-  }
-  _syncSpeakerDraftFromSelection();
-  renderSpeakerManager();
-}
-
-async function applySpeakerEditor() {
-  if (!state.sessionId) return;
-  if (!_selectedSpeakerKeys.length) {
-    uiToast({ message: 'Select at least one speaker row first.', kind: 'warn' });
-    return;
-  }
-
-  const name = (_mgrNameCombo ? _mgrNameCombo.getValue() : _speakerDraftName || '').trim();
-  const body = { speaker_keys: _selectedSpeakerKeys };
-  if (name) body.name = name;
-  if (_speakerDraftColor) body.color = _speakerDraftColor;
-  if (!body.name && !body.color) {
-    uiToast({ message: 'Assign a name or choose a colour first.', kind: 'warn' });
-    return;
-  }
-
-  const snapshot = _mgrSnapshotSelection();
-  const resp = await fetch(`/api/sessions/${state.sessionId}/speakers`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const data = await resp.json();
-  if (!resp.ok) {
-    uiToast({ message: data.error || 'Could not save the speaker.', kind: 'error' });
-    return;
-  }
-
-  (data.speakers || []).forEach(applySpeakerProfileUpdate);
-  _mgrCommittedName = name;
-  _syncSpeakerDraftFromSelection();
-  renderSpeakerManager();
-  onSpeakerDataChanged();
-  _mgrToastSaved(
-    name ? `Saved "${name}" for ${_plural(snapshot.length, 'speaker', 'speakers')}.`
-         : `Saved ${_plural(snapshot.length, 'speaker', 'speakers')}.`,
-    snapshot,
-  );
-}
 
 function appendTranscript(text, source, startTime, endTime, segId, labelOverride, originalSource) {
   const el = document.getElementById('transcript');
@@ -12164,14 +11480,7 @@ function appendTranscript(text, source, startTime, endTime, segId, labelOverride
   if (_transcriptFilter.search.trim() && seg.style.display !== 'none') {
     _tnHighlightInSeg(seg);
   }
-  // Only check this new segment's badge - no need to re-scan all segments.
-  if (_selectedSpeakerKeys.length) {
-    const badge = seg.querySelector('.src-badge.src-speaker');
-    if (badge) badge.classList.toggle('speaker-selected', _selectedSpeakerKeys.includes(badge.dataset.speakerKey));
-  }
-  if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
-    renderSpeakerManager();
-  }
+  if (_speakerModalIsOpen()) _paintSpeakerModalHeader();
   if (_autoScroll && !_pickerOpen) {
     _programmaticScrollCount++;
     el.scrollTop = el.scrollHeight;
@@ -12877,10 +12186,7 @@ function applySpeakerProfileUpdate(update) {
     }
   });
   _applySpeakerColor(speakerKey, _speakerColors[speakerKey]);
-  _highlightSelectedSpeakerBadges();
-  if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
-    renderSpeakerManager();
-  }
+  if (_speakerModalIsOpen()) _paintSpeakerModalHeader();
   _tnRefreshSpeakerPills();
   _refreshMinimap(true);
 }
@@ -18711,7 +18017,7 @@ async function loadSession(sessionId) {
   // manager left open).
   if (typeof _cleanupVideoSyncToggleBtn === 'function') _cleanupVideoSyncToggleBtn();
   // Invalidate any cached cleanup clusters from the previous session - otherwise
-  // reopening the Cleanup tab would show the old session's speakers.
+  // reopening the Speakers modal would show the old session's speakers.
   if (_cleanupState && _cleanupState.sessionId !== sessionId) {
     _cleanupState = null;
     try { _cleanupStopPlayback(); _cleanupClosePicker(); } catch (_) {}
@@ -18719,10 +18025,8 @@ async function loadSession(sessionId) {
     _cleanupSelAnchor = null;
     _cleanupExpandedKeys = new Set();
     _cleanupShowHeatmap = false;
-    const overlay = document.getElementById('speaker-manager-overlay');
-    if (_cleanupActiveTab === 'cleanup' && overlay && !overlay.classList.contains('hidden')) {
-      loadSpeakerClusters();  // manager is open on Cleanup - refetch for the new session now
-    }
+    // Manager still open: refetch for the new session now.
+    if (_speakerModalIsOpen()) loadSpeakerClusters();
   }
 
   if (data.summary) {
@@ -18828,15 +18132,7 @@ function _renderSegmentsChunked(segments, chunkSize, loadingHint, gen) {
 function _finishBulkLoad() {
   _tnExtendTimeRange();
   applyTranscriptFilter();
-  // On a fresh load nothing is selected (clearAll cleared it), so this whole
-  // O(N) per-segment querySelector pass would just toggle a class off on every
-  // badge that never had it. Skip it when the selection is empty. (Keep the
-  // unconditional calls on the real select/deselect paths - they must run with
-  // an empty set to clear stale highlights.)
-  if (_selectedSpeakerKeys.length) _highlightSelectedSpeakerBadges();
-  if (!document.getElementById('speaker-manager-overlay')?.classList.contains('hidden')) {
-    renderSpeakerManager();
-  }
+  if (_speakerModalIsOpen()) _paintSpeakerModalHeader();
   _updateCollapseFabVisibility();
   _updateMinimapFabVisibility();
   _refreshMinimap(true);
@@ -19040,10 +18336,6 @@ function clearAll() {
   _lastLiveSegId = 0;
   _speakerLabels = {};
   _speakerProfiles = {};
-  _selectedSpeakerKeys = [];
-  _speakerSelectionAnchor = null;
-  _speakerDraftName = '';
-  _speakerDraftColor = '';
   Object.keys(_speakerColors).forEach(k => delete _speakerColors[k]);
   _speakerColorIdx = 0;
   _transcriptSelectedSegs.clear();
@@ -19052,14 +18344,11 @@ function clearAll() {
   _simIndex = null;
   _simIndexPromise = null;
   _fpRejected = new Set();
-  _pendingSpeakerProfiles = [];
   _sessionLinks = {};
-  // The Speakers modal is per-meeting: drop the remembered tab and the shared
-  // status line so the next open lands deterministically for the new session.
-  _speakerModalLastTab = null;
+  // The Speakers modal is per-meeting: drop the shared status line so the next
+  // open reads the new session rather than the one that just closed.
   _speakerModalStats = null;
   _speakerModalStatsSession = null;
-  _mgrCommittedName = '';
   _transcriptFilter = { search: '', speakers: new Set(), timeMin: 0, timeMax: Infinity };
   _showNoise = false;
   _noiseSolo = false;
