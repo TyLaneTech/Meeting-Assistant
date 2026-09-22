@@ -5781,10 +5781,20 @@ img#shutdown-icon.brand-icon {
 @keyframes cleanup-spin { to { transform: rotate(360deg); } }
 .cleanup-loading-text { font-size: 12px; }
 
+/* Masonry, packed by _cleanupRelayoutGrid(): the rows are a 4px unit and each
+   card is spanned over its own measured height, so a tall group only pushes
+   down the cards under it instead of setting the height of its whole row.
+   Two things are load-bearing. `align-items: start` keeps a card at its content
+   height (stretch is what padded every neighbour with empty space), and the
+   row-gap stays 0 because a spanned card would otherwise collect one gap per
+   row it covers - the gutter is the card's own margin-bottom. */
 .cleanup-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
-  gap: 10px;
+  grid-auto-rows: 4px;
+  column-gap: 10px;
+  row-gap: 0;
+  align-items: start;
   align-content: start;
 }
 
@@ -5793,6 +5803,7 @@ img#shutdown-icon.brand-icon {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 10px 10px;
+  margin-bottom: 10px;      /* stands in for the grid's row-gap */
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -6028,6 +6039,7 @@ img#shutdown-icon.brand-icon {
   border: 1.5px dashed var(--border);
   border-radius: 8px;
   padding: 14px;
+  margin-bottom: 10px;      /* the grid's row-gap is 0; see .cleanup-grid */
   text-align: center;
   color: var(--fg-muted);
   font-size: 12px;
@@ -6206,6 +6218,53 @@ img#shutdown-icon.brand-icon {
 }
 .cleanup-cluster-label.placeholder { color: var(--fg-muted); font-style: italic; font-weight: 500; }
 .cleanup-cluster-linked { color: var(--fg-subtle); font-size: 10px; flex-shrink: 0; }
+
+/* ── How much of a group is shown ──
+   A group opens at the peek (its first few speakers, then "Show all N"), the
+   chevron folds it down to its header, and both change instantly rather than
+   animating: the masonry repack is already motion, and a height transition
+   under it reads as lag. The pills stay in the DOM whatever the state, because
+   selection, playback and the Shift-range key order all index them. */
+.cleanup-cluster-header.is-collapsible { cursor: pointer; }
+.cleanup-cluster-toggle {
+  appearance: none; background: transparent; border: 0; color: var(--fg-subtle);
+  cursor: pointer; min-width: 20px; height: 20px; border-radius: 5px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center; gap: 3px;
+  font: inherit; font-size: 11px; padding: 0 2px;
+}
+.cleanup-cluster-toggle-n {
+  font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1;
+}
+.cleanup-cluster-toggle:hover { color: var(--fg); background: var(--surface3); }
+.cleanup-cluster-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cleanup-cluster-toggle i { transition: transform 0.18s; }
+.cleanup-cluster.collapsed .cleanup-cluster-toggle i { transform: rotate(-90deg); }
+.cleanup-cluster-toggle.is-placeholder { visibility: hidden; cursor: default; }
+.cleanup-cluster.collapsed .cleanup-members { display: none; }
+/* Nothing under the header while closed, so the card sits on one line. */
+.cleanup-cluster.collapsed { padding-bottom: 8px; }
+
+/* The peek: everything past the first few speakers waits behind "Show all". */
+.cleanup-cluster:not(.show-all) .cleanup-member.is-overflow { display: none; }
+.cleanup-cluster-more {
+  appearance: none; background: transparent; border: 1px dashed var(--border);
+  color: var(--fg-muted); font: inherit; font-size: 11px;
+  border-radius: 6px; padding: 3px 8px; margin-top: 1px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+}
+.cleanup-cluster-more:hover { color: var(--fg); border-color: var(--fg-muted); }
+.cleanup-cluster-more:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cleanup-cluster-more i { font-size: 9px; }
+
+/* A group that is folded away, or peeking, can be hiding part of what the
+   selection bar is counting. */
+.cleanup-cluster.has-hidden-selected { border-color: var(--accent, #58a6ff); }
+.cleanup-cluster.has-hidden-selected .cleanup-cluster-toggle,
+.cleanup-cluster.has-hidden-selected .cleanup-cluster-more { color: var(--accent, #58a6ff); }
+@media (prefers-reduced-motion: reduce) {
+  .cleanup-cluster-toggle i { transition: none; }
+}
+
 .cleanup-assign-btn {
   appearance: none;
   background: var(--accent, #58a6ff);

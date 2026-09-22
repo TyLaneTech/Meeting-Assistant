@@ -45,6 +45,30 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Improved how the Speakers window lists groups (2026-09-22)
+
+> Nothing here changes what `Apply` writes, only what the window looks like while
+> you work through it.
+
+### Speakers
+
+- **A group shows its first three speakers**, then `Show all 11` for the rest. A
+  meeting with fifty speakers used to open as a wall of segments, where one large
+  group pushed every group after it off the bottom of the window
+  - **The arrow on a group's name folds it away altogether**, down to one line with
+    the number of voices in it. Click the arrow, or anywhere else on that line
+  - **The first button in the toolbar moves every group at once**, a step per
+    click: the first few speakers, then every speaker, then names only, then round
+    again. Its tooltip says what the next click will do
+  - A group shows all of itself when you drop a speaker into it, and so does a group
+    you make with `Merge into new group`
+- **A group hiding speakers you have selected is outlined**, so the count in the
+  selection bar always has something to point at
+- **A tall group no longer stretches the groups beside it.** Every group is only as
+  tall as what is inside it, and the next group slots in underneath rather than
+  waiting for the row to end, so opening one leaves its neighbours where they are
+
+
 ## Reworked the Speakers window into one screen (2026-09-17)
 
 > Your saved speakers and voice profiles are untouched. This changes where the

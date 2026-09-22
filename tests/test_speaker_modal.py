@@ -167,6 +167,128 @@ def test_verbs_are_aligned():
     assert "Unlink from profile" in APP_JS
 
 
+# ── C2. groups peek, and the grid packs itself ──────────────────────────────
+
+def test_groups_open_at_the_peek_with_show_all_for_the_rest():
+    """Listing every pill made one group taller than the dialog; listing none
+    of them made a header that says nothing. A group shows its first few."""
+    build = APP_JS[APP_JS.index("function _cleanupBuildState"):]
+    build = build[:build.index("const decode")]
+    assert "_cleanupClosedClusters = new Set()" in build   # default: nothing folded
+    assert "_cleanupFullClusters = new Set()" in build     # default: peek
+
+    card = APP_JS[APP_JS.index("function _cleanupRenderCluster"):]
+    card = card[:card.index("function _cleanupTalkTime")]
+    assert "i >= _CLEANUP_PEEK_MEMBERS" in card
+    assert "cleanup-cluster-more" in card
+    assert "visibleMembers.length > _CLEANUP_PEEK_MEMBERS" in card
+    assert "_CLEANUP_PEEK_MEMBERS = 3" in APP_JS
+    assert ".cleanup-cluster:not(.show-all) .cleanup-member.is-overflow { display: none; }" in CSS
+
+    # The chevron is the third state: the whole group folded down to one line.
+    assert "cleanup-cluster-toggle" in card
+    assert "_cleanupSetClusterOpen(cluster.cluster_id" in card
+    assert ".cleanup-cluster.collapsed .cleanup-members { display: none; }" in CSS
+    # An empty group has nothing to fold away and has to keep showing its hint.
+    assert "const collapsible = visibleMembers.length > 0" in card
+    is_open = APP_JS[APP_JS.index("function _cleanupIsClusterOpen"):]
+    is_open = is_open[:is_open.index("\n}")]
+    assert "!visible.length" in is_open
+
+    # Every pill is rendered whatever the state: selection, playback and the
+    # Shift-range key order all index them.
+    assert "_cleanupKeyOrder.push" in card
+
+
+def test_a_group_shows_all_of_itself_when_speakers_land_in_it():
+    reveal = APP_JS[APP_JS.index("function _cleanupRevealCluster"):]
+    reveal = reveal[:reveal.index("\n}")]
+    assert "_cleanupClosedClusters.delete" in reveal
+    assert "_cleanupFullClusters.add" in reveal
+    move = APP_JS[APP_JS.index("function _cleanupMoveKeysToCluster"):]
+    move = move[:move.index("function _cleanupMoveKeysToNewCluster")]
+    assert "_cleanupRevealCluster(destClusterId)" in move
+    blank = APP_JS[APP_JS.index("function _cleanupBlankCluster"):]
+    blank = blank[:blank.index("\n}")]
+    assert "_cleanupRevealCluster(cluster.cluster_id)" in blank
+
+
+def test_a_group_says_when_it_is_hiding_part_of_the_selection():
+    # Folded away or past the peek, the count in the selection bar has to have
+    # something on screen to point at.
+    hidden = APP_JS[APP_JS.index("function _cleanupHasHiddenSelection"):]
+    hidden = hidden[:hidden.index("\n}")]
+    assert "collapsed" in hidden and "show-all" in hidden and "is-overflow" in hidden
+    refresh = APP_JS[APP_JS.index("function _cleanupRefreshSelectionUI"):]
+    refresh = refresh[:refresh.index("\n}")]
+    assert "has-hidden-selected" in refresh
+    assert ".cleanup-cluster.has-hidden-selected" in CSS
+
+
+def test_the_toolbar_button_cycles_all_three_views():
+    """A two-ended toggle could not reach the peek, which is the state the
+    window opens in and the one worth getting back to."""
+    markup = _modal_markup()
+    assert 'id="cleanup-group-view"' in markup
+    assert 'onclick="cycleCleanupGroupView()"' in markup
+    assert "_cleanupSyncGroupViewBtn()" in APP_JS
+
+    cycle = APP_JS[APP_JS.index("const _CLEANUP_VIEW_NEXT = "):]
+    cycle = cycle[:cycle.index("\n")]
+    assert "closed: 'peek'" in cycle and "peek: 'all'" in cycle and "all: 'closed'" in cycle
+
+    # The view is read off the groups, never held in a counter that could
+    # disagree with them. Mixed reads as the peek, so the next press expands.
+    view = APP_JS[APP_JS.index("function _cleanupGroupView"):]
+    view = view[:view.index("\n}")]
+    assert "_cleanupClosedClusters.has" in view
+    assert "_cleanupFullClusters.has" in view
+    assert view.rstrip().endswith("return 'peek';")
+
+    setter = APP_JS[APP_JS.index("function _cleanupSetGroupView"):]
+    setter = setter[:setter.index("\n}")]
+    assert "view === 'closed'" in setter and "view === 'all'" in setter
+
+
+def test_the_grid_is_packed_over_measured_card_heights():
+    """A plain grid made every card in a row as tall as the tallest one in it,
+    so a big group padded its neighbours with empty space and pushed the next
+    row off the bottom. Cards are spanned over a fine row unit instead."""
+    rule = CSS[CSS.index(".cleanup-grid {"):]
+    rule = rule[:rule.index("}")]
+    assert "grid-auto-rows: 4px" in rule
+    assert "row-gap: 0" in rule           # a span would collect one gap per row
+    assert "align-items: start" in rule   # a card is its content height, not its row's
+    # The gutter that row-gap is no longer providing.
+    card_rule = CSS[CSS.index(".cleanup-cluster {"):]
+    card_rule = card_rule[:card_rule.index("}")]
+    assert "margin-bottom: 10px" in card_rule
+
+    relayout = APP_JS[APP_JS.index("function _cleanupRelayoutGrid"):]
+    relayout = relayout[:relayout.index("\n}")]
+    assert "getBoundingClientRect().height" in relayout
+    assert "gridRowEnd" in relayout
+    assert "_cleanupShowHeatmap" in relayout   # the heatmap owns the same slot
+    # The unit the spans are counted in has to match the stylesheet.
+    assert "_CLEANUP_ROW_UNIT = 4" in APP_JS
+    assert "_CLEANUP_CARD_GUTTER = 10" in APP_JS
+
+
+def test_the_relayout_watches_the_cards_not_the_grid():
+    # A card's height is the input to the packing and the grid's height is its
+    # output, so observing the grid feeds itself.
+    observe = APP_JS[APP_JS.index("function _cleanupObserveCards"):]
+    observe = observe[:observe.index("\n}")]
+    assert "for (const card of grid.children) _cleanupGridRO.observe(card)" in observe
+    assert "_cleanupGridRO.observe(grid)" not in APP_JS
+    # Anything that changes a card's height repacks: a render, a window resize,
+    # opening a speaker's segments, opening a group.
+    render = APP_JS[APP_JS.index("function renderSpeakerClusters"):]
+    render = render[:render.index("function _cleanupRelayoutGrid")]
+    assert "_cleanupObserveCards(grid)" in render
+    assert "_cleanupRelayoutGrid()" in render
+
+
 # ── D. the selection bar never covers Apply ─────────────────────────────────
 
 def test_selection_bar_is_anchored_to_the_scroll_area_not_the_pane():

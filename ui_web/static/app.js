@@ -7047,6 +7047,8 @@ let _cleanupState = null;
 // { sessionId, clusters: [...], noiseKeys: Set, library: [...], thresholds, originalSnapshot, dirty }
 let _cleanupDragKeys = [];            // speaker_keys currently being dragged (multi-select aware)
 let _cleanupExpandedKeys = new Set();
+let _cleanupClosedClusters = new Set();  // cluster_ids folded down to their header
+let _cleanupFullClusters = new Set();    // cluster_ids past the peek, showing every speaker
 let _cleanupNoiseExpanded = false;
 let _cleanupSelectedKeys = new Set(); // multi-select: speaker_keys highlighted for bulk ops
 let _cleanupSelAnchor = null;         // anchor key for Shift-range selection
@@ -7142,6 +7144,10 @@ function _cleanupBuildState(payload) {
   _cleanupSelectedKeys = new Set();
   _cleanupSelAnchor = null;
   _cleanupClosePicker();
+  // Groups start at the peek: a meeting with 50 speakers is a wall of pills if
+  // every one of them is listed, and a header alone tells you nothing.
+  _cleanupClosedClusters = new Set();
+  _cleanupFullClusters = new Set();
   // The picker similarity index derives from this state; force it to refresh.
   _simIndex = null;
   // Decode all centroids once. We keep both labeled + unlabeled clusters in
@@ -7346,6 +7352,11 @@ function renderSpeakerClusters() {
     newZone.innerHTML = '<i class="fa-solid fa-plus"></i> Drop here to merge into a new group';
     _cleanupWireDropZone(newZone, () => _cleanupMoveKeysToNewCluster(_cleanupDragKeys));
     grid.appendChild(newZone);
+
+    // Cards size themselves, so the grid has to be packed by hand.
+    _cleanupObserveCards(grid);
+    _cleanupRelayoutGrid();
+    _cleanupScheduleRelayout();
   }
 
   // ── Noise drop zone (shown beneath either view) ──
@@ -7360,6 +7371,8 @@ function renderSpeakerClusters() {
     statsEl.innerHTML = `<strong>${labeledCount}</strong> named · <strong>${unlabeledCount}</strong> unnamed · <strong>${total}</strong> voices${noiseCount ? ` · <strong>${noiseCount}</strong> noise` : ''}`;
   }
 
+  _cleanupSyncGroupViewBtn();
+
   // Enable Auto-link when any unlabeled cluster has a high-confidence match.
   const confidentBtn = document.getElementById('cleanup-confident-btn');
   if (confidentBtn) {
@@ -7372,6 +7385,165 @@ function renderSpeakerClusters() {
   _cleanupRenderSelectionBar();
   _cleanupSyncFooter();
   _cleanupWireGridAutoscroll();
+}
+
+/* ── Masonry packing ───────────────────────────────────────────────────────
+ * Cards are wildly different heights (one fragment vs seventeen), and a plain
+ * grid makes every card in a row as tall as the tallest one, so a big group
+ * pads its neighbours with empty space and pushes the next row off screen.
+ * The grid is laid on a 4px row unit instead and each card is spanned over its
+ * own measured height, which lets the auto-placement algorithm drop the next
+ * card into whichever column has run out first. Never give .cleanup-grid a
+ * row-gap: the gutter is the card's own margin-bottom, and a row-gap would be
+ * added once per spanned row. */
+
+const _CLEANUP_ROW_UNIT = 4;    // px, must match grid-auto-rows in style.css
+const _CLEANUP_CARD_GUTTER = 10;  // px, must match .cleanup-cluster margin-bottom
+
+let _cleanupGridRO = null;      // watches card heights (expanding a speaker, a collapse)
+let _cleanupRelayoutRAF = 0;
+
+function _cleanupRelayoutGrid() {
+  const grid = document.getElementById('cleanup-grid');
+  if (!grid || _cleanupShowHeatmap || !grid.clientWidth) return;   // no width = not on screen yet
+  for (const card of grid.children) {
+    const h = card.getBoundingClientRect().height;
+    if (!h) continue;
+    const span = Math.max(1, Math.ceil((h + _CLEANUP_CARD_GUTTER) / _CLEANUP_ROW_UNIT));
+    card.style.gridRowEnd = `span ${span}`;
+  }
+}
+
+function _cleanupScheduleRelayout() {
+  if (_cleanupRelayoutRAF) return;
+  _cleanupRelayoutRAF = requestAnimationFrame(() => {
+    _cleanupRelayoutRAF = 0;
+    _cleanupRelayoutGrid();
+  });
+}
+
+// Watch the cards, not the grid: a card's height is what the packing depends on,
+// and the grid's own height is what the packing changes (observing it loops).
+function _cleanupObserveCards(grid) {
+  if (!window.ResizeObserver) return;
+  if (!_cleanupGridRO) _cleanupGridRO = new ResizeObserver(() => _cleanupScheduleRelayout());
+  _cleanupGridRO.disconnect();
+  for (const card of grid.children) _cleanupGridRO.observe(card);
+}
+
+window.addEventListener('resize', () => {
+  if (_speakerModalIsOpen()) _cleanupScheduleRelayout();
+});
+
+/* ── How much of a group is shown ──────────────────────────────────────────
+ * Three states per group, two controls. A group opens at the peek: its first
+ * few speakers, then "Show all N" for the rest. The chevron on the header
+ * folds the whole thing down to one line. Every pill is rendered whatever the
+ * state (selection, playback and the Shift-range key order all index them);
+ * what changes is which of them are displayed. */
+
+const _CLEANUP_PEEK_MEMBERS = 3;   // speakers a group shows before "Show all"
+
+function _cleanupIsClusterOpen(cluster) {
+  const visible = cluster.members.filter(m => !_cleanupState.noiseKeys.has(m.speaker_key));
+  // An empty group has nothing to fold and needs to show its drop hint.
+  return !visible.length || !_cleanupClosedClusters.has(cluster.cluster_id);
+}
+
+function _cleanupSetClusterOpen(clusterId, open) {
+  if (open) _cleanupClosedClusters.delete(clusterId);
+  else _cleanupClosedClusters.add(clusterId);
+}
+
+// Open a group all the way. Used when speakers land in it: a move you cannot
+// see reads as a move that did not happen.
+function _cleanupRevealCluster(clusterId) {
+  _cleanupClosedClusters.delete(clusterId);
+  _cleanupFullClusters.add(clusterId);
+}
+
+/* The toolbar button drives every group through the same three states a single
+ * group has, in the order they open: names only, the peek, every speaker. It
+ * cycles rather than toggling so the middle one stays reachable from the
+ * button, and it reads the state off the groups instead of keeping a counter,
+ * so it never disagrees with what is on screen. Anything mixed counts as the
+ * peek, which makes the next press the one that shows everything. */
+
+const _CLEANUP_VIEW_NEXT = { closed: 'peek', peek: 'all', all: 'closed' };
+const _CLEANUP_VIEW_BTN = {
+  closed: { icon: 'fa-angles-up', label: 'Show group names only' },
+  peek: { icon: 'fa-chevron-down', label: 'Show the first few speakers in every group' },
+  all: { icon: 'fa-angles-down', label: 'Show every speaker in every group' },
+};
+
+function _cleanupGroupView() {
+  const clusters = _cleanupState.clusters;
+  if (!clusters.length) return 'peek';
+  if (clusters.every(c => _cleanupClosedClusters.has(c.cluster_id))) return 'closed';
+  if (clusters.every(c => _cleanupFullClusters.has(c.cluster_id)
+                          && !_cleanupClosedClusters.has(c.cluster_id))) return 'all';
+  return 'peek';
+}
+
+function _cleanupSetGroupView(view) {
+  const ids = _cleanupState.clusters.map(c => c.cluster_id);
+  _cleanupClosedClusters = view === 'closed' ? new Set(ids) : new Set();
+  _cleanupFullClusters = view === 'all' ? new Set(ids) : new Set();
+}
+
+function cycleCleanupGroupView() {
+  if (!_cleanupState) return;
+  _cleanupSetGroupView(_CLEANUP_VIEW_NEXT[_cleanupGroupView()]);
+  _cleanupClosePicker();
+  renderSpeakerClusters();
+}
+
+// The button shows what the next press will do, which is also what makes the
+// wrap from "every speaker" back to "names only" legible.
+function _cleanupSyncGroupViewBtn() {
+  const btn = document.getElementById('cleanup-group-view');
+  if (!btn || !_cleanupState) return;
+  const next = _CLEANUP_VIEW_BTN[_CLEANUP_VIEW_NEXT[_cleanupGroupView()]];
+  btn.innerHTML = `<i class="fa-solid ${next.icon}"></i>`;
+  btn.title = next.label;
+  btn.setAttribute('aria-label', next.label);
+}
+
+// A group can be hiding speakers the selection bar is counting, either folded
+// away or past the peek. Class checks only: this runs on every selection click.
+function _cleanupHasHiddenSelection(card) {
+  const sel = card.querySelectorAll('.cleanup-member.selected');
+  if (!sel.length) return false;
+  if (card.classList.contains('collapsed')) return true;
+  if (card.classList.contains('show-all')) return false;
+  return Array.from(sel).some(p => p.classList.contains('is-overflow'));
+}
+
+/* Paint the view state onto a card that is already built, so a toggle repaints
+ * in place instead of re-rendering the grid (which would close any open picker
+ * and lose the scroll position). */
+function _cleanupPaintCard(card, cluster) {
+  const open = _cleanupIsClusterOpen(cluster);
+  const all = _cleanupFullClusters.has(cluster.cluster_id);
+  card.classList.toggle('collapsed', !open);
+  card.classList.toggle('show-all', all);
+
+  const total = card.querySelectorAll('.cleanup-members > .cleanup-member').length;
+  const toggle = card.querySelector('.cleanup-cluster-toggle');
+  if (toggle) {
+    const what = total === 1 ? 'this speaker' : `these ${total} speakers`;
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.title = open ? `Hide ${what}` : `Show ${what}`;
+    toggle.setAttribute('aria-label', toggle.title);
+  }
+  const more = card.querySelector('.cleanup-cluster-more');
+  if (more) {
+    more.innerHTML = all
+      ? '<i class="fa-solid fa-chevron-up"></i> Show fewer'
+      : `<i class="fa-solid fa-chevron-down"></i> Show all ${total}`;
+    more.setAttribute('aria-expanded', all ? 'true' : 'false');
+  }
+  card.classList.toggle('has-hidden-selected', _cleanupHasHiddenSelection(card));
 }
 
 function _cleanupRenderNoiseSection() {
@@ -7450,6 +7622,11 @@ function _cleanupRefreshSelectionUI() {
     .forEach(pill => {
       pill.classList.toggle('selected', _cleanupSelectedKeys.has(pill.dataset.speakerKey));
     });
+  // A group that is folded away, or peeking, can be holding part of what the
+  // selection bar is counting. It says so on its header.
+  document.querySelectorAll('#cleanup-grid .cleanup-cluster').forEach(card => {
+    card.classList.toggle('has-hidden-selected', _cleanupHasHiddenSelection(card));
+  });
   _cleanupRenderSelectionBar();
 }
 
@@ -7524,6 +7701,29 @@ function _cleanupRenderCluster(cluster) {
   const header = document.createElement('div');
   header.className = 'cleanup-cluster-header';
 
+  // Collapse chevron. An empty group has nothing to fold away, so its chevron
+  // is an inert spacer that keeps the headers aligned down the column. A group
+  // of several voices carries the count here rather than in the seg pill: the
+  // name is what the column is narrow for.
+  const collapsible = visibleMembers.length > 0;
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'cleanup-cluster-toggle';
+  toggle.innerHTML = '<i class="fa-solid fa-chevron-down"></i>';
+  if (visibleMembers.length > 1) {
+    const n = document.createElement('span');
+    n.className = 'cleanup-cluster-toggle-n';
+    n.textContent = String(visibleMembers.length);
+    toggle.appendChild(n);
+  }
+  if (!collapsible) {
+    toggle.classList.add('is-placeholder');
+    toggle.disabled = true;
+    toggle.setAttribute('aria-hidden', 'true');
+    toggle.tabIndex = -1;
+  }
+  header.appendChild(toggle);
+
   // The swatch is the colour control. A group with neither a profile nor a
   // typed name has nothing to hang a colour on, so its swatch stays inert
   // until it is named: the palette colour it shows is assigned, not chosen.
@@ -7569,6 +7769,22 @@ function _cleanupRenderCluster(cluster) {
   const segTotal = visibleMembers.reduce((s, m) => s + m.segment_count, 0);
   count.textContent = `${segTotal} seg`;
   header.appendChild(count);
+
+  if (collapsible) {
+    toggle.addEventListener('click', e => {
+      e.stopPropagation();
+      _cleanupSetClusterOpen(cluster.cluster_id, !_cleanupIsClusterOpen(cluster));
+      _cleanupPaintCard(card, cluster);
+      _cleanupSyncGroupViewBtn();
+      _cleanupRelayoutGrid();
+    });
+    // The whole header is the same target; the controls on it opt out.
+    header.classList.add('is-collapsible');
+    header.addEventListener('click', e => {
+      if (e.target.closest('button, input, select, a')) return;
+      toggle.click();
+    });
+  }
 
   // Assign / change button - opens the voice-library picker popover.
   const assignBtn = document.createElement('button');
@@ -7624,11 +7840,29 @@ function _cleanupRenderCluster(cluster) {
   memberRow.dataset.clusterId = cluster.cluster_id;
   // Whole card is the drop target so short drags near the header still land.
   _cleanupWireDropZone(card, () => _cleanupMoveKeysToCluster(_cleanupDragKeys, cluster.cluster_id));
-  visibleMembers.forEach(m => {
+  visibleMembers.forEach((m, i) => {
     _cleanupKeyOrder.push(m.speaker_key);
-    memberRow.appendChild(_cleanupRenderMember(m, cluster, false));
+    const pill = _cleanupRenderMember(m, cluster, false);
+    // Past the peek. Rendered either way, hidden by CSS until "Show all".
+    if (i >= _CLEANUP_PEEK_MEMBERS) pill.classList.add('is-overflow');
+    memberRow.appendChild(pill);
   });
+  if (visibleMembers.length > _CLEANUP_PEEK_MEMBERS) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'cleanup-cluster-more';
+    more.addEventListener('click', e => {
+      e.stopPropagation();
+      if (_cleanupFullClusters.has(cluster.cluster_id)) _cleanupFullClusters.delete(cluster.cluster_id);
+      else _cleanupFullClusters.add(cluster.cluster_id);
+      _cleanupPaintCard(card, cluster);
+      _cleanupSyncGroupViewBtn();
+      _cleanupRelayoutGrid();
+    });
+    memberRow.appendChild(more);
+  }
   card.appendChild(memberRow);
+  _cleanupPaintCard(card, cluster);
 
   return card;
 }
@@ -7786,6 +8020,7 @@ function _cleanupRenderMember(member, cluster, inNoise) {
       const nowExp = _cleanupExpandedKeys.has(member.speaker_key);
       pill.classList.toggle('expanded', nowExp);
       expandBtn.title = nowExp ? 'Hide segments' : 'Show segments';
+      _cleanupScheduleRelayout();   // the detail animates open; the card grows with it
     });
     row.appendChild(expandBtn);
   }
@@ -7947,11 +8182,14 @@ function _cleanupGarbageCollectClusters() {
 }
 
 function _cleanupBlankCluster(members, tag) {
-  return {
+  const cluster = {
     cluster_id: `unlabeled:${tag}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
     kind: 'unlabeled', global_id: null, new_name: '', name: '', color: null,
     members: members || [], suggestion: null, _dropped_suggestions: new Set(),
   };
+  // A group you just made shows all of itself: it is the one you are looking at.
+  _cleanupRevealCluster(cluster.cluster_id);
+  return cluster;
 }
 
 // Pull a member out of wherever it lives (cluster or noise bucket) and return
@@ -7987,6 +8225,9 @@ function _cleanupMoveKeysToCluster(keys, destClusterId) {
     if (member) { dest.members.push(member); moved++; }
   });
   if (!moved) return;
+  // Show all of what just received a drop, so the move is visible rather than
+  // implied by a count going up.
+  _cleanupRevealCluster(destClusterId);
   _cleanupGarbageCollectClusters();
   _cleanupClearSelection();
   _cleanupMarkDirty();
@@ -8507,6 +8748,10 @@ function _cleanupRenderHeatmap(wrap) {
             ...ec.cluster.members.map(m => m.speaker_key),
           ]);
           _cleanupSelAnchor = null;
+          // Both groups all the way open, or the pills this just selected are
+          // behind a header or a peek and there is nothing to scroll to.
+          _cleanupRevealCluster(er.cluster.cluster_id);
+          _cleanupRevealCluster(ec.cluster.cluster_id);
           renderSpeakerClusters();
           const first = document.querySelector('#cleanup-grid .cleanup-member.selected');
           if (first) first.scrollIntoView({ block: 'center', behavior: 'smooth' });
