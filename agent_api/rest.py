@@ -422,6 +422,31 @@ def _setup_claude_code() -> tuple[dict, int]:
                     "tools."}, 200
 
 
+def _codex_config_problem(before: str, after: str, python: str,
+                          script: str) -> str | None:
+    """Why ``after`` must not replace ``before``, or None when it is safe.
+
+    Only a config that already parsed is held to this: Codex may accept TOML
+    newer than tomllib reads, so tomllib rejecting the old file proves nothing.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        return None
+    try:
+        tomllib.loads(before)
+    except tomllib.TOMLDecodeError:
+        return None
+    try:
+        doc = tomllib.loads(after)
+    except tomllib.TOMLDecodeError as e:
+        return str(e)
+    entry = doc.get("mcp_servers", {}).get("meeting-assistant", {})
+    if entry.get("command") != python or entry.get("args") != [script]:
+        return "the meeting-assistant entry did not read back as written"
+    return None
+
+
 def _setup_codex() -> tuple[dict, int]:
     python, script = _mcp_command()
     path = Path.home() / ".codex" / "config.toml"
@@ -430,11 +455,19 @@ def _setup_codex() -> tuple[dict, int]:
              f"command = {json.dumps(python)}\n"
              f"args = [{json.dumps(script)}]\n")
     existed = False
+    text = ""
+    newline = "\n"
     if path.exists():
         try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as e:
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as e:
             return {"ok": False, "error": f"Could not read {path}: {e}"}, 500
+        # Keep the file's own line endings: text mode would write \r\n on
+        # Windows and so touch every line of a file Codex wrote with \n.
+        if b"\r\n" in raw:
+            newline = "\r\n"
+            text = text.replace("\r\n", "\n")
         # Replace our section in place if present (every line up to the next
         # [section] header at line start), otherwise append. Pure text surgery
         # so the rest of the user's TOML (comments included) is preserved.
@@ -444,19 +477,31 @@ def _setup_codex() -> tuple[dict, int]:
         pattern = _re.compile(
             r"^\[mcp_servers\.(?:\"meeting-assistant\"|meeting-assistant)\]"
             r"[ \t]*\n(?:(?!\[).*\n?)*", _re.MULTILINE)
-        if pattern.search(text):
+        m = pattern.search(text)
+        if m:
             existed = True
-            new_text = pattern.sub(block + "\n", text, count=1).rstrip() + "\n"
+            # Splice by position, never pattern.sub(block, ...): sub() reads a
+            # string replacement as a template, which collapses the \\ in the
+            # JSON-escaped Windows paths to \ and leaves TOML a bad \U escape.
+            new_text = (text[:m.start()] + block + "\n"
+                        + text[m.end():]).rstrip() + "\n"
         else:
             sep = "" if (not text or text.endswith("\n\n")) else \
                 ("\n" if text.endswith("\n") else "\n\n")
             new_text = text + sep + block
     else:
         new_text = block
+    problem = _codex_config_problem(text, new_text, python, script)
+    if problem:
+        return {"ok": False,
+                "error": f"The updated config would not read back ({problem}), "
+                         "so it was left unchanged. Add the snippet by hand "
+                         "instead.",
+                "path": str(path)}, 409
     backup = _backup_file(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(new_text, encoding="utf-8")
+        path.write_text(new_text, encoding="utf-8", newline=newline)
     except OSError as e:
         return {"ok": False, "error": f"Could not write {path}: {e}"}, 500
     note = "New Codex sessions will see the meeting-assistant tools."

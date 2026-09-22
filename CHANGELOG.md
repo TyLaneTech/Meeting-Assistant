@@ -45,6 +45,27 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Fixed Codex refusing to start after its setup was run again (2026-09-22)
+
+### Agent API
+
+- **Running the Codex setup a second time no longer stops Codex from opening.** On
+  Windows, pressing `Run setup` next to `Codex CLI` in `Settings > Agent API` once
+  Codex was already connected saved Meeting Assistant's entry in a form Codex could
+  not read, and Codex then refused to start with "failed to read configuration layers"
+  - **If that happened to you, press `Run setup` once more.** It replaces the broken
+    entry and leaves the rest of Codex's settings alone
+  - With an accented letter in a folder name, the second run failed with an error
+    instead of saving anything, on any computer. That works now too
+- **The rest of Codex's settings file stays exactly as it was.** On Windows the setup
+  used to rewrite the line endings throughout the file as well
+- **Setup now checks that Codex can read the result before saving it**, and leaves the
+  file untouched with a message if it could not
+
+> **Claude Desktop and Claude Code were never affected**: their `Run setup` buttons
+> save settings a different way. Nothing in Codex's settings besides Meeting
+> Assistant's own entry was damaged.
+
 ## Improved how the Speakers window lists groups (2026-09-22)
 
 > Nothing here changes what `Apply` writes, only what the window looks like while
