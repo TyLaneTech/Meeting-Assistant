@@ -45,6 +45,28 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Fixed recordings that would not start after an audio device changed (2026-09-24)
+
+### Recording
+
+- **Pressing `Record` works again after you unplug a headset, turn off Bluetooth or
+  undock.** Once one recording had been made, the app kept using the list of audio
+  devices from that moment, so a device that had gone since made every later recording
+  fail with `[Errno -9992] Insufficient memory` until the app was restarted
+  - The message was never about memory: it is how Windows reports a device it can no
+    longer open, however much memory is free
+  - Each recording now looks at your devices as they are when it starts
+- **Devices you connect after a recording now appear in the recorder's device lists**
+  without restarting the app
+- **If a device really cannot be opened, the message names it and says what to do**,
+  instead of `Insufficient memory`
+- **Stopping a recording is about two seconds quicker** when nothing is playing on the
+  computer
+
+> **One limit remains during a recording**: `Follow call audio to its output device`
+> (in `Settings > System`) can only move to an output that was already connected
+> when that recording started.
+
 ## Fixed Codex refusing to start after its setup was run again (2026-09-22)
 
 ### Agent API

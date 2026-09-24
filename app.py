@@ -2968,6 +2968,7 @@ def start_recording():
                 loopback_name=loopback_name,
             )
         except Exception as e:
+            log.error("recording", f"Could not start capture: {e}")
             capture.stop_wav()
             if not resume_session_id:
                 storage.end_session(session_id)

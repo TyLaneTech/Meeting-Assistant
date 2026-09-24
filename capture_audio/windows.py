@@ -66,25 +66,84 @@ class _Throttle:
 _FFT_SIZE = 4096
 _N_BARS   = 32   # number of log-spaced frequency bands sent to the frontend
 
-# On Windows, calling Pa_StopStream / Pa_CloseStream on a WASAPI loopback stream
-# invokes ExitProcess() at the C level and kills the entire Python process.
-# We work around this by parking retired stream objects and their PyAudio instances
-# here so Python GC never calls __del__ → close() on them.  The PortAudio atexit
-# handler (registered automatically when PyAudio() is constructed) will clean up
-# all open streams/handles when the process exits normally.
+# A stream must never be closed while a thread is inside read() on it:
+# Pa_CloseStream frees the stream under that read and the process dies with an
+# access violation (0xC0000005, reproduced 2026-09-24). A WASAPI loopback read
+# waits for as long as its output is silent, which is how this first showed up,
+# as the whole process exiting when a loopback stream was closed. The capture
+# loops therefore never wait inside read() (they poll get_read_available()), so
+# once a reader thread has been joined its stream is closed. A stream whose
+# reader could not be confirmed gone is parked here instead, together with the
+# PyAudio that owns it: PyAudio.terminate() closes every stream it opened, and
+# so does the last Pa_Terminate(), so keeping the owner alive is what keeps the
+# stream open.
+#
+# Nothing else may be kept alive. PortAudio enumerates devices only on the
+# Pa_Initialize() that takes its reference count from zero, and every other
+# PyAudio() just adds a reference, so while any instance lives the device list
+# stays frozen at that moment. A device that has since gone (a headset
+# unplugged, Bluetooth switched off, a laptop undocked) then fails in
+# IMMDevice::Activate, which PortAudio's WASAPI host reports as
+# paInsufficientMemory: "[Errno -9992] Insufficient memory" with gigabytes free.
+# Parking every stopped capture here used to freeze the list after the first
+# recording, until the app restarted (2026-09-24).
 _stream_graveyard: list = []
 
 
+def _is_parked(pa) -> bool:
+    return any(p is pa for p in _stream_graveyard)
+
+
+def _park(stream, pa) -> None:
+    """Keep a stream that a thread may still be reading, and the PyAudio that
+    owns it, alive for the life of the process (see _stream_graveyard)."""
+    if stream is not None:
+        _stream_graveyard.append(stream)
+    if pa is not None and not _is_parked(pa):
+        _stream_graveyard.append(pa)
+
+
+def _retire_stream(stream, reader: "threading.Thread | None", pa) -> None:
+    """Close a stream whose reader thread has gone, or park it when that thread
+    may still be inside read() (closing it then frees it under the read)."""
+    if stream is None:
+        return
+    if reader is not None and reader.is_alive():
+        log.warn("audio", "An audio reader thread did not exit; keeping its "
+                          "stream open (devices refresh after a restart)")
+        _park(stream, pa)
+        return
+    try:
+        stream.close()
+    except Exception as e:
+        log.warn("audio", f"Closing an audio stream failed: {e}")
+
+
 def _terminate_quietly(pa) -> None:
-    """Terminate a PyAudio instance that never opened a loopback stream. Safe
-    because only closing a WASAPI *loopback* stream calls ExitProcess; a PyAudio
-    that only enumerated devices terminates normally. No-op on None or error."""
-    if pa is None:
+    """Terminate a PyAudio unless a parked stream belongs to it: terminate()
+    closes every stream the instance opened. Terminating the last instance is
+    what lets the next PyAudio() enumerate the devices afresh. No-op on None
+    or error."""
+    if pa is None or _is_parked(pa):
         return
     try:
         pa.terminate()
     except Exception:
         pass
+
+
+def _open_failure(what: str, name: str, err: Exception) -> RuntimeError:
+    """A device-open error the user can act on. PyAudio raises OSError(code,
+    text), and PortAudio's WASAPI host reports every failure to activate an
+    endpoint as paInsufficientMemory (-9992), whose text is "Insufficient
+    memory", so the text alone always pointed at the wrong problem."""
+    code = getattr(err, "errno", None)
+    label = name.replace(" [Loopback]", "").strip() or "the selected device"
+    return RuntimeError(
+        f"Windows could not open the {what} device '{label}'. It may have been "
+        f"disconnected, switched off or disabled. Reconnect it or choose another "
+        f"device, then start again."
+        + (f" (PortAudio error {code})" if isinstance(code, int) else ""))
 
 
 def probe_render_endpoints(duration: float = 1.2) -> dict | None:
@@ -214,10 +273,10 @@ class AudioCapture:
         self.on_loopback_recovered = None    # optional callback(dev_name)
         self._silence_watchdog: threading.Thread | None = None
         # Live device following: which PyAudio owns the loopback stream (starts as
-        # self._pa, becomes a fresh instance after a mid-recording switch), and a
-        # lock serialising switches. A WASAPI loopback stream can NEVER be closed
-        # while running (it calls ExitProcess), so a switch parks the old stream +
-        # PyAudio in _stream_graveyard and opens a new one.
+        # self._pa, becomes a second instance after a mid-recording switch), and a
+        # lock serialising switches with each other and with stop(). A switch
+        # opens the new stream first and then retires the old one, which is
+        # closed once its reader thread has left (see _stream_graveyard).
         self._loopback_pa = None
         self._loopback_restart_lock = threading.Lock()
         # When a mid-recording switch lands on a device whose native mix format
@@ -312,10 +371,11 @@ class AudioCapture:
         Find the WASAPI loopback device for the current default audio output.
         Falls back gracefully when device names are truncated or don't match exactly.
 
-        ``pa`` lets a caller pass a FRESH PyAudio instance: PortAudio caches the
-        device list at init, so self._pa cannot see a device connected after the
-        recording started. A live switch passes a new instance to see the current
-        default output.
+        ``pa`` lets a caller resolve against another PyAudio instance (a live
+        switch passes its own). It still sees self._pa's device list, the one
+        enumerated when the recording started: while one PyAudio is alive a new
+        one only adds a reference to PortAudio, so a device connected
+        mid-recording is not in either (see _stream_graveyard).
         """
         pa = pa or self._pa
         wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
@@ -363,9 +423,9 @@ class AudioCapture:
         exactly the bug we are guarding against, so the caller picks the
         fallback (system default) itself.
 
-        ``pa`` lets a caller pass a FRESH PyAudio instance (PortAudio caches
-        the device list at init), e.g. a live switch targeting an endpoint
-        connected after the recording started.
+        ``pa`` lets a caller match against another PyAudio instance, e.g. a
+        live switch. It sees the same device list as self._pa (see
+        _find_loopback_device).
 
         ``strict`` stops after the exact + substring tiers. Probe-sourced
         targets use it so a render name never maps onto a *sibling* endpoint of
@@ -716,21 +776,11 @@ class AudioCapture:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def start(self, loopback_index: int | None = None, mic_index: int | None = None,
-              ffmpeg_mic_name: str | None = None, loopback_name: str | None = None) -> None:
-        """
-        Start capture.  loopback_index / mic_index override auto-detection;
-        pass mic_index=-1 to explicitly disable the microphone,
-        mic_index=-2 to receive mic audio injected from the browser
-        (via inject_mic_data()), or mic_index=-3 to capture via an ffmpeg
-        subprocess using DirectShow (requires ffmpeg_mic_name).
-
-        loopback_name, when given, is the friendly name saved alongside
-        loopback_index; if that index has since been renumbered onto a
-        different device the capture re-resolves to the named device instead.
-        """
-        self._pa = pyaudio.PyAudio()
-
+    def _open_devices(self, loopback_index: int | None, mic_index: int | None,
+                      ffmpeg_mic_name: str | None, loopback_name: str | None) -> None:
+        """Everything start() does before a thread reads anything: resolve and
+        open the loopback (required) and the microphone (best effort), then the
+        WAV writers. Raises when the loopback cannot be opened."""
         # --- Loopback stream (required) ---
         # Resolve name-first so a drifted PyAudio index self-heals onto the same
         # physical device instead of silently capturing whatever now sits at
@@ -763,14 +813,19 @@ class AudioCapture:
             self._idbg_lb_q_full_drops = 0
         log.info("audio", f"Loopback: '{lb_info['name']}' @ {self.sample_rate} Hz, "
                           f"{self._loopback_channels} ch")
-        self._loopback_stream = self._pa.open(
-            format=self.FORMAT,
-            channels=self._loopback_channels,
-            rate=self.sample_rate,
-            input=True,
-            input_device_index=lb_info["index"],
-            frames_per_buffer=self.CHUNK_SIZE,
-        )
+        try:
+            self._loopback_stream = self._pa.open(
+                format=self.FORMAT,
+                channels=self._loopback_channels,
+                rate=self.sample_rate,
+                input=True,
+                input_device_index=lb_info["index"],
+                frames_per_buffer=self.CHUNK_SIZE,
+            )
+        except OSError as e:
+            log.error("audio", f"Could not open loopback '{lb_info['name']}' "
+                               f"(index {lb_info.get('index')}): {e}")
+            raise _open_failure("desktop audio", lb_info["name"], e) from e
         self._loopback_pa = self._pa   # the loopback starts on the main PyAudio
 
         # --- Microphone stream (best-effort) ---
@@ -939,6 +994,49 @@ class AudioCapture:
                 self._close_per_source_writers()
                 self._per_source_active = False
 
+    def _undo_open(self) -> None:
+        """Release what a failed start() opened. No thread has read a stream
+        yet, so closing them is safe, and terminating the PyAudio is what lets
+        the next attempt enumerate the devices afresh."""
+        if self._ffmpeg_proc is not None:
+            try:
+                self._ffmpeg_proc.terminate()
+            except Exception:
+                pass
+            self._ffmpeg_proc = None
+        for attr in ("_loopback_stream", "_mic_stream"):
+            _retire_stream(getattr(self, attr), None, self._pa)
+            setattr(self, attr, None)
+        self._close_per_source_writers()
+        self._per_source_active = False
+        self.stop_wav()
+        _terminate_quietly(self._pa)
+        self._pa = None
+        self._loopback_pa = None
+
+    def start(self, loopback_index: int | None = None, mic_index: int | None = None,
+              ffmpeg_mic_name: str | None = None, loopback_name: str | None = None) -> None:
+        """
+        Start capture.  loopback_index / mic_index override auto-detection;
+        pass mic_index=-1 to explicitly disable the microphone,
+        mic_index=-2 to receive mic audio injected from the browser
+        (via inject_mic_data()), or mic_index=-3 to capture via an ffmpeg
+        subprocess using DirectShow (requires ffmpeg_mic_name).
+
+        loopback_name, when given, is the friendly name saved alongside
+        loopback_index; if that index has since been renumbered onto a
+        different device the capture re-resolves to the named device instead.
+        """
+        # With every earlier capture stopped this is a fresh Pa_Initialize, so
+        # the devices are enumerated now rather than inherited from whatever
+        # was plugged in when PortAudio was last initialised.
+        self._pa = pyaudio.PyAudio()
+        try:
+            self._open_devices(loopback_index, mic_index, ffmpeg_mic_name, loopback_name)
+        except Exception:
+            self._undo_open()
+            raise
+
         self.is_running = True
 
         self._loopback_thread = threading.Thread(
@@ -978,22 +1076,23 @@ class AudioCapture:
         self._silence_watchdog.start()
 
     def restart_loopback(self, target_name: str | None = None) -> bool:
-        """Switch the loopback to a live output device without stopping the
-        recording, so a live device change (headphones plugged in mid-call, a new
-        default output, a Bluetooth dongle) is followed automatically.
+        """Switch the loopback to another output device without stopping the
+        recording, so a change of output during a call (a new default output,
+        the call app's own endpoint) is followed automatically.
 
         ``target_name``, when given, names the render endpoint that is ACTUALLY
         playing audio (from the render probe - typically the default
         Communications device a call app renders to, which PortAudio cannot
         see). Without it, falls back to the current default output.
 
-        A WASAPI loopback stream can NEVER be closed while running (it calls
-        ExitProcess), so the old stream and its PyAudio are parked in the graveyard
-        and never closed. A FRESH PyAudio is used because PortAudio caches the
-        device list at init, so self._pa cannot see a device connected after the
-        recording started. Returns True only when it actually switched to a
-        different, live device. Never raises; any failure leaves the current
-        stream untouched (the silence watchdog then alarms)."""
+        The switch opens the new stream on a second PyAudio, then retires the
+        old stream: closed once its reader thread has left, parked if it has
+        not (see _stream_graveyard). The second PyAudio sees the device list
+        enumerated when the recording started, because self._pa keeps PortAudio
+        initialised, so only endpoints that existed then can be switched to.
+        Returns True only when it actually switched to a different, live
+        device. Never raises; any failure leaves the current stream untouched
+        (the silence watchdog then alarms)."""
         if not self.is_running:
             return False
         if not self._loopback_restart_lock.acquire(blocking=False):
@@ -1087,13 +1186,14 @@ class AudioCapture:
             )
             self._loopback_thread.start()
 
+            # The old reader leaves within one poll of the swap above. Its
+            # stream is closed once it has; the main PyAudio is kept either
+            # way, because it still owns the mic.
             if old_thread is not None:
                 old_thread.join(timeout=2)
-            # NEVER close a WASAPI loopback stream (ExitProcess). Park it, and its
-            # PyAudio unless that is the main one (still owns the mic + WAV).
-            _stream_graveyard.append(old_stream)
-            if old_pa is not None and old_pa is not self._pa:
-                _stream_graveyard.append(old_pa)
+            _retire_stream(old_stream, old_thread, old_pa)
+            if old_pa is not self._pa:
+                _terminate_quietly(old_pa)
             src = ("the live endpoint (render probe)" if target_name
                    else "the current default output")
             log.info("audio", f"Loopback switched to {src}: '{new_info['name']}'")
@@ -1257,12 +1357,12 @@ class AudioCapture:
             comms = self._last_probe_comms
             if comms and comms in (self._loopback_device_name or "") and target != comms:
                 return False
-            # Cheap same-device check against the CACHED device list so we skip a
-            # full fresh-PyAudio switch when already on the playing device (the
-            # probe's render name lacks the ' [Loopback]' suffix, so a plain
-            # compare to _loopback_device_name never matches). A target absent
-            # from the cached list may be newly connected - fall through to
-            # restart_loopback, which re-enumerates with a fresh PyAudio.
+            # Cheap same-device check against the device list so we skip a full
+            # switch when already on the playing device (the probe's render name
+            # lacks the ' [Loopback]' suffix, so a plain compare to
+            # _loopback_device_name never matches). A target absent from the
+            # list was connected after the recording started; restart_loopback
+            # sees the same list and reports it as not found.
             cached = self._match_loopback_by_name(target, strict=True)
             if cached is not None and cached.get("name") == self._loopback_device_name:
                 return False
@@ -1371,21 +1471,52 @@ class AudioCapture:
                 self._ffmpeg_proc.terminate()
             except Exception:
                 pass
-        # Wait for the capture and mixer threads to finish their current iteration
-        # and exit naturally (they check is_running at the top of every loop).
-        # Loopback/mic streams always have data so stream.read() returns quickly.
-        for t in (self._loopback_thread, self._mic_thread, self._mixer_thread,
-                  self._silence_watchdog):
-            if t:
-                t.join(timeout=3)
-        self._loopback_thread = None
-        self._mic_thread = None
-        self._mixer_thread = None
-        self._silence_watchdog = None
-        # Finalize WAV *after* the mixer thread has stopped - calling stop_wav()
-        # while the mixer is still running is a race condition that can corrupt
-        # the file or crash on a write to a closed handle.
-        self.stop_wav()
+        # Let a device switch already under way finish, and keep a new one from
+        # starting, so the streams retired below are the ones the capture ended
+        # on. A switch wedged in a device open is not waited out: its streams
+        # are parked instead of closed.
+        switch_idle = self._loopback_restart_lock.acquire(timeout=5)
+        try:
+            # Wait for the capture and mixer threads to finish their current
+            # iteration and exit (they check is_running at the top of every
+            # loop). The capture loops never wait inside read(), so they leave
+            # within a poll even while the desktop output is silent.
+            lb_reader, mic_reader = self._loopback_thread, self._mic_thread
+            for t in (self._loopback_thread, self._mic_thread, self._mixer_thread,
+                      self._silence_watchdog):
+                if t:
+                    t.join(timeout=3)
+            self._loopback_thread = None
+            self._mic_thread = None
+            self._mixer_thread = None
+            self._silence_watchdog = None
+            # Finalize WAV *after* the mixer thread has stopped - calling stop_wav()
+            # while the mixer is still running is a race condition that can corrupt
+            # the file or crash on a write to a closed handle.
+            self.stop_wav()
+            # Close the streams whose reader has gone and release PortAudio, so
+            # the next recording enumerates the devices as they are by then
+            # rather than as they were when this one started (see
+            # _stream_graveyard for why a stream is never closed under a reader).
+            if switch_idle:
+                _retire_stream(self._loopback_stream, lb_reader, self._loopback_pa)
+                _retire_stream(self._mic_stream, mic_reader, self._pa)
+                if self._loopback_pa is not self._pa:
+                    _terminate_quietly(self._loopback_pa)
+                _terminate_quietly(self._pa)
+            else:
+                log.warn("audio", "A loopback device switch is still running; "
+                                  "keeping this capture's streams open")
+                _park(self._loopback_stream, self._loopback_pa)
+                _park(self._mic_stream, self._pa)
+            self._loopback_stream = None
+            self._mic_stream = None
+            self._ffmpeg_proc = None
+            self._pa = None
+            self._loopback_pa = None
+        finally:
+            if switch_idle:
+                self._loopback_restart_lock.release()
         # Close the per-source tracks (mic-only / desktop-only). Done after the
         # mixer thread joins so no writes race the close. The Opus encode that
         # follows is the slowest step in stopping, so callers can defer it.
@@ -1394,21 +1525,6 @@ class AudioCapture:
             self._per_source_active = False
             if encode_per_source:
                 self.finalize_per_source_tracks()
-        # Park streams + PyAudio instance in the graveyard instead of closing them.
-        # Pa_StopStream / Pa_CloseStream on a WASAPI loopback stream calls
-        # ExitProcess() at the C level on Windows, killing the whole process.
-        # Setting these to None would also trigger __del__ → close() on the stream
-        # objects, so we keep live references here and let PortAudio's own atexit
-        # handler (registered at PyAudio() construction time) clean up on exit.
-        for s in (self._loopback_stream, self._mic_stream):
-            if s is not None:
-                _stream_graveyard.append(s)
-        if self._pa is not None:
-            _stream_graveyard.append(self._pa)
-        self._loopback_stream = None
-        self._mic_stream = None
-        self._ffmpeg_proc = None
-        self._pa = None
 
     def compute_spectrum(self, buf: collections.deque) -> list[float]:
         """Return _N_BARS log-spaced frequency magnitudes from the sample buffer.
@@ -1528,14 +1644,17 @@ class AudioCapture:
                 # may not align with the WASAPI shared-mode period - the
                 # main cause of choppy mic input on Windows.
                 avail = stream.get_read_available()
-                if avail >= chunk:
-                    n = min(avail, chunk * 4)  # cap to avoid huge reads
-                else:
-                    # Not enough data yet - do a blocking read for one
-                    # buffer's worth.  The large frames_per_buffer we
-                    # requested when opening the stream means this aligns
-                    # with the device period and won't underrun.
-                    n = chunk
+                if avail < chunk:
+                    # Not enough yet: poll again shortly, never wait inside
+                    # read(). A loopback delivers nothing while its output is
+                    # silent, so a blocking read held this thread in PortAudio
+                    # past stop()'s join, and a stream closed under a read is
+                    # freed while in use (see _stream_graveyard). The count is
+                    # everything buffered (GetCurrentPadding), so it crosses a
+                    # chunk within a device period or two.
+                    time.sleep(0.005)
+                    continue
+                n = min(avail, chunk * 4)  # cap to avoid huge reads
                 data = stream.read(n, exception_on_overflow=False)
                 if is_loopback:
                     if not self._loopback_verified and data and data.strip(b"\x00"):
@@ -2075,10 +2194,16 @@ def auto_detect_devices() -> dict:
 
     # ── Reader threads ───────────────────────────────────────────────────
     def _lb_reader(stream, buf, stop_ev):
+        # Polls rather than waiting inside read(): most of these endpoints are
+        # silent, and a reader parked in read() makes its stream unsafe to
+        # close (see _stream_graveyard).
         while not stop_ev.is_set():
             try:
-                data = stream.read(512, exception_on_overflow=False)
-                buf.append(data)
+                avail = stream.get_read_available()
+                if avail < 512:
+                    time.sleep(0.005)
+                    continue
+                buf.append(stream.read(min(avail, 2048), exception_on_overflow=False))
             except Exception:
                 if not stop_ev.is_set():
                     break
@@ -2152,9 +2277,10 @@ def auto_detect_devices() -> dict:
         log.info("auto-detect", f"  Mic '{info['name']}': RMS={rms:.6f}")
 
     # ── Cleanup ──────────────────────────────────────────────────────────
-    for _, stream, _ in lb_streams:
-        _stream_graveyard.append(stream)
-    _stream_graveyard.append(pa)
+    # The first len(lb_streams) threads are the loopback readers, in order.
+    for (_, stream, _), reader in zip(lb_streams, threads):
+        _retire_stream(stream, reader, pa)
+    _terminate_quietly(pa)
 
     for _, proc, _ in mic_procs:
         try:
