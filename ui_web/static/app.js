@@ -1017,9 +1017,11 @@ function _syncCaptureWarning() {
 /* ── Record button and its chevron ───────────────────────────────────────── */
 
 /** Record always starts a NEW recording: a workspace showing a past meeting is
- *  blanked first so the server can never be asked to append to it by accident. */
+ *  blanked first so the server can never be asked to append to it by accident.
+ *  A start already on its way is the same start, whether it came from a second
+ *  press or from the tray's command reaching the window that is starting. */
 async function startNewRecording() {
-  if (state.isRecording) return;
+  if (state.isRecording || state.isStartingRecording) return;
   if (state.sessionId || state.isViewingPast) {
     await newSession();
     if (state.sessionId) return;      // the user cancelled out of newSession()
@@ -1030,7 +1032,7 @@ async function startNewRecording() {
 
 /** The chevron's explicit "append new audio to this recording" action. */
 async function resumeRecording() {
-  if (state.isRecording || !state.isViewingPast || !state.sessionId) return;
+  if (state.isRecording || state.isStartingRecording || !state.isViewingPast || !state.sessionId) return;
   Views.show('session', { url: '/session?id=' + state.sessionId });
   await toggleRecording({ start: true, resume: true });
 }
@@ -1689,6 +1691,10 @@ function jumpToTimestamp(seconds) {
 const state = {
   sessionId:      null,
   isRecording:    false,
+  // Record was pressed and the start request is out, but the server has not
+  // reported a recording yet. The button says "Starting…" for this stretch
+  // (see _setRecordStarting).
+  isStartingRecording: false,
   isTesting:      false,
   isViewingPast:  false,
   isReanalyzing:  false,
@@ -6058,7 +6064,8 @@ function _syncReliabilityToggles() {
 function _syncRecordBtnDisabled() {
   const btn = document.getElementById('record-btn');
   if (!btn) return;
-  btn.disabled = !state.isRecording && (state.isReanalyzing || !state.recordingReady);
+  btn.disabled = !state.isRecording
+    && (state.isStartingRecording || state.isReanalyzing || !state.recordingReady);
 }
 
 /** Returns a promise that resolves once the record button is enabled
@@ -6112,6 +6119,10 @@ function onStatus(d) {
   if (d.recording !== undefined) {
     const _wasRecording = state.isRecording;
     state.isRecording = d.recording;
+    // A recording is live, whoever started it, so "Starting…" is over. Pushes
+    // saying recording: false leave it alone: every push says that until the
+    // devices are open, and those are what used to put Record back mid-start.
+    if (d.recording) _setRecordStarting(false);
     updateRecordBtn();
 
     if (d.recording && d.session_id) {
@@ -6302,14 +6313,20 @@ function updateRecordBtn() {
   btn.style.color = '';
   btn.disabled = false;
   updateTopbarSessionTitle();
-  // Three states, and the button never lies about which one it is in.
+  // Four states, and the button never lies about which one it is in.
   // "Preparing recorder" is a real disabled button; the reason lives in the
-  // capture setup row, and there is no invented time estimate.
-  const preparing = !state.isRecording && (state.isReanalyzing || !state.recordingReady);
+  // capture setup row, and there is no invented time estimate. "Starting…" is
+  // the press answered while the server opens the devices: already the red it
+  // is about to be, and disabled until the server says it is recording.
+  const starting = !state.isRecording && state.isStartingRecording;
+  const preparing = !state.isRecording && !starting && (state.isReanalyzing || !state.recordingReady);
   if (state.isRecording) {
     const elapsed = _recordingStartTime ? fmtDuration((Date.now() - _recordingStartTime) / 1000) : '0:00';
     btn.innerHTML = '<span class="record-pulse" aria-hidden="true"></span> Stop · '
       + `<span class="record-elapsed" id="record-elapsed">${elapsed}</span>`;
+    btn.classList.add('recording');
+  } else if (starting) {
+    btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-spinner fa-spin"></i></span> Starting…';
     btn.classList.add('recording');
   } else if (preparing) {
     btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-hourglass-half"></i></span> Preparing recorder';
@@ -6318,12 +6335,13 @@ function updateRecordBtn() {
     btn.innerHTML = '<span class="btn-icon"><i class="fa-solid fa-play"></i></span> Record';
     btn.classList.remove('recording');
   }
+  btn.classList.toggle('is-loading', starting);
   // The chevron only offers "Resume this recording" while a past recording is
   // on screen, and it says what resuming does.
   const resumeItem = document.getElementById('record-menu-resume');
   if (resumeItem) {
     resumeItem.classList.toggle(
-      'hidden', state.isRecording || !state.isViewingPast || !state.sessionId);
+      'hidden', state.isRecording || starting || !state.isViewingPast || !state.sessionId);
   }
   _syncCaptureMeters();
   // Disable device/model selectors while recording
@@ -6357,6 +6375,60 @@ function updateTestBtn() {
 }
 
 /* ── Recording ───────────────────────────────────────────────────────────── */
+// Record answers the press at once. The server reports is_recording only once
+// the devices are open, which on a slow machine is seconds after the click (a
+// start first waits for the last meeting's cleanup), and the button used to sit
+// on "Record" all that time. Nobody could tell whether the press had taken, so
+// they pressed again, and a press that landed just after the start went in as
+// a Stop. The button now says "Starting…" as the request goes out, disabled,
+// and keeps saying it through the status pushes that report recording: false
+// until the start is done. The start request's own answer settles it, so a
+// late or lost status event cannot strand it: success is Stop, a refusal is
+// Record again with the reason. A request that never answers gets the server's
+// own patience: past a minute the server treats a start as abandoned and
+// accepts a new one, so Record comes back at the same point.
+const RECORD_START_PATIENCE_MS = 60000;
+let _recordStartTimer = null;
+let _recordStartId = 0;    // which press the button is waiting on
+
+/** Enter or leave "Starting…". Entering returns the press's id, which is how
+ *  its answer knows whether the button is still waiting on it. */
+function _setRecordStarting(on) {
+  clearTimeout(_recordStartTimer);
+  _recordStartTimer = on
+    ? setTimeout(() => _reconcileRecordStart('Recording did not start. Press Record to try again.'),
+                 RECORD_START_PATIENCE_MS)
+    : null;
+  state.isStartingRecording = on;
+  if (on) _recordStartId += 1;
+  return _recordStartId;
+}
+
+/** Settle a start that has no usable answer by asking the server what is
+ *  actually happening. A live recording becomes Stop through onStatus; anything
+ *  else puts Record back, and `failMsg`, when given, tells the user why. */
+async function _reconcileRecordStart(failMsg) {
+  if (!state.isStartingRecording) return;   // a status push got there first
+  let d = null;
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 5000);
+    const r = await fetch('/api/status', { cache: 'no-store', signal: ac.signal });
+    clearTimeout(t);
+    if (r.ok) d = await r.json();
+  } catch (_) { /* not answering either; Record comes back below */ }
+  if (d) onStatus(d);
+  if (!state.isStartingRecording) return;   // onStatus found the recording
+  _setRecordStarting(false);
+  updateRecordBtn();
+  if (failMsg) {
+    uiToast({
+      message: d ? failMsg : 'Meeting Assistant is not responding, so the recording may not have started.',
+      kind: 'error',
+    });
+  }
+}
+
 // Reconcile the record button when a Stop can't be confirmed - called when the
 // stop request is rejected (backend gone) or when the SSE stop-confirmation has
 // not arrived within the grace period. Prevents the "Stopping…" spinner from
@@ -6409,6 +6481,9 @@ async function toggleRecording(opts) {
     fetch('/api/recording/stop', { method: 'POST' }).catch(() => _handleStopUnresponsive());
     setTimeout(() => { if (state.isRecording) _handleStopUnresponsive(); }, 12000);
   } else {
+    // One start at a time. The button is disabled while one is out, so this
+    // is for the paths that do not press it: a resume, the tray's command.
+    if (state.isStartingRecording) return;
     // Read selected device indices from the dropdowns
     const lbSel  = document.getElementById('viz-loopback-sel');
     const lbVal  = lbSel?.value ?? '';
@@ -6428,19 +6503,58 @@ async function toggleRecording(opts) {
       body.resume_session_id = state.sessionId;
     }
 
-    const resp = await fetch('/api/recording/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      // A second window that lost the start election can still race the winner
-      // to the server; the reservation rejects it, and that is not an error the
-      // user needs to see.
-      if (err.error === 'Already starting' || err.error === 'Already recording') return;
-      uiToast({ message: err.error || 'Failed to start recording', kind: 'error' });
+    // Answer the press now, before the server has done anything.
+    const startId = _setRecordStarting(true);
+    updateRecordBtn();
+
+    let resp = null;
+    try {
+      resp = await fetch('/api/recording/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (_) { /* no answer at all: settled below */ }
+    // The button can move on without this request: a status push shows the
+    // recording, or the patience ran out and Record was pressed again. Only
+    // the press it is still waiting on may settle it.
+    const waitingOnThis = () => state.isStartingRecording && startId === _recordStartId;
+    if (!resp) {
+      // The connection failed, so whether the devices opened is unknown. Ask.
+      if (waitingOnThis()) _reconcileRecordStart('Recording did not start. Press Record to try again.');
+      return;
     }
+    if (resp.ok) {
+      // Started. The server pushes its status event before it answers, so the
+      // button is usually Stop already. If that event is late or was lost, this
+      // answer carries the same news, so the button does not wait for it.
+      const started = await resp.json().catch(() => null);
+      if (!waitingOnThis()) return;
+      if (started && started.session_id) {
+        onStatus({
+          recording: true,
+          session_id: started.session_id,
+          resumed: !!body.resume_session_id,
+          screen_recording: !!started.screen_recording,
+        });
+      } else {
+        _reconcileRecordStart('');
+      }
+      return;
+    }
+    const err = await resp.json().catch(() => ({}));
+    if (!waitingOnThis()) return;
+    // A second window that lost the start election can still race the winner
+    // to the server; the reservation rejects it, and that is not an error the
+    // user needs to see. The winner's status push turns this button into Stop
+    // too: "Already recording" is checked now rather than waited for, and
+    // "Already starting" is a start still running, so this button waits for it
+    // like its own.
+    if (err.error === 'Already recording') { _reconcileRecordStart(''); return; }
+    if (err.error === 'Already starting') return;
+    _setRecordStarting(false);
+    updateRecordBtn();
+    uiToast({ message: err.error || 'Failed to start recording', kind: 'error' });
   }
 }
 
@@ -19609,12 +19723,14 @@ function flashStatus(msg) {
   setTimeout(() => { el.textContent = prev; }, 1800);
 }
 
-// Persistent top banner warning that call/desktop audio is not being captured.
+// Persistent banner warning that call/desktop audio is not being captured.
 // Driven by the server's capture_alert SSE event. It comes down on its own
 // three ways, so a warning never outlives the problem it describes: the server
 // says the loopback recovered (level 'clear'), desktop audio turns up in the
 // level meters, or the recording stops (see onStatus). The x is the fourth,
-// for a user who wants it gone regardless.
+// for a user who wants it gone regardless. It sits under the header in the
+// main column's flow and pushes the view down rather than covering anything:
+// fixed over the top of the window, it hid the header and the Stop button.
 function _showCaptureAlert(d) {
   if (d && (d.cleared || d.level === 'clear')) { _clearCaptureAlert(); return; }
   const msg = (d && d.message) || 'Call/desktop audio is not being captured.';
@@ -19623,10 +19739,10 @@ function _showCaptureAlert(d) {
     bar = document.createElement('div');
     bar.id = 'capture-alert-bar';
     bar.style.cssText = [
-      'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:99999',
+      'flex-shrink:0',
       'background:var(--red,#b62324)', 'color:#fff', 'padding:11px 16px',
       'font:600 14px/1.45 system-ui,-apple-system,sans-serif', 'display:flex',
-      'align-items:center', 'gap:12px', 'box-shadow:0 2px 12px rgba(0,0,0,.45)',
+      'align-items:center', 'gap:12px',
     ].join(';');
     const icon = document.createElement('span');
     icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i>';
@@ -19639,7 +19755,9 @@ function _showCaptureAlert(d) {
     x.style.cssText = 'background:transparent;border:0;color:#fff;font-size:22px;cursor:pointer;line-height:1;padding:0 4px';
     x.addEventListener('click', _clearCaptureAlert);
     bar.append(icon, txt, x);
-    document.body.appendChild(bar);
+    const header = document.getElementById('app-header');
+    if (header) header.after(bar);
+    else document.body.appendChild(bar);
   }
   document.getElementById('capture-alert-text').textContent = msg;
   bar.style.display = 'flex';
@@ -19654,8 +19772,18 @@ function _clearCaptureAlert() {
 // the server's transcription_backlog event. A pipeline slower than real time
 // used to give no sign at all: the meeting looked healthy for its whole length
 // and the transcript simply stopped partway through. This is amber, not red,
-// because nothing is lost while it is up - the recording is complete and the
+// because nothing is lost while it is up: the recording is complete and the
 // backlog is still being worked through.
+//
+// A pill in the header (#transcript-lag), not a bar over the page. The bar it
+// replaced was fixed across the bottom of the window, on top of the chat input,
+// and the server re-sends the backlog every five seconds, so its x only hid it
+// until the next push. A dismissal now holds for the rest of that meeting,
+// including the finish after Stop. Only the step up to skipped audio brings it
+// back: that is a new problem, and one with something to do about it.
+const _backlogDismissed = new Map();   // session id -> highest severity dismissed
+let _backlogShown = null;              // { sid, severity } of the pill on screen
+
 function _showTranscriptionBacklog(d) {
   const pending = Number(d && d.pending_sec) || 0;
   const draining = !!(d && d.draining);
@@ -19663,53 +19791,51 @@ function _showTranscriptionBacklog(d) {
   state.isDrainingBacklog = draining;
   if (!draining && pending < 60 && !dropped) { _clearTranscriptionBacklog(); return; }
 
+  // 1: behind, or finishing after Stop. 2: audio is being skipped.
+  const severity = dropped && !draining ? 2 : 1;
+  const sid = (d && d.session_id) || state.sessionId || '';
+  if (severity <= (_backlogDismissed.get(sid) || 0)) { _clearTranscriptionBacklog(); return; }
+
   const mins = Math.max(1, Math.round(pending / 60));
-  let msg;
+  let label, detail;
   if (draining) {
-    msg = pending > 0
+    label = pending > 0 ? `Transcribing the last ${mins} min` : 'Finishing the transcript';
+    detail = pending > 0
       ? `Still transcribing the last ${mins} min of that meeting. You can keep using the app; the transcript fills in as it goes.`
       : 'Finishing transcription…';
   } else if (dropped) {
     // The feed overran: that audio never reached the transcriber, so only a
     // reanalysis can put those spans in the transcript. The recording itself
     // is complete either way.
-    msg = `Transcription cannot keep up with this recording, so parts of it are being skipped. The audio is still being saved in full - reanalyze the meeting afterwards to transcribe all of it.`;
+    label = 'Transcript is skipping audio';
+    detail = 'Transcription cannot keep up with this recording, so parts of it are being skipped. The audio is still being saved in full. Reanalyze the meeting afterwards to transcribe all of it.';
   } else {
-    msg = `Transcription is ${mins} min behind the recording. It will catch up after you stop.`;
+    label = `Transcript ${mins} min behind`;
+    detail = `Transcription is ${mins} min behind the recording. It will catch up after you stop.`;
   }
 
-  let bar = document.getElementById('transcription-backlog-bar');
-  if (!bar) {
-    bar = document.createElement('div');
-    bar.id = 'transcription-backlog-bar';
-    bar.style.cssText = [
-      'position:fixed', 'bottom:0', 'left:0', 'right:0', 'z-index:99998',
-      // Not var(--yellow): its dark-theme value (#d29922) is too light to
-      // carry white text. This is the light-theme amber, fixed, in both.
-      'background:#9a6700', 'color:#fff', 'padding:9px 16px',
-      'font:600 13px/1.45 system-ui,-apple-system,sans-serif', 'display:flex',
-      'align-items:center', 'gap:12px', 'box-shadow:0 -2px 12px rgba(0,0,0,.35)',
-    ].join(';');
-    const icon = document.createElement('span');
-    icon.innerHTML = '<i class="fa-solid fa-hourglass-half"></i>';
-    const txt = document.createElement('span');
-    txt.id = 'transcription-backlog-text';
-    txt.style.flex = '1';
-    const x = document.createElement('button');
-    x.textContent = '×';
-    x.setAttribute('aria-label', 'Dismiss');
-    x.style.cssText = 'background:transparent;border:0;color:#fff;font-size:20px;cursor:pointer;line-height:1;padding:0 4px';
-    x.addEventListener('click', _clearTranscriptionBacklog);
-    bar.append(icon, txt, x);
-    document.body.appendChild(bar);
-  }
-  document.getElementById('transcription-backlog-text').textContent = msg;
-  bar.style.display = 'flex';
+  const pill = document.getElementById('transcript-lag');
+  const text = document.getElementById('transcript-lag-text');
+  if (!pill || !text) return;
+  // Re-sent every five seconds, mostly with the same words. Only a change
+  // should reach the live region.
+  if (text.textContent !== label) text.textContent = label;
+  pill.title = detail;
+  pill.classList.remove('hidden');
+  _backlogShown = { sid, severity };
 }
 
 function _clearTranscriptionBacklog() {
-  const bar = document.getElementById('transcription-backlog-bar');
-  if (bar) bar.style.display = 'none';
+  document.getElementById('transcript-lag')?.classList.add('hidden');
+  _backlogShown = null;
+}
+
+function _dismissTranscriptionBacklog() {
+  if (_backlogShown) {
+    const { sid, severity } = _backlogShown;
+    _backlogDismissed.set(sid, Math.max(severity, _backlogDismissed.get(sid) || 0));
+  }
+  _clearTranscriptionBacklog();
 }
 
 /* ── Audio device selection ──────────────────────────────────────────────── */

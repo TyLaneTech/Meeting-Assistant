@@ -392,6 +392,290 @@ def test_record_button_states_are_the_three_the_brief_names():
     assert "resume: true" in resume
 
 
+_RECORD_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function need(re, what) {
+  const m = src.match(re);
+  if (!m) { throw new Error('FAIL: ' + what + ' not found in app.js'); }
+  return m;
+}
+const grab = name => need(new RegExp('\\n(?:async )?function ' + name + '\\([\\s\\S]*?\\n\\}'), name)[0];
+const stateLiteral = need(/\nconst state = (\{[\s\S]*?\n\});/, 'state')[1];
+const patience = Number(need(/\nconst RECORD_START_PATIENCE_MS = (\d+);/, 'RECORD_START_PATIENCE_MS')[1]);
+
+// The page: enough of each element for the code to run, and what a person
+// would see on the button.
+function fakeEl() {
+  const classes = new Set();
+  return {
+    innerHTML: '', textContent: '', title: '', value: '', disabled: false, style: {},
+    classList: {
+      add: (...c) => c.forEach(x => classes.add(x)),
+      remove: (...c) => c.forEach(x => classes.delete(x)),
+      toggle: (c, force) => {
+        const on = force === undefined ? !classes.has(c) : !!force;
+        if (on) classes.add(c); else classes.delete(c);
+        return on;
+      },
+      contains: c => classes.has(c),
+    },
+    setAttribute() {}, removeAttribute() {}, blur() {},
+    get parentElement() { return fakeEl(); },
+  };
+}
+let els, requests, toasts, statusLog, timers, now;
+
+// A clock that only moves when told to.
+function setTimeoutFake(fn, ms) {
+  const id = timers.length + 1;
+  timers.push({ id, due: now + (ms || 0), fn });
+  return id;
+}
+function clearTimeoutFake(id) { timers = timers.filter(t => t.id !== id); }
+const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r)); };
+async function advance(ms) {
+  const until = now + ms;
+  for (;;) {
+    const t = timers.filter(x => x.due <= until).sort((a, b) => a.due - b.due)[0];
+    if (!t) break;
+    clearTimeoutFake(t.id);
+    now = t.due;
+    t.fn();
+    await settle();
+  }
+  now = until;
+}
+
+// The server, answered by hand.
+function fetchFake(url) {
+  return new Promise((resolve, reject) => requests.push({ url: String(url), resolve, reject }));
+}
+const waiting = url => requests.find(r => r.url === url && !r.done);
+async function answer(url, status, body) {
+  const r = waiting(url);
+  if (!r) { throw new Error('FAIL: nothing is waiting on ' + url); }
+  r.done = true;
+  r.resolve({ ok: status < 400, status, json: async () => body });
+  await settle();
+}
+async function drop(url) {
+  const r = waiting(url);
+  if (!r) { throw new Error('FAIL: nothing is waiting on ' + url); }
+  r.done = true;
+  r.reject(new TypeError('Failed to fetch'));
+  await settle();
+}
+
+// Every other name the real code reaches for (the meters, the notes editor,
+// the router) is a stand-in that does nothing: this page is only the button.
+const inert = new Proxy(function () {}, {
+  get: (t, k) => (typeof k === 'symbol' || k === 'then') ? undefined
+    : (k === 'toString' || k === 'valueOf') ? () => '' : inert,
+  apply: () => inert,
+  set: () => true,
+});
+const page = {
+  document: { getElementById: id => (els[id] = els[id] || fakeEl()) },
+  fetch: fetchFake, setTimeout: setTimeoutFake, clearTimeout: clearTimeoutFake,
+  localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+  uiToast: t => toasts.push(t.message),
+  parseMicSelection: () => ({}),
+  RECORD_START_PATIENCE_MS: patience,
+};
+const scope = new Proxy(page, {
+  has: (t, k) => typeof k === 'string' && (k in t || !(k in globalThis)),
+  get: (t, k) => (typeof k === 'symbol' ? undefined : (k in t ? t[k] : inert)),
+  set: (t, k, v) => { t[k] = v; return true; },
+});
+// The real functions are compiled inside that scope. Only global names get
+// past it, so the compiler leaves through globalThis.
+with (scope) {
+  globalThis.__compileInPage = function (__code) { return eval('(' + __code + ')'); };
+}
+const compileInPage = globalThis.__compileInPage;
+delete globalThis.__compileInPage;
+for (const name of ['updateRecordBtn', '_syncRecordBtnDisabled', '_setRecordStarting',
+                    '_reconcileRecordStart', 'toggleRecording', 'startNewRecording']) {
+  page[name] = compileInPage(grab(name));
+}
+const realOnStatus = compileInPage(grab('onStatus'));
+page.onStatus = d => { statusLog.push(d); return realOnStatus(d); };
+
+// A ready app with nothing on screen, the way a press of Record finds it.
+function fresh() {
+  els = {}; requests = []; toasts = []; statusLog = []; timers = []; now = 0;
+  Object.assign(page, {
+    state: eval('(' + stateLiteral + ')'),
+    _recordStartTimer: null, _recordStartId: 0, _recordingStartTime: null,
+    _durationInterval: null, _notesSessionBound: null, _quietPromptLanding: null,
+    _sessionLinks: {},
+  });
+  page.state.modelReady = true;
+  page.state.recordingReady = true;
+  page.updateRecordBtn();
+}
+async function press() { page.toggleRecording(); await settle(); }
+function snap() {
+  const btn = els['record-btn'];
+  return {
+    label: btn.innerHTML.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim(),
+    disabled: !!btn.disabled,
+    red: btn.classList.contains('recording'),
+    busy: btn.classList.contains('is-loading'),
+    starts: requests.filter(r => r.url === '/api/recording/start').length,
+    toasts: toasts.slice(),
+  };
+}
+
+(async () => {
+  const s = {};
+
+  // A slow start that ends the usual way, with the server's status event.
+  fresh();
+  s.idle = snap();
+  await press();
+  s.pressed = snap();
+  // Every push says recording: false until the devices are open; this is the
+  // diarizer finishing its load halfway through the start.
+  page.onStatus({ recording: false, model_ready: true, recording_ready: true });
+  s.midStartPush = snap();
+  await press();
+  page.toggleRecording({ start: true });
+  await settle();
+  s.pressedAgain = snap();
+  page.onStatus({ recording: true, session_id: 's1' });
+  s.confirmed = snap();
+  const pushes = statusLog.length;
+  await answer('/api/recording/start', 200, { session_id: 's1', screen_recording: false });
+  s.answeredAfterPush = snap();
+  s.answerRepeatedThePush = statusLog.length !== pushes;
+  s.timersLeft = timers.length;
+
+  // The status event never comes: the answer says the same thing.
+  fresh();
+  await press();
+  await answer('/api/recording/start', 200, { session_id: 's2', screen_recording: true });
+  s.answerOnly = snap();
+  s.answerOnlyStatus = statusLog[statusLog.length - 1];
+
+  // The server refuses.
+  fresh();
+  await press();
+  await answer('/api/recording/start', 500, { error: 'Could not open the microphone' });
+  s.refused = snap();
+
+  // Another window got there first and is already recording.
+  fresh();
+  await press();
+  await answer('/api/recording/start', 400, { error: 'Already recording' });
+  s.otherRecordingAsks = !!waiting('/api/status');
+  await answer('/api/status', 200, { recording: true, session_id: 's4' });
+  s.otherRecording = snap();
+
+  // Another window's start is still running: wait for it, with the patience.
+  fresh();
+  await press();
+  await answer('/api/recording/start', 400, { error: 'Already starting' });
+  s.otherStarting = snap();
+  await advance(patience - 1);
+  s.otherStartingNearlyOut = snap();
+  s.askedEarly = !!waiting('/api/status');
+  await advance(1);
+  await answer('/api/status', 200, { recording: false });
+  s.otherStartingGaveUp = snap();
+
+  // A start that never answers gives Record back, and its late answer cannot
+  // settle the press that follows.
+  fresh();
+  await press();
+  await advance(patience);
+  await answer('/api/status', 200, { recording: false });
+  s.hung = snap();
+  await press();
+  s.retried = snap();
+  await answer('/api/recording/start', 500, { error: 'Device wedged' });
+  s.staleAnswer = snap();
+  await answer('/api/recording/start', 200, { session_id: 's6', screen_recording: false });
+  s.retryStarted = snap();
+
+  // No connection at all, and the status check cannot get through either.
+  fresh();
+  await press();
+  await drop('/api/recording/start');
+  await drop('/api/status');
+  s.unreachable = snap();
+
+  console.log(JSON.stringify(s));
+})().catch(e => { console.error((e && e.stack) || e); process.exit(1); });
+"""
+
+
+def test_record_answers_the_press_before_the_server_does():
+    """A start runs for seconds on a slow machine (it waits for the last
+    meeting's cleanup, then opens the devices), and the button sat on Record
+    for all of it: a press looked lost, so people pressed again, and a press
+    that landed after the start went in as a Stop. It says Starting... now,
+    disabled, from the moment the request goes out, through the status pushes
+    that say recording: false until the devices are open, and the request's
+    own answer settles it."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "record.cjs"
+        path.write_text(_RECORD_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(STATIC / "app.js")],
+                             capture_output=True, encoding="utf-8", timeout=30)
+    assert out.returncode == 0, out.stderr
+    s = json.loads(out.stdout.strip().splitlines()[-1])
+
+    def looks(snap):
+        return {k: snap[k] for k in ("label", "disabled", "red", "busy")}
+
+    record = {"label": "Record", "disabled": False, "red": False, "busy": False}
+    starting = {"label": "Starting…", "disabled": True, "red": True, "busy": True}
+    stop = {"label": "Stop · 0:00", "disabled": False, "red": True, "busy": False}
+
+    assert looks(s["idle"]) == record
+    # Answered before the server has said anything.
+    assert looks(s["pressed"]) == starting and s["pressed"]["starts"] == 1
+    assert looks(s["midStartPush"]) == starting, "a recording: false push put Record back mid-start"
+    assert s["pressedAgain"]["starts"] == 1, "a second press sent a second start"
+    assert looks(s["confirmed"]) == stop
+    assert looks(s["answeredAfterPush"]) == stop and not s["answerRepeatedThePush"]
+    assert s["timersLeft"] == 0, "the patience timer outlived the start"
+    # The status event was lost: the answer alone gets the button to Stop.
+    assert looks(s["answerOnly"]) == stop
+    assert s["answerOnlyStatus"] == {"recording": True, "session_id": "s2",
+                                     "resumed": False, "screen_recording": True}
+    # Refused: Record again, with the server's reason.
+    assert looks(s["refused"]) == record
+    assert s["refused"]["toasts"] == ["Could not open the microphone"]
+    # Another window won the race, and is recording or still starting.
+    assert s["otherRecordingAsks"] and looks(s["otherRecording"]) == stop
+    assert not s["otherRecording"]["toasts"]
+    assert looks(s["otherStarting"]) == starting
+    assert looks(s["otherStartingNearlyOut"]) == starting and not s["askedEarly"]
+    assert looks(s["otherStartingGaveUp"]) == record
+    assert len(s["otherStartingGaveUp"]["toasts"]) == 1
+    # Never answered: Record comes back on the server's patience, and the late
+    # answer cannot settle the next press.
+    assert looks(s["hung"]) == record and len(s["hung"]["toasts"]) == 1
+    assert looks(s["retried"]) == starting and s["retried"]["starts"] == 2
+    assert looks(s["staleAnswer"]) == starting
+    assert s["staleAnswer"]["toasts"] == s["hung"]["toasts"]
+    assert looks(s["retryStarted"]) == stop
+    # Nothing answers at all.
+    assert looks(s["unreachable"]) == record
+    assert "not responding" in s["unreachable"]["toasts"][-1]
+    # The busy cursor the button vocabulary promises; Record's own disabled
+    # rule would otherwise say not-allowed.
+    shell = _shell_css()
+    rule = shell[shell.index(".btn-record.is-loading:disabled {"):]
+    assert "cursor: progress" in rule[:rule.index("}")]
+
+
 def test_the_capture_meters_live_in_the_header_and_the_strip_is_gone():
     """One bar, not two. Everything the strip carried apart from the meters was
     already on screen: the title is the header title, the clock and Stop are
@@ -436,6 +720,114 @@ def test_the_header_turns_red_while_recording():
                     ".record-group"):
         assert element in recording, element
     assert "var(--accent)" not in recording
+
+
+def test_notices_sit_in_the_page_instead_of_over_it():
+    """Both banners were fixed over the window: the backlog bar across the
+    bottom, on top of the chat input, and the capture alert across the top, on
+    top of the header and its Stop button."""
+    header = _read(TEMPLATES / "_header.html")
+    lag_at = header.index('id="transcript-lag"')
+    assert header.index('class="app-header-title"') < lag_at < header.index('class="app-header-actions"')
+    assert 'onclick="_dismissTranscriptionBacklog()"' in header
+    js = _read(STATIC / "app.js")
+    assert "transcription-backlog-bar" not in js
+    for start, end in (("function _showTranscriptionBacklog(", "function _clearTranscriptionBacklog("),
+                       ("function _showCaptureAlert(", "function _clearCaptureAlert(")):
+        body = js[js.index(start):js.index(end)]
+        assert "position:fixed" not in body, start
+        assert "z-index" not in body, start
+    alert = js[js.index("function _showCaptureAlert("):js.index("function _clearCaptureAlert(")]
+    assert "header.after(bar)" in alert
+    # The pill gives way in the row instead of pushing Record off it.
+    shell = _shell_css()
+    pill = shell[shell.index(".transcript-lag {"):]
+    pill = pill[:pill.index("}")]
+    assert "flex: 0 1 auto" in pill and "min-width: 0" in pill
+
+
+_BACKLOG_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function grab(name) {
+  const m = src.match(new RegExp('\\nfunction ' + name + '\\([\\s\\S]*?\\n\\}'));
+  if (!m) { throw new Error('FAIL: ' + name + ' not found in app.js'); }
+  return m[0];
+}
+
+// The pill and its text: all of the page these functions touch.
+function fakeEl() {
+  const classes = new Set(['hidden']);
+  return {
+    textContent: '', title: '',
+    classList: { add: c => classes.add(c), remove: c => classes.delete(c),
+                 contains: c => classes.has(c) },
+  };
+}
+const els = { 'transcript-lag': fakeEl(), 'transcript-lag-text': fakeEl() };
+const document = { getElementById: id => els[id] || null };
+const state = { sessionId: 's1', isDrainingBacklog: false };
+const _backlogDismissed = new Map();
+let _backlogShown = null;
+eval(grab('_showTranscriptionBacklog'));
+eval(grab('_clearTranscriptionBacklog'));
+eval(grab('_dismissTranscriptionBacklog'));
+
+const snap = () => ({
+  shown: !els['transcript-lag'].classList.contains('hidden'),
+  text: els['transcript-lag-text'].textContent,
+  draining: state.isDrainingBacklog,
+});
+const push = d => { _showTranscriptionBacklog(d); return snap(); };
+const dismiss = () => { _dismissTranscriptionBacklog(); return snap(); };
+
+const s = {};
+s.behind = push({ session_id: 's1', pending_sec: 130, draining: false });
+s.dismissed = dismiss();
+s.behindAgain = push({ session_id: 's1', pending_sec: 250, draining: false });
+s.dropped = push({ session_id: 's1', pending_sec: 300, draining: false, dropped_chunks: 4 });
+s.droppedDismissed = dismiss();
+s.droppedAgain = push({ session_id: 's1', pending_sec: 320, draining: false, dropped_chunks: 9 });
+s.drainingAfterDismiss = push({ session_id: 's1', pending_sec: 200, draining: true });
+s.nextMeeting = push({ session_id: 's2', pending_sec: 95, draining: false });
+s.caughtUp = push({ session_id: 's2', pending_sec: 0, draining: false });
+s.draining = push({ session_id: 's2', pending_sec: 200, draining: true });
+s.finishing = push({ session_id: 's2', pending_sec: 0, draining: true });
+s.done = push({ session_id: 's2', pending_sec: 0, draining: false });
+console.log(JSON.stringify(s));
+"""
+
+
+def test_the_transcription_backlog_notice_stays_dismissed():
+    """The server re-sends the backlog every five seconds, and every push put
+    the old bar back, so its x hid it for five seconds at a time. A dismissal
+    holds for the rest of that meeting now, the finish after Stop included.
+    Only the step up to skipped audio, a new problem, brings it back."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "backlog.js"
+        path.write_text(_BACKLOG_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(STATIC / "app.js")],
+                             capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    s = json.loads(out.stdout.strip().splitlines()[-1])
+
+    assert s["behind"] == {"shown": True, "text": "Transcript 2 min behind", "draining": False}
+    assert not s["dismissed"]["shown"]
+    assert not s["behindAgain"]["shown"], "the next push put a dismissed notice back"
+    assert s["dropped"]["shown"] and s["dropped"]["text"] == "Transcript is skipping audio"
+    assert not s["droppedDismissed"]["shown"]
+    assert not s["droppedAgain"]["shown"]
+    # Hidden, but the drain is still tracked: live segments depend on it.
+    assert not s["drainingAfterDismiss"]["shown"] and s["drainingAfterDismiss"]["draining"]
+    # A dismissal belongs to its meeting.
+    assert s["nextMeeting"]["shown"] and s["nextMeeting"]["text"] == "Transcript 2 min behind"
+    assert not s["caughtUp"]["shown"]
+    assert s["draining"] == {"shown": True, "text": "Transcribing the last 3 min", "draining": True}
+    assert s["finishing"]["shown"] and s["finishing"]["text"] == "Finishing the transcript"
+    assert not s["done"]["shown"] and not s["done"]["draining"]
 
 
 def test_the_layout_control_keeps_the_pane_toggle_ids():

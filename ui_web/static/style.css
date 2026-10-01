@@ -11724,6 +11724,10 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   opacity: .55;
   cursor: not-allowed;
 }
+/* Starting: the press is taken and the server is opening the devices. The red
+   comes from .recording, the 55 % from being disabled, and the cursor says
+   busy rather than refused. */
+.btn-record.is-loading:disabled { cursor: progress; }
 
 .record-pulse {
   width: 8px;
@@ -12515,6 +12519,43 @@ body[data-view="session"] #view-title { display: none; }
   font-weight: 500;
 }
 .capture-warning.hidden { display: none; }
+
+/* How far behind transcription is. The capture warning's pill with an x, and
+   it gives way rather than pushing: the text ellipsizes before Record moves. */
+.transcript-lag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 2px 3px 2px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--yellow) 18%, var(--surface));
+  color: var(--yellow);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.transcript-lag-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.transcript-lag-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.transcript-lag-close:hover { background: color-mix(in srgb, var(--yellow) 24%, transparent); }
 
 /* ── The header while recording ──────────────────────────────────────────────
    The strip's red is now the header's own. Every element that carried a

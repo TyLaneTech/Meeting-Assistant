@@ -45,6 +45,44 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Fixed Record seeming to ignore your click (2026-10-01)
+
+### Recording
+
+- **Pressing `Record` shows `Starting…` straight away**, in red, while your microphone
+  and call audio are being opened. It turns into `Stop · 0:00` and starts counting as
+  soon as the recording is running
+  - Starting can take several seconds on a slower computer, and the button used to stay
+    on `Record` the whole time, so there was no telling whether the click had worked
+- **A second press is ignored** while it says `Starting…`. One that landed just as the
+  recording began used to stop it again
+- **If a recording cannot start**, `Record` comes back with the reason, as before
+  - **If the app stops responding instead**, `Record` comes back after a minute with a
+    message, rather than saying `Starting…` forever
+
+> Recordings take as long to start as they did. The button now says so while it
+> happens, instead of only once it is done.
+
+
+## Fixed the transcription warning covering the chat box (2026-09-25)
+
+### Recording
+
+- **The "transcription is behind" warning is a small note in the top bar now**, not a
+  bar across the bottom of the window, so it no longer sits on top of the chat box
+  - It reads `Transcript 2 min behind`; hover it for the full message
+- **Closing it with `×` keeps it closed** for the rest of that meeting. It used to come
+  back a few seconds later
+  - **It shows again only if the transcript starts skipping audio**, which is a new
+    problem with something to do about it: reanalyze the meeting afterwards
+- **The red warning that call audio is not being captured no longer covers the top
+  bar** or its `Stop` button. It appears just below the top bar and moves the page down
+  while it is up
+
+> Recording and transcription work exactly as before. Only where these warnings appear
+> has changed.
+
+
 ## Fixed recordings that would not start after an audio device changed (2026-09-24)
 
 ### Recording

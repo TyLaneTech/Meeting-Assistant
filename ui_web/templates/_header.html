@@ -12,7 +12,7 @@
    Load-bearing ids: #record-btn #topbar-session-title #home-search-input
    #home-search-clear #home-search-results #home-search-ai #pane-toggle-*
    #refresh-btn #capture-meters #capture-meter-desktop #capture-meter-mic
-   #capture-warning #}
+   #capture-warning #transcript-lag #transcript-lag-text #}
 <header class="app-header" id="app-header">
 
   <div class="app-header-title">
@@ -39,6 +39,20 @@
     </div>
   </div>
   <span class="capture-warning hidden" id="capture-warning" role="status"></span>
+
+  {# How far behind live transcription is (the transcription_backlog event). A
+     pill in the row, never a bar over the page: the fixed bar it replaced sat
+     on the chat input and came back five seconds after every dismissal. The
+     full sentence is the tooltip, and the x holds for the rest of the meeting. #}
+  <span class="transcript-lag hidden" id="transcript-lag">
+    <i class="fa-solid fa-hourglass-half" aria-hidden="true"></i>
+    <span class="transcript-lag-text" id="transcript-lag-text" role="status"></span>
+    <button type="button" class="transcript-lag-close" title="Dismiss"
+            aria-label="Dismiss the transcription notice"
+            onclick="_dismissTranscriptionBacklog()">
+      <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+    </button>
+  </span>
 
   <div class="app-header-actions">
 
