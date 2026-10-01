@@ -83,7 +83,7 @@ def test_load_reports_the_newest_entry_and_a_change_stamp(tmp_path):
 def test_the_repo_changelog_parses_newest_first():
     payload = changelog.load(ROOT)
     entries = payload["entries"]
-    assert payload["missing"] is False and len(entries) >= 150
+    assert payload["missing"] is False and len(entries) >= 30
     assert all(e["title"] for e in entries)
     assert entries[0]["date"], "the newest entry carries a date"
     dated = [e["date"] for e in entries if e["date"]]
@@ -109,10 +109,10 @@ def test_the_app_reads_the_file_not_git():
 
 # ── The notes are formatted markdown, so the styling has to keep up ──────────
 
-# What CHANGELOG.md's own preamble tells contributors to use, and what the
-# renderer therefore has to style. An element encouraged there but missing here
-# lands with browser defaults, which is how a blockquote used to render as an
-# ordinary paragraph and a nested bullet as its parent.
+# Everything an entry can use, and what the renderer therefore has to style.
+# The house style reaches for few of these, but an element missing here lands
+# with browser defaults when someone does use it, which is how a blockquote
+# used to render as an ordinary paragraph and a nested bullet as its parent.
 _STYLED_ELEMENTS = [
     "h3", "p", "ul", "ol", "li", "strong", "em", "code", "pre", "a",
     "blockquote", "del", "hr", "table", "th", "td",
@@ -154,7 +154,7 @@ def test_every_element_the_guidelines_encourage_is_styled():
     targets = _changelog_targets()
     missing = [e for e in _STYLED_ELEMENTS if e not in targets]
     assert not missing, (
-        f"CHANGELOG.md's preamble encourages {missing}, but "
+        f"An entry can use {missing}, but "
         f".changelog-entry-body does not style them, so they render with "
         f"browser defaults. Styled: {sorted(targets)}"
     )
@@ -181,7 +181,8 @@ def test_a_table_scrolls_rather_than_widening_the_card():
 def test_the_preamble_documents_the_formatting_and_is_still_a_preamble():
     text = (ROOT / changelog.FILE_NAME).read_text(encoding="utf-8")
     preamble = text[:text.index("\n## ")]
-    for hint in ("`**bold**`", "`` `code` ``", "`*italic*`", "Nested", "`> `"):
+    for hint in ("`**bold**`", "`` `code` ``", "Keep it tight", "single line",
+                 "One entry per update"):
         assert hint in preamble, hint
     # It says what code is NOT for, which is the rule most easily got wrong.
     assert "Never for a module" in preamble
@@ -190,14 +191,63 @@ def test_the_preamble_documents_the_formatting_and_is_still_a_preamble():
     assert all("How an entry is read" not in e["title"] for e in changelog.parse(text))
 
 
-def test_the_newest_entry_actually_uses_the_formatting():
-    """The house style is only real if the entry demonstrating it does."""
+# ── Tight, and one line per bullet ───────────────────────────────────────────
+#
+# The notes are rendered with marked's `breaks: true` (set once in app.js for
+# chat and summaries too), so every newline inside an entry is a visible line
+# break. A bullet hard-wrapped at 90 columns showed up in the What's new card
+# broken mid-sentence, and the notes had grown into paragraphs nobody read
+# (2026-10-01: 173 entries and 19,800 words, cut to 40 and about 3,900).
+
+_BLOCK_START = re.compile(r"^(\s*[-*+] |\s*\d+[.)] |#{1,6} )")
+_MAX_BULLET_WORDS = 25
+_MAX_NEWEST_ENTRY_WORDS = 250
+
+
+def _words(markdown: str) -> int:
+    return len(re.sub(r"[*`>#]", "", markdown).split())
+
+
+def test_no_entry_breaks_a_line_mid_sentence():
+    """A line that follows another line without starting a new bullet,
+    heading or paragraph is the second half of a wrapped sentence."""
+    text = (ROOT / changelog.FILE_NAME).read_text(encoding="utf-8")
+    wrapped = []
+    for entry in changelog.parse(text):
+        lines = entry["body"].split("\n")
+        for prev, line in zip(lines, lines[1:]):
+            if line.strip() and prev.strip() and not _BLOCK_START.match(line):
+                wrapped.append(f"{entry['title']}: {line.strip()[:60]}")
+    assert not wrapped, "join these onto the line above:\n" + "\n".join(wrapped)
+
+
+def test_every_bullet_is_short():
+    text = (ROOT / changelog.FILE_NAME).read_text(encoding="utf-8")
+    long = [
+        f"{entry['title']}: {line.strip()[:70]}"
+        for entry in changelog.parse(text)
+        for line in entry["body"].split("\n")
+        if re.match(r"^\s*- ", line) and _words(line) - 1 > _MAX_BULLET_WORDS
+    ]
+    assert not long, f"bullets over {_MAX_BULLET_WORDS} words:\n" + "\n".join(long)
+
+
+def test_the_newest_entry_is_tight_and_uses_the_formatting():
+    """It is what the What's new card shows, read in one sitting."""
     text = (ROOT / changelog.FILE_NAME).read_text(encoding="utf-8")
     body = changelog.parse(text)[0]["body"]
-    assert body.count("**") >= 8, "bold on the thing that changed"
+    assert _words(body) <= _MAX_NEWEST_ENTRY_WORDS, f"{_words(body)} words"
+    assert body.count("**") >= 4, "bold on the thing that changed"
     assert body.count("`") >= 4, "code for what the user sees in the app"
-    assert "\n  - " in body, "nested detail under a bullet"
-    assert "\n> " in body, "one note that is not itself a change"
     # code is for user-visible strings, never a module or a path.
     for banned in ("app.py", "core/", "ui_web/", ".py`", "_renderChangelogBody"):
         assert banned not in body, f"{banned} is developer language"
+
+
+def test_the_checks_catch_what_they_are_for():
+    """A wrapped bullet and a long one, as the old notes were written."""
+    wrapped = "- **Pressing `Record` shows `Starting…`**, in red, while your microphone\n  and call audio are being opened"
+    lines = wrapped.split("\n")
+    assert not _BLOCK_START.match(lines[1]) and lines[0].strip()
+    assert _BLOCK_START.match("  - a nested bullet") and _BLOCK_START.match("### Area")
+    assert _words("- " + "word " * 26) - 1 > _MAX_BULLET_WORDS

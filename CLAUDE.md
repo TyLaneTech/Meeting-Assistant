@@ -37,31 +37,20 @@ End users read `CHANGELOG.md` (repo root) in **Settings → Changelog** and in t
 card after an update. It is the only source of user-facing release notes; commit messages and
 pull request text never reach users.
 
-- Every change a user could notice gets an entry, or a bullet under the entry for the release
-  it ships in, in the same pull request. Infrastructure, docs, CI and tooling get no entry.
-- One entry per `## ` heading: the title, then the date in parentheses. Newest first. The first
-  word of the title picks the icon: Added, Fixed, Improved, Removed, Reworked.
-- Under the heading: `### ` sub-headings for areas (Recording, Speakers, Settings), `- `
-  bullets in plain user language. No module names, no emoji, no marketing verbs.
-- The notes render as full markdown in both surfaces, and both are narrow, so format for
-  scanning: `**bold**` on the thing that changed (usually the bullet's opening words),
-  `` `code` `` for what the user sees or types in the app (a control name, a path like
-  `Settings > Calendar`, a displayed value), `*italic*` for an aside or a `*Fixed:*`
-  prefix, nested `- ` bullets for the detail behind a bullet, and at most one `> ` note
-  per entry for something that applies across it. Never `code` a module or file path:
-  users do not have those. Tables and rules render but rarely earn the width.
-- Do not bold whole sentences. If everything is bold, nothing is.
+- **One entry per update.** Everything that ships together goes under one `## Title (YYYY-MM-DD)` heading, dated the day it ships, with `### ` area sub-headings (Recording, Speakers, Settings) when it covers more than one. The What's new card shows only the newest entry, so a second entry in the same push is never seen there. Newest first; the title's first word picks the icon (Added, Fixed, Improved, Removed, Reworked).
+- **Keep it tight.** One bullet per change, one short sentence: what the user will notice. Not how it works, not why it was hard, not the history of the bug. Cut anything a user would not miss. No module names, no emoji, no marketing verbs.
+- **One line per bullet.** The notes render with `breaks: true`, so a newline inside a sentence shows on screen as a break. Never hard-wrap; the page wraps text itself.
+- `**bold**` on the thing that changed, the bullet's opening words and never a whole sentence. `` `code` `` for text the user sees or types in the app (`Apply`, `Settings > Calendar`), never a module or file path. Nested bullets and a `> ` note only for a caveat the user has to act on.
+- Infrastructure, docs, CI and tooling get no entry.
 
 ```
 ## Fixed the desktop audio device (2026-09-05)
 
 ### Recording
-- **The device you select is always the device captured**, even when Windows reports a
-  different default output
-  - `Settings > System` no longer needs the follow-output workaround for this
+- **The device you select** is always the one recorded, even when Windows reports a different default output.
 ```
 
-The parser is `core/changelog.py`; `tests/test_changelog.py` fails if the file stops parsing.
+The parser is `core/changelog.py`. `tests/test_changelog.py` fails if the file stops parsing, a bullet is hard-wrapped, a bullet runs past 25 words, or the newest entry passes 250.
 
 ## Commit messages and pull requests
 
