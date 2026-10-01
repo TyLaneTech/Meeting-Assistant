@@ -45,6 +45,41 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
+## Added the app's own notifications on Windows (2026-10-01)
+
+### Notifications
+
+- **Notifications are drawn by Meeting Assistant itself**, not by Windows: a card in the
+  corner of your screen, in your app theme, that shows up every time
+  - Windows used to drop them silently under Focus Assist, which is on during most calls,
+    so the offer to record a meeting could never arrive
+  - It sits above every window and never takes focus from your call. Close it with `×`
+    or a right-click, or leave it to fade; hovering holds it, and a thin line along the
+    bottom shows the time left
+- **Buttons are real buttons**: `Start recording`, `Stop recording`, `Open the app`,
+  `Not now`, each doing what it says
+- **A notification comes down when it stops applying**: the offer to record a detected
+  meeting goes once a recording starts or the meeting ends, `Still in the meeting?` and
+  `Call audio not captured` go when the recording stops, and the audio alarm clears
+  itself as soon as audio comes back
+- **Each kind has its own sound**: a rising question for a detected meeting, a quick pair
+  for a start, a falling pair for a stop, a repeated minor third for a warning, and a
+  low, firm pair for an error
+  - Five sound packs play the same cues on different instruments: `Felt` (deep, rounded
+    bloops, the default), `Glass`, `Wood`, `Pulse` and `Chime`; press play in Settings to
+    hear them in turn
+  - Cues play softer during a recording, because the call audio capture picks them up
+
+### Settings
+
+- **`Settings > Reminders > Notifications`** has the corner they appear in, `Stay Until
+  Dismissed` for anyone who keeps missing them, the sound pack, the volume, and `Send a
+  test notification`
+- **`Test Notification` in the tray menu** replaces `Test Toast`
+
+> macOS is unchanged: notifications still go through Notification Center.
+
+
 ## Fixed Record seeming to ignore your click (2026-10-01)
 
 ### Recording

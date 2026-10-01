@@ -87,4 +87,3 @@ sentence-transformers>=2.2.0
 # template-image styling configured in tray.py.
 pystray>=0.19.0
 Pillow>=10.0.0
-winotify>=1.1.0; sys_platform == "win32"

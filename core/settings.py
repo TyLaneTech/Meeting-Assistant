@@ -134,6 +134,21 @@ DEFAULTS: dict = {
     # --app= window.
     "pwa_app_id": "",
 
+    # Desktop notifications (Windows; ui_desktop/toast). The app draws its own
+    # rather than using Windows' toasts, so these are honoured exactly.
+    # Position is the corner of the primary display's work area they stack
+    # from. Sticky keeps every notification up until it is dismissed, for
+    # anyone who keeps missing them. The sound set is one of
+    # ui_desktop.toast.sounds.SETS; volume is 0..100; quieter_while_recording
+    # softens sounds during a recording, because the desktop capture records
+    # them along with the call.
+    "notify_position": "bottom-right",
+    "notify_sticky": False,
+    "notify_sounds": True,
+    "notify_volume": 70,
+    "notify_sound_set": "felt",
+    "notify_quieter_while_recording": True,
+
     # Cloudflare WARP auto-toggle. When ON, the app briefly disconnects WARP
     # around package installs, model downloads, AI provider calls, and the
     # update check (WARP's TLS inspection historically broke those). Default

@@ -1,120 +1,43 @@
-"""Bulletproof system toast notifications for Meeting Assistant.
+"""Desktop notifications for Meeting Assistant.
 
-Backend dispatch is automatic via sys.platform:
-  - Windows: windows-toasts (WinRT ToastNotificationManager) with a registered
-             AppUserModelID so toasts actually appear in the Action Center and
-             support clickable buttons + activation callbacks.
+Dispatch is by platform:
+  - Windows: the app's own toast widget (ui_desktop/toast). Windows' toasts
+             were dropped silently by Focus Assist during the very meetings
+             the app records, needed an AppUserModelID to appear at all, and
+             could not be styled, timed or taken down by the app.
   - macOS:   osascript (Notification Center; no action buttons).
   - Other:   no-op.
 
-The Windows backend is the important one. Two things have to be true for a
-Windows toast to appear AND survive long enough for the user to click it:
-
-  1. The calling process must be associated with an AppUserModelID (AUMID)
-     that is registered under HKCU\\Software\\Classes\\AppUserModelId\\<id>.
-     Without this, Win11 silently drops toasts on the floor — which is
-     exactly the failure mode we hit with winotify.
-
-  2. Activation callbacks fire on a WinRT background thread *after* the
-     calling Python function returns. We therefore keep a strong reference
-     to every live Toast + Toaster so they aren't garbage-collected before
-     the user clicks.
+Every notification the app sends has a function here, so app.py never
+composes one. Each carries a tag, which is what lets a later notification
+about the same thing replace the earlier one, and lets the app take one down
+the moment it stops applying: a "meeting detected" question goes when the
+recording starts, "still in the meeting?" goes when it stops, and "call audio
+not captured" goes when the audio comes back.
 """
 from __future__ import annotations
 
 import subprocess
 import sys
-import threading
-import webbrowser  # noqa: F401  (kept for fallback / compatibility)
-
-from core import app_window
-from core import recording_request
-from pathlib import Path
 from typing import Callable, Optional
 
-from core import log as log
+from core import app_window
+from core import log
+from core import recording_request
+from ui_desktop import toast
+from ui_desktop.toast import Action
 
-
-_ROOT = Path(__file__).parent.parent
-_ICON_ICO = _ROOT / "ui_web" / "static" / "images" / "logo.ico"
-_ICON_PNG = _ROOT / "ui_web" / "static" / "images" / "logo.png"
-
-# AUMID — must be unique per app and stable across runs. Format is
-# "CompanyName.ProductName" (max 129 chars, no spaces).
-AUMID = "MeetingAssistant.App"
 APP_DISPLAY_NAME = "Meeting Assistant"
 
+# One tag per situation.
+TAG_MEETING = "meeting"             # a detected meeting, asked about
+TAG_RECORDING = "recording"         # a recording the app started by itself
+TAG_QUIET = "quiet"                 # "still in the meeting?"
+TAG_CAPTURE = "capture"             # call audio is not being captured
+TAG_START_FAILED = "start-failed"   # an automatic start did not happen
+TAG_TEST = "test"
 
-# ── Windows AUMID registration ────────────────────────────────────────────────
-
-_aumid_registered = False
-_aumid_lock = threading.Lock()
-
-
-def _register_windows_aumid() -> bool:
-    """Register the AUMID in HKCU so Windows treats us as a known toast source.
-
-    Idempotent. Safe to call repeatedly. Returns True if the AUMID is usable
-    after the call (already registered or freshly registered).
-    """
-    global _aumid_registered
-    with _aumid_lock:
-        if _aumid_registered:
-            return True
-        try:
-            import winreg
-            key_path = rf"Software\Classes\AppUserModelId\{AUMID}"
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_DISPLAY_NAME)
-                if _ICON_ICO.exists():
-                    winreg.SetValueEx(key, "IconUri", 0, winreg.REG_SZ, str(_ICON_ICO))
-                # ShowInSettings=1 makes the app appear in Settings >
-                # Notifications so the user can re-enable it if they muted us.
-                winreg.SetValueEx(key, "ShowInSettings", 0, winreg.REG_DWORD, 1)
-
-            # Tell the current process to use this AUMID. Without this call
-            # WinRT may attribute the toast to "python.exe" and drop it.
-            try:
-                import ctypes
-                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(AUMID)
-            except Exception as e:
-                log.warn("notify", f"SetCurrentProcessExplicitAppUserModelID failed: {e}")
-
-            _aumid_registered = True
-            return True
-        except Exception as e:
-            log.warn("notify", f"AUMID registration failed: {e}")
-            return False
-
-
-# ── Live-toast tracking ───────────────────────────────────────────────────────
-# Toast callbacks fire on a background thread after the originating Python
-# call returns. Keep strong refs so the Toast + Toaster aren't GC'd mid-flight.
-
-_live_toaster = None  # type: ignore[var-annotated]
-_live_toasts: list = []
-_live_lock = threading.Lock()
-
-
-def _remember_toast(toast) -> None:
-    with _live_lock:
-        _live_toasts.append(toast)
-        # Cap retained toasts so we don't leak memory over a long session.
-        if len(_live_toasts) > 32:
-            del _live_toasts[: len(_live_toasts) - 32]
-
-
-def _get_windows_toaster():
-    """Return a process-wide InteractableWindowsToaster bound to our AUMID."""
-    global _live_toaster
-    if _live_toaster is not None:
-        return _live_toaster
-    with _live_lock:
-        if _live_toaster is None:
-            from windows_toasts import InteractableWindowsToaster  # type: ignore[import-not-found]
-            _register_windows_aumid()
-            _live_toaster = InteractableWindowsToaster(APP_DISPLAY_NAME, notifierAUMID=AUMID)
-    return _live_toaster
+_LEGACY_TIMEOUTS = {"short": 8.0, "long": 20.0}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -124,100 +47,173 @@ def notify(
     title: str,
     body: str = "",
     *,
+    kind: str = "info",
+    icon: Optional[str] = None,
+    tag: Optional[str] = None,
+    timeout: Optional[float] = None,
+    sound=None,
     on_click: Optional[Callable[[str], None]] = None,
-    actions: Optional[list[dict]] = None,
-    image: Optional[Path | str] = None,
-    duration: str = "short",
+    on_dismiss: Optional[Callable[[str], None]] = None,
+    actions: Optional[list] = None,
+    duration: Optional[str] = None,
     scenario: str = "",
     mac_url: Optional[str] = None,
 ) -> bool:
-    """Show a system toast.
+    """Show a notification.
 
     Parameters
     ----------
     title, body
-        Toast headline and message.
+        The headline and the message.
+    kind
+        "info" | "success" | "warning" | "error" | "prompt" | "recording". Sets
+        the colour, the icon, how long it stays and the sound, each of which
+        ``icon``, ``timeout`` and ``sound`` override. Errors and prompts stay
+        until dealt with; ``timeout=0`` makes anything do that.
+    tag
+        A later notification with the same tag replaces this one, and
+        ``dismiss(tag)`` takes it down.
     on_click
-        Called with the activation argument (a string) when the user clicks
-        the toast body or any action that doesn't define its own ``on_click``.
-        Runs on a background WinRT thread; keep it short and exception-safe.
+        Runs when the body is clicked, with "". The toast closes.
+    on_dismiss
+        Runs with why the toast went: clicked, action, closed, timeout,
+        replaced, dismissed or shutdown.
     actions
-        Optional list of dicts: ``{"label": str, "arg": str, "on_click": fn}``.
-        Each becomes a button on the toast. ``on_click`` is optional — if
-        omitted, falls back to the toast-level ``on_click``.
-    image
-        Optional path to a large inline image (PNG or JPG) rendered in the
-        toast body. Off by default: the small corner app icon already comes
-        from the AUMID's IconUri, so toasts don't need a big inline logo.
-    duration
-        "short" (~5s) or "long" (~25s). Long toasts stay visible longer
-        before sliding into the Action Center.
-    scenario
-        Windows-only. "" for a normal toast, or "reminder" / "important" /
-        "incomingcall" / "alarm" to raise priority. A "reminder" toast is
-        sticky (stays on screen until the user acts on it) and breaks through
-        "Priority only" Focus Assist / Do Not Disturb, which a normal toast
-        does not: during a meeting Windows often suppresses normal banners to
-        the Action Center silently. Reminder/alarm scenarios require at least
-        one action button (this toast has them).
+        Up to three buttons: ``toast.Action`` objects, or dicts with
+        ``label``, ``on_click``, ``arg`` (passed to on_click; the label when
+        omitted), ``style`` ("primary" | "secondary" | "danger") and ``close``.
+    duration, scenario
+        The old vocabulary, still honoured: "long" stays 20 s, a scenario
+        ("reminder", "alarm", ...) stays until dismissed.
+    mac_url
+        macOS only: appended to the body, since its notifications carry no
+        buttons.
 
-    Returns
-    -------
-    True if the platform notification API accepted the toast. Note this only
-    means Windows accepted it, not that a banner was shown: a suppressed
-    (Focus Assist / full-screen) normal toast still returns True while landing
-    silently in the Action Center. Raise ``scenario`` to fight that.
+    Callbacks run on their own thread, never on the toast's UI thread.
+
+    Returns True when the platform accepted the notification. On Windows that
+    means it is on screen; nothing can swallow it.
     """
     if sys.platform == "win32":
-        return _send_windows_toast(title, body, on_click=on_click, actions=actions or [], image=image, duration=duration, scenario=scenario)
+        if timeout is None and (scenario or duration):
+            timeout = 0.0 if scenario else _LEGACY_TIMEOUTS.get(duration, 8.0)
+        handle = toast.show(title, body, kind=kind, icon=icon, actions=_actions(actions),
+                            on_click=on_click, on_dismiss=on_dismiss, timeout=timeout,
+                            tag=tag, sound=sound)
+        if handle.reason == "unsupported":
+            log.warn("notify", f"Notification not shown ({title}): the toast window is unavailable")
+            return False
+        return True
     if sys.platform == "darwin":
         return _send_macos_notification(title, body, url=mac_url)
-    log.warn("notify", f"Toast skipped: unsupported platform {sys.platform}")
+    log.warn("notify", f"Notification skipped: unsupported platform {sys.platform}")
     return False
 
 
-def _noop_dismiss(_arg: str) -> None:
-    """No-op callback for "dismiss" buttons (e.g. Not now / Keep recording).
+def _actions(actions: Optional[list]) -> list[Action]:
+    out: list[Action] = []
+    for spec in actions or []:
+        if isinstance(spec, Action):
+            out.append(spec)
+            continue
+        label = str(spec.get("label", "")).strip()
+        if not label:
+            continue
+        out.append(Action(label, on_click=spec.get("on_click"), arg=str(spec.get("arg") or label),
+                          style=str(spec.get("style") or "secondary"),
+                          close=bool(spec.get("close", True))))
+    return out
 
-    A toast button with no on_click falls back to the toast-level on_click in
-    _on_activated, which for our toasts opens a page. Wiring a dismiss button to
-    this explicit no-op stops that fallback: clicking the button just closes the
-    toast (Windows dismisses any toast on activation) and does nothing else.
-    """
+
+def dismiss(tag: str) -> None:
+    """Take down the notification carrying ``tag``, if it is still up."""
+    if sys.platform == "win32":
+        toast.dismiss(tag)
+
+
+def configure(*, is_recording: Optional[Callable[[], bool]] = None) -> None:
+    """What the toast needs from the app: whether a recording is running, so
+    sounds can be softer while they are being recorded."""
+    if sys.platform == "win32":
+        toast.configure(is_recording=is_recording)
+
+
+def recording_started() -> None:
+    """A recording is running, however it was started: the question about
+    the meeting and any "not recording" alarm are answered."""
+    dismiss(TAG_MEETING)
+    dismiss(TAG_START_FAILED)
+
+
+def recording_stopped() -> None:
+    """Nothing is recording: the prompts and alarms about the one that was
+    are moot."""
+    dismiss(TAG_QUIET)
+    dismiss(TAG_CAPTURE)
+    dismiss(TAG_RECORDING)
+
+
+def meeting_ended() -> None:
+    """The detected meeting is gone, so the offer to record it is withdrawn."""
+    dismiss(TAG_MEETING)
+
+
+def capture_recovered() -> None:
+    """Call audio is being captured again: the alarm comes down by itself."""
+    dismiss(TAG_CAPTURE)
+
+
+def preview_sound(motif: str = "ask", sound_set: Optional[str] = None,
+                  volume: Optional[float] = None) -> bool:
+    """Play one notification sound, for the Settings picker."""
+    if sys.platform != "win32":
+        return False
+    return toast.play_sound(motif, sound_set, volume)
+
+
+def sound_sets() -> list[dict]:
+    return toast.sound_sets()
+
+
+# ── The notifications the app sends ───────────────────────────────────────────
+
+
+def _post_stop(stop_url: str) -> None:
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            stop_url, data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        log.warn("notify", f"Stop-from-notification failed: {e}")
 
 
 def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
-    """Show a system toast that routes back to the active recording session."""
+    """Ask whether a recording that has gone quiet should go on."""
     base = server_url.rstrip("/")
     session_url = f"{base}/session?id={session_id}&quiet_prompt=1"
     stop_url = f"{base}/api/recording/stop"
 
     def _open_session(_arg: str) -> None:
         # The window the user already has is raised and sent to the meeting,
-        # so a toast never leaves a second one behind it.
+        # so a notification never leaves a second one behind it.
         app_window.show(session_url, reason="toast:quiet")
 
     def _stop_recording(_arg: str) -> None:
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                stop_url, data=b"{}",
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5).read()
-        except Exception as e:
-            log.warn("notify", f"Stop-from-toast failed: {e}")
+        _post_stop(stop_url)
         app_window.show(session_url, reason="toast:quiet-stop")
 
     return notify(
         "Still in the meeting?",
-        "Things have gone quiet. Click to stop the recording.",
+        "Things have gone quiet. Stop the recording, or keep it going.",
+        kind="prompt", icon="moon", tag=TAG_QUIET, timeout=30,
         on_click=_open_session,
         actions=[
-            {"label": "Stop recording", "arg": "stop", "on_click": _stop_recording},
-            {"label": "Keep recording", "arg": "keep", "on_click": _noop_dismiss},
+            {"label": "Stop recording", "arg": "stop", "on_click": _stop_recording, "style": "danger"},
+            {"label": "Keep recording", "arg": "keep"},
         ],
-        duration="long",
         mac_url=session_url,
     )
 
@@ -230,11 +226,13 @@ def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
     session page (that is where device selection and the readiness gate live),
     but the coordinator offers it to the window that is already open first and
     only opens a new one if nothing takes it. See core/recording_request.py.
+
+    The question stays up until it is answered, the recording starts some
+    other way (recording_started), or the meeting ends (meeting_ended).
     """
     base = server_url.rstrip("/")
-    # macOS has no toast buttons: clicking the notification just opens a URL,
-    # so the autostart page stays the only affordance there. On Windows the
-    # coordinator handles it and no second window is opened.
+    # macOS has no notification buttons: clicking the notification just opens
+    # a URL, so the autostart page stays the only affordance there.
     start_url = f"{base}/session?autostart=1"
 
     def _start(_arg: str) -> None:
@@ -244,19 +242,18 @@ def send_meeting_detected_toast(app_name: str, server_url: str) -> bool:
     return notify(
         f"{app_name} meeting detected",
         "Want to record and transcribe it?",
+        kind="prompt", icon="video", tag=TAG_MEETING,
         on_click=_start,
         actions=[
-            {"label": "Start recording", "arg": "start", "on_click": _start},
-            {"label": "Not now", "arg": "dismiss", "on_click": _noop_dismiss},
+            {"label": "Start recording", "arg": "start", "on_click": _start, "style": "primary"},
+            {"label": "Not now", "arg": "dismiss"},
         ],
-        duration="long",
-        scenario="reminder",
         mac_url=start_url,
     )
 
 
 def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
-    """Auto-start recording a just-detected meeting and confirm with a toast.
+    """Auto-start recording a just-detected meeting and confirm it.
 
     Mirrors ``send_meeting_detected_toast`` but, instead of asking, it requests
     the start immediately and then shows a confirmation. The request goes to the
@@ -264,14 +261,11 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
     before opening anything (core/recording_request.py); the page still performs
     the start, exactly as a manual click would.
 
-    Uses the sticky "reminder" scenario so the user reliably sees that recording
-    began even while Focus Assist / Do Not Disturb is on during the meeting.
-
-    Returns True once the start request has been dispatched, EVEN IF the toast
-    itself failed. The caller (the meeting-detect loop) uses the return value to
-    mark the meeting as handled and to arm auto-stop, so tying it to the toast
-    would leave a recording running forever and re-fire the detection every two
-    seconds. A failed toast is logged, not escalated.
+    Returns True once the start request has been dispatched, EVEN IF the
+    notification itself failed. The caller (the meeting-detect loop) uses the
+    return value to mark the meeting as handled and to arm auto-stop, so tying
+    it to the notification would leave a recording running forever and re-fire
+    the detection every two seconds. A failed notification is logged.
     """
     base = server_url.rstrip("/")
     session_url = f"{base}/session"
@@ -281,6 +275,7 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
     # seconds and this runs on the meeting-detect loop.
     recording_request.request_start_async(
         "toast:autostart", f"{app_name} meeting detected")
+    dismiss(TAG_MEETING)
 
     def _open(_arg: str) -> None:
         # Raise the app window the user already has rather than opening a
@@ -291,153 +286,47 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
                         reason="toast:autostarted")
 
     def _stop(_arg: str) -> None:
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                stop_url, data=b"{}",
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5).read()
-        except Exception as e:
-            log.warn("notify", f"Stop-from-toast failed: {e}")
+        _post_stop(stop_url)
 
     shown = notify(
         f"Recording {app_name} meeting",
-        "Auto-started recording and transcription. Click to open.",
+        "Recording and transcription started by themselves. Click to open.",
+        kind="recording", icon="microphone", tag=TAG_RECORDING, timeout=12,
         on_click=_open,
         actions=[
-            {"label": "Open", "arg": "open", "on_click": _open},
-            {"label": "Stop recording", "arg": "stop", "on_click": _stop},
+            {"label": "Open", "arg": "open", "on_click": _open, "style": "primary"},
+            {"label": "Stop recording", "arg": "stop", "on_click": _stop, "style": "danger"},
         ],
-        duration="long",
-        scenario="reminder",
         mac_url=session_url,
     )
     if not shown:
         log.warn("notify", f"Recording {app_name} meeting: start requested but the "
-                           f"confirmation toast did not display")
+                           f"confirmation did not display")
     return True
 
 
-def send_test_toast() -> bool:
-    """Diagnostic toast — fired from the tray menu's Test Toast item."""
-    def _on_body(arg: str) -> None:
-        log.info("notify", f"Test toast body clicked (arg={arg!r})")
+def send_test_toast(server_url: Optional[str] = None) -> bool:
+    """A notification to look at: the tray's Test Notification item and the
+    Settings button both send it."""
+    def _clicked(arg: str) -> None:
+        log.info("notify", f"Test notification: {'button ' + arg if arg else 'body'} clicked")
 
-    def _on_button(arg: str) -> None:
-        log.info("notify", f"Test toast button clicked (arg={arg!r})")
+    actions = [{"label": "Looks good", "arg": "ok", "on_click": _clicked, "style": "primary"}]
+    if server_url:
+        settings_url = f"{server_url.rstrip('/')}/session?settings=1&section=reminders"
+
+        def _settings(_arg: str) -> None:
+            app_window.show(settings_url, reason="toast:test")
+
+        actions.append({"label": "Open settings", "arg": "settings", "on_click": _settings})
 
     return notify(
-        "Meeting Assistant — Test Toast",
-        "If you can see this, system toasts are working. Click a button to verify callbacks.",
-        on_click=_on_body,
-        actions=[
-            {"label": "Click me", "arg": "primary", "on_click": _on_button},
-            {"label": "Or me",   "arg": "secondary", "on_click": _on_button},
-        ],
-        duration="long",
+        "Notifications are working",
+        "This is how Meeting Assistant gets your attention. Buttons work too.",
+        kind="success", icon="bell", tag=TAG_TEST, timeout=20,
+        on_click=_clicked,
+        actions=actions,
     )
-
-
-# ── Windows backend ───────────────────────────────────────────────────────────
-
-
-def _send_windows_toast(
-    title: str,
-    body: str,
-    *,
-    on_click: Optional[Callable[[str], None]],
-    actions: list[dict],
-    image: Optional[Path | str],
-    duration: str,
-    scenario: str = "",
-) -> bool:
-    try:
-        from windows_toasts import (  # type: ignore[import-not-found]
-            Toast, ToastButton, ToastDisplayImage, ToastDuration, ToastScenario,
-        )
-    except ImportError as e:
-        log.warn("notify", f"windows-toasts not installed ({e}). Run: pip install windows-toasts")
-        return False
-
-    try:
-        toaster = _get_windows_toaster()
-
-        # Map button arg → callback so we can dispatch in on_activated.
-        button_callbacks: dict[str, Callable[[str], None]] = {}
-        toast_buttons = []
-        for spec in actions:
-            label = str(spec.get("label", "")).strip()
-            if not label:
-                continue
-            arg = str(spec.get("arg", label))
-            cb = spec.get("on_click")
-            if callable(cb):
-                button_callbacks[arg] = cb
-            toast_buttons.append(ToastButton(content=label, arguments=arg))
-
-        def _on_activated(event_args) -> None:
-            try:
-                arg = getattr(event_args, "arguments", "") or ""
-                cb = button_callbacks.get(arg)
-                if cb is None and on_click is not None:
-                    cb = on_click
-                if cb is not None:
-                    cb(arg)
-            except Exception as e:
-                log.warn("notify", f"Toast on_activated callback raised: {e}")
-
-        def _on_failed(event_args) -> None:
-            try:
-                err = getattr(event_args, "error_code", event_args)
-                log.warn("notify", f"Toast failed to display: {err}")
-            except Exception:
-                pass
-
-        text_fields = [title]
-        if body:
-            text_fields.append(body)
-
-        toast_kwargs = dict(
-            text_fields=text_fields,
-            duration=ToastDuration.Long if duration == "long" else ToastDuration.Short,
-            on_activated=_on_activated,
-            on_failed=_on_failed,
-            actions=toast_buttons,
-        )
-        # A raised scenario (especially "reminder") makes the banner sticky and
-        # lets it break through "Priority only" Focus Assist / Do Not Disturb,
-        # which a normal toast cannot: during a meeting Windows otherwise drops
-        # the banner silently into the Action Center. Reminder/alarm scenarios
-        # require at least one action button, which our callers provide.
-        _scenarios = {
-            "reminder": ToastScenario.Reminder,
-            "important": ToastScenario.Important,
-            "incomingcall": ToastScenario.IncomingCall,
-            "alarm": ToastScenario.Alarm,
-        }
-        _sc = _scenarios.get(scenario.lower()) if scenario else None
-        if _sc is not None:
-            toast_kwargs["scenario"] = _sc
-        toast = Toast(**toast_kwargs)
-
-        # Only attach an inline image when a caller explicitly passes one. We
-        # deliberately do NOT default to the app logo: an inline
-        # ToastDisplayImage renders large in the toast body, and the small
-        # corner branding is already provided by the AUMID's IconUri.
-        img_path = Path(image) if image else None
-        if img_path is not None and img_path.exists():
-            try:
-                toast.AddImage(ToastDisplayImage.fromPath(str(img_path)))
-            except Exception as e:
-                log.warn("notify", f"Toast image attach failed: {e}")
-
-        toaster.show_toast(toast)
-        _remember_toast(toast)
-        return True
-    except Exception as e:
-        log.warn("notify", f"windows-toasts show failed: {e}")
-        return False
 
 
 # ── macOS backend ─────────────────────────────────────────────────────────────

@@ -479,17 +479,18 @@ def _notify_start_failed(source: str, reason: str) -> None:
             log.warn("record", f"Opening the app window from the toast failed: {e}")
 
     try:
+        # An error stays until dealt with; a recording that does start takes
+        # it down (notifications.recording_started).
         notifications.notify(
             "Meeting Assistant is NOT recording",
             "Automatic start did not go through. Open the app and press Record.",
+            kind="error", icon="microphone-slash", tag=notifications.TAG_START_FAILED,
             on_click=_open,
-            actions=[{"label": "Open the app", "arg": "open", "on_click": _open}],
-            duration="long",
-            scenario="reminder",   # sticky, and survives Focus Assist
+            actions=[{"label": "Open the app", "arg": "open", "on_click": _open, "style": "primary"}],
             mac_url=f"{_server_url}/session",
         )
     except Exception as e:
-        log.warn("record", f"Start-failure toast failed: {e}")
+        log.warn("record", f"Start-failure notification failed: {e}")
 
 
 # One app window, not two: a "start recording" request (meeting auto-detect,
@@ -514,6 +515,10 @@ recording_request.set_default(_start_coordinator)
 # call is what puts it in charge.
 app_window.configure(push=_push, client_count=_connected_client_count)
 
+# The desktop notifications soften their sound while a recording is running,
+# because the desktop capture records them along with the call.
+notifications.configure(is_recording=lambda: bool(_state.get("is_recording")))
+
 
 def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
     """Surface a loopback-silence alarm to the UI (a persistent banner) and a
@@ -532,9 +537,12 @@ def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
     log.warn("audio", f"CAPTURE ALERT ({kind}): {msg}")
     _push("capture_alert", {"level": "error", "kind": kind, "message": msg, "device": dev_name})
     try:
-        notifications.notify("Meeting Assistant: call audio not captured", msg, duration="long")
+        # Stays up until the audio comes back (_alert_loopback_recovered takes
+        # it down) or the recording stops.
+        notifications.notify("Call audio not captured", msg, kind="warning", icon="volume-xmark",
+                             tag=notifications.TAG_CAPTURE, timeout=0)
     except Exception as e:
-        log.warn("audio", f"capture-alert toast failed: {e}")
+        log.warn("audio", f"capture-alert notification failed: {e}")
 
 
 def _alert_loopback_recovered(session_id: str, dev_name: str) -> None:
@@ -542,13 +550,15 @@ def _alert_loopback_recovered(session_id: str, dev_name: str) -> None:
 
     Same event as the alarm, flagged as a clear. A warning about a problem that
     has already gone away is worse than no warning: the user learns to dismiss
-    the banner without reading it. No toast: "it is fine again" is not worth
-    interrupting anyone for."""
+    the banner without reading it. No new notification: "it is fine again" is
+    not worth interrupting anyone for. The alarm's own notification comes down
+    instead."""
     with _state_lock:
         if not _state.get("is_recording") or _state.get("session_id") != session_id:
             return
     _push("capture_alert", {"level": "clear", "kind": "recovered",
                             "cleared": True, "device": dev_name})
+    notifications.capture_recovered()
 
 
 def _recording_prereqs_locked() -> tuple[bool, str]:
@@ -1977,6 +1987,7 @@ def _meeting_detect_loop() -> None:
                     autostarted = False
                 if prompted:
                     prompted = False  # meeting ended; re-arm for the next one
+                    notifications.meeting_ended()   # the offer to record it is withdrawn
             continue
 
         # A meeting looks active.
@@ -3086,6 +3097,9 @@ def start_recording():
             "resumed": bool(resume_session_id),
             "screen_recording": screen_recording_active,
         })
+        # However it was started, the offer to record the detected meeting and
+        # any "not recording" alarm are answered.
+        notifications.recording_started()
         return jsonify({"session_id": session_id, "screen_recording": screen_recording_active})
     finally:
         # Released however this returns: early error, exception, or a
@@ -3234,6 +3248,9 @@ def stop_recording():
                 log.info("recording",
                          f"Stopped - session {sid} ({seg_count} segments{tail})")
             _push_status({"recording": False, "session_id": sid})
+            # The prompts about this recording (still in the meeting? call
+            # audio not captured) are moot now, so they come down by themselves.
+            notifications.recording_stopped()
         finally:
             # Streams, transcriber, video and the session row are all settled,
             # which is everything a new recording needs to wait for. Release it
@@ -4169,6 +4186,46 @@ def set_preferences():
     if updated.get("calendar_ics_url"):
         updated["calendar_ics_url"] = calendar_feed.mask_url(updated["calendar_ics_url"])
     return jsonify(updated)
+
+
+# ── Desktop notifications ────────────────────────────────────────────────────
+# Settings > Reminders > Notifications. The toasts themselves are the app's
+# own windows (ui_desktop/toast); these routes let the page try one out.
+
+@app.route("/api/notifications/sounds", methods=["GET"])
+def get_notification_sounds():
+    """The sound sets the picker offers, and the cues each one plays."""
+    from ui_desktop.toast import sounds as _sounds
+    return jsonify({
+        "sets": notifications.sound_sets(),
+        "motifs": list(_sounds.MOTIF_ORDER),
+        "supported": sys.platform == "win32",
+    })
+
+
+@app.route("/api/notifications/sound", methods=["POST"])
+def preview_notification_sound():
+    """Play one cue on this computer, with the set and volume given (the saved
+    ones when omitted), so a choice can be heard before it is saved."""
+    data = request.get_json(silent=True) or {}
+    motif = str(data.get("motif") or "ask")
+    sound_set = data.get("set") or None
+    volume = data.get("volume")
+    try:
+        volume = None if volume is None else float(volume)
+    except (TypeError, ValueError):
+        volume = None
+    played = notifications.preview_sound(motif, sound_set, volume)
+    return jsonify({"played": played})
+
+
+@app.route("/api/notifications/test", methods=["POST"])
+def send_test_notification():
+    """Show the test notification on this desktop."""
+    shown = notifications.send_test_toast(_server_url)
+    if not shown:
+        return jsonify({"shown": False, "error": "Notifications are not available on this computer"}), 409
+    return jsonify({"shown": True})
 
 
 # ── Data folder relocation ───────────────────────────────────────────────────

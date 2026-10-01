@@ -357,11 +357,81 @@
 
         <!-- Recording Reminders -->
         <div class="settings-panel" id="section-reminders">
+          <div class="settings-group-title">Notifications</div>
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">
-                <div class="settings-row-label">Quiet Recording Toast</div>
-                <div class="settings-row-desc">Windows notification when a recording goes quiet</div>
+                <div class="settings-row-label">Where They Appear</div>
+                <div class="settings-row-desc">The corner of your main display notifications stack from (Windows)</div>
+              </div>
+              <select class="model-config-sel notify-select" id="notify-position" onchange="saveNotifySettings()">
+                <option value="bottom-right">Bottom right</option>
+                <option value="top-right">Top right</option>
+                <option value="bottom-left">Bottom left</option>
+                <option value="top-left">Top left</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Stay Until Dismissed</div>
+                <div class="settings-row-desc">Keep every notification on screen until you close it, rather than letting it fade after a few seconds</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="notify-sticky" onchange="saveNotifySettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Sounds</div>
+                <div class="settings-row-desc">Play a short cue with each notification</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="notify-sounds" onchange="saveNotifySettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Sound Set</div>
+                <div class="settings-row-desc">Every set plays the same cues on a different instrument. Press play to hear them in turn</div>
+              </div>
+              <div class="notify-sound-pick">
+                <select class="model-config-sel notify-select" id="notify-sound-set" onchange="saveNotifySettings(); previewNotifySound()"></select>
+                <button class="icon-btn" id="notify-sound-play" title="Play the next cue" onclick="previewNotifySound()"><i class="fa-solid fa-play"></i></button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Volume</div>
+                <div class="settings-row-desc"><span id="notify-volume-val">70</span>%</div>
+              </div>
+              <input type="range" class="theme-custom-slider notify-volume" id="notify-volume" min="0" max="100" step="5" value="70" oninput="updateNotifyVolume(this.value)" onchange="saveNotifySettings(); previewNotifySound()">
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Quieter While Recording</div>
+                <div class="settings-row-desc">Play cues softer during a recording, since the call audio capture picks them up</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="notify-quieter" onchange="saveNotifySettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Try It</div>
+                <div class="settings-row-desc">Send a notification to this desktop to see how it looks</div>
+              </div>
+              <button class="btn-settings-action btn-settings-secondary" id="notify-test-btn" onclick="sendTestNotification()">Send a test notification</button>
+            </div>
+          </div>
+          <div class="settings-group-title">Quiet Recording Reminder</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Ask When It Goes Quiet</div>
+                <div class="settings-row-desc">A notification asking whether to stop when a recording goes quiet</div>
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="quiet-prompt-enabled" onchange="saveQuietReminderSettings()">
@@ -371,7 +441,7 @@
             <div class="settings-row">
               <div class="settings-row-info">
                 <div class="settings-row-label">Quiet Threshold</div>
-                <div class="settings-row-desc">Seconds of no audio before showing the toast</div>
+                <div class="settings-row-desc">Seconds of no audio before asking</div>
               </div>
               <input type="number" id="quiet-prompt-threshold" class="settings-number-input" min="5" max="600" step="5" onchange="saveQuietReminderSettings()">
             </div>
@@ -395,11 +465,12 @@
             <div class="settings-row">
               <div class="settings-row-info">
                 <div class="settings-row-label">Reminder Cooldown</div>
-                <div class="settings-row-desc">Minimum seconds between repeated quiet toasts</div>
+                <div class="settings-row-desc">Minimum seconds between repeated quiet reminders</div>
               </div>
               <input type="number" id="quiet-prompt-cooldown" class="settings-number-input" min="0" max="1800" step="30" onchange="saveQuietReminderSettings()">
             </div>
           </div>
+          <div class="settings-group-title">Meeting Auto-Detect</div>
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">

@@ -359,7 +359,7 @@ class MeetingTray:
                 enabled=lambda _: self._get_state().get("recording_ready", False),
             ),
             S("Settings...", self._open_settings),
-            S("Test Toast", self._test_toast),
+            S("Test Notification", self._test_toast),
             SEP,
             # ── Server ───────────────────────────────────────────────────
             S("Check for Updates", self._check_updates),
@@ -464,7 +464,7 @@ class MeetingTray:
             recording_request.request_start_async("tray")
 
     def _test_toast(self, icon=None, item=None) -> None:
-        """Fire a diagnostic system toast — verifies callbacks + visibility.
+        """Send a notification to look at: visibility, theme and buttons.
 
         Runs on a daemon thread: send_test_toast() shells out to osascript
         (subprocess.run with a 5 s timeout) on macOS, and this callback fires on
@@ -473,11 +473,11 @@ class MeetingTray:
         def _do() -> None:
             try:
                 from ui_desktop import notifications
-                ok = notifications.send_test_toast()
+                ok = notifications.send_test_toast(self._url)
                 if not ok:
-                    print("[tray] Test toast failed to dispatch — see [notify] log lines above.")
+                    print("[tray] Test notification failed to dispatch; see the [notify] log lines above.")
             except Exception as e:
-                print(f"[tray] Test toast error: {e}")
+                print(f"[tray] Test notification error: {e}")
         threading.Thread(target=_do, daemon=True).start()
 
     def _quit(self, icon=None, item=None) -> None:

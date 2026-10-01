@@ -92,17 +92,18 @@ def _pid_alive(pid: int) -> bool:
         return True  # if we cannot tell, assume alive (do not kill blindly)
 
 
-def _toast(title: str, body: str) -> None:
-    """Best-effort OS toast. Safe here: the watchdog is a clean separate process
-    and never touches pycaw/COM, so the in-app WinRT toast crash does not apply."""
+def _toast(title: str, body: str, kind: str = "warning") -> None:
+    """Best-effort desktop notification through the app's own widget
+    (ui_desktop/toast), which needs no registration and is not subject to
+    Focus Assist. It lives on this process's own notification thread, so in
+    --once mode the process waits for it to be dismissed before exiting."""
     if DRY_RUN:
         return
     try:
-        from windows_toasts import Toast, WindowsToaster
-        toaster = WindowsToaster("Meeting Assistant")
-        t = Toast()
-        t.text_fields = [title, body]
-        toaster.show_toast(t)
+        from ui_desktop import toast
+        handle = toast.show(title, body, kind=kind, icon="heart-pulse", timeout=0)
+        if ONCE:
+            handle.wait(120)
     except Exception as e:
         _log(f"toast failed ({e})")
 
@@ -206,7 +207,8 @@ def _decide_and_act(state: dict) -> None:
     if len(hist) >= MAX_RESTARTS:
         _log(f"restart budget exhausted ({len(hist)} in {RESTART_WINDOW}s); alerting only")
         _toast("Meeting Assistant keeps failing",
-               "It has restarted several times and needs a look. Open the app.")
+               "It has restarted several times and needs a look. Open the app.",
+               kind="error")
         state["restarts"] = hist
         state["seen_healthy"] = False
         return

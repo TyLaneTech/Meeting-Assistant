@@ -4777,6 +4777,11 @@ body.video-fullscreen .playback-bar {
   width: 100%;
   accent-color: var(--accent);
 }
+/* Settings > Reminders > Notifications: the controls sit on the right of
+   their rows, so they get a fixed width rather than the slider's 100%. */
+.notify-select { flex: 0 0 auto; width: 160px; font-size: 12px; padding: 6px 8px; }
+.notify-sound-pick { display: flex; align-items: center; gap: 6px; }
+.notify-volume { width: 160px; flex: 0 0 auto; }
 .theme-custom-hint {
   font-size: 10px;
   color: var(--fg-subtle);

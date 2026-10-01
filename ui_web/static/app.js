@@ -20670,6 +20670,7 @@ async function openSettings(section) {
     _updateSessionModelLabels();
     _renderQuietReminderSettings();
     _renderMeetingDetectSettings();
+    _renderNotifySettings();
     _renderWarpSettings();
     _renderMicIsMeSettings();
   } catch (_) {}
@@ -20768,6 +20769,113 @@ function saveMeetingDetectSettings() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates),
   }).catch(() => {});
+}
+
+/* ── Desktop notifications (Settings > Reminders) ─────────────────────────── */
+let _notifySoundSets = null;      // from /api/notifications/sounds, once
+let _notifyPreviewIndex = 0;      // which cue the play button plays next
+
+function _renderNotifySettings() {
+  const pos = document.getElementById('notify-position');
+  if (!pos) return;
+  pos.value = _prefs.notify_position || 'bottom-right';
+  document.getElementById('notify-sticky').checked = _prefs.notify_sticky === true;
+  document.getElementById('notify-sounds').checked = _prefs.notify_sounds !== false;
+  const vol = document.getElementById('notify-volume');
+  vol.value = _prefs.notify_volume ?? 70;
+  updateNotifyVolume(vol.value);
+  document.getElementById('notify-quieter').checked = _prefs.notify_quieter_while_recording !== false;
+  _syncNotifySoundControls();
+  _loadNotifySoundSets();
+}
+
+async function _loadNotifySoundSets() {
+  const sel = document.getElementById('notify-sound-set');
+  if (!sel) return;
+  if (!_notifySoundSets) {
+    try {
+      _notifySoundSets = await fetch('/api/notifications/sounds').then(r => r.json());
+    } catch (_) { return; }  // the select keeps whatever it has
+    sel.innerHTML = '';
+    for (const s of _notifySoundSets.sets || []) {
+      const o = document.createElement('option');
+      o.value = s.id;
+      o.textContent = s.label;
+      o.title = s.description || '';
+      sel.appendChild(o);
+    }
+  }
+  sel.value = _prefs.notify_sound_set || 'glass';
+  if (sel.selectedIndex < 0 && sel.options.length) sel.selectedIndex = 0;
+}
+
+// The set, the volume and the softening only matter while sounds are on.
+function _syncNotifySoundControls() {
+  const on = document.getElementById('notify-sounds')?.checked !== false;
+  for (const id of ['notify-sound-set', 'notify-sound-play', 'notify-volume', 'notify-quieter']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !on;
+  }
+}
+
+function updateNotifyVolume(v) {
+  const lbl = document.getElementById('notify-volume-val');
+  if (lbl) lbl.textContent = String(Math.round(parseFloat(v) || 0));
+}
+
+function saveNotifySettings() {
+  const updates = {
+    notify_position: document.getElementById('notify-position')?.value || 'bottom-right',
+    notify_sticky: document.getElementById('notify-sticky')?.checked === true,
+    notify_sounds: document.getElementById('notify-sounds')?.checked !== false,
+    notify_volume: Math.round(parseFloat(document.getElementById('notify-volume')?.value) || 0),
+    notify_sound_set: document.getElementById('notify-sound-set')?.value || 'glass',
+    notify_quieter_while_recording: document.getElementById('notify-quieter')?.checked !== false,
+  };
+  Object.assign(_prefs, updates);
+  _syncNotifySoundControls();
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
+}
+
+/** Play a cue on the computer the app runs on, with the set and volume the
+ *  controls show now, so a change can be heard before it is saved. Each press
+ *  of the play button moves on to the next cue, so the whole set gets heard. */
+function previewNotifySound(motif) {
+  const motifs = (_notifySoundSets && _notifySoundSets.motifs) || ['ask'];
+  if (!motif) {
+    motif = motifs[_notifyPreviewIndex % motifs.length];
+    _notifyPreviewIndex += 1;
+  }
+  const body = {
+    motif,
+    set: document.getElementById('notify-sound-set')?.value || undefined,
+    volume: parseFloat(document.getElementById('notify-volume')?.value),
+  };
+  fetch('/api/notifications/sound', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+async function sendTestNotification() {
+  let error = '';
+  try {
+    const r = await fetch('/api/notifications/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      error = d.error || 'Could not send a test notification';
+    }
+  } catch (_) {
+    error = 'Could not send a test notification';
+  }
+  if (error) uiToast({ message: error, kind: 'error' });
 }
 
 function _renderWarpSettings() {

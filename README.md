@@ -336,9 +336,17 @@ A notification-area icon provides quick access without opening the browser:
 | Gray | Models loading |
 | Amber | Setup required (missing API key) |
 
-**Menu options:** Start/Stop recording, open web interface, configure API keys, quit.
+**Menu options:** Start/Stop recording, open web interface, configure API keys, send a test notification, quit.
 
 Dynamic tooltips show the current status on hover.
+
+---
+
+## Notifications
+
+On Windows the app draws its own notifications rather than using the Windows toast system: a small always-on-top card in a corner of your main display (the corner is a setting), in your app theme, with real buttons such as `Start recording` or `Stop recording`. Focus Assist cannot swallow them, they never take focus from your call, and they come down by themselves once they no longer apply (the offer to record a detected meeting goes as soon as a recording starts). Each kind of notification has its own short sound cue, in one of five sound packs.
+
+`Settings > Reminders > Notifications` has the corner, the sounds, the volume, a `Stay Until Dismissed` option and a test button; `Test Notification` in the tray menu sends one too. On macOS, Notification Center is used as before.
 
 ---
 
@@ -505,7 +513,8 @@ Meeting Assistant/
 │
 ├── ui_desktop/            ← Desktop OS integration
 │   ├── tray.py             — System tray icon (pystray + Pillow)
-│   └── notifications.py    — Toast/banner notifications (winotify / osascript)
+│   ├── notifications.py    - Desktop notifications: the app's own toast on Windows, osascript on macOS
+│   └── toast/              - The notification widget: theme, painting, sounds, stacking, Win32 window
 │
 ├── ui_web/                ← Flask web UI assets
 │   ├── templates/
