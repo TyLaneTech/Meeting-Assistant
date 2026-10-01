@@ -439,6 +439,39 @@ def test_pending_count_sees_staged_identity_changes():
     assert "identityBefore" in count and "identityNow" in count
 
 
+def test_a_successful_apply_closes_the_dialog_and_a_failed_one_does_not():
+    # The post-meeting auto-open used to stay up on the reloaded groups after
+    # Apply, to be closed by hand. Apply is the commit, so it closes now.
+    body = APP_JS[APP_JS.index("async function applySpeakerCleanup"):]
+    body = body[:body.index("/* ── Cleanup video popup")]
+    success = body[body.index("// Written, so the dialog's job is done"):]
+    success = success[:success.index("} catch (e) {")]
+    # The state is dropped before the close, so the wrapped close's dirty guard
+    # has nothing to ask about.
+    assert success.index("_cleanupState = null;") < success.index("closeSpeakerManager();")
+    # Nothing reloads the groups into a dialog that is no longer on screen.
+    assert "loadSpeakerClusters(" not in body
+    # The early-return loadSession() of the meeting already open did nothing.
+    assert "loadSession(state" not in body and "await loadSession(" not in body
+    # A refused or failed apply keeps the dialog, and the edits, on screen.
+    refused = body[body.index("if (!resp.ok) {"):body.index("// Written, so the dialog's job is done")]
+    failed = body[body.index("} catch (e) {"):]
+    for path in (refused, failed):
+        assert "closeSpeakerManager" not in path
+        assert "uiToast(" in path
+    assert "closeSpeakerManager" not in body[:body.index("const resp = await fetch(")]
+    # Reopening reloads, because the state is gone.
+    open_fn = APP_JS[APP_JS.index("function openSpeakerManager()"):]
+    open_fn = open_fn[:open_fn.index("\n}")]
+    assert "if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();" in open_fn
+    # And the transcript behind it learns the names from the apply route's events.
+    app_py = (ROOT / "app.py").read_text(encoding="utf-8")
+    corrections = app_py[app_py.index("def _apply_speaker_corrections("):]
+    corrections = corrections[:corrections.index('@app.route("/api/sessions/<session_id>/speaker_clusters/apply"')]
+    assert '_push("speaker_label", {' in corrections
+    assert "if (d.session_id === state.sessionId) applySpeakerProfileUpdate(d);" in APP_JS
+
+
 def test_staged_toast_rechecks_before_applying_and_is_dismissed_on_close():
     # "Close and discard" only clears the dirty flag, so a live toast could
     # still write edits the user had thrown away.

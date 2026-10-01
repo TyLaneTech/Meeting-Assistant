@@ -533,6 +533,8 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 Every entry point (post-recording auto-open, `?speakers=cleanup`, the Home, Needs attention and Calendar buttons) opens the same surface; `openSpeakerManager()` still tolerates a tab argument and ignores it.
 
+**A successful Apply closes the Speakers dialog:** Apply is the commit, so `applySpeakerCleanup()` closes the dialog once the server accepts the write, whichever entry point opened it (2026-10-01). It drops `_cleanupState` **before** calling `closeSpeakerManager()`, so the wrapped close's dirty guard has nothing to ask about, and the next open reloads the groups from disk with the canonical names. A refused or failed apply returns before that point and leaves the dialog open with the edits staged; keep it that way, since closing on failure throws away work the user can retry. Nothing reloads the groups into the closed dialog, and the meeting behind it is renamed by the `speaker_label` events `_apply_speaker_corrections()` pushes for every speaker (`applySpeakerProfileUpdate`). Do not reach for `loadSession()` to refresh it: it returns early for the meeting already open, which is why the call that used to sit here never did anything. Covered by `tests/test_speaker_modal.py`.
+
 **One bar while recording, not two:** the capture strip under the header is
 gone. The header itself turns red (`body.is-recording`, set by
 `_syncCaptureMeters()`) and shows the Desktop/Mic meters beside the view title;

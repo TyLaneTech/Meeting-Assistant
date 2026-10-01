@@ -9036,17 +9036,20 @@ async function applySpeakerCleanup() {
       _cleanupSyncFooter();
       return;
     }
-    // Refresh from server to pick up canonical names/links + show the new state.
+    // Written, so the dialog's job is done: it closes, wherever it was opened
+    // from (the post-meeting auto-open included). The state goes first, so the
+    // close finds nothing staged to ask about, and the next open reads the
+    // groups back from disk with the canonical names. A failed apply never
+    // reaches this point and leaves the dialog open with the edits staged.
     _cleanupState = null;
     if (applyBtn) delete applyBtn.dataset.busy;
-    await loadSpeakerClusters(true);
     _cleanupSyncFooter();
+    closeSpeakerManager();
     onSpeakerDataChanged();
     uiToast({ message: 'Cleanup applied.', kind: 'success', id: 'cleanup-apply' });
-    // Refresh transcript / sidebar speaker pills so they reflect new labels.
-    try {
-      if (typeof loadSession === 'function' && state.sessionId) await loadSession(state.sessionId);
-    } catch (_) {}
+    // The transcript, the sidebar and the minimap take the new names from the
+    // speaker_label events the apply route pushes (applySpeakerProfileUpdate).
+    // loadSession() cannot do it: it returns early for the meeting already open.
     try {
       if (typeof _tnRefreshSpeakerPills === 'function') _tnRefreshSpeakerPills();
     } catch (_) {}
