@@ -32,12 +32,14 @@ SR = 48000
 
 # ── Sets ──────────────────────────────────────────────────────────────────────
 # id -> what the Settings picker shows.
+# id -> what the Settings picker shows, in the order it lists them: the
+# default first.
 SETS: dict[str, dict] = {
+    "felt":  {"label": "Felt",  "description": "Deep, rounded bloops with a soft echo"},
     "glass": {"label": "Glass", "description": "Clear bell tones with a little air"},
     "wood":  {"label": "Wood",  "description": "Warm marimba, short and soft"},
     "pulse": {"label": "Pulse", "description": "Rounded synth plucks with a slow chorus"},
     "chime": {"label": "Chime", "description": "Bright music-box bells, quick and sparkling"},
-    "felt":  {"label": "Felt",  "description": "Deep, rounded bloops with a soft echo"},
 }
 DEFAULT_SET = "felt"
 
@@ -277,7 +279,7 @@ def amplitude(volume: float) -> float:
     try:
         v = max(0.0, min(100.0, float(volume))) / 100.0
     except (TypeError, ValueError):
-        v = 0.7
+        v = 1.0
     return v ** 1.7
 
 

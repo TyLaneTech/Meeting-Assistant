@@ -20782,7 +20782,7 @@ function _renderNotifySettings() {
   document.getElementById('notify-sticky').checked = _prefs.notify_sticky === true;
   document.getElementById('notify-sounds').checked = _prefs.notify_sounds !== false;
   const vol = document.getElementById('notify-volume');
-  vol.value = _prefs.notify_volume ?? 70;
+  vol.value = _prefs.notify_volume ?? 100;
   updateNotifyVolume(vol.value);
   document.getElementById('notify-quieter').checked = _prefs.notify_quieter_while_recording !== false;
   _syncNotifySoundControls();
@@ -20805,7 +20805,9 @@ async function _loadNotifySoundSets() {
       sel.appendChild(o);
     }
   }
-  sel.value = _prefs.notify_sound_set || 'glass';
+  // The server lists the packs with the default first, so an unknown saved
+  // value falls back to it.
+  sel.value = _prefs.notify_sound_set || 'felt';
   if (sel.selectedIndex < 0 && sel.options.length) sel.selectedIndex = 0;
 }
 
@@ -20829,9 +20831,12 @@ function saveNotifySettings() {
     notify_sticky: document.getElementById('notify-sticky')?.checked === true,
     notify_sounds: document.getElementById('notify-sounds')?.checked !== false,
     notify_volume: Math.round(parseFloat(document.getElementById('notify-volume')?.value) || 0),
-    notify_sound_set: document.getElementById('notify-sound-set')?.value || 'glass',
     notify_quieter_while_recording: document.getElementById('notify-quieter')?.checked !== false,
   };
+  // The pack list arrives from the server after the panel opens; a save made
+  // before it lands must not overwrite the saved pack with a blank.
+  const pack = document.getElementById('notify-sound-set')?.value;
+  if (pack) updates.notify_sound_set = pack;
   Object.assign(_prefs, updates);
   _syncNotifySoundControls();
   fetch('/api/preferences', {

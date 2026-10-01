@@ -145,7 +145,7 @@ DEFAULTS: dict = {
     "notify_position": "bottom-right",
     "notify_sticky": False,
     "notify_sounds": True,
-    "notify_volume": 70,
+    "notify_volume": 100,
     "notify_sound_set": "felt",
     "notify_quieter_while_recording": True,
 

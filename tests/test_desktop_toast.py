@@ -295,7 +295,7 @@ def test_the_wav_image_is_a_real_wav_and_the_volume_curve_is_sane():
     assert sounds.amplitude(0) == 0.0 and sounds.amplitude(100) == 1.0
     curve = [sounds.amplitude(v) for v in range(0, 101, 10)]
     assert curve == sorted(curve) and 0.2 < sounds.amplitude(50) < 0.5
-    assert sounds.amplitude("junk") == sounds.amplitude(70)
+    assert sounds.amplitude("junk") == sounds.amplitude(100)
 
 
 def test_export_writes_every_cue_and_a_tour_per_set(tmp_path):
@@ -574,21 +574,23 @@ def test_the_kind_picks_the_cue_and_the_settings_pick_the_set_and_gain():
     assert played[-1][1] == "stopped"
 
 
-def test_a_repeated_cue_plays_softer_and_so_does_one_during_a_recording():
+def test_the_volume_means_what_it_says_except_during_a_recording():
     played = []
     m, host, clock = make(played=played, recording=True)
     m.show(ToastSpec("A"))
-    base = sounds.amplitude(70) * mgr.RECORDING_GAIN
+    base = sounds.amplitude(100) * mgr.RECORDING_GAIN
     assert played[0] == (sounds.DEFAULT_SET, "info", round(base, 3))
     clock.advance(10)
-    m.show(ToastSpec("B"))
-    assert played[1] == (sounds.DEFAULT_SET, "info", round(base * mgr.SOUND_FATIGUE_GAIN, 3))
-    clock.advance(mgr.SOUND_FATIGUE_SEC + 1)
-    m.show(ToastSpec("C"))
-    assert played[2] == played[0]
+    m.show(ToastSpec("B"))          # the same cue again is not scaled down
+    assert played[1] == played[0]
+    loud = []
+    m2, _, _ = make(played=loud)
+    m2.show(ToastSpec("A"))
+    m2.show(ToastSpec("B"))
+    assert loud == [(sounds.DEFAULT_SET, "info", 1.0)] * 2
     quiet = []
-    m2, _, _ = make(prefs=Prefs(play_sounds=False), played=quiet)
-    m2.show(ToastSpec("Silent"))
+    m3, _, _ = make(prefs=Prefs(play_sounds=False), played=quiet)
+    m3.show(ToastSpec("Silent"))
     assert quiet == []
 
 
@@ -596,8 +598,9 @@ def test_the_preference_defaults_round_trip():
     p = Prefs.from_settings(settings.DEFAULTS)
     assert p == Prefs()
     assert settings.DEFAULTS["notify_position"] == "bottom-right"
-    assert settings.DEFAULTS["notify_sound_set"] in sounds.SETS
-    assert settings.DEFAULTS["notify_volume"] == 70
+    assert settings.DEFAULTS["notify_sound_set"] == "felt" == sounds.DEFAULT_SET
+    assert next(iter(sounds.SETS)) == "felt"            # listed first in the picker
+    assert settings.DEFAULTS["notify_volume"] == 100
     assert settings.DEFAULTS["notify_sticky"] is False
     assert Prefs.from_settings({"notify_position": "nowhere", "notify_sound_set": "kazoo",
                                 "notify_volume": "loud"}) == Prefs()

@@ -35,8 +35,6 @@ ENTER_SEC, LEAVE_SEC, REFLOW_SEC = 0.24, 0.16, 0.20
 HOVER_GRACE_SEC = 1.5  # the least a toast stays after the mouse leaves it
 PROGRESS_STEPS = 48    # how finely the hairline is redrawn
 TICK_ANIM_MS, TICK_IDLE_MS = 16, 80
-SOUND_FATIGUE_SEC = 60 # the same motif again within this plays softer
-SOUND_FATIGUE_GAIN = 0.65
 RECORDING_GAIN = 0.6   # "quieter while recording": the sound lands in the recording
 
 DISMISS_REASONS = ("clicked", "action", "closed", "timeout", "replaced", "dismissed", "shutdown")
@@ -63,7 +61,7 @@ class Prefs:
     position: str = DEFAULT_POSITION
     sticky: bool = False
     play_sounds: bool = True
-    volume: float = 70.0
+    volume: float = 100.0
     sound_set: str = sounds.DEFAULT_SET
     quieter_while_recording: bool = True
 
@@ -75,9 +73,9 @@ class Prefs:
         p.sticky = bool(values.get("notify_sticky", False))
         p.play_sounds = values.get("notify_sounds", True) is not False
         try:
-            p.volume = float(values.get("notify_volume", 70))
+            p.volume = float(values.get("notify_volume", 100))
         except (TypeError, ValueError):
-            p.volume = 70.0
+            p.volume = 100.0
         s = str(values.get("notify_sound_set") or "")
         p.sound_set = s if s in sounds.SETS else sounds.DEFAULT_SET
         p.quieter_while_recording = values.get("notify_quieter_while_recording", True) is not False
@@ -191,7 +189,6 @@ class ToastManager:
         self._play_sound = play_sound
         self._prefs = Prefs()
         self._timer_ms = 0
-        self._last_sound: dict[str, float] = {}
         self.is_recording: Callable[[], bool] = lambda: False
 
     # ── Public, any thread ────────────────────────────────────────────────────
@@ -587,15 +584,13 @@ class ToastManager:
         return next((t for t in self._live if t.hwnd == hwnd), None)
 
     def _sound_for(self, spec: ToastSpec, prefs: Prefs) -> None:
+        """The cue, at the saved volume. The only thing that changes it is a
+        recording in progress; nothing else is quietly scaled, so the volume
+        setting always means what it says."""
         motif = spec.sound_motif
         if motif is None or not prefs.play_sounds:
             return
         gain = sounds.amplitude(prefs.volume)
-        now = self._clock()
-        last = self._last_sound.get(motif)
-        if last is not None and now - last < SOUND_FATIGUE_SEC:
-            gain *= SOUND_FATIGUE_GAIN
-        self._last_sound[motif] = now
         if prefs.quieter_while_recording:
             try:
                 if self.is_recording():
