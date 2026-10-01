@@ -45,7 +45,7 @@ What not to do: bold whole sentences (nothing stands out if everything does),
 word. If a bullet needs more than two of these, it is two bullets.
 
 
-## Added the app's own notifications on Windows (2026-10-01)
+## Added the app's own notifications, plus fixes for Record and Speakers (2026-10-01)
 
 ### Notifications
 
@@ -70,39 +70,19 @@ word. If a bullet needs more than two of these, it is two bullets.
     hear them in turn
   - Cues play softer during a recording, because the call audio capture picks them up
 
-### Settings
-
-- **`Settings > Reminders > Notifications`** has the corner they appear in, `Stay Until
-  Dismissed` for anyone who keeps missing them, the sound pack, the volume, and `Send a
-  test notification`
-- **`Test Notification` in the tray menu** replaces `Test Toast`
-
-> macOS is unchanged: notifications still go through Notification Center.
-
-
-## Fixed Record seeming to ignore your click (2026-10-01)
-
 ### Recording
 
 - **Pressing `Record` shows `Starting…` straight away**, in red, while your microphone
   and call audio are being opened. It turns into `Stop · 0:00` and starts counting as
   soon as the recording is running
   - Starting can take several seconds on a slower computer, and the button used to stay
-    on `Record` the whole time, so there was no telling whether the click had worked
+    on `Record` the whole time, so there was no telling whether the click had worked.
+    A recording takes as long to start as it did; the button now says so while it happens
 - **A second press is ignored** while it says `Starting…`. One that landed just as the
   recording began used to stop it again
 - **If a recording cannot start**, `Record` comes back with the reason, as before
   - **If the app stops responding instead**, `Record` comes back after a minute with a
     message, rather than saying `Starting…` forever
-
-> Recordings take as long to start as they did. The button now says so while it
-> happens, instead of only once it is done.
-
-
-## Fixed the transcription warning covering the chat box (2026-09-25)
-
-### Recording
-
 - **The "transcription is behind" warning is a small note in the top bar now**, not a
   bar across the bottom of the window, so it no longer sits on top of the chat box
   - It reads `Transcript 2 min behind`; hover it for the full message
@@ -114,8 +94,25 @@ word. If a bullet needs more than two of these, it is two bullets.
   bar** or its `Stop` button. It appears just below the top bar and moves the page down
   while it is up
 
-> Recording and transcription work exactly as before. Only where these warnings appear
-> has changed.
+### Speakers
+
+- **`Apply` closes the Speakers window** once your changes are saved, and the names
+  update in the meeting behind it
+  - That includes the window that opens by itself after a meeting, which used to stay
+    open on the reloaded groups until you closed it
+- **If saving fails, the window stays open** with the reason, and your changes are still
+  there to try again
+- **To keep working on the speakers**, press `Speakers` again; it opens with your saved
+  changes in place
+
+### Settings
+
+- **`Settings > Reminders > Notifications`** has the corner they appear in, `Stay Until
+  Dismissed` for anyone who keeps missing them, the sound pack, the volume, and `Send a
+  test notification`
+- **`Test Notification` in the tray menu** replaces `Test Toast`
+
+> macOS is unchanged: notifications still go through Notification Center.
 
 
 ## Fixed recordings that would not start after an audio device changed (2026-09-24)
