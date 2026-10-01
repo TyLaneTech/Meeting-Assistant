@@ -445,14 +445,16 @@ def paint(lay: Layout, state: Optional[PaintState] = None) -> Image.Image:
         draw.text((bx + bw / 2, by + (bh + asc - desc) // 2), label, font=button_font,
                   fill=text, anchor="ms")
 
-    # The time left, as a hairline along the bottom edge.
+    # The time left, as a hairline along the bottom edge, in the theme's
+    # accent: the kind already has the rail and the chip, and the line is
+    # about time, not severity.
     if state.progress is not None and not spec.sticky:
         frac = max(0.0, min(1.0, float(state.progress)))
         hw = int(round((W - _px(RAIL_W, s)) * frac))
         if hw > 0:
             hy = H - inset - _px(HAIRLINE, s)
             draw.rectangle([_px(RAIL_W, s), hy, _px(RAIL_W, s) + hw, H - inset],
-                           fill=theme.over(theme.with_alpha(kind, 0.55), surface))
+                           fill=theme.over(theme.with_alpha(pal["accent"], 0.6), surface))
 
     card.putalpha(_rounded_mask(W, H, radius))
     plate = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))

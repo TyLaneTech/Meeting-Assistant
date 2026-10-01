@@ -253,6 +253,14 @@ def test_the_picture_has_rounded_corners_a_rail_and_no_white_line_along_the_top(
     assert img.getpixel((M, M))[3] < 128                         # the corner is cut round
     assert img.getpixel((M + 20, M + 20))[3] == 255              # the card is solid
     assert img.getpixel((M + 1, M + H // 2))[:3] == PAL["red"][:3]   # the kind's rail
+    # An error stays until dealt with, so it has no hairline to show.
+    assert img.getpixel((M + paint.RAIL_W + 8, M + H - 2)) == PAL["surface"]
+    # A timed toast's hairline is the theme's accent, not the kind's colour.
+    warn = paint.layout(ToastSpec("Call audio not captured", "Check the device.", kind="warning"), PAL)
+    timed = paint.paint(warn, paint.PaintState(progress=0.5))
+    line = timed.getpixel((M + paint.RAIL_W + 8, M + warn.card_h - 2))
+    assert line == theme.over(theme.with_alpha(PAL["accent"], 0.6), PAL["surface"])
+    assert line[:3] != PAL["yellow"][:3]
     # The top edge is the surface, not the solid white line the first build drew:
     # ImageDraw writes alpha literally and the mask then made it opaque.
     top = img.getpixel((M + W // 2, M + 1))
