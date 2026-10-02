@@ -24,16 +24,18 @@ How to write one:
 ### Notifications
 
 - **Notifications are drawn by Meeting Assistant**, not Windows, so Focus Assist no longer hides them during calls.
-- **They follow your app theme**, stay on top without taking focus, and wait while you hover.
+- **They follow your app theme** and stay on top without taking focus.
 - **They close themselves** once they no longer apply, like a meeting prompt after recording starts.
 - **Each kind has its own sound**, from one of five packs. `Felt` is the default.
 
 ### Recording
 
-- **`Record` shows `Starting…` immediately**, so you know the click registered. Extra presses are ignored.
+- **`Record` shows `Starting…` immediately**, and extra presses are ignored.
 - **If the app hangs while starting**, `Record` comes back after a minute.
-- **The "transcription is behind" warning** is now a small note in the top bar, and stays closed once dismissed.
+- **The "transcription is behind" warning** is a top-bar note that stays closed once dismissed.
 - **The call audio warning** no longer covers the top bar or its `Stop` button.
+- **Playback no longer jumps back to the start** when you return to the window mid-meeting.
+- **Double-click the meeting title** to rename it; clicking away saves.
 
 ### Speakers
 

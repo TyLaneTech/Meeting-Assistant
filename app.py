@@ -3247,7 +3247,10 @@ def stop_recording():
                         if _drain_seconds >= _BACKLOG_WARN_SECONDS else "")
                 log.info("recording",
                          f"Stopped - session {sid} ({seg_count} segments{tail})")
-            _push_status({"recording": False, "session_id": sid})
+            # media_ready: the WAV and the video are final, so this is the push
+            # a page showing the meeting loads playback on. Every other status
+            # push leaves playback alone (onStatus in app.js).
+            _push_status({"recording": False, "session_id": sid, "media_ready": True})
             # The prompts about this recording (still in the meeting? call
             # audio not captured) are moot now, so they come down by themselves.
             notifications.recording_stopped()

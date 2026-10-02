@@ -12363,6 +12363,16 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   text-overflow: ellipsis;
 }
 body:not([data-view="session"]) #topbar-session-title { display: none; }
+/* Renaming in place (double-click): the same heading, so nothing moves. The
+   ellipsis gives way to the caret, and an underline says it is a field. */
+#topbar-session-title.is-editing {
+  text-overflow: clip;
+  cursor: text;
+  outline: none;
+  background: var(--surface2);
+  box-shadow: inset 0 -2px 0 var(--accent);
+  border-radius: 4px 4px 0 0;
+}
 body[data-view="session"] #view-title { display: none; }
 .view-subtitle {
   font-size: 13px;

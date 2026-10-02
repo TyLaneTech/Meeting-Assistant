@@ -675,7 +675,12 @@ const Views = {
     const title = custom.title || fallback;
     if (name === 'session') {
       const el = document.getElementById('topbar-session-title');
-      if (el) el.textContent = title;
+      // Never rewrite a title that is being edited (startTitleRename): status
+      // pushes refresh it constantly and would replace what is being typed.
+      if (el && !el.classList.contains('is-editing')) {
+        el.textContent = title;
+        el.title = state.sessionId ? `${title}\nDouble-click to rename` : '';
+      }
       document.title = title === 'Meeting Assistant' ? 'Meeting Assistant' : `${title} · Meeting Assistant`;
     } else {
       const el = document.getElementById('view-title');
@@ -5141,6 +5146,113 @@ function startEditTitle(e, sessionId, currentTitle) {
   });
 }
 
+/* ── Rename the meeting from the workspace title ───────────────────────────
+ * Double-click the title in the header to edit it where it is: the heading
+ * itself becomes editable, so the type and the position stay put. Enter or
+ * clicking away saves, Escape puts it back. The new name shows everywhere at
+ * once and is written in the background; if the write fails, the old name
+ * comes back with a message. It is the sidebar Rename's PATCH, so the name is
+ * locked against auto-titling. */
+let _titleEdit = null;               // { el, sessionId, before } while editing
+const _titleSaves = new Map();       // sessionId -> number of its newest save
+
+function startTitleRename() {
+  const el = document.getElementById('topbar-session-title');
+  if (!el || _titleEdit || Views.current !== 'session' || !state.sessionId) return;
+  const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
+  if (!entry) return;                // not in the list yet: nothing to rename
+  const before = entry.title || el.textContent;
+  _titleEdit = { el, sessionId: state.sessionId, before };
+  el.classList.add('is-editing');
+  el.textContent = before;
+  try { el.contentEditable = 'plaintext-only'; } catch (_) {}
+  if (el.contentEditable !== 'plaintext-only') el.contentEditable = 'true';
+  el.setAttribute('role', 'textbox');
+  el.setAttribute('aria-label', 'Meeting title');
+  el.spellcheck = false;
+  el.focus();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function _endTitleRename(save) {
+  const edit = _titleEdit;
+  if (!edit) return;
+  _titleEdit = null;
+  const { el, sessionId, before } = edit;
+  const typed = (el.textContent || '').replace(/\s+/g, ' ').trim();
+  el.removeAttribute('contenteditable');
+  el.removeAttribute('role');
+  el.removeAttribute('aria-label');
+  el.classList.remove('is-editing');
+  el.scrollLeft = 0;
+  if (save && typed && typed !== before) _renameSession(sessionId, typed, before);
+  else updateTopbarSessionTitle();   // nothing to save: show the current title again
+}
+
+/** The name changes everywhere now; the write follows. A failed write puts the
+ *  old name back, unless a newer rename of the same meeting has replaced it. */
+async function _renameSession(sessionId, title, before) {
+  const seq = (_titleSaves.get(sessionId) || 0) + 1;
+  _titleSaves.set(sessionId, seq);
+  _setSessionTitleLocally(sessionId, title);
+  let error = '';
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      error = d.error || `the server answered ${r.status}`;
+    }
+  } catch (_) {
+    error = 'Meeting Assistant is not responding';
+  }
+  if (!error || _titleSaves.get(sessionId) !== seq) return;
+  _setSessionTitleLocally(sessionId, before);
+  uiToast({ message: `Could not rename the meeting: ${error}`, kind: 'error' });
+}
+
+/** Write a meeting's title into the sessions slice; its subscribers repaint the
+ *  sidebar and the header from it. The same patch the session_title event makes. */
+function _setSessionTitleLocally(sessionId, title) {
+  AppData.patch('sessions', list => {
+    const entry = (list || []).find(s => s.id === sessionId);
+    if (entry) entry.title = title;
+    return list;
+  });
+  if (sessionId === state.sessionId) updateTopbarSessionTitle();
+}
+
+(function _wireTitleRename() {
+  const el = document.getElementById('topbar-session-title');
+  if (!el) return;
+  el.addEventListener('dblclick', e => { e.preventDefault(); startTitleRename(); });
+  el.addEventListener('blur', () => _endTitleRename(true));
+  el.addEventListener('keydown', e => {
+    if (!_titleEdit) return;
+    if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
+    else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();           // the title's Escape, not a dialog's
+      _endTitleRename(false);
+      el.blur();
+    }
+  });
+  // A pasted name arrives as one plain line.
+  el.addEventListener('paste', e => {
+    if (!_titleEdit) return;
+    e.preventDefault();
+    const text = (e.clipboardData ? e.clipboardData.getData('text/plain') : '').replace(/\s+/g, ' ');
+    document.execCommand('insertText', false, text);
+  });
+})();
+
 /* ── SSE connection ──────────────────────────────────────────────────────── */
 function connectSSE(afterSegId = 0) {
   if (_sseSource) { _sseSource.close(); _sseSource = null; }
@@ -6208,9 +6320,18 @@ function onStatus(d) {
       AppData.invalidate(['sessions', 'analytics', 'attention'], 'recording_stop');
       AppData.invalidate(['storage'], 'recording_stop');
       if (_wasRecording && state.sessionId) _announceRecordingSaved(state.sessionId);
-      // The WAV is finalized before this event fires, so playback is available
-      // immediately - no need to reload the page or click the session.
-      if (state.isViewingPast && state.sessionId) {
+      // Load playback for a meeting that has just stopped on this page: on the
+      // server's push that says its audio and video are final (media_ready), or
+      // on any push that names it while playback is not set up yet, which
+      // covers a stop whose push this page missed. Nothing here reloads playback
+      // that is already running. It used to reload on every status push while
+      // a past meeting was open, and status arrives for more than stops: an SSE
+      // reconnect, the window coming back into focus after a minute
+      // (_reconcileAfterGap), a settings change. Each one sent the audio and
+      // the video back to 0:00 in the middle of playback.
+      const stoppedHere = state.isViewingPast && state.sessionId
+        && d.session_id === state.sessionId;
+      if (stoppedHere && (d.media_ready || !_playbackActive)) {
         initPlayback(state.sessionId);
         // Check if a screen recording was saved for this session
         fetch(`/api/sessions/${state.sessionId}`).then(r => r.json()).then(s => {
