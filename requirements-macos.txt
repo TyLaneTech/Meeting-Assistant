@@ -59,6 +59,9 @@ pyobjc-framework-ScreenCaptureKit; sys_platform == "darwin"
 pyobjc-framework-CoreMedia; sys_platform == "darwin"
 pyobjc-framework-Quartz; sys_platform == "darwin"
 pyobjc-framework-AVFoundation; sys_platform == "darwin"
+# EventKit: Settings > Calendar > Use Mac Calendar reads the macOS Calendar app
+# (core/mac_calendar.py) instead of a published, unauthenticated ICS link.
+pyobjc-framework-EventKit; sys_platform == "darwin"
 
 # ── Echo cancellation ───────────────────────────────────────────────────────
 # WebRTC AEC3 bindings - removes speaker echo from the microphone signal.

@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from core import calendar_feed as calendar_feed
 from core import log as log
+from core import mac_calendar as mac_calendar
 from core import paths as paths
 from core import settings as settings
 from core import storage as storage
@@ -309,15 +311,16 @@ def _write_candidates(session_id: str, payload: dict) -> bool:
 
 def load_feed(url: str) -> dict:
     """Fetch, parse and expand one feed. Raises CalendarFeedError on failure."""
-    text = calendar_feed.fetch_ics(url, timeout=20)
+    now = _utcnow()
+    window_start = now - timedelta(days=WINDOW_BACK_DAYS)
+    window_end = now + timedelta(days=WINDOW_FORWARD_DAYS)
+    if mac_calendar.is_mac_calendar_url(url):
+        text = mac_calendar.export_ics(url, window_start, window_end)
+    else:
+        text = calendar_feed.fetch_ics(url, timeout=20)
     notes: list = []
     events = calendar_feed.parse_ics(text, default_tz=_timezone_name(), notes=notes)
-    now = _utcnow()
-    instances = calendar_feed.expand(
-        events,
-        now - timedelta(days=WINDOW_BACK_DAYS),
-        now + timedelta(days=WINDOW_FORWARD_DAYS),
-    )
+    instances = calendar_feed.expand(events, window_start, window_end)
     return {
         "events": events,
         "instances": instances,
@@ -579,6 +582,7 @@ def status() -> dict:
         "matched_sessions": cache.get("matched_sessions") or 0,
         "timezone_notes": cache.get("timezone_notes") or [],
         "next_refresh_due": next_refresh_due(),
+        "mac_calendar_available": sys.platform == "darwin",
     }
 
 
@@ -603,6 +607,9 @@ def sanitize_preferences(updates: dict) -> dict:
 def set_link(url: str) -> dict:
     """Store the ICS link. The only writer of calendar_ics_url, with clear_link."""
     candidate = (url or "").strip()
+    if mac_calendar.is_mac_calendar_url(candidate):
+        settings.update({"calendar_ics_url": candidate, "calendar_last_error": ""})
+        return {"ok": True, "url_masked": calendar_feed.mask_url(candidate)}
     if not candidate.lower().startswith("https://"):
         return {
             "ok": False,

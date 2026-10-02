@@ -830,6 +830,7 @@
               <li>Pick your calendar, choose <strong>Can view all details</strong>, and click <strong>Publish</strong>.</li>
               <li>Copy the <strong>ICS</strong> link that appears and paste it below.</li>
             </ol>
+            <p class="settings-setup-note" id="calendar-mac-note" hidden>On a Mac you can skip publishing: add your work account in System Settings &gt; Internet Accounts &gt; Microsoft Exchange with Calendars on, then click <strong>Use Mac Calendar</strong> below. Only the work calendar is read, and nothing leaves this Mac.</p>
             <p class="settings-setup-note">The attendee count caps how many speakers a reanalysis looks for, and attendee names are offered when you clean up speakers. Nothing is renamed on its own.</p>
           </div>
           <div class="settings-group">
@@ -883,6 +884,9 @@
                   <button class="btn-settings-action" id="calendar-save-btn" onclick="saveCalendarLink()">Save link</button>
                   <button class="btn-settings-action btn-settings-secondary" id="calendar-test-btn"
                           onclick="testCalendarLink()">Test link</button>
+                  <button class="btn-settings-action btn-settings-secondary" id="calendar-mac-btn"
+                          onclick="useMacCalendar()" hidden
+                          title="Read the work calendar from the macOS Calendar app instead of a published link">Use Mac Calendar</button>
                   <button class="btn-settings-action btn-settings-secondary" id="calendar-forget-btn"
                           onclick="forgetCalendarLink()" hidden>Forget link</button>
                 </div>

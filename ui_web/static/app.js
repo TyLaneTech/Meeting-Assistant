@@ -22275,9 +22275,16 @@ async function loadCalendarStatus() {
   const input = document.getElementById('calendar-ics-url');
   if (input) input.placeholder = st.has_url ? st.url_masked : 'Paste the ICS link';
 
-  stateEl.textContent = st.has_url ? `Saved link: ${st.url_masked}` : 'No link saved yet.';
+  const usingMac = st.has_url && (st.url_masked || '').toLowerCase().startsWith('macos-calendar://');
+  stateEl.textContent = usingMac
+    ? `Reading the macOS Calendar app (${st.url_masked.slice('macos-calendar://'.length) || 'all'}). Nothing is published.`
+    : (st.has_url ? `Saved link: ${st.url_masked}` : 'No link saved yet.');
   const forgetBtn = document.getElementById('calendar-forget-btn');
   if (forgetBtn) forgetBtn.hidden = !st.has_url;
+  const macBtn = document.getElementById('calendar-mac-btn');
+  if (macBtn) macBtn.hidden = !st.mac_calendar_available;
+  const macNote = document.getElementById('calendar-mac-note');
+  if (macNote) macNote.hidden = !st.mac_calendar_available;
 
   if (st.last_error) {
     lineEl.textContent = st.last_error;
@@ -22370,6 +22377,16 @@ async function saveCalendarLink() {
     btn.textContent = 'Save link';
     loadCalendarStatus();
   }
+}
+
+/** macOS only: read the work (Exchange) calendar from the Calendar app instead
+ *  of a published link. A typed macos-calendar://<name> is kept as typed. */
+async function useMacCalendar() {
+  const input = document.getElementById('calendar-ics-url');
+  if (!input) return;
+  const typed = (input.value || '').trim();
+  if (!typed.toLowerCase().startsWith('macos-calendar://')) input.value = 'macos-calendar://exchange';
+  await saveCalendarLink();
 }
 
 /** Remove the stored link entirely and switch the feature off. */

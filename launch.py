@@ -419,6 +419,49 @@ def _create_start_menu_shortcut():
         _warn("Could not update Start Menu shortcut (non-fatal)")
 
 
+def _macos_plist(icon_name: str) -> str:
+    """The launcher bundle's Info.plist. The usage strings are what macOS shows
+    in its permission prompts; without one, that permission is denied outright
+    (Calendars is read by core/mac_calendar.py)."""
+    icon_plist = (
+        f"    <key>CFBundleIconFile</key>\n    <string>{icon_name}</string>\n"
+        if icon_name else ""
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "    <key>CFBundleName</key>\n    <string>Meeting Assistant</string>\n"
+        "    <key>CFBundleDisplayName</key>\n    <string>Meeting Assistant</string>\n"
+        "    <key>CFBundleIdentifier</key>\n"
+        "    <string>com.higg.meetingassistant.launcher</string>\n"
+        "    <key>CFBundleVersion</key>\n    <string>1.0</string>\n"
+        "    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n"
+        "    <key>CFBundleExecutable</key>\n    <string>MeetingAssistant</string>\n"
+        + icon_plist +
+        "    <key>NSHighResolutionCapable</key>\n    <true/>\n"
+        "    <key>LSMinimumSystemVersion</key>\n    <string>13.0</string>\n"
+        "    <key>NSMicrophoneUsageDescription</key>\n"
+        "    <string>Meeting Assistant records your microphone to transcribe meetings.</string>\n"
+        "    <key>NSCalendarsFullAccessUsageDescription</key>\n"
+        "    <string>Meeting Assistant matches recordings to the meetings on your work calendar.</string>\n"
+        "    <key>NSCalendarsUsageDescription</key>\n"
+        "    <string>Meeting Assistant matches recordings to the meetings on your work calendar.</string>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+
+def _macos_plist_text(existing: str) -> str:
+    """What this version would write, keeping the icon line the bundle already
+    has, so the self-heal check compares like with like."""
+    import re
+    match = re.search(r"<key>CFBundleIconFile</key>\s*<string>([^<]*)</string>", existing or "")
+    return _macos_plist(match.group(1) if match else "")
+
+
 def _create_macos_app_shortcut():
     """Create (or refresh) a launcher app bundle in ~/Applications on macOS,
     mirroring the Windows Start Menu shortcut.
@@ -433,7 +476,12 @@ def _create_macos_app_shortcut():
     if sys.platform != "darwin":
         return
 
-    root = Path(__file__).parent
+    # Resolved, so the bundle names the real folder however the launcher was
+    # reached. Through a symlinked checkout, the bundle launch passes the link
+    # path but the in-app restart passes the real one; unresolved, each would
+    # rewrite and re-sign the bundle for the other, and every re-sign can drop
+    # the Microphone and Screen Recording grants.
+    root = Path(__file__).resolve().parent
     launcher = root / "launch.command"
     if not launcher.exists():
         return
@@ -459,11 +507,13 @@ def _create_macos_app_shortcut():
         'exec "./launch.command"\n'
     )
 
-    # Self-heal: only rewrite when missing or when the embedded checkout path
-    # has changed (the script content carries the root path).
+    # Self-heal: only rewrite when missing, when the embedded checkout path
+    # has changed (the script content carries the root path), or when the
+    # Info.plist this version writes differs (e.g. a new privacy usage string).
     if exe_path.exists() and plist_path.exists():
         try:
-            if exe_path.read_text() == exe_script:
+            if (exe_path.read_text() == exe_script
+                    and _macos_plist_text(plist_path.read_text()) == plist_path.read_text()):
                 return
         except Exception:
             pass
@@ -518,31 +568,7 @@ def _create_macos_app_shortcut():
             except Exception:
                 pass
 
-        icon_plist = (
-            f"    <key>CFBundleIconFile</key>\n    <string>{icon_name}</string>\n"
-            if icon_name else ""
-        )
-        plist_path.write_text(
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-            '<plist version="1.0">\n'
-            "<dict>\n"
-            "    <key>CFBundleName</key>\n    <string>Meeting Assistant</string>\n"
-            "    <key>CFBundleDisplayName</key>\n    <string>Meeting Assistant</string>\n"
-            "    <key>CFBundleIdentifier</key>\n"
-            "    <string>com.higg.meetingassistant.launcher</string>\n"
-            "    <key>CFBundleVersion</key>\n    <string>1.0</string>\n"
-            "    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n"
-            "    <key>CFBundleExecutable</key>\n    <string>MeetingAssistant</string>\n"
-            + icon_plist +
-            "    <key>NSHighResolutionCapable</key>\n    <true/>\n"
-            "    <key>LSMinimumSystemVersion</key>\n    <string>13.0</string>\n"
-            "    <key>NSMicrophoneUsageDescription</key>\n"
-            "    <string>Meeting Assistant records your microphone to transcribe meetings.</string>\n"
-            "</dict>\n"
-            "</plist>\n"
-        )
+        plist_path.write_text(_macos_plist(icon_name))
 
         # Ad-hoc codesign so the bundle has a stable identity; macOS then keeps
         # its TCC grants across launches instead of re-prompting. Best-effort.
