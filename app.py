@@ -55,6 +55,7 @@ from core import dashboard_api as dashboard_api
 from core import heartbeat as heartbeat
 from core import icons as icons
 from core import icons_api as icons_api
+from core import updater as updater
 
 from core import config as config
 from capture_video import media_edit as media_edit
@@ -10837,20 +10838,26 @@ def update_check():
 
 @app.route("/api/update/apply", methods=["POST"])
 def update_apply():
-    """Pull latest changes then restart via the Start Menu shortcut."""
+    """Install the latest main, keeping local edits, then restart.
+
+    Every failure answers with the reason as JSON and leaves the checkout as it
+    was (core/updater.py), so the UI can say why instead of a bare 500.
+    """
     root = Path(__file__).parent
-
-    # Fetch first so we know which remote is reachable
-    ok, remote, err = _git_fetch(root)
-    if not ok:
-        return jsonify({"error": err}), 500
-
-    pull = subprocess.run(
-        ["git", "pull", remote, "main"],
-        cwd=str(root), capture_output=True, text=True, timeout=120,
-    )
-    if pull.returncode != 0:
-        return jsonify({"error": pull.stderr.strip() or "git pull failed"}), 500
+    try:
+        # Fetch first so we know which remote is reachable
+        ok, _remote, err = _git_fetch(root)
+        if not ok:
+            return jsonify({"error": err}), 500
+        problem = updater.install(root)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Timed out - check your connection"}), 504
+    except Exception as e:
+        log.error("update", f"Update failed: {e!r}")
+        return jsonify({"error": str(e) or type(e).__name__}), 500
+    if problem:
+        log.warn("update", f"Update not installed: {problem}")
+        return jsonify({"error": problem}), 409
 
     def _restart() -> None:
         global _tray

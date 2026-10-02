@@ -119,6 +119,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view; `event_key` / `find_instance` turn one opaque key back into its cached occurrence |
 | `core/meeting_links.py` | Finds a Teams/Zoom/Meet/Webex join link in a calendar event and hands it to the OS, preferring the desktop client's own URL scheme. The link is a credential and never reaches the browser |
 | `core/changelog.py` | Parses `CHANGELOG.md` into the entries the Changelog tab and What's new card show |
+| `core/updater.py` | Installs an update for `/api/update/apply`: stashes local edits, fast-forwards to the fetched `main`, pops them back on top; on a clash or any failure it restores the checkout exactly and says why |
 | `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries; `/api/dashboard/storage` and `storage_report()`, the disk scan joined to the sessions table |
 | `core/heartbeat.py` | `<data>/heartbeat.json`, refreshed while alive and removed on a clean quit; read by `watchdog.py` |
 | `core/icons.py`, `core/icons_api.py` | Icon sets (Settings > Icons): per-state slots, tinting, PNG/ICO rendering, custom uploads, the tray and shortcut icons; `/api/icons/*` and the web manifest |
@@ -383,7 +384,7 @@ All API routes follow these conventions:
 | `/api/restart` | Graceful stop, then relaunch through the launcher (`_relaunch_app()`) |
 | `/api/window/open` | Show the app window (`core/app_window.py`): raise the open one, else open one; called by `app_launcher.vbs`. With `cold_start` true the app decides: nothing opens when `open_window_from_start_menu` is off, or when `open_window_on_launch` or first-run setup is already opening a window from `main()`. Always 200 |
 | `/api/changelog` | `CHANGELOG.md` parsed into entries (`core/changelog.py`); `?refresh=1` re-reads |
-| `/api/update/check`, `/api/update/apply` | Self-update: fetch `main`, compare, pull, relaunch |
+| `/api/update/check`, `/api/update/apply` | Self-update: fetch `main`, compare, fast-forward keeping local edits (`core/updater.py`), relaunch |
 | `/`, `/session/<id>`, `/calendar`, `/attention`, `/speakers` | The one app shell (`index.html`); the client router picks the view |
 | `/api/dashboard` | Home dashboard data (`core/dashboard_api.py`) |
 | `/api/dashboard/storage` | Disk use per kind, per meeting, per backup folder, orphans and leftovers (`core/disk_usage.py`); the Home `storage` slice |
@@ -583,6 +584,8 @@ because pressing Record must never wait on a fetch or fail on a bad feed.
 
 **Sidebar page links are preferences:** `sidebar_nav_items` and `sidebar_nav_compact` drive `applySidebarNavPrefs()`, which moves the nav anchors (not copies) into the brand row when folded, so ids and the router's current-page marking keep working. The collapsed rail always shows the icons and pins Settings and the status dot to its bottom.
 
+**An update installs over local edits, or changes nothing:** `/api/update/apply` fetches, then `updater.install()` fast-forwards to the fetched `main`. It used to run a bare `git pull`, which will not overwrite a file with uncommitted edits, so one edited file blocked every update that touched it (reported from a Mac, 2026-10-02). `install()` stashes the edits under `STASH_MESSAGE`, fast-forwards, and pops them back on top. When they clash, it resets to the commit it started from and pops them there, so the checkout is exactly as it was, and the answer names the files. Never leave conflict markers or a half-applied update behind: the app restarts straight into this tree, and a broken file stops it starting, taking the Update button with it. A copy with commits of its own is refused (`merge-base --is-ancestor`), never merged or rebased, and a lock turns away a second install while one runs. Every failure answers JSON with the reason. Both buttons go through `_installUpdate()` in app.js, which keeps the page until the server has the update, so a refusal is a toast (App menu) or the status line (Settings), not a dead-end screen. Covered by `tests/test_updater.py` (real repositories, no git identity) and `tests/test_update_button.py`.
+
 ---
 
 ## Platform Notes
@@ -631,6 +634,7 @@ The BlackHole implementation this replaced is still in git history if it is ever
 
 ### macOS gotchas (do not regress)
 
+- **Both audio backends take the same calls:** app.py calls whichever `AudioCapture` the dispatcher picked, so a parameter added to one backend's public method alone is a `TypeError` on the other platform. `loopback_name` went into the Windows `start()` on 2026-07-19, and Record and the audio test crashed on every Mac until 2026-10-02. Add it to both, even where the Mac ignores it. `tests/test_capture_parity.py` compares the signatures from source, since neither backend imports on the other OS.
 - **Screen recording permission is cached per process:** macOS grants Screen & System Audio Recording to the running binary. After the user grants it, the app must be restarted once before SCK returns audio. Do not treat the first post-grant failure as a bug.
 - **PyObjC imports must stay inside `_SCKLoopbackStream.start()`:** importing `ScreenCaptureKit` at module scope breaks `import capture_audio` on any machine without it. The deferred import is what lets the dispatcher load on older macOS.
 - **Loopback is not a CoreAudio device on macOS:** `enumerate_audio_devices()` returns a single synthetic loopback entry, and `auto_detect_devices()` never probes it. Code that assumes loopback has a real device index is Windows-only thinking.

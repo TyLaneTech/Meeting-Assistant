@@ -25,31 +25,36 @@ How to write one:
 
 - **Notifications are drawn by Meeting Assistant**, not Windows, so Focus Assist no longer hides them during calls.
 - **They follow your app theme** and stay on top without taking focus.
-- **They close themselves** once they no longer apply, like a meeting prompt after recording starts.
+- **They close themselves** once they no longer apply.
 - **Each kind has its own sound**, from one of five packs. `Felt` is the default.
+
+> macOS still uses Notification Center.
 
 ### Recording
 
 - **`Record` shows `Starting…` immediately**, and extra presses are ignored.
 - **If the app hangs while starting**, `Record` comes back after a minute.
 - **The "transcription is behind" warning** is a top-bar note that stays closed once dismissed.
-- **The call audio warning** no longer covers the top bar or its `Stop` button.
+- **The call audio warning** no longer covers the `Stop` button.
 - **Playback no longer jumps back to the start** when you return to the window mid-meeting.
 - **Double-click the meeting title** to rename it; clicking away saves.
+- **On a Mac, `Record` and the audio test** work again.
 
 ### Speakers
 
 - **`Apply` closes the Speakers window** after saving. If saving fails, it stays open.
-- **The recording preview** plays along with whatever is playing, instead of staying frozen.
-- **Space pauses playback** in the Speakers window without it restarting a few seconds later.
-- **Selecting a speaker** no longer shifts the window, so a click and drag stays on the speaker you picked.
+- **The recording preview** follows playback instead of staying frozen.
+- **Space pauses playback** in the Speakers window, and it stays paused.
+- **Selecting a speaker** no longer shifts the window under your mouse.
 
 ### Settings
 
 - **`Settings > Reminders > Notifications`** sets the position, sound pack, volume and `Stay Until Dismissed`, with a test button.
 - **`Test Notification`** in the tray menu replaces `Test Toast`.
 
-> macOS still uses Notification Center.
+### Updates
+
+- **Installing an update** keeps your edits to the app's files, and says why when it can't.
 
 
 ## Fixed recordings that would not start after an audio device changed (2026-09-24)

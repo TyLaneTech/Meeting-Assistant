@@ -18688,16 +18688,15 @@ async function confirmUpdateRestart() {
 }
 
 async function doUpdateRestart() {
+  if (_installingUpdate) return;
+  // The page stays as it is until the update is in, so a refusal leaves it usable.
+  uiToast({ message: 'Installing the update\u2026', id: 'update-install', duration: 0 });
+  const error = await _installUpdate();
+  if (error) {
+    uiToast({ message: `Could not install the update: ${error}`, kind: 'error', id: 'update-install', duration: 0 });
+    return;
+  }
   const screen = _showTransitionScreen('Updating & Restarting\u2026', 'The page will reload when the server is back.');
-  try {
-    const res = await fetch('/api/update/apply', { method: 'POST' });
-    const data = await res.json();
-    if (data.error) {
-      screen.titleEl.textContent = 'Update failed';
-      screen.subtitleEl.textContent = data.error;
-      return;
-    }
-  } catch {}
   let attempts = 0;
   const poll = setInterval(async () => {
     if (++attempts > 60) {   // give up after ~2 min so we don't poll forever
@@ -21528,7 +21527,39 @@ async function checkForUpdates() {
   }
 }
 
+let _installingUpdate = false;
+
+/** Installs the update: resolves to why it did not go in, or '' once the
+ *  server has it and is restarting. Both Update buttons come through here, and
+ *  the App menu item says what is happening meanwhile. The server answers a
+ *  refusal with its reason, local edits that clash with the update included. */
+async function _installUpdate() {
+  _installingUpdate = true;
+  const item = document.getElementById('app-update-item');
+  const label = item && item.querySelector('.menu-item-label');
+  const idle = label ? label.textContent : '';
+  if (item) item.disabled = true;
+  if (label) label.textContent = 'Installing the update…';
+  let error = '';
+  try {
+    const res = await fetch('/api/update/apply', { method: 'POST' });
+    const data = await res.json().catch(() => null);
+    error = (data && data.error) || (res.ok ? '' : `The server answered ${res.status}.`);
+  } catch (_) {
+    // A dropped connection is taken as the restart; the poll after this finds out.
+  }
+  if (!error) {
+    if (label) label.textContent = 'Restarting…';
+    return '';
+  }
+  _installingUpdate = false;
+  if (item) item.disabled = false;
+  if (label) label.textContent = idle;
+  return error;
+}
+
 async function applyUpdate() {
+  if (_installingUpdate) return;
   const btn = document.getElementById('check-update-btn');
   const statusEl = document.getElementById('settings-update-status');
   btn.disabled = true;
@@ -21536,39 +21567,20 @@ async function applyUpdate() {
   statusEl.textContent = 'Pulling latest changes...';
   statusEl.className = 'settings-info-val';
 
-  // The App menu item is the same action; keep the two in step
-  const tbBtn = document.getElementById('app-update-item');
-  const tbLabel = tbBtn && tbBtn.querySelector('.menu-item-label');
-  if (tbBtn) tbBtn.disabled = true;
-  if (tbLabel) tbLabel.textContent = 'Installing the update…';
-
-  try {
-    const res = await fetch('/api/update/apply', { method: 'POST' });
-    const data = await res.json();
-
-    if (data.error) {
-      statusEl.textContent = data.error;
-      statusEl.className = 'settings-info-val val-warn';
-      btn.disabled = false;
-      btn.textContent = 'Retry Update';
-      if (tbBtn) tbBtn.disabled = false;
-      if (tbLabel) tbLabel.textContent = 'Retry the update';
-    } else {
-      statusEl.textContent = 'Restarting...';
-      btn.textContent = 'Restarting...';
-      if (tbLabel) tbLabel.textContent = 'Restarting…';
-      // The server re-reads CHANGELOG.md whenever the file changes; flip
-      // the in-memory guard so the Changelog tab refetches after the restart.
-      _changelogLoaded = false;
-      _pollUntilBack();
-    }
-  } catch (_) {
-    statusEl.textContent = 'Update failed';
+  const error = await _installUpdate();
+  if (error) {
+    statusEl.textContent = error;
     statusEl.className = 'settings-info-val val-warn';
     btn.disabled = false;
     btn.textContent = 'Retry Update';
-    if (tbBtn) { tbBtn.disabled = false; tbBtn.innerHTML = '<i class="fa-solid fa-download"></i> Retry'; }
+    return;
   }
+  statusEl.textContent = 'Restarting...';
+  btn.textContent = 'Restarting...';
+  // The server re-reads CHANGELOG.md whenever the file changes; flip
+  // the in-memory guard so the Changelog tab refetches after the restart.
+  _changelogLoaded = false;
+  _pollUntilBack();
 }
 
 function _pollUntilBack() {
@@ -21612,32 +21624,6 @@ function _showTopbarUpdate(commitsBehind) {
   const label = item.querySelector('.menu-item-label');
   if (label) label.textContent = `Install ${commitsBehind} update${s} and restart`;
   document.getElementById('app-menu-dot')?.classList.remove('hidden');
-}
-
-async function topbarApplyUpdate() {
-  const item = document.getElementById('app-update-item');
-  const label = item && item.querySelector('.menu-item-label');
-  if (item) item.disabled = true;
-  if (label) label.textContent = 'Installing the update…';
-
-  try {
-    const res = await fetch('/api/update/apply', { method: 'POST' });
-    const data = await res.json();
-
-    if (data.error) {
-      if (item) { item.disabled = false; item.title = `Update failed: ${data.error}`; }
-      if (label) label.textContent = 'Retry the update';
-      uiToast({ message: `Update failed: ${data.error}`, kind: 'error' });
-    } else {
-      if (label) label.textContent = 'Restarting…';
-      _changelogLoaded = false;
-      _pollUntilBack();
-    }
-  } catch (_) {
-    if (item) { item.disabled = false; item.title = 'Update failed. Try again.'; }
-    if (label) label.textContent = 'Retry the update';
-    uiToast({ message: 'Update failed. Try again.', kind: 'error' });
-  }
 }
 
 // Silent update check - shows the topbar button only if updates are found.

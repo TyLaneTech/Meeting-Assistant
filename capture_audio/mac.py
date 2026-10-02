@@ -860,14 +860,17 @@ class AudioCapture:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self, loopback_index: int | None = None, mic_index: int | None = None,
-              ffmpeg_mic_name: str | None = None) -> None:
+              ffmpeg_mic_name: str | None = None,
+              loopback_name: str | None = None) -> None:
         """Start capture with the same semantics as the Windows backend:
             mic_index=-1  explicitly disable mic
             mic_index=-2  receive mic audio injected from the browser
             mic_index=-3  capture via ffmpeg avfoundation subprocess
 
-        loopback_index is accepted for signature compatibility but ignored —
-        SCK is the only system-audio path on macOS.
+        loopback_index and loopback_name are accepted for signature
+        compatibility but ignored: SCK is the only system-audio path on macOS.
+        app.py passes both, so dropping either is a TypeError on every Record
+        (tests/test_capture_parity.py).
         """
         # ── Loopback (ScreenCaptureKit) ──────────────────────────────────
         self.sample_rate = _SCK_SAMPLE_RATE
