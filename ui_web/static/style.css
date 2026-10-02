@@ -5730,15 +5730,17 @@ img#shutdown-icon.brand-icon {
   min-height: 0;
   overflow-y: auto;
   padding-right: 2px;
-  /* Reserve room so the floating selection bar never overlaps the last pills. */
+  /* Room for the floating selection bar, so it never covers the last pills.
+     Reserved whether or not anything is selected: reserving it only on a
+     selection grew the dialog by 56px on the first click, and the centred
+     dialog moved up 28px under the pointer, so the press that should have
+     started a drag landed off the pill. */
   padding-bottom: 64px;
   scroll-padding-bottom: 64px;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-/* When nothing is selected the bar is hidden, so the reserved space isn't needed. */
-.speaker-cleanup-body:not(.has-selection) #cleanup-scroll { padding-bottom: 8px; }
 #cleanup-scroll::-webkit-scrollbar { width: 8px; }
 #cleanup-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 /* High-specificity hide rules - the existing speaker-manager-body rule uses

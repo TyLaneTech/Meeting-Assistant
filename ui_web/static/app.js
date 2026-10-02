@@ -7755,8 +7755,8 @@ function _cleanupRenderSelectionBar() {
   const countEl = document.getElementById('cleanup-selbar-count');
   if (!bar) return;
   const n = _cleanupSelectedKeys.size;
-  const body = document.querySelector('#speaker-manager-overlay .speaker-cleanup-body');
-  if (body) body.classList.toggle('has-selection', n > 0);
+  // Showing or hiding the bar must not change the layout: it floats, and the
+  // scroll area keeps its room whether it is up or not (see #cleanup-scroll).
   if (n === 0) { bar.hidden = true; return; }
   bar.hidden = false;
   if (countEl) countEl.textContent = `${n} selected`;
@@ -8195,12 +8195,22 @@ function _cleanupStopPlayback() {
   if (_cleanupPlayQueueState && _cleanupPlayQueueState.timer) clearTimeout(_cleanupPlayQueueState.timer);
   _cleanupPlayQueueState = null;
   if (audio) {
-    if (audio._cleanupStopAt) { audio.removeEventListener('timeupdate', audio._cleanupStopAt); audio._cleanupStopAt = null; }
+    _cleanupDetachSegment(audio);
     try { audio.pause(); } catch (_) {}
     audio.dataset.cleanupActive = '';
   }
   _cleanupClearPlayingButtons();
-  _cvStopPreview();   // park the floating video popup
+  // The floating video follows the audio, so the pause above parks it too.
+}
+
+// Take off the listeners the current segment hung on the shared audio.
+function _cleanupDetachSegment(audio) {
+  const h = audio._cleanupSegHandlers;
+  if (!h) return;
+  audio.removeEventListener('timeupdate', h.timeupdate);
+  audio.removeEventListener('pause', h.pause);
+  audio.removeEventListener('play', h.play);
+  audio._cleanupSegHandlers = null;
 }
 
 // Light every button mapped to the active queue key (segment + member buttons
@@ -8249,31 +8259,45 @@ function _cleanupPlayCurrent() {
   if (!st || !audio) return;
   const seg = st.segs[st.idx];
   if (!seg) { _cleanupStopPlayback(); return; }
-  if (audio._cleanupStopAt) { audio.removeEventListener('timeupdate', audio._cleanupStopAt); audio._cleanupStopAt = null; }
+  _cleanupDetachSegment(audio);
   if (st.timer) { clearTimeout(st.timer); st.timer = 0; }
   const start = seg.start, end = seg.end;
-  // Set the active flag BEFORE driving the video so its sync loop matches.
+  // Marks the audio as a preview, so the transcript's filter skip leaves it be.
   audio.dataset.cleanupActive = String(start);
   try { audio.currentTime = start; } catch (_) {}
   audio.play().catch(() => { _cleanupStopPlayback(); });
 
   const advance = () => {
     if (_cleanupPlayQueueState !== st) return;   // superseded by a newer queue
-    if (audio._cleanupStopAt) { audio.removeEventListener('timeupdate', audio._cleanupStopAt); audio._cleanupStopAt = null; }
+    _cleanupDetachSegment(audio);
     if (st.timer) { clearTimeout(st.timer); st.timer = 0; }
     st.idx += 1;
     if (st.idx >= st.segs.length) _cleanupStopPlayback();
     else _cleanupPlayCurrent();
   };
-  const stopAt = () => { if (audio.currentTime >= end) advance(); };
-  audio._cleanupStopAt = stopAt;
-  audio.addEventListener('timeupdate', stopAt);
-  // Safety net in case 'timeupdate' stops firing (tab blur, decode stall).
-  st.timer = setTimeout(advance, (end - start + 0.7) * 1000);
-
-  // Mirror onto the video popup when it's open.
-  const popup = _cleanupVideoPopupEl();
-  if (popup && !popup.hidden && _cleanupVideoAvailable()) _cleanupVideoPlaySegment(seg);
+  // The safety net for a 'timeupdate' that stops firing (tab blur, decode
+  // stall) only runs while the audio does. A pause (Space, with this dialog
+  // open) holds the segment and playing again re-arms it for what is left. It
+  // used to keep running through the pause and start the next segment by
+  // itself, a few seconds after the user had paused.
+  const arm = () => {
+    if (st.timer) { clearTimeout(st.timer); st.timer = 0; }
+    if (_cleanupPlayQueueState !== st || audio.paused) return;
+    const left = Math.max(0, end - audio.currentTime) / (audio.playbackRate || 1);
+    st.timer = setTimeout(advance, (left + 0.7) * 1000);
+  };
+  const handlers = {
+    timeupdate: () => { if (audio.currentTime >= end) advance(); },
+    pause: () => { if (st.timer) { clearTimeout(st.timer); st.timer = 0; } },
+    play: arm,
+  };
+  audio._cleanupSegHandlers = handlers;
+  audio.addEventListener('timeupdate', handlers.timeupdate);
+  audio.addEventListener('pause', handlers.pause);
+  audio.addEventListener('play', handlers.play);
+  arm();
+  // The floating video needs nothing here: it follows the audio, this seek
+  // included.
 }
 
 function _cleanupFindMember(speakerKey) {
@@ -9068,17 +9092,18 @@ async function applySpeakerCleanup() {
 
 let _cleanupVideoLoadedFor = null;  // sessionId the popup's <video> is bound to
 let _cleanupVideoUserClosed = false;  // user explicitly closed → don't auto-reopen this session
-let _cleanupVideoPlayingFor = null; // segment id currently driving playback
+let _cleanupVideoAudioBound = false;  // the shared audio's listeners are attached (once per page)
 
-// ── Cleanup floating-player sync state ──────────────────────────────────────
-// The popup's muted <video> is slaved to the SAME master audio (playback-audio)
-// that the cleanup segment preview drives, using the same soft-sync rules as
-// the main viewer: rate nudge for drift, guarded + throttled seeks with a
-// watchdog, and never play() while a seek is in flight. The audio's
-// cleanupActive flag alone bounds the segment, so the two stay locked and the
-// video can't stutter or replay a snippet on its own.
-let _cvPreviewing   = false; // a segment preview currently owns the popup video
-let _cvSegStartKey  = '';    // String(seg.start); matches audio.dataset.cleanupActive
+// ── Cleanup floating-player sync ────────────────────────────────────────────
+// The popup's muted <video> mirrors the shared playback-audio, whoever is
+// playing it: a segment preview from this dialog, the transcript's player, or
+// a Space press. It used to follow only a segment preview it had started
+// itself, so opening it while anything else played left a frozen frame, and
+// opening it part-way through a preview left it idle until the next segment.
+// Same soft-sync rules as the main viewer (_VS): nudge the rate for drift,
+// hard-seek only across real jumps, throttled and with a watchdog, never
+// play() while a seek is in flight. While the audio is paused it holds the
+// frame at the playhead.
 let _cvSeekPending  = false; // between currentTime= and its 'seeked'
 let _cvSeekWatchdog = 0;     // watchdog timer id for a stuck pending seek
 let _cvRAF          = 0;     // requestAnimationFrame id for the sync loop
@@ -9086,6 +9111,8 @@ let _cvLastSeekAt   = 0;     // perf clock of the last throttled seek
 
 function _cleanupVideoEl() { return document.getElementById('cleanup-video'); }
 function _cleanupVideoPopupEl() { return document.getElementById('cleanup-video-popup'); }
+function _cvAudio() { return document.getElementById('playback-audio'); }
+function _cvShown() { const p = _cleanupVideoPopupEl(); return !!p && !p.hidden; }
 
 function _cleanupVideoAvailable() {
   return typeof _videoAvailable !== 'undefined' && _videoAvailable && !!state.sessionId;
@@ -9101,12 +9128,42 @@ function _cleanupVideoEnsureLoaded() {
     video.src = `/api/sessions/${state.sessionId}/video`;
     video.load();
     _cleanupVideoLoadedFor = state.sessionId;
+    _cvSetStatus('loading');
     // Stable named handlers, so re-adding on a later session swap is a no-op.
     video.addEventListener('timeupdate', _cleanupVideoUpdateTime);
-    video.addEventListener('seeked', _cvOnSeeked);
+    video.addEventListener('seeked', _cvSeekLanded);
     video.addEventListener('error', _cvOnError);
+    video.addEventListener('loadedmetadata', _cvKick);
+    video.addEventListener('loadeddata', _cvKick);
   }
+  _cvBindAudio();
   return true;
+}
+
+// Follow the shared audio from now on: its transport events realign the
+// popup, and the rAF loop runs while it plays. Bound once per page.
+function _cvBindAudio() {
+  if (_cleanupVideoAudioBound) return;
+  const audio = _cvAudio();
+  if (!audio) return;
+  _cleanupVideoAudioBound = true;
+  for (const ev of ['play', 'pause', 'seeked', 'ended']) audio.addEventListener(ev, _cvKick);
+  // Safety net, as on the main viewer: restart the loop if a frame was lost.
+  audio.addEventListener('timeupdate', () => { if (!audio.paused && !_cvRAF) _cvStart(); });
+}
+
+// What the popup shows over the video: a loading or error message, the
+// outside-the-recording notice, or nothing once a frame is up.
+function _cvSetStatus(status) {
+  const idle = document.getElementById('cleanup-video-idle');
+  const noseek = document.getElementById('cleanup-video-noseek');
+  if (idle) {
+    idle.hidden = status !== 'loading' && status !== 'error';
+    const label = idle.querySelector('span');
+    if (label) label.textContent = status === 'error'
+      ? 'The recording could not be loaded' : 'Loading the recording…';
+  }
+  if (noseek) noseek.hidden = status !== 'outside';
 }
 
 function _cleanupVideoUpdateTime() {
@@ -9208,13 +9265,14 @@ function showCleanupVideoPopup() {
   _cleanupVideoUserClosed = false;
   if (typeof savePref === 'function') savePref('cleanup_video_open', true);
   _cleanupVideoSyncToggleBtn();
+  _cvKick();   // join whatever is playing, or show the frame at the playhead
 }
 
 function closeCleanupVideoPopup() {
   const popup = _cleanupVideoPopupEl();
   if (!popup) return;
   popup.hidden = true;
-  _cvStopPreview();
+  _cvStop();
   _cvResetZoom();
   _cleanupVideoUserClosed = true;
   if (typeof savePref === 'function') savePref('cleanup_video_open', false);
@@ -9241,58 +9299,105 @@ function _cvClampTarget(t) {
   return t;
 }
 
-function _cvOnSeeked() {
+// A seek landed (its 'seeked', or the watchdog gave up waiting): realign and
+// carry on, which plays the video again if the audio is playing.
+function _cvSeekLanded() {
   clearTimeout(_cvSeekWatchdog);
   _cvSeekWatchdog = 0;
   _cvSeekPending = false;
-  _cvAfterSeek();
+  _cvKick();
 }
 function _cvOnError() {
   clearTimeout(_cvSeekWatchdog);
   _cvSeekWatchdog = 0;
   _cvSeekPending = false;
-}
-
-// Resume the popup video once a seek has landed (real 'seeked', a no-op seek,
-// or the watchdog) - but only if the preview is still live and audio is playing.
-function _cvAfterSeek() {
-  const v = _cleanupVideoEl();
-  const audio = document.getElementById('playback-audio');
-  if (!v || !audio) return;
-  if (_cvPreviewing && !audio.paused && v.paused) v.play().catch(() => {});
+  _cvSetStatus('error');
+  _cleanupVideoLoadedFor = null;   // the next show tries again
 }
 
 // Guarded seek for the popup video. `force` bypasses the anti-spam throttle
-// (use for the initial segment seek); drift seeks pass force=false so they can
-// never machine-gun the decoder. Reuses the main controller's _VS tolerances.
+// (a paused playhead moved); drift seeks pass force=false so they can never
+// machine-gun the decoder. Returns false when nothing was issued: throttled,
+// or already there. Reuses the main controller's _VS tolerances.
 function _cvHardSeek(target, force) {
   const v = _cleanupVideoEl();
   if (!v) return false;
   target = _cvClampTarget(target);
   const now = _vsNow();
   if (!force && (now - _cvLastSeekAt) < _VS.SEEK_MIN_MS) return false;
-  if (Math.abs(v.currentTime - target) < _VS.NOOP) { _cvAfterSeek(); return true; }
+  if (Math.abs(v.currentTime - target) < _VS.NOOP) return false;
   _cvLastSeekAt = now;
   if (Math.abs(v.playbackRate - 1) > 1e-3) v.playbackRate = 1;
   _cvSeekPending = true;
   clearTimeout(_cvSeekWatchdog);
-  _cvSeekWatchdog = setTimeout(() => {
-    _cvSeekWatchdog = 0; _cvSeekPending = false; _cvAfterSeek();
-  }, _VS.WATCHDOG_MS);
+  _cvSeekWatchdog = setTimeout(_cvSeekLanded, _VS.WATCHDOG_MS);
   try {
     v.currentTime = target;
   } catch (_) {
     _cvSeekPending = false;
     clearTimeout(_cvSeekWatchdog);
     _cvSeekWatchdog = 0;
+    return false;
   }
   return true;
 }
 
-// Stop the current preview and park the popup video.
-function _cvStopPreview() {
-  _cvPreviewing = false;
-  _cvSegStartKey = '';
+// One correction step: mirror the audio's play/pause onto the video, hard-seek
+// across a jump, otherwise nudge the playback rate to converge on the audio.
+function _cvSyncOnce() {
+  if (!_cvShown() || _cvSeekPending) return;
+  const v = _cleanupVideoEl();
+  const a = _cvAudio();
+  if (!v || !a) return;
+  const dur = v.duration;
+  if (!(isFinite(dur) && dur > 0)) return;          // no metadata yet: 'loadedmetadata' kicks
+  const raw = _cvVideoTime(a.currentTime);
+  const outside = raw < -0.05 || raw >= dur - 0.05; // before the video began, or past its end
+  if (v.readyState >= 2) _cvSetStatus(outside ? 'outside' : 'ready');
+  if (a.paused || outside) {
+    if (!v.paused) v.pause();
+    // Paused: hold the frame at the playhead, so it is right when play resumes.
+    if (!outside) {
+      const exp = _cvClampTarget(raw);
+      if (Math.abs(v.currentTime - exp) > 0.34) _cvHardSeek(exp, true);
+    }
+    return;
+  }
+  const expected = _cvClampTarget(raw);
+  const signed = v.currentTime - expected;          // + ahead of audio, - behind
+  const adrift = Math.abs(signed);
+  if (adrift >= _VS.HARD_DRIFT && _cvHardSeek(expected, false)) return;
+  if (v.paused) v.play().catch(() => {});
+  let corr = 0;
+  if (adrift > _VS.IN_SYNC) {
+    corr = Math.max(-_VS.RATE_MAX,
+                    Math.min(_VS.RATE_MAX, (-signed / _VS.HARD_DRIFT) * _VS.RATE_MAX));
+  }
+  const want = (a.playbackRate || 1) * (1 + corr);
+  if (Math.abs(v.playbackRate - want) > 1e-3) v.playbackRate = want;
+}
+
+// rAF loop: per-frame convergence while the audio plays. Stops itself when the
+// audio pauses or the popup closes; the audio's events start it again.
+function _cvSyncLoop() {
+  _cvRAF = 0;
+  _cvSyncOnce();
+  _cvStart();
+}
+function _cvStart() {
+  const a = _cvAudio();
+  if (!_cvRAF && _cvShown() && a && !a.paused) _cvRAF = requestAnimationFrame(_cvSyncLoop);
+}
+
+// Realign now and keep the loop going while the audio plays.
+function _cvKick() {
+  if (!_cvShown()) return;
+  _cvSyncOnce();
+  _cvStart();
+}
+
+// The popup closed or the session went: park the video.
+function _cvStop() {
   if (_cvRAF) { cancelAnimationFrame(_cvRAF); _cvRAF = 0; }
   clearTimeout(_cvSeekWatchdog);
   _cvSeekWatchdog = 0;
@@ -9302,96 +9407,6 @@ function _cvStopPreview() {
     try { v.pause(); } catch (_) {}
     if (Math.abs(v.playbackRate - 1) > 1e-3) v.playbackRate = 1;
   }
-  // Restore the idle prompt so the popup never looks like a dead black box.
-  const idle = document.getElementById('cleanup-video-idle');
-  if (idle) idle.hidden = false;
-}
-
-// Per-frame sync: track the master audio clock. The audio's cleanupActive flag
-// (set/cleared by the WAV preview) is the single source of truth for when the
-// segment is over, so audio and video start and stop locked together.
-function _cvSyncLoop() {
-  _cvRAF = 0;
-  if (!_cvPreviewing) return;
-  const v = _cleanupVideoEl();
-  const audio = document.getElementById('playback-audio');
-  if (!v || !audio) { _cvStopPreview(); return; }
-  const popup = _cleanupVideoPopupEl();
-  const stillPreview = popup && !popup.hidden
-    && audio.dataset.cleanupActive === _cvSegStartKey;
-  if (!stillPreview) { _cvStopPreview(); return; }  // ended / toggled off / switched
-
-  if (!_cvSeekPending) {
-    const base = audio.playbackRate || 1;
-    const expected = _cvClampTarget(_cvVideoTime(audio.currentTime));
-    if (audio.paused) {
-      // Mid-preview pause (e.g. still waiting on audio metadata): hold, but
-      // keep the loop alive so we resume in lockstep when audio starts.
-      if (!v.paused) v.pause();
-    } else {
-      const signed = v.currentTime - expected;     // + ahead of audio, - behind
-      const adrift = Math.abs(signed);
-      if (adrift >= _VS.HARD_DRIFT) {
-        if (_cvHardSeek(expected, false)) { if (_cvRAF === 0) _cvRAF = requestAnimationFrame(_cvSyncLoop); return; }
-      }
-      if (v.paused) v.play().catch(() => {});
-      let corr = 0;
-      if (adrift > _VS.IN_SYNC) {
-        corr = Math.max(-_VS.RATE_MAX,
-                        Math.min(_VS.RATE_MAX, (-signed / _VS.HARD_DRIFT) * _VS.RATE_MAX));
-      }
-      const want = base * (1 + corr);
-      if (Math.abs(v.playbackRate - want) > 1e-3) v.playbackRate = want;
-    }
-  }
-  // Guard against a concurrent restart having already scheduled a frame.
-  if (_cvRAF === 0) _cvRAF = requestAnimationFrame(_cvSyncLoop);
-}
-
-function _cleanupVideoPlaySegment(seg) {
-  if (!_cleanupVideoEnsureLoaded()) return false;
-  const popup = _cleanupVideoPopupEl();
-  if (popup.hidden) showCleanupVideoPopup();
-  const video = _cleanupVideoEl();
-  const noseek = document.getElementById('cleanup-video-noseek');
-  const idle = document.getElementById('cleanup-video-idle');
-  const offset = typeof _videoOffset === 'number' ? _videoOffset : 0;
-  const vStart = seg.start - offset;
-  const vEnd = seg.end - offset;
-  if (vEnd <= 0 || (isFinite(video.duration) && vStart >= video.duration)) {
-    _cvStopPreview();              // parks video + re-shows idle prompt
-    if (idle) idle.hidden = true;  // ...but the no-video notice takes over here
-    if (noseek) noseek.hidden = false;
-    return true;  // we handled it (even if we couldn't seek)
-  }
-  if (noseek) noseek.hidden = true;
-  if (idle) idle.hidden = true;
-
-  // Retire any legacy per-video stop handler still attached from older builds;
-  // the audio clock bounds the segment now, so a video-time stop would fight it.
-  if (video._cvStopAt) {
-    video.removeEventListener('timeupdate', video._cvStopAt);
-    video._cvStopAt = null;
-  }
-
-  _cvSegStartKey = String(seg.start);
-  _cvPreviewing = true;
-  _cvLastSeekAt = 0;
-  _cleanupVideoPlayingFor = `${seg.id}:${seg.start}`;
-
-  const target = Math.max(0, vStart);
-  const startSync = () => {
-    if (!_cvPreviewing) return;   // preview was cancelled before metadata arrived
-    // Seek first; the persistent 'seeked' handler starts playback only once the
-    // frame has actually decoded (no play()-during-seek freeze), then the loop
-    // keeps the video locked to the audio clock.
-    _cvHardSeek(target, true);
-    if (_cvRAF) cancelAnimationFrame(_cvRAF);
-    _cvRAF = requestAnimationFrame(_cvSyncLoop);
-  };
-  if (isFinite(video.duration) && video.duration > 0) startSync();
-  else video.addEventListener('loadedmetadata', startSync, { once: true });
-  return true;
 }
 
 // ── Drag + resize + zoom wiring (run once on first popup show) ──
@@ -15259,7 +15274,7 @@ function destroyVideo() {
   _cancelVideoSeek();
   // Reset cleanup popup so it doesn't keep stale video from the previous session.
   try {
-    _cvStopPreview();
+    _cvStop();
     const cv = document.getElementById('cleanup-video');
     if (cv) { cv.pause(); cv.removeAttribute('src'); cv.load(); }
     const popup = document.getElementById('cleanup-video-popup');

@@ -3,12 +3,20 @@
 The modal used to be two tabs. Manage was retired once the only job Cleanup
 could not already do, picking a speaker's colour, moved onto the colour square
 in each group header, so there is one surface, one header, one commit model and
-one playback helper. These are file-level checks on purpose: the modal is
-vanilla JS in a 20k-line file, so a unit harness would cost more than it
-catches.
+one playback helper. These are mostly file-level checks on purpose: the modal
+is vanilla JS in a 20k-line file, so a unit harness would cost more than it
+catches. Playback is the exception (section H): what a pause does over time is
+not something a source assertion can see, so that runs the real functions under
+node against fake media elements and a fake clock.
 """
+import json
 import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
@@ -312,6 +320,31 @@ def test_selection_bar_is_anchored_to_the_scroll_area_not_the_pane():
     assert "position: absolute" in bar_rule
 
 
+def test_selecting_a_speaker_does_not_move_anything():
+    """The scroll area reserved the bar's room only while something was
+    selected, so the first click grew the dialog by 56px and the centred dialog
+    moved up 28px under the pointer: the press that should have started a drag
+    landed off the pill and cleared the selection (2026-10-02). The room is
+    reserved all the time now, and nothing about the layout keys on a
+    selection."""
+    css = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    scroll = css[css.index("#cleanup-scroll {"):]
+    scroll = scroll[:scroll.index("}")]
+    assert "padding-bottom: 64px" in scroll
+    # No rule may resize the scroll area (or anything else) on a selection.
+    assert "has-selection" not in css
+    assert "has-selection" not in APP_JS
+    # The bar is out of the flow, so showing it moves nothing either.
+    bar_rule = css[css.index(".cleanup-selbar {"):]
+    bar_rule = bar_rule[:bar_rule.index("}")]
+    assert "position: absolute" in bar_rule and "bottom:" in bar_rule
+    # And the selected pill is no bigger than an unselected one.
+    selected = css[css.index(".cleanup-member.selected {"):]
+    selected = selected[:selected.index("}")]
+    for prop in ("border-width", "padding", "margin", "height", "font-size"):
+        assert prop not in selected, prop
+
+
 # ── E. the colour square is the colour picker ───────────────────────────────
 
 def test_group_header_swatch_opens_a_colour_picker():
@@ -437,6 +470,268 @@ def test_pending_count_sees_staged_identity_changes():
     count = count[:count.index("\n}")]
     assert "clusterSnap" in count
     assert "identityBefore" in count and "identityNow" in count
+
+
+# ── H. playback: the recording preview follows the audio, a pause holds ─────
+
+_PLAYBACK_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function grab(name) {
+  const one = src.match(new RegExp('\\n(?:async )?function ' + name + '\\([^)]*\\) \\{[^\\r\\n]*\\}(?=\\r?\\n)'));
+  if (one) return one[0];
+  const m = src.match(new RegExp('\\n(?:async )?function ' + name + '\\([\\s\\S]*?\\n\\}'));
+  if (!m) { throw new Error('FAIL: ' + name + ' not found in app.js'); }
+  return m[0];
+}
+const vsLiteral = src.match(/\nconst _VS = (\{[\s\S]*?\n\});/)[1];
+
+// A clock that only moves when told to, in 16 ms animation frames.
+let now = 0, seq = 0, timers = [], rafs = [];
+const setTimeoutFake = (fn, ms) => { const id = ++seq; timers.push({ id, due: now + Math.max(0, ms || 0), fn }); return id; };
+const clearTimeoutFake = id => { timers = timers.filter(t => t.id !== id); };
+const rafFake = fn => { const id = ++seq; rafs.push({ id, fn }); return id; };
+const cafFake = id => { rafs = rafs.filter(r => r.id !== id); };
+
+// Media elements that behave like the browser's where it matters: play() and
+// pause() flip `paused` at once and announce it a moment later, a video seek
+// takes 120 ms to decode, and time only moves while playing.
+const media = [];
+class FakeMedia {
+  constructor(kind) {
+    Object.assign(this, { kind, paused: true, _t: 0, duration: NaN, playbackRate: 1, readyState: 0,
+                          dataset: {}, _l: {}, src: '', seeking: false, _lastTU: 0 });
+    media.push(this);
+  }
+  get currentTime() { return this._t; }
+  set currentTime(v) {
+    this._t = Math.max(0, Number(v));
+    if (this.kind === 'video') {
+      this.seeking = true;
+      setTimeoutFake(() => { this.seeking = false; this._fire('seeked'); }, 120);
+    } else {
+      setTimeoutFake(() => this._fire('seeked'), 0);
+    }
+  }
+  play() { if (this.paused) { this.paused = false; setTimeoutFake(() => this._fire('play'), 0); } return Promise.resolve(); }
+  pause() { if (!this.paused) { this.paused = true; setTimeoutFake(() => this._fire('pause'), 0); } }
+  load() {
+    if (this.kind === 'video') setTimeoutFake(() => {
+      this.duration = 3600; this.readyState = 4; this._fire('loadedmetadata'); this._fire('loadeddata');
+    }, 50);
+  }
+  addEventListener(ev, fn, o) { (this._l[ev] = this._l[ev] || []).push({ fn, once: !!(o && o.once) }); }
+  removeEventListener(ev, fn) { this._l[ev] = (this._l[ev] || []).filter(x => x.fn !== fn); }
+  _fire(ev) {
+    for (const x of [...(this._l[ev] || [])]) { if (x.once) this.removeEventListener(ev, x.fn); x.fn({ type: ev }); }
+  }
+  _tick(dt) {
+    if (this.paused || this.seeking) return;
+    this._t += dt / 1000 * this.playbackRate;
+    if (now - this._lastTU >= 250) { this._lastTU = now; this._fire('timeupdate'); }
+  }
+}
+async function advance(ms) {
+  const until = now + ms;
+  while (now < until) {
+    const step = Math.min(16, until - now);
+    now += step;
+    for (const m of media) m._tick(step);
+    for (;;) {
+      const t = timers.filter(x => x.due <= now).sort((a, b) => a.due - b.due || a.id - b.id)[0];
+      if (!t) break;
+      clearTimeoutFake(t.id);
+      t.fn();
+    }
+    const frame = rafs; rafs = [];
+    for (const r of frame) r.fn(now);
+    await Promise.resolve();
+  }
+}
+
+function el(extra) {
+  const classes = new Set();
+  return Object.assign({
+    hidden: false, textContent: '', innerHTML: '', style: {}, dataset: {},
+    classList: { add: c => classes.add(c), remove: c => classes.delete(c),
+                 toggle: (c, f) => (f ? classes.add(c) : classes.delete(c)), contains: c => classes.has(c) },
+    querySelector() { return this.label || null; },
+  }, extra || {});
+}
+const audio = new FakeMedia('audio');
+audio.duration = 3600;
+audio.src = 'http://127.0.0.1/api/sessions/s1/audio';
+const video = new FakeMedia('video');
+const popup = el({ hidden: true });
+const idle = el({ label: el() });
+const noseek = el({ hidden: true });
+const els = { 'playback-audio': audio, 'cleanup-video': video, 'cleanup-video-popup': popup,
+              'cleanup-video-idle': idle, 'cleanup-video-noseek': noseek,
+              'cleanup-video-time': el(), 'playback-play': el() };
+
+const inert = new Proxy(function () {}, {
+  get: (t, k) => (typeof k === 'symbol' || k === 'then') ? undefined
+    : (k === 'toString' || k === 'valueOf') ? () => '' : inert,
+  apply: () => inert,
+  set: () => true,
+});
+const page = {
+  document: { getElementById: id => els[id] || null, querySelectorAll: () => [], querySelector: () => null },
+  setTimeout: setTimeoutFake, clearTimeout: clearTimeoutFake,
+  requestAnimationFrame: rafFake, cancelAnimationFrame: cafFake,
+  performance: { now: () => now },
+  state: { sessionId: 's1' },
+  _videoAvailable: true, _videoOffset: 0, _playbackActive: true, _playbackAudio: audio,
+  _cleanupState: { sessionId: 's1' }, _cleanupPlayQueueState: null,
+  _cleanupVideoLoadedFor: null, _cleanupVideoUserClosed: false, _cleanupVideoAudioBound: false,
+  _cvSeekPending: false, _cvSeekWatchdog: 0, _cvRAF: 0, _cvLastSeekAt: 0,
+  stopSpeakerVoice() {}, savePref() {}, flashStatus() {}, _cvResetZoom() {},
+  _cleanupVideoApplySavedPosition() {}, _cleanupVideoEnsureDragWired() {}, _cleanupVideoSyncToggleBtn() {},
+};
+const scope = new Proxy(page, {
+  has: (t, k) => typeof k === 'string' && (k in t || !(k in globalThis)),
+  get: (t, k) => (typeof k === 'symbol' ? undefined : (k in t ? t[k] : inert)),
+  set: (t, k, v) => { t[k] = v; return true; },
+});
+with (scope) {
+  globalThis.__compileInPage = function (__code) { return eval('(' + __code + ')'); };
+}
+const compileInPage = globalThis.__compileInPage;
+delete globalThis.__compileInPage;
+page._VS = eval('(' + vsLiteral + ')');
+for (const name of [
+  '_vsNow', '_fmtTime', 'togglePlayback',
+  '_cleanupClearPlayingButtons', '_cleanupSyncPlayButtons', '_cleanupStopPlayback',
+  '_cleanupDetachSegment', '_cleanupPlayQueue', '_cleanupPlayCurrent',
+  '_cleanupVideoEl', '_cleanupVideoPopupEl', '_cvAudio', '_cvShown', '_cleanupVideoAvailable',
+  '_cleanupVideoEnsureLoaded', '_cvBindAudio', '_cvSetStatus', '_cleanupVideoUpdateTime',
+  'showCleanupVideoPopup', 'closeCleanupVideoPopup', '_cvVideoTime', '_cvClampTarget',
+  '_cvSeekLanded', '_cvOnError', '_cvHardSeek', '_cvSyncOnce', '_cvSyncLoop', '_cvStart',
+  '_cvKick', '_cvStop',
+]) {
+  page[name] = compileInPage(grab(name));
+}
+
+const snap = () => ({
+  popupShown: !popup.hidden, idleShown: !idle.hidden, idleText: idle.label.textContent,
+  outsideShown: !noseek.hidden, rafRunning: !!page._cvRAF,
+  audioPaused: audio.paused, audioTime: +audio.currentTime.toFixed(2),
+  videoPaused: video.paused, videoTime: +video.currentTime.toFixed(2),
+  idx: page._cleanupPlayQueueState ? page._cleanupPlayQueueState.idx : null,
+});
+
+(async () => {
+  const s = {};
+  // The transcript is playing when the preview opens: it loads, then joins in.
+  audio.currentTime = 100;
+  page.togglePlayback();
+  await advance(2000);
+  page.showCleanupVideoPopup();
+  s.opening = snap();
+  await advance(1500);
+  s.joined = snap();
+  // Space pauses: the frame holds at the playhead, and follows it if it moves.
+  page.togglePlayback();
+  await advance(1000);
+  s.paused = snap();
+  audio.currentTime = 300;
+  await advance(800);
+  s.pausedMoved = snap();
+  page.togglePlayback();
+  await advance(1500);
+  s.resumed = snap();
+  // A resumed meeting's video starts later than its audio.
+  page._videoOffset = 50;
+  audio.currentTime = 20;
+  await advance(800);
+  s.outside = snap();
+  page._videoOffset = 0;
+  page.togglePlayback();
+  await advance(300);
+
+  // A segment queue from this dialog, paused with Space part-way through.
+  page._cleanupPlayQueue([{ id: 1, start: 10, end: 14 }, { id: 2, start: 30, end: 33 }], el(), { key: 'q' });
+  await advance(1000);
+  s.queuePlaying = snap();
+  page.togglePlayback();
+  await advance(10000);   // far past the segment's end and its old safety timer
+  s.queueHeld = snap();
+  page.togglePlayback();
+  await advance(4000);    // the rest of segment 1, then into segment 2
+  s.queueNext = snap();
+  await advance(5000);    // segment 2 ends and the queue stops
+  s.queueDone = Object.assign(snap(), {
+    active: !!page._cleanupPlayQueueState, flag: audio.dataset.cleanupActive || '',
+    listeners: Object.fromEntries(['play', 'pause', 'seeked', 'ended', 'timeupdate']
+      .map(ev => [ev, (audio._l[ev] || []).length])),
+  });
+
+  // Closing the preview parks it while the transcript carries on.
+  page.togglePlayback();
+  await advance(500);
+  page.closeCleanupVideoPopup();
+  await advance(1000);
+  s.closed = snap();
+  console.log(JSON.stringify(s));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_the_recording_preview_follows_the_audio_and_a_pause_holds():
+    """Two reports from the Speakers dialog (2026-10-01). Show recording preview
+    stayed frozen while the transcript played behind it: the popup only ever
+    followed a segment preview it had started itself. And Space paused playback
+    for a few seconds before it resumed by itself: the segment queue's safety
+    timer kept running through the pause and started the next segment."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "speakers_playback.cjs"
+        path.write_text(_PLAYBACK_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(ROOT / "ui_web/static/app.js")],
+                             capture_output=True, encoding="utf-8", timeout=60)
+    assert out.returncode == 0, out.stderr
+    s = json.loads(out.stdout.strip().splitlines()[-1])
+
+    def in_step(snap, tol=0.3):
+        return abs(snap["videoTime"] - snap["audioTime"]) <= tol
+
+    # Opened while the transcript plays: loading, then playing in step with it.
+    assert s["opening"]["popupShown"] and s["opening"]["idleShown"]
+    assert s["opening"]["idleText"] == "Loading the recording…"
+    joined = s["joined"]
+    assert not joined["audioPaused"] and not joined["videoPaused"], joined
+    assert in_step(joined) and not joined["idleShown"], joined
+    # Space pauses both, the frame stays on the playhead and follows it.
+    assert s["paused"]["audioPaused"] and s["paused"]["videoPaused"] and in_step(s["paused"])
+    moved = s["pausedMoved"]
+    assert moved["videoPaused"] and abs(moved["videoTime"] - 300) < 0.05, moved
+    resumed = s["resumed"]
+    assert not resumed["videoPaused"] and in_step(resumed) and resumed["audioTime"] > 301, resumed
+    # Outside the screen recording: the notice, and the video holds.
+    outside = s["outside"]
+    assert outside["outsideShown"] and outside["videoPaused"] and not outside["audioPaused"]
+
+    # A segment queue: Space holds it, and nothing starts by itself.
+    playing = s["queuePlaying"]
+    assert not playing["audioPaused"] and playing["idx"] == 0, playing
+    assert 10.5 < playing["audioTime"] < 11.5 and in_step(playing), playing
+    held = s["queueHeld"]
+    assert held["audioPaused"] and held["videoPaused"] and held["idx"] == 0, held
+    assert abs(held["audioTime"] - playing["audioTime"]) < 0.1, held
+    nxt = s["queueNext"]
+    assert not nxt["audioPaused"] and nxt["idx"] == 1, nxt
+    assert 30 <= nxt["audioTime"] < 33 and in_step(nxt), nxt
+    done = s["queueDone"]
+    assert done["audioPaused"] and not done["active"] and done["flag"] == "", done
+    # Each segment's listeners came off: only the preview's own remain.
+    assert done["listeners"] == {"play": 1, "pause": 1, "seeked": 1, "ended": 1, "timeupdate": 1}
+
+    # Closed: parked, while the audio keeps playing.
+    closed = s["closed"]
+    assert not closed["popupShown"] and closed["videoPaused"] and not closed["rafRunning"]
+    assert not closed["audioPaused"]
 
 
 def test_a_successful_apply_closes_the_dialog_and_a_failed_one_does_not():

@@ -38,6 +38,9 @@ How to write one:
 ### Speakers
 
 - **`Apply` closes the Speakers window** after saving. If saving fails, it stays open.
+- **The recording preview** plays along with whatever is playing, instead of staying frozen.
+- **Space pauses playback** in the Speakers window without it restarting a few seconds later.
+- **Selecting a speaker** no longer shifts the window, so a click and drag stays on the speaker you picked.
 
 ### Settings
 
