@@ -1,10 +1,12 @@
-"""The Windows launchers: a silent Start Menu start, and no launcher that can
-hang or die quietly when it runs without a console.
+"""The launchers: a silent Start Menu start, no launcher that can hang or die
+quietly when it runs without a console, and a Mac bundle that settles.
 
 Until 2026-09-05 the Start Menu shortcut ran ``cmd /c launch.bat`` and left a
 minimised console window open for the whole session, and ``launch.bat`` ended
 in ``pause`` even when the hidden launcher ran it, which nobody could answer.
 """
+import ast
+import re
 from pathlib import Path
 
 from core import shortcut
@@ -14,6 +16,37 @@ ROOT = Path(__file__).parents[1]
 
 def _read(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
+
+
+def _launch_functions(*names: str) -> dict:
+    """Functions from launch.py, compiled on their own: importing launch.py
+    would run the launcher's setup."""
+    tree = ast.parse(_read("launch.py"))
+    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    scope = {"re": re}
+    exec(compile(ast.Module(body=body, type_ignores=[]), "launch.py", "exec"), scope)
+    return {name: scope[name] for name in names}
+
+
+def test_the_mac_bundle_plist_settles_after_one_rewrite():
+    """launch.py rewrites and re-signs the Mac bundle whenever its Info.plist
+    differs from what this version writes, and a re-sign can drop the
+    Microphone and Screen Recording grants. What it writes must therefore
+    compare equal on the next launch, or every launch would cost them."""
+    f = _launch_functions("_macos_plist", "_macos_plist_text")
+    for icon in ("", "AppIcon"):
+        written = f["_macos_plist"](icon)
+        assert f["_macos_plist_text"](written) == written, icon
+        assert "<key>NSCalendarsFullAccessUsageDescription</key>" in written
+        assert "<key>NSMicrophoneUsageDescription</key>" in written
+    # A bundle written before the Calendar strings existed is rewritten once.
+    older = re.sub(r"    <key>NSCalendars.*?</string>\n", "", f["_macos_plist"]("AppIcon"), flags=re.S)
+    assert "NSCalendars" not in older
+    assert f["_macos_plist_text"](older) != older
+    launch = _read("launch.py")
+    heal = launch[launch.index("def _create_macos_app_shortcut"):]
+    assert "root = Path(__file__).resolve().parent" in heal
+    assert "_macos_plist_text(plist_path.read_text()) == plist_path.read_text()" in heal
 
 
 def test_start_menu_shortcut_runs_the_click_launcher():

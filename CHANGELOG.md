@@ -34,15 +34,14 @@ How to write one:
 
 - **`Record` shows `Starting…` immediately**, and extra presses are ignored.
 - **If the app hangs while starting**, `Record` comes back after a minute.
-- **The "transcription is behind" warning** is a top-bar note that stays closed once dismissed.
+- **The "transcription is behind" warning** stays closed once dismissed.
 - **The call audio warning** no longer covers the `Stop` button.
 - **Playback no longer jumps back to the start** when you return to the window mid-meeting.
 - **Double-click the meeting title** to rename it; clicking away saves.
-- **On a Mac, `Record` and the audio test** work again.
 
 ### Speakers
 
-- **`Apply` closes the Speakers window** after saving. If saving fails, it stays open.
+- **`Apply` closes the Speakers window** after saving.
 - **The recording preview** follows playback instead of staying frozen.
 - **Space pauses playback** in the Speakers window, and it stays paused.
 - **Selecting a speaker** no longer shifts the window under your mouse.
@@ -51,6 +50,11 @@ How to write one:
 
 - **`Settings > Reminders > Notifications`** sets the position, sound pack, volume and `Stay Until Dismissed`, with a test button.
 - **`Test Notification`** in the tray menu replaces `Test Toast`.
+
+### Mac
+
+- **`Record` and the audio test** work again.
+- **`Use Mac Calendar`** in `Settings > Calendar` reads your work calendar without publishing it.
 
 ### Updates
 
