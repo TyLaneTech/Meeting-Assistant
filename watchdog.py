@@ -113,9 +113,12 @@ def _kill(pid: int) -> None:
         _log(f"[dry-run] would kill pid {pid}" if DRY_RUN else "no pid to kill")
         return
     try:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
-                       capture_output=True, text=True, timeout=20)
-        _log(f"killed pid {pid}")
+        r = subprocess.run(["taskkill", "/F", "/T", "/PID", str(int(pid))],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            _log(f"killed pid {pid}")
+        else:
+            _log(f"pid {pid} was already gone ({(r.stderr or r.stdout).strip()[:80]})")
     except Exception as e:
         _log(f"kill pid {pid} failed ({e})")
 
@@ -223,7 +226,11 @@ def _decide_and_act(state: dict) -> None:
     else:
         _toast("Meeting Assistant restarted", "The app stopped responding and was restarted.")
 
-    _kill(pid)
+    if not crashed:
+        # Only a frozen app still owns its pid. A crashed one is gone, and
+        # Windows hands pids out again quickly: taskkill /T on a reused pid
+        # would take down whatever unrelated process tree holds it now.
+        _kill(pid)
     heartbeat.clear()  # avoid re-acting on the same stale heartbeat
     time.sleep(2)
     _relaunch()

@@ -96,7 +96,12 @@ def _is_parked(pa) -> bool:
 
 def _park(stream, pa) -> None:
     """Keep a stream that a thread may still be reading, and the PyAudio that
-    owns it, alive for the life of the process (see _stream_graveyard)."""
+    owns it, alive for the life of the process (see _stream_graveyard). A
+    loopback helper is never parked: killing it is always safe (its reader just
+    sees the pipe end), and a parked one would capture for nothing until exit."""
+    if isinstance(stream, _LoopbackChild):
+        stream.close()
+        stream = None
     if stream is not None:
         _stream_graveyard.append(stream)
     if pa is not None and not _is_parked(pa):
@@ -105,8 +110,12 @@ def _park(stream, pa) -> None:
 
 def _retire_stream(stream, reader: "threading.Thread | None", pa) -> None:
     """Close a stream whose reader thread has gone, or park it when that thread
-    may still be inside read() (closing it then frees it under the read)."""
+    may still be inside read() (closing it then frees it under the read). A
+    loopback helper is always killed: that is safe under a read."""
     if stream is None:
+        return
+    if isinstance(stream, _LoopbackChild):
+        stream.close()
         return
     if reader is not None and reader.is_alive():
         log.warn("audio", "An audio reader thread did not exit; keeping its "
@@ -174,6 +183,277 @@ def probe_render_endpoints(duration: float = 1.2) -> dict | None:
         log.warn("audio", f"Render probe failed: {e}")
         return None
 
+_LOOPBACK_CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "loopback_child.py")
+
+
+class _DeviceSnapshot:
+    """Read-only stand-in for PyAudio's device queries, built from the device
+    report of a loopback helper process (a fresh PortAudio scan). The device
+    resolution code (_resolve_loopback and friends) runs on it unchanged."""
+
+    def __init__(self, report: dict):
+        self._host = dict(report.get("wasapi") or {})
+        self._devices = {int(d["index"]): d for d in report.get("devices") or []}
+
+    def get_host_api_info_by_type(self, _api) -> dict:
+        return dict(self._host)
+
+    def get_device_info_by_index(self, index) -> dict:
+        try:
+            return dict(self._devices[int(index)])
+        except (KeyError, TypeError, ValueError):
+            raise IOError(f"Invalid device index {index}") from None
+
+    def get_device_count(self) -> int:
+        return len(self._devices)
+
+    def get_loopback_device_info_generator(self):
+        wasapi = self._host.get("index")
+        return iter([dict(d) for d in self._devices.values()
+                     if d.get("isLoopbackDevice")
+                     and (wasapi is None or d.get("hostApi") == wasapi)])
+
+
+def _fresh_device_snapshot(timeout: float = 15.0) -> _DeviceSnapshot | None:
+    """The audio devices Windows has right now, scanned by a helper process.
+
+    In this process PortAudio's device list is frozen at its first
+    initialisation (see loopback_child.py), so a device list for the UI or for
+    choosing a recording device must come from a helper: the warm spare
+    (rescanned) when there is one, else a one-off process. None on failure;
+    callers fall back to an in-process scan."""
+    spare = _borrow_spare()
+    if spare is not None:
+        snapshot = spare.devices
+        _return_spare(spare)
+        return snapshot
+    with _spare_lock:
+        _refill_spare_locked()
+    try:
+        r = subprocess.run(
+            [sys.executable, _LOOPBACK_CHILD, "--list"],
+            capture_output=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        first = (r.stdout or b"").split(b"\n", 1)[0].strip()
+        report = json.loads(first) if first else None
+        if report and report.get("ok"):
+            return _DeviceSnapshot(report)
+        log.warn("audio", f"Fresh device scan returned no data"
+                          f"{': ' + str(report.get('error')) if report else ''}")
+    except Exception as e:
+        log.warn("audio", f"Fresh device scan failed: {e}")
+    return None
+
+
+class _LoopbackChild:
+    """A WASAPI loopback stream captured in a helper process
+    (capture_audio/loopback_child.py), read through the two stream calls
+    _capture_loop makes. The helper scans the devices Windows has at the moment
+    it starts, where this process's PortAudio list is frozen at the first
+    recording (2026-10-06: a call on newly connected headphones could not be
+    found and was recorded one-sided). Killing the helper retires the stream,
+    which an in-process WASAPI loopback stream can never do safely.
+
+    Constructing one starts the helper and reads its device report
+    (``.devices``); ``open()`` then starts capture on one device."""
+
+    def __init__(self, timeout: float = 15.0):
+        self.channels = 1
+        self._dead = False
+        self.warm = False   # set when it was the pre-started spare
+        self._proc = subprocess.Popen(
+            [sys.executable, _LOOPBACK_CHILD],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            bufsize=0,   # unbuffered, so get_read_available() sees every byte
+        )
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        report = self._read_json(timeout)
+        if not report.get("ok"):
+            self.close()
+            raise RuntimeError(f"loopback helper: {report.get('error')}")
+        self.devices = _DeviceSnapshot(report)
+
+    def _read_json(self, timeout: float) -> dict:
+        box: list[bytes] = []
+        t = threading.Thread(target=lambda: box.append(self._proc.stdout.readline()),
+                             daemon=True)
+        t.start()
+        t.join(timeout)
+        if not box or not box[0].strip():
+            self.close()
+            raise RuntimeError("loopback helper did not answer" if not box
+                               else "loopback helper exited")
+        return json.loads(box[0])
+
+    def _send(self, cmd: dict) -> None:
+        try:
+            self._proc.stdin.write((json.dumps(cmd) + "\n").encode("utf-8"))
+            self._proc.stdin.flush()
+        except Exception as e:
+            self.close()
+            raise RuntimeError(f"loopback helper: {e}") from None
+
+    def rescan(self, timeout: float = 10.0) -> None:
+        """Rescan the devices in this idle helper (PortAudio re-initialised,
+        about 0.2 s), so a warm spare answers with what Windows has now."""
+        self._send({"scan": True})
+        report = self._read_json(timeout)
+        if not report.get("ok"):
+            self.close()
+            raise RuntimeError(f"loopback helper: {report.get('error')}")
+        self.devices = _DeviceSnapshot(report)
+
+    def open(self, info: dict, channels: int, rate: int,
+             frames_per_buffer: int, chunk: int, timeout: float = 10.0) -> None:
+        self._send({"open": int(info["index"]), "channels": int(channels),
+                    "rate": int(rate), "frames_per_buffer": int(frames_per_buffer),
+                    "chunk": int(chunk)})
+        reply = self._read_json(timeout)
+        if not reply.get("ok"):
+            self.close()
+            raise RuntimeError(reply.get("error") or "open failed")
+        self.channels = int(channels)
+
+    def get_read_available(self) -> int:
+        """Whole frames waiting in the pipe, like PyAudio's count of frames
+        buffered, so a reader that only reads what is already there never
+        blocks. A broken pipe means the helper exited: 0, and ``dead``."""
+        if self._dead:
+            return 0
+        import ctypes
+        import msvcrt
+        avail = ctypes.c_ulong(0)
+        try:
+            ok = ctypes.windll.kernel32.PeekNamedPipe(
+                ctypes.c_void_p(msvcrt.get_osfhandle(self._proc.stdout.fileno())),
+                None, 0, None, ctypes.byref(avail), None)
+        except Exception:
+            ok = 0
+        if not ok:
+            self._dead = True
+            return 0
+        return avail.value // (self.channels * 2)
+
+    def read(self, frames: int, exception_on_overflow: bool = False) -> bytes:
+        want = frames * self.channels * 2
+        data = bytearray()
+        while not self._dead and len(data) < want:
+            part = self._proc.stdout.read(want - len(data))
+            if not part:
+                break
+            data += part
+        data = bytes(data)
+        if len(data) < want:
+            # The helper exited. Pause so the reader loop does not spin; the
+            # silence watchdog reopens the capture.
+            self._dead = True
+            time.sleep(0.05)
+            raise IOError("loopback helper stopped")
+        return data
+
+    @property
+    def dead(self) -> bool:
+        return self._dead or self._proc.poll() is not None
+
+    def close(self) -> None:
+        self._dead = True
+        try:
+            self._proc.kill()
+            self._proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    def _drain_stderr(self) -> None:
+        try:
+            for line in self._proc.stderr:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    log.warn("audio", f"Desktop audio helper: {text}")
+        except Exception:
+            pass
+
+
+# One idle helper is kept started ahead of time. Starting a Python process takes
+# 3 to 5 s on this machine, which would delay every recording start and device
+# switch by that much; an idle helper rescans in ~0.2 s instead. Taking it starts
+# the next spare in the background.
+_spare_lock = threading.Lock()
+_spare: _LoopbackChild | None = None
+_spare_refilling = False
+
+
+def _refill_spare_locked() -> None:
+    """Start a background spare unless one exists or is starting. Caller holds
+    _spare_lock."""
+    global _spare_refilling
+    if _spare is not None or _spare_refilling:
+        return
+    _spare_refilling = True
+    threading.Thread(target=_refill_spare, daemon=True).start()
+
+
+def _refill_spare() -> None:
+    global _spare, _spare_refilling
+    try:
+        child = _LoopbackChild()
+    except Exception as e:
+        log.warn("audio", f"Could not start a spare desktop audio helper: {e}")
+        child = None
+    with _spare_lock:
+        _spare_refilling = False
+        if child is not None and _spare is None:
+            _spare, child = child, None
+    if child is not None:
+        child.close()
+
+
+def prewarm_loopback_helper() -> None:
+    """Start the spare helper now, so the first recording does not wait for one."""
+    with _spare_lock:
+        _refill_spare_locked()
+
+
+def _borrow_spare() -> _LoopbackChild | None:
+    """The spare, rescanned so its device list is current, or None. The caller
+    owns it until it is opened, closed, or handed back with _return_spare()."""
+    global _spare
+    with _spare_lock:
+        child, _spare = _spare, None
+    if child is None:
+        return None
+    try:
+        if child.dead:
+            raise RuntimeError("it had exited")
+        child.rescan()
+        child.warm = True
+        return child
+    except Exception as e:
+        child.close()
+        log.warn("audio", f"Spare desktop audio helper unusable ({e}); starting a new one")
+        return None
+
+
+def _return_spare(child: _LoopbackChild) -> None:
+    global _spare
+    with _spare_lock:
+        if _spare is None and not child.dead:
+            _spare, child = child, None
+    if child is not None:
+        child.close()
+
+
+def _take_loopback_child() -> _LoopbackChild:
+    """A helper with a device scan from right now: the warm spare when there is
+    one, otherwise a newly started process. Either way the next spare starts."""
+    child = _borrow_spare()
+    with _spare_lock:
+        _refill_spare_locked()
+    return child or _LoopbackChild()
+
+
 # Guards the per-source Opus encode, which now runs after a recording has
 # already been reported as stopped. Module level (not per instance) because the
 # capture object that produced the temp WAVs is not the one that resumes them.
@@ -191,6 +471,54 @@ def _follow_output_enabled() -> bool:
         return False
 
 
+# How long the watchdog keeps the Communications-role device through a silent
+# stretch while some OTHER output is audibly playing, before it concludes the
+# call is not on the comms device at all and follows the audio.
+STICKY_COMMS_HOLD_SEC = 90.0
+
+
+def follow_decision(*, held: str | None, held_had_signal: bool, silent_for: float,
+                    comms: str | None, target: str | None,
+                    sticky_hold: float = STICKY_COMMS_HOLD_SEC) -> tuple[str, str]:
+    """The one decision the watchdog makes once the render probe names a
+    playing endpoint: ``("switch", why)`` to move the loopback onto *target*,
+    ``("hold", why)`` to stay on the current device, or ``("none", why)``.
+
+    *held* is the loopback device we capture now (with its " [Loopback]"
+    suffix), *comms* the default Communications endpoint the probe reported,
+    *target* the endpoint the probe says is actually playing, *silent_for* how
+    long the held device has produced nothing, *held_had_signal* whether it
+    ever produced anything in this recording.
+
+    The comms device is sticky only while it is plausibly mid-call: it has
+    produced signal before and went quiet less than *sticky_hold* ago (a
+    far-end pause while music or a notification plays elsewhere). A comms
+    device that never produced signal, or has been silent longer than the hold
+    while another output is audibly playing, is not carrying the call, and the
+    loopback follows the audio. 2026-09-15: Teams was pinned to the Realtek
+    headphone jack while Windows' comms default was the Shure; an
+    unconditional hold kept the loopback on the silent Shure for three whole
+    calls even though every probe saw the call playing on the Realtek jack.
+    Pure: no I/O, so the sequence is unit-testable.
+    """
+    if not target:
+        return "none", "nothing is playing"
+    held = held or ""
+    if held.removesuffix(" [Loopback]") == target:
+        return "none", f"already capturing '{target}'"
+    on_comms = bool(comms) and comms in held
+    if on_comms and target != comms:
+        if held_had_signal and silent_for < sticky_hold:
+            return ("hold", f"call device '{comms}' went quiet {silent_for:.0f}s ago; "
+                            f"not leaving it for '{target}'")
+        if held_had_signal:
+            why = f"call device '{comms}' has been silent for {silent_for:.0f}s"
+        else:
+            why = f"call device '{comms}' has never produced signal"
+        return "switch", f"{why} while '{target}' is playing; following the audio"
+    return "switch", f"'{target}' is playing"
+
+
 class AudioCapture:
     CHUNK_SIZE = 512
     FORMAT = pyaudio.paInt16
@@ -199,6 +527,9 @@ class AudioCapture:
         self.audio_queue = audio_queue
         self.is_running = False
         self._pa: pyaudio.PyAudio | None = None
+        # Device resolution reads _devices: the loopback helper's fresh scan,
+        # or _pa when the helper cannot start (see _open_start_loopback).
+        self._devices = None
         self._loopback_stream = None
         self._mic_stream = None
         self._loopback_thread: threading.Thread | None = None
@@ -272,11 +603,11 @@ class AudioCapture:
         # a warning about a problem that has already gone away.
         self.on_loopback_recovered = None    # optional callback(dev_name)
         self._silence_watchdog: threading.Thread | None = None
-        # Live device following: which PyAudio owns the loopback stream (starts as
-        # self._pa, becomes a second instance after a mid-recording switch), and a
-        # lock serialising switches with each other and with stop(). A switch
-        # opens the new stream first and then retires the old one, which is
-        # closed once its reader thread has left (see _stream_graveyard).
+        # Live device following: which PyAudio owns the loopback stream (None
+        # when a loopback helper process captures it, the normal case; self._pa
+        # only in the in-process fallback), and a lock serialising switches with
+        # each other and with stop(). A switch opens the new stream in a new
+        # helper first and then retires the old one (see _LoopbackChild).
         self._loopback_pa = None
         self._loopback_restart_lock = threading.Lock()
         # When a mid-recording switch lands on a device whose native mix format
@@ -290,6 +621,13 @@ class AudioCapture:
         # probe (or None). Used to keep the loopback "sticky" on the call device
         # through a far-end pause, rather than chasing an unrelated sound.
         self._last_probe_comms: str | None = None
+        # The desktop device the user selected, by the name it carries now, set
+        # by _resolve_loopback() at start. While the capture is on another output
+        # because that device was unavailable (missing at start, or it went away
+        # mid-recording), the watchdog switches back as soon as it exists again.
+        # None when there is nothing to return to: no saved selection, or Follow
+        # call audio, where following decides the device.
+        self._selected_loopback_name: str | None = None
 
         # User-controlled gain multipliers (1.0 = no change, persisted via localStorage)
         self.loopback_gain: float = 1.0
@@ -326,6 +664,20 @@ class AudioCapture:
         self._ffmpeg_proc: subprocess.Popen | None = None
         self._ffmpeg_mic_name: str | None = None
         self._ffmpeg_stderr_thread: threading.Thread | None = None
+        # The DirectShow mic the user selected ("ffmpeg:<name>" in the mic menu),
+        # by its saved name; None for every other mic choice. While the mic is
+        # captured from anything else (the default mic standing in because the
+        # selected one was missing at start or dropped mid-recording), the
+        # watchdog switches back the moment it is available again, the same
+        # rule as the desktop device (_check_selected_mic).
+        self._selected_mic_name: str | None = None
+        self._mic_on_selected: bool = False
+        # When a mic reader last delivered data. A live mic sends samples all
+        # the time, silence included, so a gap means the device is gone even if
+        # its ffmpeg has not exited.
+        self._mic_last_data_ts: float = 0.0
+        # Serialises mic switches with each other and with stop().
+        self._mic_switch_lock = threading.Lock()
 
         # INPUT_DEBUG bookkeeping. Counters are advanced from the capture
         # threads and the mixer; the throttle ensures we emit summaries at
@@ -366,18 +718,43 @@ class AudioCapture:
             power <<= 1
         return power
 
+    @staticmethod
+    def _compute_loopback_buffer_size(lb_info: dict) -> int:
+        """frames_per_buffer for the desktop (loopback) stream: the mic rule with a
+        2048-frame floor.
+
+        The loopback used to open with CHUNK_SIZE (512) frames while the reader
+        blocks in stream.read(512). PortAudio's blocking read on WASAPI can wait
+        up to ~47 ms between returns, its ring buffer (sized from
+        frames_per_buffer) overflowed, and the excess was dropped silently, with
+        no overflow error: about 3 percent of the far end on the Creative BT-W6
+        and on the Realtek speakers. The mixer then padded every missing chunk
+        with 10.7 ms of digital silence, heard as popping and crackling whenever
+        the other side talked (2026-09-21). Measured: 512 loses 3.1 percent,
+        1024 and up lose 0.1 percent (the device's own clock offset). The read
+        chunk stays CHUNK_SIZE; only the ring buffer grows.
+        """
+        rate = int(lb_info.get("defaultSampleRate") or 48000)
+        latency = lb_info.get("defaultHighInputLatency", 0.02)
+        frames = int(rate * latency)
+        frames = max(2048, min(frames, 8192))
+        power = 1
+        while power < frames:
+            power <<= 1
+        return power
+
     def _find_loopback_device(self, pa=None) -> dict:
         """
         Find the WASAPI loopback device for the current default audio output.
         Falls back gracefully when device names are truncated or don't match exactly.
 
-        ``pa`` lets a caller resolve against another PyAudio instance (a live
-        switch passes its own). It still sees self._pa's device list, the one
-        enumerated when the recording started: while one PyAudio is alive a new
-        one only adds a reference to PortAudio, so a device connected
-        mid-recording is not in either (see _stream_graveyard).
+        ``pa`` is any device source with PyAudio's query methods; a live switch
+        passes the new loopback helper's fresh scan, which sees a device
+        connected mid-recording (a second in-process PyAudio would not: while one
+        is alive a new one only adds a reference to PortAudio). Defaults to this
+        recording's device list (self._devices).
         """
-        pa = pa or self._pa
+        pa = pa or self._devices
         wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
         default_output = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
         default_name: str = default_output["name"]
@@ -423,9 +800,9 @@ class AudioCapture:
         exactly the bug we are guarding against, so the caller picks the
         fallback (system default) itself.
 
-        ``pa`` lets a caller match against another PyAudio instance, e.g. a
-        live switch. It sees the same device list as self._pa (see
-        _find_loopback_device).
+        ``pa`` lets a caller pass another device source, e.g. a live switch
+        passing the new loopback helper's fresh scan so an endpoint connected
+        after the recording started is found (see _find_loopback_device).
 
         ``strict`` stops after the exact + substring tiers. Probe-sourced
         targets use it so a render name never maps onto a *sibling* endpoint of
@@ -434,7 +811,7 @@ class AudioCapture:
         would bind the wrong, idle endpoint.
         """
         try:
-            all_lb = list((pa or self._pa).get_loopback_device_info_generator())
+            all_lb = list((pa or self._devices).get_loopback_device_info_generator())
         except Exception:
             return None
         if not all_lb:
@@ -479,6 +856,7 @@ class AudioCapture:
         not.
         """
         # No hint at all: follow the current system default render device.
+        self._selected_loopback_name = None
         if index is None and not name:
             return self._find_loopback_device()
 
@@ -494,11 +872,22 @@ class AudioCapture:
         # saved device is authoritative; the default is only the fallback when
         # the saved device has gone.
         if not _follow_output_enabled():
+            # Remember the selection so the watchdog can return to it while the
+            # capture runs anywhere else: by the name it carries now when it is
+            # here, else by the saved name. That includes a stand-in found only
+            # by the loose name tiers (missing "Headphones (Realtek(R) Audio)"
+            # matches "Speakers (Realtek(R) Audio)" on the word "Audio)"), so the
+            # real device is picked up when it is plugged in.
+            if name:
+                here = self._match_loopback_by_name(name, strict=True)
+                self._selected_loopback_name = here["name"] if here else name
+            else:
+                self._selected_loopback_name = saved["name"] if saved is not None else None
             if saved is not None:
                 return saved
             if name:
-                log.warn("audio", f"Loopback device '{name}' not found; "
-                                  f"using system default")
+                log.warn("audio", f"Loopback device '{name}' not found; using system "
+                                  f"default until it is available again")
             return self._find_loopback_device()
 
         # Follow mode (Settings > System > "Follow call audio"): call/system
@@ -547,7 +936,7 @@ class AudioCapture:
         resolves, so the caller decides the fallback."""
         if index is not None:
             try:
-                info = self._pa.get_device_info_by_index(index)
+                info = self._devices.get_device_info_by_index(index)
                 if info.get("maxInputChannels", 0) > 0 and (
                         not name or info["name"] == name):
                     return info
@@ -776,6 +1165,75 @@ class AudioCapture:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _new_loopback_child() -> "_LoopbackChild":
+        """A loopback helper with a fresh device scan. A method so tests can
+        substitute one."""
+        return _take_loopback_child()
+
+    def _open_start_loopback(self, loopback_index: int | None,
+                             loopback_name: str | None) -> tuple[dict, int, str]:
+        """Resolve and open the desktop (loopback) stream for start().
+
+        Normally the stream runs in a helper process whose fresh device scan is
+        also what the device is resolved against, so an output connected after
+        the app started is both visible and openable, and a later switch can
+        reach one connected mid-recording. Only if the helper cannot start or
+        open does this capture in-process on self._pa. Returns (device info,
+        ring buffer frames, where)."""
+        t0 = time.monotonic()
+        try:
+            child = self._new_loopback_child()
+        except Exception as e:
+            child = None
+            log.warn("audio", f"Desktop audio helper unavailable ({e}); capturing "
+                              f"in-process, so a device switch cannot reach an "
+                              f"output connected during the recording")
+        if child is not None:
+            log.info("audio", f"Desktop audio helper ready in "
+                              f"{(time.monotonic() - t0) * 1000:.0f} ms "
+                              f"({'warm spare' if getattr(child, 'warm', False) else 'new process'})")
+            self._devices = child.devices
+            try:
+                lb_info = self._resolve_loopback(loopback_index, loopback_name)
+            except Exception:
+                # Nothing to capture (no default output, no loopback device).
+                # The helper has not opened anything; close it here, or it
+                # waits for a command until the app exits.
+                child.close()
+                raise
+            lb_buf_size = self._compute_loopback_buffer_size(lb_info)
+            try:
+                child.open(lb_info,
+                           channels=max(1, lb_info["maxInputChannels"]),
+                           rate=int(lb_info["defaultSampleRate"]),
+                           frames_per_buffer=lb_buf_size,
+                           chunk=self.CHUNK_SIZE)
+                self._loopback_stream = child
+                self._loopback_pa = None
+                return lb_info, lb_buf_size, "helper process"
+            except Exception as e:
+                log.warn("audio", f"Desktop audio helper could not open "
+                                  f"'{lb_info['name']}' ({e}); capturing in-process")
+        self._devices = self._pa
+        lb_info = self._resolve_loopback(loopback_index, loopback_name)
+        lb_buf_size = self._compute_loopback_buffer_size(lb_info)
+        try:
+            self._loopback_stream = self._pa.open(
+                format=self.FORMAT,
+                channels=max(1, lb_info["maxInputChannels"]),
+                rate=int(lb_info["defaultSampleRate"]),
+                input=True,
+                input_device_index=lb_info["index"],
+                frames_per_buffer=lb_buf_size,
+            )
+        except OSError as e:
+            log.error("audio", f"Could not open loopback '{lb_info['name']}' "
+                               f"(index {lb_info.get('index')}): {e}")
+            raise _open_failure("desktop audio", lb_info["name"], e) from e
+        self._loopback_pa = self._pa   # the in-process fallback uses the main PyAudio
+        return lb_info, lb_buf_size, "in-process"
+
     def _open_devices(self, loopback_index: int | None, mic_index: int | None,
                       ffmpeg_mic_name: str | None, loopback_name: str | None) -> None:
         """Everything start() does before a thread reads anything: resolve and
@@ -784,8 +1242,9 @@ class AudioCapture:
         # --- Loopback stream (required) ---
         # Resolve name-first so a drifted PyAudio index self-heals onto the same
         # physical device instead of silently capturing whatever now sits at
-        # that index (see _resolve_loopback).
-        lb_info = self._resolve_loopback(loopback_index, loopback_name)
+        # that index (see _resolve_loopback), against a fresh device scan.
+        lb_info, lb_buf_size, lb_where = self._open_start_loopback(
+            loopback_index, loopback_name)
         self.sample_rate = int(lb_info["defaultSampleRate"])
         self._loopback_channels = max(1, lb_info["maxInputChannels"])
         self._loopback_device_name = lb_info["name"]
@@ -812,28 +1271,23 @@ class AudioCapture:
             self._idbg_mic_q_full_drops = 0
             self._idbg_lb_q_full_drops = 0
         log.info("audio", f"Loopback: '{lb_info['name']}' @ {self.sample_rate} Hz, "
-                          f"{self._loopback_channels} ch")
-        try:
-            self._loopback_stream = self._pa.open(
-                format=self.FORMAT,
-                channels=self._loopback_channels,
-                rate=self.sample_rate,
-                input=True,
-                input_device_index=lb_info["index"],
-                frames_per_buffer=self.CHUNK_SIZE,
-            )
-        except OSError as e:
-            log.error("audio", f"Could not open loopback '{lb_info['name']}' "
-                               f"(index {lb_info.get('index')}): {e}")
-            raise _open_failure("desktop audio", lb_info["name"], e) from e
-        self._loopback_pa = self._pa   # the loopback starts on the main PyAudio
+                          f"{self._loopback_channels} ch, ring buffer {lb_buf_size} frames "
+                          f"({lb_where})")
+
+
 
         # --- Microphone stream (best-effort) ---
+        self._selected_mic_name = None
+        self._mic_on_selected = False
+        self._mic_last_data_ts = time.monotonic()
         if mic_index == -3:
             # FFmpeg subprocess mic via DirectShow - completely independent of
             # Python/WASAPI audio stack for maximum reliability.
             from capture_video import find_ffmpeg
             ffmpeg_path = find_ffmpeg()
+            # The selection, whatever happens below: if the default mic has to
+            # stand in for it, the watchdog switches back once it is available.
+            self._selected_mic_name = ffmpeg_mic_name or None
             if not ffmpeg_path:
                 log.warn("audio", "ffmpeg not found - cannot use FFmpeg mic capture")
                 mic_info = None
@@ -844,7 +1298,7 @@ class AudioCapture:
                 # Re-resolve the saved name against the live dshow device list.
                 # The friendly name we persisted may have shifted (driver update,
                 # USB re-enumeration) or the device may be gone entirely. Doing
-                # this here — instead of trusting the caller's stale string —
+                # this here, instead of trusting the caller's stale string,
                 # turns "ffmpeg silently records nothing" into a clean failure
                 # or an automatic retarget onto the same physical device.
                 resolved, reason = resolve_dshow_mic_name(ffmpeg_mic_name)
@@ -872,48 +1326,13 @@ class AudioCapture:
                         log.info("audio", f"Mic name re-resolved: '{ffmpeg_mic_name}' "
                                           f"-> '{resolved}' ({reason})")
                     ffmpeg_mic_name = resolved
-                    self._mic_rate     = 48000
-                    self._mic_channels = 1
+                    self._set_mic_format(48000, 1)
                     self._has_mic      = True
                     self._ffmpeg_mic_name = ffmpeg_mic_name
                     self._mic_device_name = ffmpeg_mic_name
-                    if self._mic_rate != self.sample_rate:
-                        g = gcd(self.sample_rate, self._mic_rate)
-                        self._resample_up   = self.sample_rate // g
-                        self._resample_down = self._mic_rate    // g
-                    cmd = [
-                        ffmpeg_path,
-                        "-f", "dshow",
-                        "-rtbufsize", "32k",         # small DirectShow buffer for low latency
-                        "-audio_buffer_size", "40",   # dshow audio buffer in ms (default ~500)
-                        "-i", f"audio={ffmpeg_mic_name}",
-                        "-f", "s16le",
-                        "-acodec", "pcm_s16le",
-                        "-ar", str(self._mic_rate),
-                        "-ac", "1",
-                        "-fflags", "+nobuffer",       # minimize internal buffering
-                        "-flags", "+low_delay",
-                        "-loglevel", "error",
-                        "pipe:1",
-                    ]
                     log.info("audio", f"Mic: ffmpeg dshow '{ffmpeg_mic_name}' @ {self._mic_rate} Hz, 1 ch")
-                    if INPUT_DEBUG:
-                        log.info("input-debug", "ffmpeg cmd: " + " ".join(
-                            f'"{a}"' if " " in a else a for a in cmd))
-                    self._ffmpeg_proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                    if INPUT_DEBUG:
-                        log.info("input-debug",
-                                 f"ffmpeg pid={self._ffmpeg_proc.pid} started; "
-                                 f"continuous stderr drain thread spawning")
-                        self._ffmpeg_stderr_thread = threading.Thread(
-                            target=self._ffmpeg_stderr_drain,
-                            args=(self._ffmpeg_proc,),
-                            daemon=True,
-                        )
-                        self._ffmpeg_stderr_thread.start()
+                    self._ffmpeg_proc = self._spawn_ffmpeg_mic(ffmpeg_path, ffmpeg_mic_name)
+                    self._mic_on_selected = True
                     mic_info = None   # skip the WASAPI-open block below
         elif mic_index == -2:
             # Browser mic - no WASAPI stream; audio arrives via inject_mic_data()
@@ -1075,34 +1494,42 @@ class AudioCapture:
             target=self._loopback_silence_watchdog, daemon=True)
         self._silence_watchdog.start()
 
-    def restart_loopback(self, target_name: str | None = None) -> bool:
+    def restart_loopback(self, target_name: str | None = None,
+                         reopen_same: bool = False, reason: str | None = None) -> bool:
         """Switch the loopback to another output device without stopping the
-        recording, so a change of output during a call (a new default output,
-        the call app's own endpoint) is followed automatically.
+        recording, so a change of output during a call (headphones plugged in,
+        a new default output, the call app's own endpoint) is followed
+        automatically.
 
         ``target_name``, when given, names the render endpoint that is ACTUALLY
         playing audio (from the render probe - typically the default
         Communications device a call app renders to, which PortAudio cannot
         see). Without it, falls back to the current default output.
 
-        The switch opens the new stream on a second PyAudio, then retires the
-        old stream: closed once its reader thread has left, parked if it has
-        not (see _stream_graveyard). The second PyAudio sees the device list
-        enumerated when the recording started, because self._pa keeps PortAudio
-        initialised, so only endpoints that existed then can be switched to.
-        Returns True only when it actually switched to a different, live
-        device. Never raises; any failure leaves the current stream untouched
-        (the silence watchdog then alarms)."""
+        Every switch starts a NEW loopback helper process, so the target is
+        looked up in a fresh device scan. A second in-process PyAudio would see
+        only the list enumerated when the recording started, because self._pa
+        keeps PortAudio initialised: on 2026-10-06 the probe heard a call on
+        "Headphones (Realtek(R) Audio)", the switch found no such device, and the
+        whole call was recorded one-sided. The old stream is retired once the
+        new helper is capturing (a helper is killed; an in-process fallback
+        stream is closed once its reader has left, see _stream_graveyard).
+        ``reopen_same`` reopens even when the target is the device already held
+        (its helper died). ``reason`` names where the target came from in the
+        log line. Returns True only when it actually switched to a live device.
+        Never raises; any failure leaves the current stream untouched (the
+        silence watchdog then alarms)."""
         if not self.is_running:
             return False
         if not self._loopback_restart_lock.acquire(blocking=False):
             return False  # a switch is already in progress
-        pa2 = None
+        child = None
         try:
             try:
-                pa2 = pyaudio.PyAudio()
+                child = self._new_loopback_child()
+                devices = child.devices
                 if target_name:
-                    new_info = self._match_loopback_by_name(target_name, pa=pa2, strict=True)
+                    new_info = self._match_loopback_by_name(target_name, pa=devices, strict=True)
                     if new_info is None:
                         # The probe named an endpoint with no matching loopback
                         # device. Do NOT fall back to the console default and
@@ -1111,19 +1538,20 @@ class AudioCapture:
                         # watchdog tries again next tick.
                         log.warn("audio", f"Loopback switch: no loopback device matches "
                                           f"'{target_name}'; staying on the current device")
-                        _terminate_quietly(pa2)
+                        child.close()
                         return False
                 else:
-                    new_info = self._find_loopback_device(pa=pa2)
+                    new_info = self._find_loopback_device(pa=devices)
             except Exception as e:
                 log.warn("audio", f"Loopback switch: could not resolve a target device ({e})")
-                _terminate_quietly(pa2)
+                if child is not None:
+                    child.close()
                 return False
 
             # Same device as now? Then the silence is not a device move (the call
             # is muted, or its app is pinned to a non-default output); don't churn.
-            if new_info["name"] == self._loopback_device_name:
-                _terminate_quietly(pa2)
+            if new_info["name"] == self._loopback_device_name and not reopen_same:
+                child.close()
                 return False
 
             # Open the new loopback at ITS OWN native mix format, not the start
@@ -1138,18 +1566,19 @@ class AudioCapture:
             new_ch = max(1, int(new_info.get("maxInputChannels") or self._loopback_channels))
             new_rate = int(new_info.get("defaultSampleRate") or self.sample_rate)
             try:
-                new_stream = pa2.open(
-                    format=self.FORMAT,
-                    channels=new_ch,
-                    rate=new_rate,
-                    input=True,
-                    input_device_index=new_info["index"],
-                    frames_per_buffer=self.CHUNK_SIZE,
-                )
+                child.open(new_info, channels=new_ch, rate=new_rate,
+                           frames_per_buffer=self._compute_loopback_buffer_size(new_info),
+                           chunk=self.CHUNK_SIZE)
             except Exception as e:
                 log.warn("audio", f"Loopback switch: could not open '{new_info['name']}' "
                                   f"at {new_rate}Hz/{new_ch}ch ({e})")
-                _terminate_quietly(pa2)
+                child.close()
+                return False
+            if not self.is_running:
+                # stop() ran while the new helper was starting and retires this
+                # capture's streams itself. Publishing this one now would leave
+                # a helper capturing until the app exits.
+                child.close()
                 return False
 
             old_stream = self._loopback_stream
@@ -1171,8 +1600,9 @@ class AudioCapture:
 
             # Publish the new stream: the old loopback thread's while-condition
             # (self._loopback_stream is stream) goes False and it exits.
-            self._loopback_stream = new_stream
-            self._loopback_pa = pa2
+            self._loopback_stream = child
+            self._loopback_pa = None
+            self._devices = devices
             self._loopback_device_name = new_info["name"]
             self._loopback_verified = False
             self.loopback_had_signal = False
@@ -1180,26 +1610,250 @@ class AudioCapture:
             self.loopback_peak = 0.0
             self._loopback_thread = threading.Thread(
                 target=self._capture_loop,
-                args=(new_stream, self._loopback_q),
+                args=(child, self._loopback_q),
                 kwargs={"is_loopback": True},
                 daemon=True,
             )
             self._loopback_thread.start()
 
             # The old reader leaves within one poll of the swap above. Its
-            # stream is closed once it has; the main PyAudio is kept either
-            # way, because it still owns the mic.
+            # stream is retired once it has (a helper is killed either way); the
+            # main PyAudio is kept, because it still owns the mic.
             if old_thread is not None:
                 old_thread.join(timeout=2)
             _retire_stream(old_stream, old_thread, old_pa)
-            if old_pa is not self._pa:
+            if old_pa is not None and old_pa is not self._pa:
                 _terminate_quietly(old_pa)
-            src = ("the live endpoint (render probe)" if target_name
-                   else "the current default output")
-            log.info("audio", f"Loopback switched to {src}: '{new_info['name']}'")
+            src = reason or ("the live endpoint (render probe)" if target_name
+                             else "the current default output")
+            verb = "reopened on" if reopen_same else "switched to"
+            log.info("audio", f"Loopback {verb} {src}: '{new_info['name']}'")
             return True
         finally:
             self._loopback_restart_lock.release()
+
+    # While the capture runs on another output because the selected device was
+    # unavailable, the watchdog checks whether it is back: every 10 s at first,
+    # easing off to every 30 s while it stays away. After a return attempt that
+    # found the device but could not open it (another app holding it in
+    # exclusive mode, say), the gap doubles up to the maximum.
+    SELECTED_RECHECK_SEC = 10.0
+    SELECTED_RECHECK_MAX_SEC = 60.0
+
+    @staticmethod
+    def _scan_devices_now():
+        """The devices Windows has right now, from the spare helper's rescan, or
+        None when no spare is ready (the next check tries again). It never
+        waits for a new process, which is what makes it cheap enough to run
+        every few seconds. A method so tests can substitute a scan."""
+        spare = _borrow_spare()
+        if spare is None:
+            with _spare_lock:
+                _refill_spare_locked()
+            return None
+        try:
+            return spare.devices
+        finally:
+            _return_spare(spare)
+
+    def _return_to_selected_device(self) -> bool | None:
+        """Switch back to the desktop device the user selected once it exists
+        again, while the capture runs on another output because that device was
+        unavailable (missing at start, or gone mid-recording).
+
+        Returns True when it switched back, False when the device is listed but
+        the switch failed, and None when there is nothing to do: no selection,
+        already on it, not back yet, or no device scan available. Never raises.
+        """
+        selected = self._selected_loopback_name
+        if not selected or self._loopback_device_name == selected:
+            return None
+        try:
+            devices = self._scan_devices_now()
+        except Exception as e:
+            log.warn("audio", f"Device scan for the selected output failed: {e}")
+            return None
+        if devices is None:
+            return None
+        match = self._match_loopback_by_name(selected, pa=devices, strict=True)
+        if match is None:
+            return None
+        if match.get("name") == self._loopback_device_name:
+            # Already capturing it; it only carries a slightly different name.
+            self._selected_loopback_name = match["name"]
+            return None
+        log.info("audio", f"Loopback: the selected device "
+                          f"'{selected.removesuffix(' [Loopback]')}' is available again; "
+                          f"returning to it")
+        try:
+            switched = self.restart_loopback(target_name=selected,
+                                             reason="the selected device")
+        except Exception as e:
+            log.warn("audio", f"loopback switch failed: {e}")
+            return False
+        if switched:
+            # Adopt the name it has now, so a small rename (a driver update) is
+            # not read as "still away" on every later check.
+            self._selected_loopback_name = self._loopback_device_name
+        return switched
+
+    # ── Microphone: the same rule as the desktop device ─────────────────────
+    # The mic the user selected is the mic recorded. While it is unavailable
+    # (missing at start, or unplugged / switched off mid-recording) the default
+    # mic stands in, and the capture goes back to the selected one as soon as
+    # it is there again. Before 2026-10-07 the stand-in was kept for the rest
+    # of the recording, and a mic lost mid-recording stayed silent.
+
+    # No data from the mic for this long means the device is gone, even if its
+    # ffmpeg has not exited: a live mic sends samples continuously, silence
+    # included.
+    MIC_DEAD_AFTER_SEC = 5.0
+    # A DirectShow device that cannot be opened makes ffmpeg exit within
+    # moments; a new one still running after this long is taken as working.
+    MIC_OPEN_CHECK_SEC = 1.0
+
+    def _mic_is_on_selected(self) -> bool:
+        """The selected mic is the one being captured, and it is delivering."""
+        proc = self._ffmpeg_proc
+        return bool(self._mic_on_selected and proc is not None and proc.poll() is None
+                    and time.monotonic() - self._mic_last_data_ts < self.MIC_DEAD_AFTER_SEC)
+
+    def _mic_is_live(self) -> bool:
+        """Some mic (the selected one or a stand-in) is delivering."""
+        proc = self._ffmpeg_proc
+        source = ((proc is not None and proc.poll() is None)
+                  or self._mic_stream is not None)
+        return bool(source and time.monotonic() - self._mic_last_data_ts
+                    < self.MIC_DEAD_AFTER_SEC)
+
+    def _default_mic_dshow_name(self) -> str | None:
+        """The DirectShow name of Windows' default recording device, from a
+        fresh scan through the spare helper (this process's PortAudio list is
+        frozen at the start of the recording). None when there is no default
+        input, no scan, or no DirectShow device by that name."""
+        devices = self._scan_devices_now()
+        if devices is None:
+            return None
+        try:
+            default = devices.get_host_api_info_by_type(pyaudio.paWASAPI).get(
+                "defaultInputDevice")
+            name = devices.get_device_info_by_index(default).get("name") or ""
+        except Exception:
+            return None
+        if not name:
+            return None
+        resolved, _why = resolve_dshow_mic_name(name)
+        return resolved
+
+    def _retire_mic_source(self) -> None:
+        """Stop the mic source in use (an ffmpeg process or a WASAPI stream)
+        and wait for its reader to leave. Caller holds _mic_switch_lock."""
+        old_thread, old_proc, old_stream = (self._mic_thread, self._ffmpeg_proc,
+                                            self._mic_stream)
+        self._ffmpeg_proc = None
+        self._mic_stream = None   # a WASAPI reader leaves within a poll (_capture_loop)
+        if old_proc is not None:
+            try:
+                old_proc.terminate()
+            except Exception:
+                pass
+        if old_thread is not None:
+            old_thread.join(timeout=3)
+        if old_stream is not None:
+            _retire_stream(old_stream, old_thread, self._pa)
+
+    def _switch_mic_to_dshow(self, name: str, *, selected: bool, reason: str) -> bool:
+        """Capture the mic from DirectShow device ``name`` in place of whatever
+        captures it now, without stopping the recording.
+
+        The new ffmpeg starts with its reader draining (and dropping) its output
+        and must still be running MIC_OPEN_CHECK_SEC later; only then is the old
+        source retired, so a device that will not open costs nothing. The mixer
+        gets a moment to take the old source's last chunks in their own format
+        before the new format is set. Returns True when it switched. Never
+        raises."""
+        if not self.is_running:
+            return False
+        if not self._mic_switch_lock.acquire(blocking=False):
+            return False   # a switch is already under way
+        proc = None
+        reader = None
+        try:
+            from capture_video import find_ffmpeg
+            ffmpeg_path = find_ffmpeg()
+            if not ffmpeg_path:
+                return False
+            try:
+                proc = self._spawn_ffmpeg_mic(ffmpeg_path, name)
+            except Exception as e:
+                log.warn("audio", f"Mic switch: could not start ffmpeg for '{name}' ({e})")
+                return False
+            live = threading.Event()
+            reader = threading.Thread(target=self._ffmpeg_capture_loop,
+                                      args=(proc, live), daemon=True)
+            reader.start()
+            deadline = time.monotonic() + self.MIC_OPEN_CHECK_SEC
+            while time.monotonic() < deadline and proc.poll() is None and self.is_running:
+                time.sleep(0.05)
+            if proc.poll() is not None or not self.is_running:
+                if self.is_running:
+                    log.warn("audio", f"Mic switch: could not open '{name}'")
+                return False
+
+            self._retire_mic_source()
+            time.sleep(0.05)
+            self._set_mic_format(48000, 1)
+            self._ffmpeg_proc = proc
+            self._ffmpeg_mic_name = name
+            self._mic_device_name = name
+            self._mic_thread = reader
+            self._mic_on_selected = selected
+            self._mic_verified = False
+            self._mic_last_data_ts = time.monotonic()
+            self._has_mic = True
+            live.set()
+            proc = reader = None   # published: stop() owns them now
+            log.info("audio", f"Mic switched to {reason}: '{name}'")
+            return True
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                if reader is not None:
+                    reader.join(timeout=3)
+            self._mic_switch_lock.release()
+
+    def _check_selected_mic(self) -> bool | None:
+        """Keep the mic on the device the user selected, with the default mic
+        standing in while it is unavailable.
+
+        Returns True when it switched (back to the selected mic, or to a
+        stand-in), False when a switch was tried and failed, None when there
+        was nothing to do. Never raises."""
+        selected = self._selected_mic_name
+        if not selected or self._mic_is_on_selected():
+            return None
+        try:
+            resolved, _why = resolve_dshow_mic_name(selected)
+        except Exception as e:
+            log.warn("audio", f"Mic check failed: {e}")
+            return None
+        if resolved:
+            log.info("audio", f"Mic: the selected microphone '{selected}' is available; "
+                              f"switching to it")
+            return self._switch_mic_to_dshow(resolved, selected=True,
+                                              reason="the selected microphone")
+        if self._mic_is_live():
+            return None   # the stand-in is recording; wait for the selected one
+        name = self._default_mic_dshow_name()
+        if not name:
+            return None
+        log.warn("audio", f"Mic: the selected microphone '{selected}' is unavailable; "
+                          f"recording the default microphone until it is back")
+        return self._switch_mic_to_dshow(name, selected=False,
+                                          reason="the default microphone, standing in")
 
     def _probe_live_output(self, require_playing: bool = True,
                            duration: float = 1.2) -> str | None:
@@ -1289,6 +1943,14 @@ class AudioCapture:
         consecutive quiet probes find nothing, so a legitimately silent
         recording (mic-only, muted call) does not spawn a COM subprocess every
         few seconds for the whole meeting.
+
+        The Communications-role device is held through a far-end pause, but
+        not unconditionally: see follow_decision(). 2026-09-15 lost three
+        calls because the hold kept the loopback on a comms device that never
+        carried the call while every probe heard it on another jack. Having
+        left the comms device, the watchdog re-probes it every
+        RETURN_PROBE_EVERY seconds and goes back once RETURN_CONFIRM
+        consecutive probes hear it playing.
         """
         INITIAL_CHECK = 1.5        # first proactive device check after start
         RECOVER_AFTER = 10.0       # silent this long (had signal) -> probe
@@ -1313,6 +1975,9 @@ class AudioCapture:
         DROP_AFTER = 90.0          # alarm if a live loopback dropped
         MIC_ACTIVE_NEEDED = 45.0   # of which this much had the mic talking
         ALARM_COOLDOWN = 300.0
+        STICKY_HOLD = STICKY_COMMS_HOLD_SEC  # keep the comms device through a pause this long
+        RETURN_PROBE_EVERY = 45.0  # after leaving the comms device, re-check it this often
+        RETURN_CONFIRM = 2         # consecutive probes that must see it playing to go back
         started = time.monotonic()
         last_signal_ts = started
         # Mic-active seconds accrued since the loopback last produced anything.
@@ -1338,9 +2003,28 @@ class AudioCapture:
         # applies to the next one, not this one.
         follow_output = _follow_output_enabled()
 
-        def _try_follow_audio() -> bool:
+        # Set once the watchdog deliberately leaves the Communications device
+        # for another output that was playing. Only then does it keep checking
+        # whether the call device has come back to life, so a recording that
+        # never left it costs no extra probes.
+        left_comms = False
+        last_return_probe_ts = started
+        return_streak = 0
+        last_reopen_ts = started - 10.0
+        # Return to the device the user selected (see _return_to_selected_device).
+        last_selected_check_ts = started
+        selected_check_every = self.SELECTED_RECHECK_SEC
+        # The same for the microphone (see _check_selected_mic). Checking that
+        # the selected mic is the live source is cheap and runs every tick, so
+        # a mic lost mid-recording gets its stand-in within seconds; looking
+        # for a mic that is away lists the DirectShow devices, so it backs off.
+        next_mic_check = 0.0
+        mic_check_every = self.SELECTED_RECHECK_SEC
+
+        def _try_follow_audio(silent_for: float) -> bool:
             """Probe for a live endpoint and switch ONLY to a different,
             actually-playing device. Returns True if it switched. Never raises."""
+            nonlocal left_comms
             if not follow_output:
                 return False
             try:
@@ -1348,29 +2032,70 @@ class AudioCapture:
             except Exception as e:
                 log.warn("audio", f"loopback probe failed: {e}")
                 return False
-            if not target:
-                return False
-            # Sticky comms: if we are already on the call device (the
-            # Communications-role default) and the only thing playing is a
-            # DIFFERENT endpoint (music / a notification / a video on the
-            # speakers during a far-end pause), do not abandon the call for it.
+            held = self._loopback_device_name or ""
             comms = self._last_probe_comms
-            if comms and comms in (self._loopback_device_name or "") and target != comms:
+            action, why = follow_decision(
+                held=held, held_had_signal=self.loopback_had_signal,
+                silent_for=silent_for, comms=comms, target=target,
+                sticky_hold=STICKY_HOLD)
+            if action == "none":
                 return False
-            # Cheap same-device check against the device list so we skip a full
-            # switch when already on the playing device (the probe's render name
-            # lacks the ' [Loopback]' suffix, so a plain compare to
-            # _loopback_device_name never matches). A target absent from the
-            # list was connected after the recording started; restart_loopback
-            # sees the same list and reports it as not found.
+            if action == "hold":
+                log.info("audio", f"Loopback: holding, {why}")
+                return False
+            # Cheap same-device check against this recording's device list so we
+            # skip starting a new helper when already on the playing device (the
+            # probe's render name lacks the ' [Loopback]' suffix, so a plain
+            # compare to _loopback_device_name never matches). A target absent
+            # from that list may have been connected since; restart_loopback's
+            # new helper scans the devices afresh and finds it.
             cached = self._match_loopback_by_name(target, strict=True)
-            if cached is not None and cached.get("name") == self._loopback_device_name:
+            if cached is not None and cached.get("name") == held:
                 return False
+            leaving_comms = bool(comms) and comms in held
+            if leaving_comms:
+                log.info("audio", f"Loopback: {why}")
             try:
-                return self.restart_loopback(target_name=target)
+                switched = self.restart_loopback(target_name=target)
             except Exception as e:
                 log.warn("audio", f"loopback switch failed: {e}")
                 return False
+            if switched and leaving_comms:
+                left_comms = True
+            return switched
+
+        def _try_return_to_comms() -> bool:
+            """After leaving the call device for another playing output, go
+            back the moment the call device is audibly playing again. Two
+            consecutive probes must agree so a one-second notification chime on
+            the idle comms device cannot drag the capture off a live call.
+            Returns True if it switched back. Never raises."""
+            nonlocal left_comms, return_streak
+            comms = self._last_probe_comms
+            try:
+                target = self._probe_live_output(require_playing=True)
+            except Exception as e:
+                log.warn("audio", f"loopback probe failed: {e}")
+                return False
+            comms = self._last_probe_comms or comms
+            held = self._loopback_device_name or ""
+            if not (target and comms and target == comms and comms not in held):
+                return_streak = 0
+                return False
+            return_streak += 1
+            if return_streak < RETURN_CONFIRM:
+                return False
+            log.info("audio", f"Loopback: call device '{comms}' is playing again; "
+                              f"returning to it")
+            try:
+                switched = self.restart_loopback(target_name=comms)
+            except Exception as e:
+                log.warn("audio", f"loopback switch failed: {e}")
+                return False
+            if switched:
+                left_comms = False
+                return_streak = 0
+            return switched
 
         while self.is_running:
             # Proactive first check: a call already audible at record-start (e.g.
@@ -1381,13 +2106,81 @@ class AudioCapture:
                 did_initial = True
                 if not self.is_running:
                     break
-                if _try_follow_audio():
+                if _try_follow_audio(silent_for=0.0):
                     last_signal_ts = last_recover_ts = grace_base = time.monotonic()
                     fired_start = False
                 continue
 
             time.sleep(2)
             now = time.monotonic()
+
+            # The helper capturing the desktop audio exited (its output was
+            # unplugged or disabled, or it crashed). Reopen at once, whatever
+            # the follow setting: the same output if it still exists, else the
+            # current default output until the selected one returns (below).
+            stream = self._loopback_stream
+            if (self.is_running and isinstance(stream, _LoopbackChild)
+                    and stream.dead and now - last_reopen_ts > 5.0):
+                last_reopen_ts = now
+                held_render = (self._loopback_device_name or "").removesuffix(" [Loopback]")
+                log.warn("audio", f"Desktop audio capture of '{held_render}' stopped; "
+                                  f"reopening")
+                if (self.restart_loopback(target_name=held_render, reopen_same=True)
+                        or self.restart_loopback()):
+                    last_signal_ts = last_recover_ts = grace_base = time.monotonic()
+                    mic_active_for = 0.0
+                    fired_start = False
+                    continue
+
+            # The default output stands in for the selected device only while
+            # that device is unavailable: switch back as soon as it returns.
+            # Only set outside Follow call audio (see _resolve_loopback), so
+            # following never fights this.
+            if (self.is_running and self._selected_loopback_name
+                    and self._loopback_device_name != self._selected_loopback_name
+                    and now - last_selected_check_ts >= selected_check_every):
+                last_selected_check_ts = now
+                back = self._return_to_selected_device()
+                if back:
+                    selected_check_every = self.SELECTED_RECHECK_SEC
+                    last_signal_ts = last_recover_ts = grace_base = time.monotonic()
+                    mic_active_for = 0.0
+                    fired_start = False
+                    continue
+                if back is False:
+                    selected_check_every = min(selected_check_every * 2,
+                                               self.SELECTED_RECHECK_MAX_SEC)
+                else:
+                    # Still away. Ease off to every 30 s, so a device renamed
+                    # for good (a driver update) costs little for the rest of
+                    # the recording, while a reconnect is still picked up soon.
+                    selected_check_every = min(selected_check_every + 5.0,
+                                               max(self.SELECTED_RECHECK_SEC, 30.0))
+
+            # The microphone: the default mic stands in only while the selected
+            # one is unavailable. Nothing here touches the desktop accounting.
+            if self.is_running and self._selected_mic_name:
+                if self._mic_is_on_selected():
+                    next_mic_check = 0.0
+                    mic_check_every = self.SELECTED_RECHECK_SEC
+                elif now >= next_mic_check:
+                    switched_mic = self._check_selected_mic()
+                    if switched_mic:
+                        mic_check_every = self.SELECTED_RECHECK_SEC
+                        # Back on the selected mic: watch it from the next tick,
+                        # so losing it again is acted on at once. On a stand-in:
+                        # look for the selected one again after the usual gap.
+                        next_mic_check = (0.0 if self._mic_on_selected
+                                          else time.monotonic() + mic_check_every)
+                    else:
+                        if switched_mic is False:
+                            mic_check_every = min(mic_check_every * 2,
+                                                  self.SELECTED_RECHECK_MAX_SEC)
+                        else:
+                            mic_check_every = min(mic_check_every + 5.0,
+                                                  max(self.SELECTED_RECHECK_SEC, 30.0))
+                        next_mic_check = time.monotonic() + mic_check_every
+
             lb_peak, mic_peak = self.take_peaks()
             if lb_peak > SILENT_FLOOR:
                 last_signal_ts = now
@@ -1410,7 +2203,7 @@ class AudioCapture:
             cooldown = min(RECOVER_COOLDOWN * (2 ** min(quiet_probe_streak, 3)),
                            MAX_COOLDOWN)
             if silent_for > recover_after and now - last_recover_ts > cooldown:
-                switched = _try_follow_audio()
+                switched = _try_follow_audio(silent_for)
                 now = time.monotonic()   # the probe + any switch took real time
                 last_recover_ts = now
                 if switched:
@@ -1423,6 +2216,19 @@ class AudioCapture:
                     fired_start = False
                     continue
                 quiet_probe_streak += 1
+            elif (follow_output and left_comms and self._last_probe_comms
+                    and now - last_return_probe_ts > RETURN_PROBE_EVERY):
+                # We are capturing a non-call output we followed; keep an eye
+                # on the call device even though the current one is not silent.
+                switched = _try_return_to_comms()
+                now = time.monotonic()
+                last_return_probe_ts = last_recover_ts = now
+                if switched:
+                    quiet_probe_streak = 0
+                    last_signal_ts = grace_base = now
+                    mic_active_for = 0.0
+                    fired_start = False
+                    continue
 
             if not self.loopback_had_signal:
                 if not fired_start and now - grace_base > GRACE:
@@ -1476,7 +2282,16 @@ class AudioCapture:
         # on. A switch wedged in a device open is not waited out: its streams
         # are parked instead of closed.
         switch_idle = self._loopback_restart_lock.acquire(timeout=5)
+        # The same for a mic switch: one under way gives up once it sees
+        # is_running is False, and one that already finished has published its
+        # ffmpeg, which is ended here with the rest.
+        mic_idle = self._mic_switch_lock.acquire(timeout=5)
         try:
+            if self._ffmpeg_proc is not None:
+                try:
+                    self._ffmpeg_proc.terminate()
+                except Exception:
+                    pass
             # Wait for the capture and mixer threads to finish their current
             # iteration and exit (they check is_running at the top of every
             # loop). The capture loops never wait inside read(), so they leave
@@ -1517,6 +2332,8 @@ class AudioCapture:
         finally:
             if switch_idle:
                 self._loopback_restart_lock.release()
+            if mic_idle:
+                self._mic_switch_lock.release()
         # Close the per-source tracks (mic-only / desktop-only). Done after the
         # mixer thread joins so no writes race the close. The Opus encode that
         # follows is the slowest step in stopping, so callers can defer it.
@@ -1589,16 +2406,61 @@ class AudioCapture:
                     self._idbg_mic_q_full_drops += 1
                     if self._idbg_throttle.ready("mic_q_full_inject"):
                         log.warn("input-debug",
-                                 f"mic queue FULL on inject — dropped "
+                                 f"mic queue FULL on inject, dropped "
                                  f"(total drops={self._idbg_mic_q_full_drops})")
 
     # ── Capture threads ───────────────────────────────────────────────────────
+
+    def _set_mic_format(self, rate: int, channels: int) -> None:
+        """The mic source's native format, and the ratio the mixer resamples it
+        by to reach the pipeline rate (self.sample_rate)."""
+        self._mic_rate = int(rate)
+        self._mic_channels = max(1, int(channels))
+        if self._mic_rate != self.sample_rate:
+            g = gcd(self.sample_rate, self._mic_rate)
+            self._resample_up = self.sample_rate // g
+            self._resample_down = self._mic_rate // g
+        else:
+            self._resample_up = self._resample_down = 1
+
+    def _spawn_ffmpeg_mic(self, ffmpeg_path: str, name: str) -> subprocess.Popen:
+        """Start ffmpeg capturing DirectShow mic ``name`` as 48 kHz mono s16le on
+        its stdout. A method so tests can substitute a process."""
+        cmd = [
+            ffmpeg_path,
+            "-f", "dshow",
+            "-rtbufsize", "32k",         # small DirectShow buffer for low latency
+            "-audio_buffer_size", "40",   # dshow audio buffer in ms (default ~500)
+            "-i", f"audio={name}",
+            "-f", "s16le",
+            "-acodec", "pcm_s16le",
+            "-ar", "48000",
+            "-ac", "1",
+            "-fflags", "+nobuffer",       # minimize internal buffering
+            "-flags", "+low_delay",
+            "-loglevel", "error",
+            "pipe:1",
+        ]
+        if INPUT_DEBUG:
+            log.info("input-debug", "ffmpeg cmd: " + " ".join(
+                f'"{a}"' if " " in a else a for a in cmd))
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if INPUT_DEBUG:
+            log.info("input-debug",
+                     f"ffmpeg pid={proc.pid} started; continuous stderr drain thread spawning")
+            self._ffmpeg_stderr_thread = threading.Thread(
+                target=self._ffmpeg_stderr_drain, args=(proc,), daemon=True)
+            self._ffmpeg_stderr_thread.start()
+        return proc
 
     def _ffmpeg_stderr_drain(self, proc: subprocess.Popen) -> None:
         """Continuously surface ffmpeg's stderr while INPUT_DEBUG is on.
 
         Without this, ffmpeg's stderr is only read after the process exits
-        (see _ffmpeg_capture_loop's finally block) — which means a silently
+        (see _ffmpeg_capture_loop's finally block), which means a silently
         failing dshow capture leaves no breadcrumbs. With INPUT_DEBUG on we
         run this in a side thread so every line lands in the log in real
         time, including non-fatal warnings ffmpeg emits while still alive.
@@ -1631,12 +2493,12 @@ class AudioCapture:
     def _capture_loop(self, stream, out_queue: queue.Queue,
                       buf_size: int = 0, is_loopback: bool = False) -> None:
         chunk = buf_size or self.CHUNK_SIZE
-        # A loopback thread services one stream. On a live device switch the
-        # loopback stream is swapped (self._loopback_stream points at the new
-        # one), so this thread's `self._loopback_stream is stream` goes False and
-        # it exits, handing off to the new thread. The mic thread only tracks
-        # is_running.
-        while self.is_running and (not is_loopback or self._loopback_stream is stream):
+        # A capture thread services one stream. On a live device switch the
+        # stream is swapped (self._loopback_stream or self._mic_stream points at
+        # the new one, or at None), so this thread's identity check goes False
+        # and it exits, handing off to the new reader.
+        while self.is_running and (self._loopback_stream is stream if is_loopback
+                                   else self._mic_stream is stream):
             try:
                 # Read however many frames WASAPI has ready, clamped to a
                 # reasonable range.  This adapts to the device's actual
@@ -1662,6 +2524,7 @@ class AudioCapture:
                         log.info("audio", f"Verified audio device "
                                           f"(desktop/loopback): {self._loopback_device_name}")
                 else:
+                    self._mic_last_data_ts = time.monotonic()
                     if not self._mic_verified and data and data.strip(b"\x00"):
                         self._mic_verified = True
                         log.info("audio", f"Verified audio device "
@@ -1713,11 +2576,17 @@ class AudioCapture:
                     break
                 time.sleep(0.01)  # brief pause to avoid a tight error loop
 
-    def _ffmpeg_capture_loop(self) -> None:
-        """Read raw PCM from an ffmpeg subprocess capturing via DirectShow."""
+    def _ffmpeg_capture_loop(self, proc: "subprocess.Popen | None" = None,
+                             live: "threading.Event | None" = None) -> None:
+        """Read raw PCM from an ffmpeg subprocess capturing via DirectShow.
+
+        ``proc`` defaults to the current mic process. ``live`` is for a mic
+        switch: until it is set the data is read and dropped, so the new device
+        is drained from the moment ffmpeg starts (no backlog building up in the
+        pipe to land late) while the old source is still the one recorded."""
         # 512 frames * 2 bytes (Int16) * 1 channel = 1024 bytes per chunk
         read_size = self.CHUNK_SIZE * 2
-        proc = self._ffmpeg_proc
+        proc = proc or self._ffmpeg_proc
         try:
             while self.is_running and proc and proc.poll() is None:
                 data = proc.stdout.read(read_size)
@@ -1727,6 +2596,9 @@ class AudioCapture:
                                  f"ffmpeg stdout returned empty — process "
                                  f"poll={proc.poll() if proc else 'n/a'}")
                     break
+                if live is not None and not live.is_set():
+                    continue
+                self._mic_last_data_ts = time.monotonic()
                 if not self._mic_verified and data.strip(b"\x00"):
                     self._mic_verified = True
                     log.info("audio", f"Verified audio device "
@@ -2147,30 +3019,59 @@ def auto_detect_devices() -> dict:
 
     Returns {"best_loopback": {...}, "best_mic": {...}, "loopback": [...], "mic": [...]}.
     """
-    pa = pyaudio.PyAudio()
     stop_event = threading.Event()
 
     # ── Enumerate ────────────────────────────────────────────────────────
-    loopbacks = list(pa.get_loopback_device_info_generator())
+    # Each loopback is captured by its own helper process (a fresh device scan,
+    # see _LoopbackChild), so the list includes outputs connected since the
+    # app started.
+    snapshot = _fresh_device_snapshot()
+    loopbacks = list(snapshot.get_loopback_device_info_generator()) if snapshot else []
     dshow_mics = enumerate_dshow_audio_devices()
     log.info("auto-detect", f"Found {len(loopbacks)} loopback, {len(dshow_mics)} dshow mic devices")
 
-    # ── Open all loopback streams (main thread, single PyAudio) ──────────
-    lb_streams: list[tuple[dict, object, list]] = []  # (info, stream, data_chunks)
-    for lb in loopbacks:
+    # ── Open every loopback in its own helper ────────────────────────────
+    # The helpers start side by side: a new Python process takes 3 to 5 s on
+    # some machines, and starting one per output in turn made Auto-detect wait
+    # that long for every output in the list before the tone even played.
+    opened: list = [None] * len(loopbacks)
+    opened_lock = threading.Lock()
+    collected = False   # set once the list below is taken; a later opener closes its own
+
+    def _open_loopback(slot: int, lb: dict) -> None:
+        child = None
         try:
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=max(1, lb["maxInputChannels"]),
-                rate=int(lb["defaultSampleRate"]),
-                input=True,
-                input_device_index=lb["index"],
-                frames_per_buffer=512,
-            )
-            lb_streams.append((lb, stream, []))
-            log.info("auto-detect", f"  Opened loopback: {lb['name']}")
+            child = _LoopbackChild()
+            info = next((d for d in child.devices.get_loopback_device_info_generator()
+                         if d["name"] == lb["name"]), None)
+            if info is None:
+                raise RuntimeError("gone before it could be opened")
+            child.open(info, channels=max(1, info["maxInputChannels"]),
+                       rate=int(info["defaultSampleRate"]),
+                       frames_per_buffer=AudioCapture._compute_loopback_buffer_size(info),
+                       chunk=512)
+            with opened_lock:
+                if not collected:
+                    opened[slot] = (info, child)
+                    child = None   # handed over; retired with the others below
+            if child is None:
+                log.info("auto-detect", f"  Opened loopback: {lb['name']}")
         except Exception as e:
             log.warn("auto-detect", f"  Failed loopback '{lb['name']}': {e}")
+        finally:
+            if child is not None:
+                child.close()
+
+    openers = [threading.Thread(target=_open_loopback, args=(i, lb), daemon=True)
+               for i, lb in enumerate(loopbacks)]
+    for t in openers:
+        t.start()
+    for t in openers:
+        t.join(timeout=30)
+    with opened_lock:
+        collected = True
+        lb_streams: list[tuple[dict, object, list]] = [  # (info, stream, data_chunks)
+            (info, child, []) for info, child in (o for o in opened if o is not None)]
 
     # ── Spawn ffmpeg for each dshow mic ──────────────────────────────────
     from capture_video import find_ffmpeg
@@ -2279,8 +3180,7 @@ def auto_detect_devices() -> dict:
     # ── Cleanup ──────────────────────────────────────────────────────────
     # The first len(lb_streams) threads are the loopback readers, in order.
     for (_, stream, _), reader in zip(lb_streams, threads):
-        _retire_stream(stream, reader, pa)
-    _terminate_quietly(pa)
+        _retire_stream(stream, reader, None)   # kills the helper
 
     for _, proc, _ in mic_procs:
         try:
@@ -2328,47 +3228,56 @@ def default_device_name_matches(output_name: str, loopback_name: str) -> bool:
 def enumerate_audio_devices() -> dict:
     """
     Return lists of available loopback and microphone input devices.
-    Creates and destroys a temporary PyAudio instance - safe to call
-    even while recording is active.
+    Scans in a helper process (see _fresh_device_snapshot): this process's
+    PortAudio list is frozen at the first recording, which hid headphones
+    plugged in later from the recorder's device menu. Falls back to a
+    temporary in-process PyAudio. Safe to call even while recording is active.
 
     Input devices are filtered to WASAPI only (same API used for capture)
     to avoid showing the same physical device three times (MME / DirectSound /
     WASAPI) and to exclude loopback virtual devices from the mic list.
     """
+    snapshot = _fresh_device_snapshot()
+    if snapshot is not None:
+        return _list_audio_devices(snapshot)
     pa = pyaudio.PyAudio()
     try:
-        loopbacks = [
-            {"index": int(d["index"]), "name": d["name"]}
-            for d in pa.get_loopback_device_info_generator()
-        ]
-
-        try:
-            wasapi_idx = pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
-        except Exception:
-            wasapi_idx = None
-
-        # Collect the loopback device indices so we can exclude them from mic list
-        loopback_indices = {lb["index"] for lb in loopbacks}
-
-        inputs = []
-        for i in range(pa.get_device_count()):
-            info = pa.get_device_info_by_index(i)
-            # WASAPI only - skip MME / DirectSound duplicates
-            if wasapi_idx is not None and info.get("hostApi") != wasapi_idx:
-                continue
-            # Must have at least one input channel
-            if info.get("maxInputChannels", 0) <= 0:
-                continue
-            # Exclude loopback virtual devices (they're already in the loopback list)
-            if int(info["index"]) in loopback_indices:
-                continue
-            if "[Loopback]" in info.get("name", ""):
-                continue
-            inputs.append({"index": int(info["index"]), "name": info["name"]})
-
-        return {"loopback": loopbacks, "input": inputs}
+        return _list_audio_devices(pa)
     finally:
         pa.terminate()
+
+
+def _list_audio_devices(pa) -> dict:
+    loopbacks = [
+        {"index": int(d["index"]), "name": d["name"]}
+        for d in pa.get_loopback_device_info_generator()
+    ]
+
+    try:
+        wasapi_idx = pa.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+    except Exception:
+        wasapi_idx = None
+
+    # Collect the loopback device indices so we can exclude them from mic list
+    loopback_indices = {lb["index"] for lb in loopbacks}
+
+    inputs = []
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        # WASAPI only - skip MME / DirectSound duplicates
+        if wasapi_idx is not None and info.get("hostApi") != wasapi_idx:
+            continue
+        # Must have at least one input channel
+        if info.get("maxInputChannels", 0) <= 0:
+            continue
+        # Exclude loopback virtual devices (they're already in the loopback list)
+        if int(info["index"]) in loopback_indices:
+            continue
+        if "[Loopback]" in info.get("name", ""):
+            continue
+        inputs.append({"index": int(info["index"]), "name": info["name"]})
+
+    return {"loopback": loopbacks, "input": inputs}
 
 
 def enumerate_dshow_audio_devices() -> list[dict]:

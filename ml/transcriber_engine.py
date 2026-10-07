@@ -47,6 +47,21 @@ class _EngineBase:
 
 # ── faster-whisper backend (Windows / CUDA / CPU) ───────────────────────────
 
+def _load_cuda_libraries(device: str) -> None:
+    """Load cuBLAS before CTranslate2's first GPU call, or raise.
+
+    Left to CTranslate2, the load fails and every later GPU call in the
+    process hangs, which stops live transcription with no error (see
+    core.gpu_probe.load_cublas). Raising here, before the model exists, keeps
+    the failure loud."""
+    if device != "cuda" or sys.platform != "win32":
+        return
+    from core import gpu_probe
+    if not gpu_probe.load_cublas():
+        raise RuntimeError("cuBLAS (cublas64_12.dll) could not be loaded, "
+                           "so Whisper cannot run on the GPU")
+
+
 class FasterWhisperEngine(_EngineBase):
     """Wraps faster_whisper.WhisperModel. Native passthrough — no transformation."""
 
@@ -56,6 +71,7 @@ class FasterWhisperEngine(_EngineBase):
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
+        _load_cuda_libraries(device)
         self._inner = WhisperModel(
             model_size, device=device, compute_type=compute_type,
             local_files_only=True,
@@ -80,6 +96,7 @@ class FasterWhisperEngine(_EngineBase):
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
+        _load_cuda_libraries(device)
         self._inner = self._WhisperModel(
             model_size, device=device, compute_type=compute_type,
             local_files_only=True,

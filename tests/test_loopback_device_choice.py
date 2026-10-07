@@ -38,7 +38,7 @@ BOSE_OUT = {"index": 7, "name": "Bose (High Definition Audio Device)", "maxInput
 
 def _capture(pa):
     cap = windows.AudioCapture.__new__(windows.AudioCapture)
-    cap._pa = pa
+    cap._devices = pa
     return cap
 
 

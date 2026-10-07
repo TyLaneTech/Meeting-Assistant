@@ -5807,7 +5807,7 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id !== state.sessionId) return;
     const pct = Math.round((d.progress || 0) * 100);
     const text = document.getElementById('status-text');
-    if (text) text.textContent = `Reanalyzing… ${pct}%`;
+    if (text) text.textContent = `${d.post_meeting ? 'Transcribing' : 'Reanalyzing'}… ${pct}%`;
   });
 
   src.addEventListener('reanalysis_done', e => {
@@ -6165,6 +6165,8 @@ function _iconsChanged() {
 /* ── Settings: System > Recording reliability ───────────────────────────── */
 
 function _syncReliabilityToggles() {
+  const after = document.getElementById('transcribe-after-toggle');
+  if (after) after.checked = !!_prefs.transcribe_after_meeting;
   const follow = document.getElementById('loopback-follow-toggle');
   if (follow) follow.checked = !!_prefs.loopback_follow_output;
   const watchdog = document.getElementById('freeze-watchdog-toggle');
@@ -6269,7 +6271,7 @@ function onStatus(d) {
       state.isViewingPast = false;
       _loadChatContextFoldersForSession(d.session_id);
       dot.className       = 'status-dot recording';
-      text.textContent    = 'Recording';
+      text.textContent    = d.transcribe_after ? 'Recording (transcript after the meeting)' : 'Recording';
       _loadPaneVisible(d.session_id);
       refreshSessionChatPromptBadge();
       destroyPlayback();
@@ -19869,8 +19871,17 @@ function flashStatus(msg) {
 // for a user who wants it gone regardless. It sits under the header in the
 // main column's flow and pushes the view down rather than covering anything:
 // fixed over the top of the window, it hid the header and the Stop button.
+// A "stalled" warning (the recording file stopped growing) is about the disk,
+// not the desktop audio: desktop audio in the meters, or the loopback
+// recovering, says nothing about it, so only its own clear or a stop ends it.
+let _captureAlertKind = '';
+
 function _showCaptureAlert(d) {
-  if (d && (d.cleared || d.level === 'clear')) { _clearCaptureAlert(); return; }
+  if (d && (d.cleared || d.level === 'clear')) {
+    if ((d.kind === 'stalled') === (_captureAlertKind === 'stalled')) _clearCaptureAlert();
+    return;
+  }
+  _captureAlertKind = (d && d.kind) || '';
   const msg = (d && d.message) || 'Call/desktop audio is not being captured.';
   let bar = document.getElementById('capture-alert-bar');
   if (!bar) {
@@ -19902,6 +19913,7 @@ function _showCaptureAlert(d) {
 }
 
 function _clearCaptureAlert() {
+  _captureAlertKind = '';
   const bar = document.getElementById('capture-alert-bar');
   if (bar) bar.style.display = 'none';
 }
@@ -20302,8 +20314,9 @@ function updateLevelMeters(lb, mic, hasMic) {
   if (lb > 0.01) {
     _captureLastDesktopAudio = Date.now();
     // Proof the desktop side is being captured, straight from the stream the
-    // alarm is about. Nothing to warn about any more.
-    _clearCaptureAlert();
+    // alarm is about. Nothing to warn about any more, unless the warning is
+    // that the file stopped growing: the meters run ahead of the disk write.
+    if (_captureAlertKind !== 'stalled') _clearCaptureAlert();
   }
 }
 

@@ -1,4 +1,4 @@
-# Meeting Assistant — Developer Agent Guide
+# Meeting Assistant: Developer Agent Guide
 
 This document is the authoritative reference for AI agents working on this codebase. Read it before making changes.
 
@@ -85,16 +85,16 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | File | Responsibility |
 |---|---|
 | `app.py` | Flask server, all API routes, session orchestration, SSE dispatch. Configured with `template_folder="ui_web/templates"`, `static_folder="ui_web/static"`. |
-| `launch.py` | Setup automation — venv creation, GPU/Metal probe, dependency install (picks `requirements-macos.txt` on darwin), model predownload, app launch. |
+| `launch.py` | Setup automation: venv creation, GPU/Metal probe, dependency install (picks `requirements-macos.txt` on darwin), model predownload, app launch. |
 | `launch.bat` / `launch.command` | OS-specific shells that invoke `launch.py`. |
-| `mcp_server.py` | Stdio MCP server for external AI agents (Claude Desktop/Code, Codex). Pure stdlib, zero project imports — proxies to the Agent REST API over localhost HTTP, so it works with any Python and never loads app modules. |
-| `watchdog.py` | External freeze watchdog, opt-in via `freeze_watchdog_enabled`. Polls `/api/status` from outside the process and reads `<data>/heartbeat.json` to tell a frozen or crashed app (restart) from a clean quit (leave alone). Started by `launch.py`, never by the app. |
+| `mcp_server.py` | Stdio MCP server for external AI agents (Claude Desktop/Code, Codex). Pure stdlib, zero project imports: proxies to the Agent REST API over localhost HTTP, so it works with any Python and never loads app modules. |
+| `watchdog.py` | External freeze watchdog, opt-in via `freeze_watchdog_enabled`. Polls `/api/status` from outside the process and reads `<data>/heartbeat.json` to tell a frozen or crashed app (restart) from a clean quit (leave alone). Started by `launch.py`, never by the app. Every in-app exit, restarts included, calls `_stop_heartbeat()` before it relaunches, so the watchdog never mistakes the relaunch gap for a crash. |
 | `launch_hidden.vbs` | Tray-only Windows start: runs `launch.bat --hidden` with no console and sends the startup output to `storage/logs/launch-startup-<stamp>.log`, one file per launch, pruned after a week. `_relaunch_app()` prefers it for restarts and updates; the sign-in shortcut runs it. |
 | `app_launcher.vbs` | What the Start Menu shortcut runs. Server up: asks it to open the app window (`POST /api/window/open`, so the PWA / app-window / browser choice lives in `core/browser.py`). Server down: starts it through `launch_hidden.vbs`, waits up to three minutes, then asks the same with `cold_start` set, so the app can keep the window closed (`open_window_from_start_menu` off, or `open_window_on_launch` / first-run setup already opening one from `main()`). No `.venv` yet: runs `launch.bat` in a visible console so the first-run install shows its progress. |
 | `CHANGELOG.md` | The release notes users read (Settings → Changelog, What's new card). Parsed by `core/changelog.py`; see Release Notes below. |
 | `tests/` | pytest suite, no hardware needed: unit tests for the pure modules plus static assertions over the templates, scripts and stylesheets. `python -m pytest tests -q` runs in about ten seconds. See CONTRIBUTING.md. |
 
-### `core/` — foundational utilities
+### `core/`: foundational utilities
 
 | File | Responsibility |
 |---|---|
@@ -103,9 +103,11 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/paths.py` | Data directory resolution (configurable via `.data_location` pointer) |
 | `core/settings.py` | JSON user preferences (device selections, model choices, UI prefs) |
 | `core/network.py` | HuggingFace token + pipeline download helpers |
-| `core/compute_device.py` | `best_torch_device()` — single source of truth for CUDA/MPS/CPU choice |
+| `core/compute_device.py` | `best_torch_device()`: single source of truth for CUDA/MPS/CPU choice; `plan_batch_devices()`: the reanalysis device plan (settings + power source) |
+| `core/gpu_probe.py` | Answers "which accelerators exist" from a short-lived child (`python -m core.gpu_probe`), cached, so the app process never initializes CUDA just by asking; `load_cublas()` loads cuBLAS into the app process before Whisper's first GPU call |
+| `core/power.py` | Charger or battery (`GetSystemPowerStatus`), the `MA_FORCE_POWER` / `<data>/force_power` test override, and `ChargerGate` (once-a-minute recheck while a GPU job waits) |
 | `core/storage.py` | SQLite CRUD: sessions, segments, summaries, chat, speaker labels, calendar matches, expected speaker counts, the `media_encodes` ledger |
-| `core/media.py` | Where a meeting's media is, in either format: `audio_path()` (Opus or WAV), `pcm_wav_path()` (the WAV, or a cached decode of the Opus in `tmp/pcm/` for `wave`-based readers), `replace_audio()`, `delete_session_media()`. Every reader of a recording's audio goes through it; only writers name `{sid}.wav` |
+| `core/media.py` | Where a meeting's media is, in either format: `audio_path()` (Opus or WAV), `pcm_wav_path()` (the WAV, or a cached decode of the Opus in `tmp/pcm/` for `wave`-based readers), `replace_audio()`, `delete_session_media()` (every file a session owns, leftovers found by `{sid}.*` / `{sid}_*`; it refuses an id that is not a UUID, see `is_session_id()`, since `*` as an id matched every recording and `..\` reached outside the folder). Every reader of a recording's audio goes through it; only writers name `{sid}.wav` |
 | `core/disk_usage.py` | The Storage card's scan: bytes per kind, per meeting, per backup folder, plus orphans and encoder leftovers with their age. Pure filesystem over the metadata the route hands in |
 | `core/media_compress.py` | The Free up space engine: audio and video presets, encoder discovery (NVENC probed by a test encode), `plan()` pricing, the one-at-a-time `Job` (WAV to Opus with the per-source tracks, MP4 re-encode, backup WAVs, orphan removal), the ledger writes |
 | `core/storage_api.py` | `/api/storage/*` blueprint: price a plan, start it, read the job, cancel it |
@@ -128,12 +130,13 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/recording_request.py` | Start-recording coordinator: offers the start to an already-open window over SSE, then the installed PWA, then a fresh `?autostart=1` window |
 | `core/shortcut.py` | Windows `.lnk` helpers shared by the launcher and the icon sync; only ever touches shortcuts that launch this checkout |
 
-### `capture_audio/` — audio input
+### `capture_audio/`: audio input
 
 | File | Responsibility |
 |---|---|
-| `capture_audio/__init__.py` | Platform dispatcher — re-exports `AudioCapture`, `enumerate_audio_devices`, `auto_detect_devices` based on `sys.platform`. |
+| `capture_audio/__init__.py` | Platform dispatcher: re-exports `AudioCapture`, `enumerate_audio_devices`, `auto_detect_devices` based on `sys.platform`. |
 | `capture_audio/windows.py` | WASAPI loopback + microphone capture, mixer, RMS levels, AGC, FFmpeg mic ingestion. |
+| `capture_audio/loopback_child.py` | Helper process that scans the audio devices fresh and captures one WASAPI loopback stream, piping PCM to the app. Every recording and device switch starts one. |
 | `capture_audio/mac.py` | ScreenCaptureKit loopback (system audio) + CoreAudio mic capture via sounddevice. |
 | `capture_audio/mac_bootstrap.py` | Retired no-op shim. ScreenCaptureKit needs no virtual driver, aggregate device, or output reroute, so the BlackHole machinery this held is gone. Kept only so a stale import gets no-ops instead of an `ImportError`. |
 | `capture_audio/wav_writer.py` | Minimal WAV file writer with sample-offset tracking; append mode walks the RIFF chunks so an ffmpeg-written header survives |
@@ -142,7 +145,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `capture_audio/audio/test_sample.mp3` | Tone played during input-device auto-detection (read directly off disk by `windows.py`/`mac.py`) |
 | `capture_audio/audio/complete.mp3` | Recording-complete chime |
 
-### `capture_video/` — screen recording + media editing
+### `capture_video/`: screen recording + media editing
 
 | File | Responsibility |
 |---|---|
@@ -152,27 +155,28 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `capture_video/ffmpeg_util.py` | `find_ffmpeg()`, `download_ffmpeg()`, `_LOCAL_FFMPEG` constants |
 | `capture_video/media_edit.py` | Trim, split, waveform profile and the trim/split backups. Reads PCM through `core/media.py`, so an Opus session trims, profiles and restores like a WAV one; a trim writes a WAV that retires the Opus |
 
-### `ml/` — transcription, diarization, speakers
+### `ml/`: transcription, diarization, speakers
 
 | File | Responsibility |
 |---|---|
-| `ml/transcriber.py` | Streaming Whisper — model management, audio queue consumer, pause-based flush. `WHISPER_PRESETS` filtered by `sys.platform`. |
-| `ml/transcriber_engine.py` | Engine factory — `make_engine()` returns `FasterWhisperEngine` (CUDA) or `MLXWhisperEngine` (Metal). |
-| `ml/batch_transcriber.py` | Reanalysis pipeline — full-file pyannote diarization + batched Whisper transcription. |
+| `ml/transcriber.py` | Streaming Whisper: model management, audio queue consumer, pause-based flush. `WHISPER_PRESETS` filtered by `sys.platform`. |
+| `ml/transcriber_engine.py` | Engine factory: `make_engine()` returns `FasterWhisperEngine` (CUDA) or `MLXWhisperEngine` (Metal). |
+| `ml/batch_transcriber.py` | Reanalysis pipeline: full-file pyannote diarization + batched Whisper transcription. |
+| `ml/batch_worker.py` | Runs the reanalysis pipeline in a child process (`python -m ml.batch_worker`) that exits when the job ends; streams segments, fingerprint audio, progress and log lines back as pickled frames |
 | `ml/diarizer.py` | pyannote streaming diarization, speaker profile tracking, embedding merges |
 | `ml/speaker_db.py` | Voice library: embeddings, centroids, cross-session speaker matching |
 | `ml/text_embeddings.py` | Text embedding helpers (chat memory / RAG) |
 | `ml/eval_diarization.py` | Standalone diarization evaluation script |
 | `ml/optimize_diarization.py` | Hyperparameter tuning script |
 
-### `ai/` — LLM assistant
+### `ai/`: LLM assistant
 
 | File | Responsibility |
 |---|---|
-| `ai/assistant.py` | Anthropic/OpenAI integration — streaming summary, incremental patch, Q&A, title generation. Per-tool model selection and prompt caching. |
+| `ai/assistant.py` | Anthropic/OpenAI integration: streaming summary, incremental patch, Q&A, title generation. Per-tool model selection and prompt caching. |
 | `ai/speaker_relabel.py` | Bulk speaker relabel agent for the global chat: plans, confirms and applies speaker reassignments (`plan_speaker_relabel`, `apply_speaker_relabel`, `cancel_speaker_relabel`). The only chat tools that write. |
 
-### `agent_api/` — external agent interface (REST)
+### `agent_api/`: external agent interface (REST)
 
 | File | Responsibility |
 |---|---|
@@ -183,7 +187,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `agent_api/openapi.py` | OpenAPI 3.1 spec builder, served at `/api/agent/v1/openapi.json`. |
 | `docs/AGENT_API.md` | The agent-facing guide; served live (base URL substituted) at `GET /api/agent/v1/docs`. Keep it in sync when adding endpoints/tools. |
 
-### `ui_desktop/` — OS integration
+### `ui_desktop/`: OS integration
 
 | File | Responsibility |
 |---|---|
@@ -191,7 +195,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `ui_desktop/notifications.py` | Every desktop notification the app sends (meeting detected, auto-started, quiet recording, capture alarm, start failed, test), each tagged so the app can replace or withdraw it. The app's own toast on Windows, `osascript` on macOS. |
 | `ui_desktop/toast/` | The notification widget (Windows). `spec.py`: what a toast is (kinds, icons, buttons). `theme.py`: the palette, read from `style.css`'s theme blocks and the saved theme. `paint.py`: the card as an RGBA image (Pillow, Segoe UI, the bundled Font Awesome). `sounds.py`: the synthesised cues and `PlaySound`. `manager.py`: stacking, timing, hover, clicks, animation. `win32.py`: the layered windows and their thread. `python -m ui_desktop.toast` shows every kind. |
 
-### `ui_web/` — Flask web UI assets
+### `ui_web/`: Flask web UI assets
 
 | File | Responsibility |
 |---|---|
@@ -204,22 +208,22 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `ui_web/static/style.css`, `home.css`, `calendar.css` | Styles; the two view sheets belong to their views |
 | `ui_web/static/images/` | Logo, the bundled icon set under `sets/wave/`, fontAwesome assets. Custom sets live under `<data>/icons/`. |
 
-### `storage/` — runtime data and bundled binaries (not a Python package)
+### `storage/`: runtime data and bundled binaries (not a Python package)
 
-`storage/` is fully gitignored (`**/storage/` in `.gitignore`) and auto-created by its consumers on first use — it does not need to exist at checkout. Files inside are runtime/cache, not code.
+`storage/` is fully gitignored (`**/storage/` in `.gitignore`) and auto-created by its consumers on first use: it does not need to exist at checkout. Files inside are runtime/cache, not code.
 
 **Auto-migration on update:** `launch.py` runs `_migrate_legacy_layout()` early in `main()` (right after `_ensure_venv()`). On users who pull a version with the storage/ layout, any pre-existing `<project>/{tools,models}/` get moved into `storage/` automatically. `<project>/data/` is moved as well **only if it's still at the default location** (no `.data_location` pointer, or pointer points exactly at `<project>/data/`). After moving the default-located data folder, the pointer file is deleted since the new default IS `storage/data/`. If the pointer redirects to a relocated custom dir, both the data folder and the pointer are left alone. Migration is idempotent and silent on no-op runs; collisions (target already exists) are skipped without clobber.
 
 | Path | Responsibility |
 |---|---|
-| `storage/data/` | SQLite DB, `settings.json`, recorded WAV/video files, attachments, screenshots, voice profiles, backups, tmp. **Location is overridable** — the `.data_location` pointer file at the project root can redirect this to any absolute path (see `core/paths.py`). |
+| `storage/data/` | SQLite DB, `settings.json`, recorded WAV/video files, attachments, screenshots, voice profiles, backups, tmp. **Location is overridable**: the `.data_location` pointer file at the project root can redirect this to any absolute path (see `core/paths.py`). |
 | `storage/models/` | HuggingFace model cache (`HF_HOME` is pointed here at import time by `core/config.py`). |
-| `storage/tools/` | Bundled binaries — currently just `ffmpeg(.exe)`, auto-downloaded by `launch.py` if not on PATH. |
+| `storage/tools/` | Bundled binaries: currently just `ffmpeg(.exe)`, auto-downloaded by `launch.py` if not on PATH. |
 
 ### Import conventions
 
 - Always import packages via their qualified path: `from core import log`, `from ml.transcriber import Transcriber`, `from capture_audio import AudioCapture`.
-- Never reach into a platform backend directly (`from capture_audio.windows import ...`) from app code — go through the dispatcher so macOS/Windows behavior stays symmetric.
+- Never reach into a platform backend directly (`from capture_audio.windows import ...`) from app code; go through the dispatcher so macOS/Windows behavior stays symmetric.
 - New shared utilities default to `core/`. New ML/AI features split between `ml/` (models, embeddings) and `ai/` (LLM-facing prompts, summarization, chat).
 
 ---
@@ -247,7 +251,7 @@ Daemon threads: Flask server
 - `core/storage.py` → uses thread-local SQLite connections via `_conn()` context manager
 - Tray refresh (`_refresh_tray()`) is safe to call from any thread (wrapped in try/except)
 
-Never call `_state` without the lock. Never do slow I/O (model loading, DB writes, HTTP) while holding the lock — snapshot the values you need first, release the lock, then do the work.
+Never call `_state` without the lock. Never do slow I/O (model loading, DB writes, HTTP) while holding the lock: snapshot the values you need first, release the lock, then do the work.
 
 ---
 
@@ -272,6 +276,7 @@ _state = {
     "model_ready": bool,
     "model_info": str,
     "diarizer_ready": bool,
+    "ml_sleeping": bool,           # idle sweep unloaded the models (not a load error)
     "speaker_labels": dict,        # speaker_key → display name
     "custom_prompt": str,
 }
@@ -289,7 +294,7 @@ const state = {
 }
 ```
 
-`isViewingPast` is critical — when `true`, live transcript appends are suppressed so loading a past session doesn't get polluted by ongoing transcription.
+`isViewingPast` is critical: when `true`, live transcript appends are suppressed so loading a past session doesn't get polluted by ongoing transcription.
 
 ### User preferences (`_prefs` in app.js, `data/settings.json` on server)
 
@@ -353,11 +358,11 @@ es.addEventListener("event_name", e => {
 
 All API routes follow these conventions:
 
-- `GET` routes return `jsonify(data)` — never raise, return error dict with 4xx status
-- `POST`/`PATCH` routes accept `request.get_json(silent=True) or {}` — never crash on missing body
+- `GET` routes return `jsonify(data)`: never raise, return error dict with 4xx status
+- `POST`/`PATCH` routes accept `request.get_json(silent=True) or {}`: never crash on missing body
 - Error responses: `return jsonify({"error": "message"}), 4xx`
 - Success responses: `return jsonify({"ok": True, ...})`
-- Slow operations (model loading, AI calls) always dispatched to a `daemon=True` thread — routes return immediately
+- Slow operations (model loading, AI calls) always dispatched to a `daemon=True` thread; routes return immediately
 - Routes that must not run during recording check `_state["is_recording"]` under lock first
 
 ### Existing route groups
@@ -399,7 +404,7 @@ All API routes follow these conventions:
 | `/api/recording/request_start`, `/api/recording/ack_command` | Start coordinator (`core/recording_request.py`) |
 | `/api/icons/*`, `/manifest.webmanifest` | Icon sets (`core/icons_api.py`) |
 | `/api/obsidian/*` | Optional Obsidian export |
-| `/api/agent/v1/*` | Agent API blueprint (`agent_api/rest.py`) — REST interface for external AI agents; self-documenting via `/docs` + `/openapi.json` |
+| `/api/agent/v1/*` | Agent API blueprint (`agent_api/rest.py`): REST interface for external AI agents; self-documenting via `/docs` + `/openapi.json` |
 
 ---
 
@@ -408,7 +413,7 @@ All API routes follow these conventions:
 ### New user preference
 
 1. Add the key + default to `DEFAULTS` in `core/settings.py`
-2. Save it from JS: `savePref('my_pref', value)` — this debounces and PUTs to `/api/preferences`
+2. Save it from JS: `savePref('my_pref', value)`; this debounces and PUTs to `/api/preferences`
 3. Read it from JS: `_prefs.my_pref` (available after `loadPreferences()` resolves)
 4. If it needs to be restored on startup, read it in `loadPreferences().then(...)` in the init block
 
@@ -432,7 +437,7 @@ def my_feature():
 
 ### New storage (persistent data)
 
-Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits on exit and handles rollback on error. SQLite is thread-safe here because each thread gets its own connection via `threading.local()`.
+Add to `core/storage.py`. Use the `_conn()` context manager: it auto-commits on exit and handles rollback on error. SQLite is thread-safe here because each thread gets its own connection via `threading.local()`.
 
 ### New model configuration option
 
@@ -442,26 +447,26 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 ### New Agent API endpoint + MCP tool
 
-1. Add the route to `agent_api/rest.py`. Storage/paths/settings are imported directly; anything app-owned (live `_state`, shared search helpers) goes through `AgentContext` — extend the dataclass in `agent_api/context.py` and the `register_agent_api(...)` call near the bottom of app.py if you need a new capability.
+1. Add the route to `agent_api/rest.py`. Storage/paths/settings are imported directly; anything app-owned (live `_state`, shared search helpers) goes through `AgentContext`, extend the dataclass in `agent_api/context.py` and the `register_agent_api(...)` call near the bottom of app.py if you need a new capability.
 2. Register the path in `agent_api/openapi.py` (`build_spec`).
-3. Mirror it as a tool in `mcp_server.py`: add a `_tool(...)` entry to `TOOLS` and a dispatch branch in `call_tool()`. Keep `mcp_server.py` stdlib-only — it must never import project modules (it runs under whatever Python the MCP client spawns).
+3. Mirror it as a tool in `mcp_server.py`: add a `_tool(...)` entry to `TOOLS` and a dispatch branch in `call_tool()`. Keep `mcp_server.py` stdlib-only: it must never import project modules (it runs under whatever Python the MCP client spawns).
 4. Document it in `docs/AGENT_API.md` (served at `/api/agent/v1/docs`).
 5. Conventions: JSON errors as `{"error": ...}` with 4xx status; timestamps through `helpers.parse_timestamp` (accepts seconds or `M:SS`); meeting-scoped listings accept the shared folder/date/speaker filters via `_filters_input` + `ctx.scope_filters`; nothing in the Agent API may delete user data (the one irreversible operation, a voice-profile merge, requires `confirm: true` and refuses the Me profile).
 6. A write that the UI also performs goes through the UI's function, injected via `AgentContext`, never a re-implementation: speaker labels through `_patch_session_speakers`, cleanup decisions through `_apply_speaker_corrections`, line reattribution through `_relabel_segment`, profile renames through `_rename_profile`. If the UI path grows a side effect, the agent path gets it for free.
 
 ### Log capture (core/log.py)
 
-`log.info/warn/error` still print to the console, but every line is also kept in an in-memory ring buffer (4000 entries) and appended to `<data>/logs/app.log` (5 MB rotation, 3 files kept). `GET /api/agent/v1/system/logs` reads the ring; use `log.recent()` / `log.log_files()` / `log.read_log_file()` from code. File-write failures are swallowed — logging must never crash the app.
+`log.info/warn/error` still print to the console, but every line is also kept in an in-memory ring buffer (4000 entries) and appended to `<data>/logs/app.log` (5 MB rotation, 3 files kept). `GET /api/agent/v1/system/logs` reads the ring; use `log.recent()` / `log.log_files()` / `log.read_log_file()` from code. File-write failures are swallowed, logging must never crash the app.
 
 ---
 
 ## Key Behaviors to Preserve
 
-**Pause-based Whisper flushing:** The transcriber uses RMS energy to detect pauses. Flush occurs when: `(buffer ≥ 0.5s AND silence ≥ 0.4s) OR buffer ≥ 8s`. The 8s hard cap is intentionally short to prevent large audio chunks from causing Whisper inference spikes that compete with system audio playback. Do not raise `MAX_BUFFER_SECONDS` significantly — 30s chunks were the original value and caused audio buffering issues under load. `beam_size=2` is also intentional for speed; do not raise it to 5.
+**Pause-based Whisper flushing:** The transcriber uses RMS energy to detect pauses. Flush occurs when: `(buffer ≥ 0.5s AND silence ≥ 0.4s) OR buffer ≥ 8s`. The 8s hard cap is intentionally short to prevent large audio chunks from causing Whisper inference spikes that compete with system audio playback. Do not raise `MAX_BUFFER_SECONDS` significantly: 30s chunks were the original value and caused audio buffering issues under load. `beam_size=2` is also intentional for speed; do not raise it to 5.
 
 **Incremental summary patching:** After the first summary, `ai.patch_summary()` sends only the `new_transcript` (segments since last summary) and asks Claude to return a JSON patch of only changed sections. This avoids rewriting the whole summary and keeps it stable. The `summarized_seg_count` tracks the split point.
 
-**Auto-chapters cadence (full replace):** Chapters are regenerated wholesale via `storage.replace_chapters()`, not patched. During a live recording `_run_chapters(is_auto=True)` fires only when BOTH `pending_chapter_segments >= AUTO_CHAPTERS_EVERY` (12) AND `AUTO_CHAPTERS_MIN_GAP_SEC` (90s) have elapsed — this dual gate is what keeps chapters from being added too often. Auto-runs pass the existing chapters to the model to keep early ones stable and never wipe to an empty list; the manual `/api/chapters/generate` regenerate is authoritative and may clear. AI timestamps are snapped to the nearest transcript segment start (`_prepare_chapters`), and chapters feed the summary + chat via `meta["chapters"]` rendered in `_format_meta_block`. Serialized by `_chapters_lock`.
+**Auto-chapters cadence (full replace):** Chapters are regenerated wholesale via `storage.replace_chapters()`, not patched. During a live recording `_run_chapters(is_auto=True)` fires only when BOTH `pending_chapter_segments >= AUTO_CHAPTERS_EVERY` (12) AND `AUTO_CHAPTERS_MIN_GAP_SEC` (90s) have elapsed; this dual gate is what keeps chapters from being added too often. Auto-runs pass the existing chapters to the model to keep early ones stable and never wipe to an empty list; the manual `/api/chapters/generate` regenerate is authoritative and may clear. AI timestamps are snapped to the nearest transcript segment start (`_prepare_chapters`), and chapters feed the summary + chat via `meta["chapters"]` rendered in `_format_meta_block`. Serialized by `_chapters_lock`.
 
 **Speaker label merging:** When a user renames two speakers to the same display name, `_state["speaker_labels"]` is checked for collision and `diarizer.merge_speakers(keep, merge)` is called to combine their embedding pools. This should always happen atomically under `_state_lock`.
 
@@ -469,7 +474,7 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **Chapters get one authoritative pass after the stop:** a live auto-run is handed the chapters already placed and told to keep them (`is_auto=True`), by design, so nothing renames a chapter under the user mid-meeting; the cost is that the opening chapters were chosen from a fraction of the transcript. `_final_chapters_pass()` runs the manual path once the recording stops, so the list describes the meeting rather than its first few minutes. Opt-in through `chapters_regen_after_meeting` (default on), read when it runs so a toggle during a meeting still decides that meeting's ending. It is **last** in the stop tail: the only thing there that waits on a model with no deadline, and the tail already sits behind the gate that lets a new recording start. Both it and `/api/chapters/generate` build their input through `_chapters_args_from_storage()`, or the button and the automatic run drift apart.
 
-**Recording cleanup is always async:** `stop_recording()` returns immediately and dispatches `_cleanup()` to a daemon thread. This thread stops streams, finalizes WAV, ends the DB session, and runs auto-title. Never move this back to the request handler — the operations can take up to 12s (thread join timeout).
+**Recording cleanup is always async:** `stop_recording()` returns immediately and dispatches `_cleanup()` to a daemon thread. This thread stops streams, finalizes WAV, ends the DB session, and runs auto-title. Never move this back to the request handler: the operations can take up to 12s (thread join timeout).
 
 **Stop drains the transcription backlog, it does not discard it:** the feed is a producer/consumer queue and the consumer can be slower than real time (large-v3 with the streaming diarizer on CPU measured at 0.56x on an RTX 2070 SUPER). `stop()` clearing `is_running` made the loop exit and take everything still queued with it, which on a 74-minute meeting deleted the last 32 minutes while the log reported a healthy segment count. `_cleanup()` now calls `begin_drain()` once `capture.stop()` has halted the producers, so the queue is finite and runs dry; both loops continue `while self.is_running or self._draining` and break on the `queue.Empty` branch only when draining. Three things are load-bearing. `begin_drain()` **must not block**: the backlog can outlast the meeting (32 minutes at 0.56x is another 57), and the Stop button, `end_session()` and `_recording_cleanup_done` all sit in front of it; `await_drain()` is called at the top of the deferred tail instead, which is what makes the title, the vault export and `_final_chapters_pass` describe the whole meeting (the title is rebuilt from storage when the drain added segments, since its snapshot was taken at Stop). `stop()` stays immediate and lossy, because `_force_quit` and the takeover path cannot hang. And a new recording wins: `start_recording()` calls `cancel_drain()` **before** it empties the queue, or the warning that says what the tail cost reads zero. The feed is bounded now (`make_audio_queue()`, `MAX_QUEUE_SECONDS`) and `TranscriptionQueue` counts what the capture could not hand over; the WAV is written before the queue is fed, so a drop costs the live transcript, never the recording. `_backlog_push_loop()` pushes `transcription_backlog` while it is falling behind. Covered by `tests/test_transcriber_drain.py`.
 
@@ -477,15 +482,27 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **A reanalysis counts as busy:** `/api/instance-handshake` read `is_recording` alone, so launching the app again during a reanalysis made the busy instance answer "idle", accept `/api/shutdown` and hard exit through `os._exit(0)`, mid-rebuild, with the transcript already deleted. It happened twice on the same meeting. `_busy_reason()` is the single decision (`"recording"` | `"reanalyzing"` | `""`) and both the handshake and `shutdown` read it. The reply still carries `recording` as true-for-recording-only, because an instance built before this change reads that key and would otherwise print the wrong reason; `busy`/`reason` are what a current build reads. `/api/shutdown` answers 409 during a reanalysis unless the caller passes `force`, which the UI does after confirming. Covered by `tests/test_instance_handshake_busy.py`.
 
-**A stream is never closed under a reader, and a stopped capture releases PortAudio:** closing a PortAudio stream while another thread is inside `read()` on it frees the stream under that read, and the process dies with an access violation (0xC0000005). A WASAPI loopback read waits for as long as its output is silent, which is how this first showed up (as the process exiting when a loopback stream was closed) and why every stopped capture used to be parked in `_stream_graveyard` for the life of the process. The parking froze the device list: PortAudio enumerates devices only on the `Pa_Initialize()` that takes its reference count from zero, and every later `PyAudio()` just adds a reference. A device removed after the first recording (a headset unplugged, Bluetooth off, an undock) then failed to open with `[Errno -9992] Insufficient memory`, which is how PortAudio's WASAPI host reports a failed `IMMDevice::Activate`, until the app restarted (2026-09-24). Three things hold the fix up, and each will bring the crash or the frozen list back if reverted. The capture loops (`_capture_loop`, auto-detect's `_lb_reader`) poll `get_read_available()` and never ask `read()` for more than is buffered, so a reader leaves within a poll of being told to. `_retire_stream()` closes a stream only once its reader thread is confirmed gone, and otherwise parks it together with the PyAudio that owns it, because `terminate()` closes every stream its instance opened. And `stop()`, a failed `start()` (`_undo_open()`) and a device switch terminate their PyAudio (`_terminate_quietly()` skips a parked owner), so between recordings nothing holds PortAudio and the next start enumerates the devices as they are then. During a recording the main PyAudio keeps PortAudio initialised, so `restart_loopback()` can only switch to an endpoint that existed when the recording started. Covered by `tests/test_capture_stream_lifecycle.py`.
+**A stream is never closed under a reader, and a stopped capture releases PortAudio:** closing a PortAudio stream while another thread is inside `read()` on it frees the stream under that read, and the process dies with an access violation (0xC0000005). A WASAPI loopback read waits for as long as its output is silent, which is how this first showed up (as the process exiting when a loopback stream was closed) and why every stopped capture used to be parked in `_stream_graveyard` for the life of the process. The parking froze the device list: PortAudio enumerates devices only on the `Pa_Initialize()` that takes its reference count from zero, and every later `PyAudio()` just adds a reference. A device removed after the first recording (a headset unplugged, Bluetooth off, an undock) then failed to open with `[Errno -9992] Insufficient memory`, which is how PortAudio's WASAPI host reports a failed `IMMDevice::Activate`, until the app restarted (2026-09-24). Three things hold the fix up, and each will bring the crash or the frozen list back if reverted. The capture loops (`_capture_loop`, auto-detect's `_lb_reader`) poll `get_read_available()` and never ask `read()` for more than is buffered, so a reader leaves within a poll of being told to. `_retire_stream()` closes a stream only once its reader thread is confirmed gone, and otherwise parks it together with the PyAudio that owns it, because `terminate()` closes every stream its instance opened. And `stop()`, a failed `start()` (`_undo_open()`) and a device switch terminate their PyAudio (`_terminate_quietly()` skips a parked owner), so between recordings nothing holds PortAudio and the next start enumerates the devices as they are then. During a recording the main PyAudio keeps PortAudio initialised, which is why the desktop (loopback) stream runs in a helper process (see below). Covered by `tests/test_capture_stream_lifecycle.py`.
 
 **Notifications are the app's own windows (Windows):** `ui_desktop/toast/` draws every desktop notification. Windows' toasts were dropped silently under Focus Assist, which is on during most calls, and whether one appeared at all depended on an AppUserModelID registration, so `windows-toasts` and `winotify` are gone; do not bring either back as a fallback, since a notification that sometimes does not appear is the bug this replaced. The pieces: `paint.py` renders the card as an RGBA image with Pillow (Segoe UI and the bundled Font Awesome woff2, anti-aliased corners from a 4x mask, the shadow blurred in), `win32.py` shows it with `UpdateLayeredWindow` on a daemon thread that runs its own message loop and sets per-monitor DPI awareness for itself, `manager.py` stacks, times, hovers, clicks and animates through a `Host` protocol, and `sounds.py` synthesises the cues with numpy and plays them through `PlaySound`. Things that must stay: the window styles `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` and `MA_NOACTIVATE`, so a click never takes focus from the meeting; every caller callback runs off the UI thread (`_run_callback`), because handlers POST to the server and the UI thread must never wait; colours come from `style.css`'s `:root[...]` theme blocks through `theme.py` (the custom accent is `_deriveCustomPalette` ported), so there is no second palette to keep in step; `ImageDraw` writes alpha literally, so any translucent fill is composited with `theme.over()` before it is drawn (the first build's solid white line along the top edge was this); and every notification `notifications.py` sends carries a tag, which is how the app replaces or withdraws it (`recording_started`, `recording_stopped`, `meeting_ended`, `capture_recovered`). The watchdog uses the same widget from its own process and, in `--once` mode, waits for the toast before exiting. Covered by `tests/test_desktop_toast.py`, which drives the manager through a fake host and checks the picture, the palette and the cues.
 
+**Idle model unload (opt-in):** `_idle_unload_loop()` drops Whisper, the diarizer and the fingerprint embedder after `ml_idle_unload_minutes` with nothing recording, testing, reanalyzing or summarizing, because under WDDM their VRAM is charged to process commit (8.6 GB idle before this, 2026-09-05). The default is 0, which keeps them loaded: a start waits for the reload and the capture opens only once the models are back, so those seconds of the meeting are not recorded. That is the price of opting in, and the reason it is not on for everyone. Sleeping is not "not ready": `_recording_prereqs_locked()` keeps `recording_ready` true, `start_recording()` calls `_wake_ml_and_wait()` and blocks until the reload lands (at most `_ML_WAKE_TIMEOUT_SEC`, 40 s, under the start coordinator's 45 s grace and the browser's 60 s patience), and the meeting-detect loop wakes the models on the first positive poll of a meeting, never on every poll. A wake that fails leaves the models asleep with the error in the status, so the next press of Record tries again; latching the error disabled Record until a restart. The sweep re-checks the idle clock under `_state_lock` before it flips the flags, which is what closes the race with a press landing at the idle boundary. A wake reloads the Whisper preset saved now (`settings.get("whisper_preset")` in `_load_model()`), not the one the app started with. `Transcriber.load_model()` never deletes the model cache for an out-of-memory or CUDA/Metal error (`_is_resource_error()`): the files are fine, the app runs offline, and the deletion turned one failed wake into a missing model. `SpeakerFingerprintDB` stays `ready` while asleep and reloads its model on demand, so nothing that gates on `fingerprint_db.ready` may be changed to gate on the model being loaded. `OPENBLAS_NUM_THREADS` is capped at the top of app.py before numpy imports; keep it ahead of every numpy or scipy import.
+
 **CUDA DLL registration:** `ml/transcriber.py` registers nvidia pip-package DLL directories at import time (before ctranslate2 loads). This must happen before any CUDA library is imported. Do not move this code.
+
+**cuBLAS is loaded before Whisper's first GPU call:** registering the folders is not enough for CTranslate2. It loads `cublas64_12.dll` itself on its first GPU call, with a search that skips those folders, and once that load fails every later Whisper call on the GPU in the process hangs, even on a new model. On 2026-10-07 that stopped live transcription with no error while the mic recorded and metered normally. `FasterWhisperEngine` calls `core.gpu_probe.load_cublas()` before it builds a GPU model, and raises if cuBLAS cannot be loaded (a library already in the process is found by name, and ctypes searches the registered folders). The in-process GPU check used to load it as a side effect; with the check in a child process nothing else does, so keep this call. If the warm-up in `Transcriber.load_model()` fails on the GPU anyway, Whisper moves to the CPU (`_switch_to_cpu()`) and stays there until the app restarts (`_GPU_FAILED`), rather than swallowing the error and hanging on the first real call. `_switch_to_cpu()` tries `small`, then the size that was on the GPU, because the launcher downloads only large-v3 and the runtime is offline. Tests: `tests/test_whisper_gpu_start.py`; its last test loads Whisper on the real GPU in a fresh process, the way the app starts.
 
 **macOS loopback watchdog:** `_sck_watchdog_loop()` supervises the ScreenCaptureKit stream and restarts it through `_restart_sck_loopback()` if it dies mid-recording. SCK delivers sample buffers continuously even during silence, so a gap longer than `_SCK_WATCHDOG_TIMEOUT` (5 s) means a dead stream (TCC permission revoked, display reconfigured), not a quiet room. Do not "optimize" that check away by treating silence as normal. Restart backoff is `_SCK_RESTART_BACKOFF` = (0.5, 1.0, 2.0) seconds; if all three attempts fail, `loopback_error` is set and the recording continues mic-only rather than dying.
 
-**Desktop device choice (Windows):** `_resolve_loopback()` uses the device the user selected: the saved index when it still carries the saved name, otherwise the live device with that name, and the default output only when the saved device is gone. Following the default output, at start and mid-recording through `render_probe.py`, is behind `loopback_follow_output` (default off). Windows keeps two output roles and PortAudio reports only one, so "the default output" is routinely not the device the user hears; following it captured an idle endpoint for a whole call (2026-09-05). The word-level name tier ignores the `[Loopback]` suffix, which every loopback device carries.
+**Desktop capture runs in a helper process (Windows):** the loopback stream is captured by `capture_audio/loopback_child.py`, wrapped in `_LoopbackChild`, not by the app's own PortAudio. While any in-process PyAudio is alive a new one only adds a reference, so an in-process switch sees the device list from when the recording started: on 2026-10-06 the render probe heard a Teams call on `Headphones (Realtek(R) Audio)`, the switch found no such device, and the whole call was recorded mic-only. `_open_start_loopback()` and every `restart_loopback()` take a helper, resolve the device against its fresh scan (`_DeviceSnapshot`, the same query methods as PyAudio, so `_resolve_loopback()` is unchanged) and open it there. The helper's `get_read_available()` reports the frames waiting in its pipe (`PeekNamedPipe`), so the polling capture loops work unchanged and never block. Retiring a helper stream is killing the helper (`_retire_stream()` and `_park()` never park one); the watchdog reopens a helper that died (see Desktop device choice for where it reopens). No helper may outlive its capture: a start that fails to resolve a device closes the helper it took, and a switch whose helper finishes starting after `stop()` closes it instead of publishing it. The pipe holds one pending write at a time, so the helper sends a backlog as one write; with chunk-sized writes an 8-channel 96 kHz output drained at barely over real time and a one second stall in the app left it behind the mic for many seconds. A new Python process takes 3 to 5 s on Pat's machine, so one idle spare is kept (`prewarm_loopback_helper()` in `main()`, refilled after every take) and rescans on `{"scan": true}` by terminating and re-initialising its own PortAudio, about 20 ms. The device menu (`enumerate_audio_devices()`) and Auto-detect scan in helpers too; Auto-detect starts one helper per output side by side, not one after another. In-process capture on `self._pa` is only the fallback when a helper cannot start. Tests: `tests/test_loopback_helper.py` (the catch-up test runs the real helper against `tests/fake_portaudio/`). Do not move loopback capture back in-process.
+
+**Loopback ring buffer (Windows):** every loopback `open()` (the helper process at start and on the mid-recording switch in `restart_loopback()`, and the in-process fallback) passes `frames_per_buffer=_compute_loopback_buffer_size(info)`, at least 2048 frames, never `CHUNK_SIZE`. The reader polls availability before `stream.read(512)` so it can exit safely; historically, PortAudio's blocking WASAPI read could wait about 47 ms between returns, and with a 512-frame ring buffer the overflow is dropped silently (no exception even with `exception_on_overflow=True`). That lost about 3 percent of the far end on the Creative BT-W6 and the Realtek speakers, and the wall-clock mixer padded every missing chunk with 10.7 ms of digital silence: popping and crackling whenever the other side talked (2026-09-21, `tests/test_loopback_ring_buffer.py`). The read chunk stays `CHUNK_SIZE`; only the ring buffer is larger, exactly as `_compute_mic_buffer_size()` already does for a WASAPI mic.
+
+**Device selection changes are opt-in:** the owner's rule for every change to how the app picks or moves a capture device (desktop or mic): the device the user selected is the device recorded, and a change to that behavior ships behind a setting that is off by default. Use an existing opt-in setting when the change fits what it already means; anything that follows audio to another output belongs behind `loopback_follow_output` ("Follow call audio to its output device"), as the communications-device hold and return in `follow_decision()` do. Otherwise add a new setting, default off. The one behavior that needs no setting is the baseline below, the same for the desktop output and the mic: when the selected device is unavailable the Windows default device stands in (the default output, the default recording device), and the capture goes back to the selected device as soon as it returns. A pull request that changes device selection without an opt-in should be sent back. This applies to every contributor and every agent.
+
+**Desktop device choice (Windows):** `_resolve_loopback()` uses the device the user selected: the saved index when it still carries the saved name, otherwise the live device with that name, and the default output only when the saved device is gone. It also records the selection in `_selected_loopback_name`: the name the device carries now, or the saved name when it is missing or was only matched by the loose name tiers (a missing "Headphones (Realtek(R) Audio)" matches "Speakers (Realtek(R) Audio)" on the word "Audio)"). The stand-in is temporary in both directions: when the device being recorded disappears mid-recording its helper exits, and the watchdog reopens the same device if it still exists or else moves to the current default output; and while the capture is on anything but the selected device, the watchdog rescans through the spare helper (`_return_to_selected_device()`, every 10 s easing off to 30 s) and switches back the moment it is there (2026-10-07; before, the stand-in was kept for the rest of the recording). Following the default output, at start and mid-recording through `render_probe.py`, is behind `loopback_follow_output` (default off), and with it on `_selected_loopback_name` is None, so following decides alone. Windows keeps two output roles and PortAudio reports only one, so "the default output" is routinely not the device the user hears; following it captured an idle endpoint for a whole call (2026-09-05). The word-level name tier ignores the `[Loopback]` suffix, which every loopback device carries. Tests: `tests/test_loopback_helper.py`.
+
+**Microphone choice (Windows):** the mic menu offers DirectShow devices only (`ffmpeg:<name>`), captured by an ffmpeg subprocess. `_open_devices()` records the saved name in `_selected_mic_name`; when it does not resolve at start, the default recording device stands in (in-process WASAPI, as before). The watchdog applies the baseline rule from then on (`_check_selected_mic()`): whenever the selected mic is not the live source it lists the DirectShow devices (every 10 s easing to 30 s) and switches back the moment the mic is there; when the selected mic is lost mid-recording (its ffmpeg exits, or no data for `MIC_DEAD_AFTER_SEC`, 5 s, since a live mic sends samples continuously, silence included) the default recording device stands in within seconds, found by name through the spare helper's fresh scan and opened through ffmpeg too (this process's PortAudio list is frozen at the start). Before 2026-10-07 a start-time stand-in was kept for the whole recording and a mic lost mid-recording stayed silent. `_switch_mic_to_dshow()` starts the new ffmpeg with its reader draining and dropping output (`live` in `_ffmpeg_capture_loop()`), so no backlog lands late; only once that ffmpeg is still running after `MIC_OPEN_CHECK_SEC` does it retire the old source, let the mixer take the old source's last chunks in their own format, set the new format (`_set_mic_format()`) and go live. A WASAPI mic reader leaves when `_mic_stream` stops being its stream, like the loopback reader, and `stop()` takes `_mic_switch_lock` so a switch under way cannot publish an ffmpeg after the capture stopped. Tests: `tests/test_mic_return.py` (a fake ffmpeg streams silence).
 
 **Agent speaker labels are the UI's labels, with training opt-in:** `POST /api/agent/v1/meetings/<id>/speakers/label` calls `_patch_session_speakers(..., global_id=, train_profile=)`, so an agent's label carries the live merge detection, the SSE pushes, the summary refresh and the profile link exactly as a rename typed into the Speakers dialog does. Two differences are deliberate: the agent passes the exact `global_id` it resolved (so a duplicate-named profile is never picked up by name), and `train_profile` is False unless the request says `reinforce: true`, because a wrong label that trains a centroid is how "magnet" profiles form. The evidence pack behind the decision lives in `agent_api/speakers.py` and reports the library's own thresholds (`AUTO_APPLY_THRESHOLD`, `MARGIN_FLOOR`, `MARGIN_GAP`, `SUGGEST_THRESHOLD`) as verdicts, so the agent is told what the app itself would have done live. The owner's microphone key (`me`) and the Me profile are refused on every speaker write (label, same_as target, segment key, profile rename, merge), matching `ai/speaker_relabel.py`. Noise and reset go through `apply_cluster_corrections`, the Speakers dialog's Apply.
 
@@ -495,7 +512,13 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 
 **Home's charts are two, with remembered knobs:** Activity (measure, span, grouping) and Storage (view, span, top-N, details) keep their choices in localStorage (`home-activity-v1`, `home-storage-v1`; the tool's format choices in `home-storage-tool-v1`), validated against the allowed values on load so a stale entry can never wedge a card. Both derive everything from slices (Activity from `sessions`, Storage from `storage`); turning a knob never fetches. The `storage` slice is view-only: it is invalidated by `refreshSidebar()` (a list change is usually a media change), `recording_stop`, the reconnect reconciliation and `storage_job` finishing, and reloads when Home is on screen.
 
-**Loopback silence watchdog:** `_loopback_silence_watchdog()` raises `capture_alert` when the desktop capture never produces signal or drops out. It only ever switches devices when following is on and the probe shows a different endpoint actually playing; silence alone never moves the capture.
+**Record now, transcribe after (`transcribe_after_meeting`):** when the setting is on, `start_recording()` skips the model wake and `_transcriber.start()`, marks `_state["transcribe_after"]`, and runs `_drain_audio_queue()` for the session (the mixer keeps feeding the bounded `_audio_queue`; nothing else consumes it). `_recording_prereqs_locked()` reports ready regardless of model state. The session joins `_post_meeting` (`_PostMeetingTranscription`) when the recording starts, held (`hold()`), and the stop releases it in its tail's `finally`, after `finalize_per_source_tracks()` (`release()`); held sessions are persisted but never picked, and the held set is in memory only, so after a quit, restart, update or crash the next run transcribes what was recorded (queued only at the end of the stop, such a session was lost). The worker runs `_run_reanalysis(..., cancel_event, post_meeting=True)` only while nothing records, capped by the calendar's `expected_speaker_count`, then title, `_run_summary(force_full=True, export_after=True)`, `_run_chapters`, and `update_session_embedding` from the database rows. A recording that starts mid-pass calls `cancel_for_recording()`; `BatchTranscriber` raises `ReanalysisCancelled` at its next progress checkpoint or emitted segment (`tests/test_batch_cancel.py`), and the session goes back to the front of the queue, which is persisted in `post_meeting_pending` and restored at startup. A cancelled pass on a record-only meeting clears what it wrote (the rollback never restores an empty snapshot, so it would otherwise leave half a transcript that looks finished), and a pass that finished just as the cancel came in is kept rather than run again. `_recording_prereqs_locked()` lets Record through a reanalysis only when the session being rebuilt is the post-meeting pass's own: a manual reanalysis has no cancel. Every delete path (`/api/sessions/<id>`, bulk delete, a folder deleted with its meetings) calls `forget()` first, which drops the session and, when its pass is running, cancels it and waits for it to end, so nothing is written for the deleted id; a successful manual reanalysis calls `discard()`, so the queue does not redo it later over the user's speaker names. Both mark the session settled, and a settled session is never queued again in that run unless a resumed record-only recording holds it anew. Tests: `tests/test_post_meeting_queue.py` (runs the real class against stand-ins). `_audio_growth_loop()` raises `capture_alert` kind `stalled` when the session WAV, having grown, then stops growing for 45 s, and clears it when it grows again.
+
+**Short-reply folding is opt-in:** `absorb_short_replies()` (`reanalysis_absorb_short_replies`, `Fold Short Replies Into Speakers`, default off) folds "mm-hmm" speakers into the closest real one during reanalysis. It never folds a voice whose centroid is less similar than `SHORT_REPLY_MIN_SIMILARITY` to every real speaker (that is somebody else who spoke briefly), never below the user's Min Speakers, and is skipped for a forced exact count. On by default it credited a real participant's one remark to someone else.
+
+**Batch GPU work runs in a child process:** the app process touches CUDA only for what it runs itself, live Whisper and the live diarizer when the settings put them on the GPU. Nothing else may: device questions go through `core.gpu_probe` (a child that exits; if that child fails or times out the check runs in-process instead, because a cached "cpu" would put live Whisper on the processor for the whole session), the search-embeddings model is pinned to `device="cpu"` (with no device, sentence-transformers picks CUDA and kept the app listed in nvidia-smi all day), and `empty_cache` checks `torch.cuda.is_initialized()`, never `is_available()`. Every reanalysis and post-meeting pass runs through `ml.batch_worker.run_in_child()`: cancelling kills the child and everything it started (`_kill_tree()`, `taskkill /T` on Windows, so the ffmpeg decoding a per-source track goes too), so no segment lands after the cancel and the card is released at once (`empty_cache()` never released it; only the process exiting does). A cancel that arrives after the child reported done does not undo the pass. `os._exit` ends the app's threads but not that child, so every exit path (`_force_quit`, `/api/restart`, the updater) calls `_end_batch_workers()` before it rolls the reanalysis back. The child calls `prepare_pipeline_env()` first, because pyannote only imports after `ml.diarizer`'s torchaudio shims (a fresh child died on `torchaudio.AudioMetaData` without them). A job planned entirely on the CPU runs with `CUDA_VISIBLE_DEVICES=-1`: importing pyannote and transformers otherwise wakes the card for about 10 s, and the exit wakes it again. Devices come from `_plan_reanalysis_devices()`: the Reanalysis "Device" setting picks Whisper's device and `reanalysis_diarization_device` ("Speaker Detection Device") picks diarization's ("auto" follows Whisper). On battery an automatic post-meeting pass that would use CUDA stays queued (`post_meeting_pending`, so a restart keeps it) while `ChargerGate` re-reads power at most once a minute. A reanalysis the user starts ignores the power source and runs on the device the settings pick: moving it to the CPU on battery overrode an explicit GPU choice, and with Record locked out during a reanalysis an hour-long meeting kept the user from recording for most of an hour. To verify without unplugging, write `battery` or `ac` to `<data>/force_power` (a running app picks it up) or set `MA_FORCE_POWER`; every forced answer is logged. Read the card's real power state with `DEVPKEY_Device_PowerData` (bytes 4 to 7, 4 = D3); `nvidia-smi` wakes the card, so it cannot judge power (`tests/test_battery_gpu.py`, 2026-10-01).
+
+**Loopback silence watchdog:** `_loopback_silence_watchdog()` raises `capture_alert` when the desktop capture never produces signal or drops out. It only ever switches devices when following is on and the probe shows a different endpoint actually playing; silence alone never moves the capture. The Communications-role device is sticky only while it is plausibly mid-call: it produced signal before and went quiet less than `STICKY_COMMS_HOLD_SEC` (90 s) ago. A comms device that never produced signal, or has been silent past the hold while another output is playing, is left for that output (`follow_decision()`, pure, tested in `tests/test_follow_decision.py`); after leaving it the watchdog re-probes every 45 s and returns once two consecutive probes hear the comms device playing. 2026-09-15: an unconditional hold kept the capture on the silent Shure (Windows' comms default) for three whole calls while Teams played on the Realtek jack. The alert path is the SSE banner, a toast, a taskbar flash of the app window (`notifications.flash_app_window()`, immune to toasts being off or Do not disturb), and, when no app window exists, opening one once per recording. The flash finds the app's windows with `core.window_focus.app_windows()`, never by caption alone: the app's own notification windows are captioned "Meeting Assistant notification", and counting one of them as the app window meant the app was never opened. Opening a window is Windows only, where "no app window" can be known. The banner and the notification are shared between alarms, so `_capture_alert_kind` keeps a clear for one fault from taking down a warning about another: the "stalled" warning (the recording file stopped growing) ends only when the file grows again (`_alert_capture_stall_cleared()`) or the recording stops, never on desktop audio in the meters.
 
 **The watchdog measures a window's peak, never a spot reading:** it polls every two seconds, and reading `loopback_level` (the latest chunk's RMS) at that cadence samples the gaps between words, so it called a live two-way call silent and fired the alarm through ordinary conversation (2026-09-08). `take_peaks()` returns and resets the loudest RMS since the last call, which partitions the timeline into windows with nothing falling through the gap. The thresholds go with it: `SILENT_FLOOR` (0.0008) is far below the speech level the meters use, because a dead loopback delivers digital silence while a live but quiet call does not, and the "dropped" alarm now needs 90 s of that silence *plus* 45 s of mic activity inside it, so an idle desk or a recording left running is not mistaken for a one-sided call. Measured numbers are in the constants' comment and replayed in `tests/test_capture_silence_alarm.py`; do not raise the floor back toward the speech threshold.
 
@@ -514,6 +537,8 @@ Add to `core/storage.py`. Use the `_conn()` context manager — it auto-commits 
 **Preference writes are partial:** `savePref()` sends only the changed keys (see User preferences). Do not reintroduce a whole-object `PUT`.
 
 **WAV append walks the RIFF chunks:** `WavWriter(append=True)` locates the data chunk instead of patching offset 40, and the resume path decodes Opus parts with `-fflags +bitexact`. Pause/resume with per-source tracks corrupted both tracks without this.
+
+**In-app restarts are clean quits:** `_stop_heartbeat()` stops the heartbeat writer and removes `heartbeat.json` before `_relaunch_app()` in every exit path (`_force_quit`, `/api/restart`, the updater). The relaunch chain takes about 20 s to answer HTTP and the watchdog polls every 20 s; without the clear, a poll in that gap read a dead pid with the heartbeat present, logged a crash, toasted, and launched a second chain that then had to back out (2026-09-05). The watchdog also never runs `taskkill` on a pid that is already dead (Windows reuses pids; `/T` would kill an unrelated tree).
 
 **Console logging never raises:** `core/log.py` reconfigures stdout/stderr with `errors="replace"` and echoes through `_echo()`. Under `launch_hidden.vbs` stdout is a cp1252 file, and a `→` in a log line used to raise inside the screen recorder at record start. `launch.py` does the same for its own output.
 
@@ -595,7 +620,7 @@ The app supports Windows (CUDA) and macOS Apple Silicon (Metal/MPS). Platform br
 
 ### Device selection
 
-`core.compute_device.best_torch_device()` is the single source of truth for accelerator choice and returns `"cuda"`, `"mps"`, or `"cpu"`. Every component (transcriber, diarizer, batch transcriber, app settings layer) consults it. User-saved device strings from another machine are revalidated and auto-fall-back through this same probe — never trust a raw string from `settings.json`.
+`core.compute_device.best_torch_device()` is the single source of truth for accelerator choice and returns `"cuda"`, `"mps"`, or `"cpu"`. Every component (transcriber, diarizer, batch transcriber, app settings layer) consults it. User-saved device strings from another machine are revalidated and auto-fall-back through this same probe, never trust a raw string from `settings.json`. In the app process the answer comes from `core.gpu_probe`'s child process (started at startup, cached); processes started with `MA_GPU_PROBE_INPROCESS=1` (the batch worker) and macOS check in-process.
 
 ### Whisper backends
 
@@ -653,7 +678,7 @@ A published Outlook link has no login: anyone holding it reads every meeting. On
 
 ```
 storage/data/
-├── meetings.db       # SQLite — sessions, segments, summaries, chat, speaker labels
+├── meetings.db       # SQLite: sessions, segments, summaries, chat, speaker labels
 ├── settings.json     # User preferences (auto-created, human-readable JSON)
 ├── audio/
 │   └── <session_id>.wav    # Recorded audio per session
@@ -680,7 +705,7 @@ chat_messages (id INT PK, session_id TEXT, role TEXT, content TEXT, created_at T
 speaker_labels (session_id TEXT, speaker_key TEXT, name TEXT, PRIMARY KEY (session_id, speaker_key))
 ```
 
-**Live migrations** run at startup — missing columns are added automatically. When extending the schema, add a migration in `storage.init_db()` using the existing `_add_column_if_missing()` pattern.
+**Live migrations** run at startup: missing columns are added automatically. When extending the schema, add a migration in `storage.init_db()` using the existing `_add_column_if_missing()` pattern.
 
 ---
 
@@ -691,11 +716,11 @@ speaker_labels (session_id TEXT, speaker_key TEXT, name TEXT, PRIMARY KEY (sessi
 2. `highlightCode(container)` → highlight.js on code blocks
 3. `linkifyTimestamps(container)` → wraps `[M:SS]` in clickable links
 
-Always apply all three steps when rendering AI-generated content. Do not skip linkification — users rely on timestamp links to navigate audio playback.
+Always apply all three steps when rendering AI-generated content. Do not skip linkification: users rely on timestamp links to navigate audio playback.
 
 **Escaping:** Always use `escapeHtml()` before inserting user-provided strings into innerHTML. Speaker names, session titles, and chat questions all need escaping.
 
-**`isViewingPast` guard:** Before appending live data to the transcript, check `state.isViewingPast`. When `true`, the user is reviewing a historical session — suppress live appends to avoid corrupting the view.
+**`isViewingPast` guard:** Before appending live data to the transcript, check `state.isViewingPast`. When `true`, the user is reviewing a historical session; suppress live appends to avoid corrupting the view.
 
 **Preferences loading order:** `loadPreferences()` must resolve before calling `loadAudioDevices()` or `loadModelConfig()`, because those functions read `_prefs` to restore saved selections. This is enforced in the init block:
 
@@ -719,13 +744,13 @@ loadPreferences().then(() => {
 ## Environment & Configuration
 
 ### Required
-- `ANTHROPIC_API_KEY` — Claude API key. Validated at startup; app enters setup mode if missing.
+- `ANTHROPIC_API_KEY`: Claude API key. Validated at startup; app enters setup mode if missing.
 
 ### Optional
-- `HUGGING_FACE_KEY` — Enables speaker diarization (pyannote models from HuggingFace Hub)
-- `PORT` — HTTP server port (default: `6969`)
+- `HUGGING_FACE_KEY`: Enables speaker diarization (pyannote models from HuggingFace Hub)
+- `PORT`: HTTP server port (default: `6969`)
 
-Keys are stored in `.env` and hot-reloadable — `POST /api/settings/keys` calls `config.save_key()` which writes to `.env` and updates `os.environ`, then `ai.reload_client()` re-instantiates the Anthropic client.
+Keys are stored in `.env` and hot-reloadable: `POST /api/settings/keys` calls `config.save_key()` which writes to `.env` and updates `os.environ`, then `ai.reload_client()` re-instantiates the Anthropic client.
 
 ### First-run detection
 `config.needs_setup()` returns `True` if `ANTHROPIC_API_KEY` is unset. On first run, the browser opens to `?settings=1` which auto-triggers the settings modal.
@@ -734,15 +759,15 @@ Keys are stored in `.env` and hot-reloadable — `POST /api/settings/keys` calls
 
 ## Performance Architecture
 
-The audio pipeline is designed to avoid progressive slowdown during long sessions. These patterns exist for specific performance reasons — do not regress them.
+The audio pipeline is designed to avoid progressive slowdown during long sessions. These patterns exist for specific performance reasons; do not regress them.
 
 **Pre-allocated diarization ring buffer:** `ml/transcriber.py` uses a fixed-size numpy array (`_diar_buf`) for the rolling diarization window instead of `np.concatenate()`. The old approach allocated a new 30-second array (~1.9 MB) on every flush cycle (~62 times/sec), causing severe GC pressure and memory fragmentation over time. The ring buffer writes in-place with zero allocations.
 
-**List-based mixer accumulation:** `capture_audio/windows.py`'s `_mixer_loop()` collects chunks in a Python list (`lb_parts`, `mic_parts`) and only calls `np.concatenate()` once per emit cycle (bounded to a few chunks). The old approach called `np.concatenate()` inside the drain loop — O(n²) copies over many iterations. The mixer also caps internal buffers at 3 seconds to prevent unbounded growth when the downstream transcriber is slow.
+**List-based mixer accumulation:** `capture_audio/windows.py`'s `_mixer_loop()` collects chunks in a Python list (`lb_parts`, `mic_parts`) and only calls `np.concatenate()` once per emit cycle (bounded to a few chunks). The old approach called `np.concatenate()` inside the drain loop: O(n²) copies over many iterations. The mixer also caps internal buffers at 3 seconds to prevent unbounded growth when the downstream transcriber is slow.
 
 **Speaker profile cap and garbage collection:** `ml/diarizer.py` limits speaker profiles to `_MAX_SPEAKERS = 12`. Without this, acoustic noise (coughing, laughter, environmental sounds) gradually creates dozens of phantom speaker profiles, and every new embedding requires an O(n_profiles) cosine similarity scan. Immature profiles (< 5 embeddings) not seen in 5 minutes are automatically pruned by `_cleanup_stale_profiles()`.
 
-**Pre-normalized centroids:** `_SpeakerProfile` stores centroids as unit-normalized vectors. The query embedding is also normalized once per `_resolve()` call. Cosine similarity then reduces to a single `np.dot()` instead of two `np.linalg.norm()` calls plus a division — roughly 3x faster per comparison.
+**Pre-normalized centroids:** `_SpeakerProfile` stores centroids as unit-normalized vectors. The query embedding is also normalized once per `_resolve()` call. Cosine similarity then reduces to a single `np.dot()` instead of two `np.linalg.norm()` calls plus a division, roughly 3x faster per comparison.
 
 **Backpressure-aware transcription:** When `audio_queue.qsize() > 50` (~1.6s backed up), the transcriber skips diarization for that cycle and falls through to plain Whisper. This circuit-breaker prevents the cascade failure where a slow diarizer causes queue buildup → chunk drops → "no new speech" → apparent freeze. Diarization resumes automatically when the queue drains.
 
@@ -777,11 +802,13 @@ Past-tense verb first, then what changed and why, for the developer reading `git
 
 ## Common Pitfalls
 
+- **Don't change device selection without an opt-in.** Any change to how a capture device is picked or moved ships behind a setting that is off by default, an existing one (`loopback_follow_output` for anything that follows audio) or a new one. See "Device selection changes are opt-in" under Key Behaviors to Preserve.
+- **Don't move a GPU check without checking what it loaded.** The in-process check loaded cuBLAS, and live Whisper on the GPU depended on that: after moving it to a child, CTranslate2 failed to load cuBLAS itself and every later GPU call hung. `gpu_probe.load_cublas()` now does it explicitly; run `tests/test_whisper_gpu_start.py` on a machine with an NVIDIA GPU after touching GPU startup.
 - **Don't hold `_state_lock` during I/O.** Snapshot values, release the lock, then do DB/network/file operations.
 - **Don't call `_push()` while holding `_state_lock`.** `_push` acquires `_cq_lock` and could deadlock if another thread holds `_cq_lock` and tries to acquire `_state_lock`.
 - **Don't touch `_state["segments"]` after stop.** The cleanup thread calls `storage.end_session()` asynchronously. Use the snapshot taken at stop time.
 - **pystray menu items must be rebuilt, not mutated.** Call `_tray.refresh()` which rebuilds the full menu. Don't try to update individual menu items in place.
-- **pyannote is not in requirements.txt.** It's installed separately or pulled in by the HuggingFace pipeline on first diarizer load. Don't add it to requirements.txt — it has complex CUDA-version-dependent dependencies.
+- **pyannote is not in requirements.txt.** It's installed separately or pulled in by the HuggingFace pipeline on first diarizer load. Don't add it to requirements.txt, it has complex CUDA-version-dependent dependencies.
 - **WAV writer tracks sample offsets.** These are used to compute `start_time`/`end_time` for segments. If you change the audio pipeline, maintain the `sample_offset` tracking in `WavWriter.write()`.
-- **SSE queues have a max size of 200.** If a client falls behind (slow browser, many events), old events are silently dropped when the queue fills. Don't rely on SSE for durability — use the DB or REST for historical data.
+- **SSE queues have a max size of 200.** If a client falls behind (slow browser, many events), old events are silently dropped when the queue fills. Don't rely on SSE for durability, use the DB or REST for historical data.
 - **Don't raise `_MAX_SPEAKERS` above ~15.** Each speaker profile adds an O(1) cosine similarity check per embedding. At 30+ profiles the diarizer thread can't keep up with real-time audio, triggering the backpressure cascade described above.

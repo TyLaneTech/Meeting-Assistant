@@ -685,6 +685,16 @@
           <div class="settings-group">
             <div class="settings-row">
               <div class="settings-row-info">
+                <div class="settings-row-label">Transcribe after the meeting</div>
+                <div class="settings-row-desc">On records the audio and the screen only: no live transcription, speaker detection, summary or chapters while the meeting runs. The recording is transcribed the moment it stops, then the summary, chapters and title are written. Keeps the transcription models off the machine while you present. A recording that starts during that pass pauses it; it resumes when the recording ends. Applies to the next recording.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="transcribe-after-toggle" onchange="savePref('transcribe_after_meeting', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
                 <div class="settings-row-label">Follow call audio to its output device</div>
                 <div class="settings-row-desc">Off records the desktop device selected in the recorder, exactly as chosen. On binds the desktop capture to the current Windows default output when a recording starts and, while that capture is silent, re-binds it to whichever output device is actually playing (Teams and Zoom often use the Communications device). Needs the pycaw and comtypes packages.</div>
               </div>

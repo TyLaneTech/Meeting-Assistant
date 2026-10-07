@@ -40,23 +40,25 @@ import numpy as np
 from scipy import signal as scipy_signal
 
 
+_RESOURCE_ERROR_MARKERS = ("out of memory", "cuda", "cublas", "cudnn", "bad_alloc",
+                           "alloc_failed", "metal")
+
+
+def _is_resource_error(message: str) -> bool:
+    """True for a model-load failure caused by the machine (GPU or system
+    memory, the CUDA or Metal runtime) rather than by the model files, so the
+    model cache must be left alone."""
+    text = (message or "").lower()
+    return any(marker in text for marker in _RESOURCE_ERROR_MARKERS)
+
+
 def detect_cuda_available() -> bool:
-    """Check whether CUDA is actually usable for ctranslate2 (Whisper)."""
-    try:
-        import ctranslate2
-        types = ctranslate2.get_supported_compute_types("cuda")
-        if types and ctranslate2.get_cuda_device_count() > 0:
-            import ctypes, sys
-            for ver in ("12", "13", "11"):
-                try:
-                    lib = f"cublas64_{ver}.dll" if sys.platform == "win32" else f"libcublas.so.{ver}"
-                    ctypes.CDLL(lib)
-                    return True
-                except OSError:
-                    continue
-    except Exception:
-        pass
-    return False
+    """Check whether CUDA is actually usable for ctranslate2 (Whisper).
+
+    Answered by core.gpu_probe in a short-lived child process, so the app
+    process never initializes the NVIDIA driver just by asking."""
+    from core import gpu_probe
+    return gpu_probe.ct2_cuda()
 
 
 def detect_device() -> tuple[str, str, str]:
@@ -119,6 +121,10 @@ DIARIZER_OPTIONS = [
 
 _RUNTIME_LOCK = threading.Lock()
 _CUDA_AVAILABLE: bool | None = None
+# Set when Whisper's first run on the GPU failed in this process. CTranslate2's
+# GPU calls can hang after that (see Transcriber.load_model), so every later
+# load in this process goes to the CPU.
+_GPU_FAILED = False
 _DEFAULT_DEVICE = "cpu"
 _DEFAULT_COMPUTE_TYPE = "int8"
 _DEFAULT_MODEL_SIZE = "small"
@@ -616,14 +622,25 @@ class Transcriber:
         Engine selection is automatic per platform: faster-whisper on
         Windows/Linux, mlx-whisper on macOS. See transcriber_engine.py.
         """
+        global _GPU_FAILED
         if self._auto_model_config:
             self.device, self.compute_type, self.model_size = get_default_model_config()
+        if self.device == "cuda" and _GPU_FAILED:
+            log.warn("whisper", "Whisper failed on the GPU earlier in this run; "
+                                "using the CPU until the app restarts")
+            self._switch_to_cpu()
+            log.info("whisper", "Model ready.")
+            return
         log.info("whisper", f"Loading {self.model_size} on {self.device} ({self.compute_type})…")
         from ml.transcriber_engine import make_engine
         try:
             self.model = make_engine(self.model_size, self.device, self.compute_type)
         except Exception as e:
-            if not self._clear_bad_model_cache(str(e)):
+            # Out of GPU memory, or a CUDA/Metal runtime failure, says nothing
+            # about the files on disk. Clearing the cache for one deleted a good
+            # model the offline runtime then could not fetch again, and with the
+            # idle unload this load runs on every wake, not only at startup.
+            if _is_resource_error(str(e)) or not self._clear_bad_model_cache(str(e)):
                 raise
             log.info("whisper", "Retrying after cache clear…")
             self.model = make_engine(self.model_size, self.device, self.compute_type)
@@ -635,8 +652,18 @@ class Transcriber:
             _warmup = np.zeros(self.TARGET_RATE, dtype=np.float32)
             _segs, _info = self.model.transcribe(_warmup, language="en")
             list(_segs)
-        except Exception:
-            pass
+        except Exception as e:
+            if self.device == "cuda":
+                # When CTranslate2 fails its first GPU call (it could not load
+                # cuBLAS, say), every later GPU call in this process hangs,
+                # even on a new model. Swallowing this error left the first
+                # real call hung, and live transcription stopped with no error.
+                # The CPU still works.
+                log.warn("whisper", f"Whisper failed its first run on the GPU "
+                                    f"({type(e).__name__}: {e}); using the CPU instead")
+                _GPU_FAILED = True
+                self.model = None
+                self._switch_to_cpu()
         log.info("whisper", "Model ready.")
 
     def _clear_bad_model_cache(self, error_msg: str) -> bool:
@@ -821,7 +848,9 @@ class Transcriber:
             gc.collect()
             try:
                 import torch
-                if torch.cuda.is_available():
+                # is_initialized, not is_available: asking for availability
+                # would initialize CUDA in a process that never used it.
+                if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
             except Exception:
                 pass
@@ -1245,14 +1274,25 @@ class Transcriber:
         Only relevant on Windows/Linux — on macOS the engine is mlx-whisper
         which doesn't fail with cublas/cuda errors. We keep the method
         available for callers that don't check platform.
+
+        Tries "small", then the size that was on the GPU: the app runs offline
+        and the launcher downloads only large-v3, so a "small" that was never
+        downloaded failed to load and took transcription down with the GPU.
         """
         from ml.transcriber_engine import make_engine
-        self.device = "cpu"
-        self.compute_type = "int8"
-        self.model_size = "small"
-        log.warn("whisper", "Reloading as 'small' on CPU (int8)…")
-        self.model = make_engine("small", "cpu", "int8")
-        log.info("whisper", "CPU fallback ready.")
+        error: Exception | None = None
+        for size in dict.fromkeys(("small", self.model_size)):
+            log.warn("whisper", f"Reloading as '{size}' on CPU (int8)…")
+            try:
+                model = make_engine(size, "cpu", "int8")
+            except Exception as e:
+                error = e
+                continue
+            self.model = model
+            self.device, self.compute_type, self.model_size = "cpu", "int8", size
+            log.info("whisper", "CPU fallback ready.")
+            return
+        raise error
 
     def _finish_drain(self) -> None:
         """Release anyone waiting on ``await_drain``. Runs on the loop thread

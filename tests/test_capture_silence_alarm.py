@@ -132,10 +132,13 @@ def test_the_alarm_needs_a_conversation_not_just_a_quiet_room():
 
 def test_a_switched_device_starts_its_accounting_over():
     body = _watchdog()
-    switch = body[body.index("if switched:"):]
-    switch = switch[:switch.index("continue")]
-    assert "last_signal_ts = grace_base = now" in switch
-    assert "mic_active_for = 0.0" in switch
+    polling = body[body.index("while self.is_running:"):]
+    switches = polling.split("if switched:")[1:]
+    assert len(switches) == 2  # Follow another endpoint and return to comms.
+    for switch in switches:
+        switch = switch[:switch.index("continue")]
+        assert "last_signal_ts = grace_base = now" in switch
+        assert "mic_active_for = 0.0" in switch
 
 
 # ── Recovery: the warning does not outlive the fault ─────────────────────────
@@ -207,3 +210,38 @@ def test_a_running_clock_re_anchors_only_on_a_real_gap():
     assert "if (!_durationInterval || !(behind > 0)) return;" in body
     assert "if (Math.abs(local - behind) < 2) return;" in body
     assert "_syncDurationCounter(d.elapsed_sec);" in js
+
+
+# ── The alarm's other channels (review of PR 1086, 2026-10-07) ───────────────
+
+def test_the_taskbar_flash_finds_only_the_app_window():
+    # The caption alone matched the app's own notification windows ("Meeting
+    # Assistant notification"), a folder of that name and an editor open on the
+    # repo; any hit counted as "the app window is open", so the alarm never
+    # opened the app when it was closed.
+    src = (Path(__file__).parents[1] / "ui_desktop/notifications.py").read_text(encoding="utf-8")
+    flash = src[src.index("def flash_app_window("):]
+    flash = flash[:flash.index("\ndef ")]
+    assert "window_focus.app_windows()" in flash
+    assert "EnumWindows" not in flash
+    app = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+    alarm = app[app.index("def _alert_loopback_silent("):]
+    alarm = alarm[:alarm.index("\ndef ")]
+    # Only Windows can tell "no app window" for certain; elsewhere the alarm
+    # must not raise or open a window over the call.
+    assert alarm.index('if sys.platform != "win32":') < alarm.index("app_window.show(")
+
+
+def test_a_stalled_file_warning_ends_only_when_the_file_grows():
+    app = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+    growth = app[app.index("def _audio_growth_loop("):]
+    growth = growth[:growth.index("\nclass ")]
+    assert "_alert_capture_stall_cleared(sid)" in growth
+    recovered = app[app.index("def _alert_loopback_recovered("):]
+    recovered = recovered[:recovered.index("def _alert_capture_stall_cleared(")]
+    # Desktop audio coming back says nothing about the disk.
+    assert '_capture_alert_kind.get(session_id) == "stalled"' in recovered
+    js = (Path(__file__).parents[1] / "ui_web/static/app.js").read_text(encoding="utf-8")
+    meters = js[js.index("function updateLevelMeters("):]
+    meters = meters[:meters.index("function startVizLoop(")]
+    assert "if (_captureAlertKind !== 'stalled') _clearCaptureAlert();" in meters

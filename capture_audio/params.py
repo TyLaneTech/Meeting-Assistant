@@ -717,13 +717,32 @@ REANALYSIS_DEFAULTS = {
             {"id": "cpu", "label": "CPU"},
         ],
     },
+    "reanalysis_diarization_device": {
+        "value": "auto",
+        "label": "Speaker Detection Device",
+        "description": "Device for working out who spoke, after the meeting.",
+        "tooltip": (
+            "Which device separates the speakers during reanalysis and the "
+            "after-meeting pass. This is separate from the live Diarizer device, "
+            "so live speaker detection can stay on the CPU while the after-meeting "
+            "pass uses the GPU.<br><br>"
+            "<b>Same as Device</b>: Follows the Device setting above.<br>"
+            "<b>CPU</b>: Always the CPU. About 40 minutes per hour of audio."
+        ),
+        "type": "select",
+        "options": [
+            {"id": "auto", "label": "Same as Device"},
+            {"id": "cpu", "label": "CPU"},
+        ],
+    },
     "reanalysis_num_speakers": {
         "value": 0,
         "label": "Number of Speakers",
         "description": "Expected speaker count (0 = auto-detect).",
         "tooltip": (
             "Set the exact number of speakers if known. This significantly "
-            "improves diarization accuracy.<br><br>"
+            "improves diarization accuracy. Count everyone in the meeting, you "
+            "included; the speaker counts below work the same way.<br><br>"
             "<b>0</b>: Auto-detect (pyannote estimates from the audio).<br>"
             "<b>1\u201320</b>: Force exact speaker count."
         ),
@@ -757,6 +776,25 @@ REANALYSIS_DEFAULTS = {
         "max": 20,
         "step": 1,
         "type": "int",
+    },
+    "reanalysis_absorb_short_replies": {
+        "value": 0,
+        "label": "Fold Short Replies Into Speakers",
+        "description": "Stop \"mm-hmm\" and \"yeah\" from becoming extra speakers.",
+        "tooltip": (
+            "Short replies carry too little voice to recognize, so the speaker "
+            "model often files them as a new person. When this is on, a speaker "
+            "whose typical turn is a second or less and who talks under 10% as "
+            "much as the main speaker, or anyone with under 5 seconds in total, "
+            "is folded into the closest-sounding real speaker. A voice that "
+            "sounds like none of them is kept as its own person.<br><br>"
+            "Off by default. Skipped when you force an exact Number of Speakers, "
+            "and never folds below Min Speakers."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
     },
     "reanalysis_merge_gap": {
         "value": 0.8,

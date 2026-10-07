@@ -100,6 +100,9 @@ def test_the_capture_loop_reads_only_what_is_buffered():
     cap, stream = _capture(), _FakeStream(avail=chunk // 2)
     out: queue.Queue = queue.Queue()
     cap.is_running = True
+    # A mic reader serves the current mic stream and leaves once it is swapped
+    # (a mic switch), like the loopback reader.
+    cap._mic_stream = stream
     reader = threading.Thread(target=cap._capture_loop, args=(stream, out), daemon=True)
     reader.start()
     try:

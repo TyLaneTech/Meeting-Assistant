@@ -332,6 +332,67 @@ def send_test_toast(server_url: Optional[str] = None) -> bool:
 # ── macOS backend ─────────────────────────────────────────────────────────────
 
 
+def flash_app_window() -> int:
+    """Flash the taskbar button of every open app window until the user
+    focuses it.
+
+    A second channel beside the app's own toast: a taskbar flash goes through
+    no notification platform and cannot be silenced. On 2026-09-15 every
+    capture alert of the day was a Windows toast that Windows dropped (toasts
+    switched off for the app, or Do not disturb on), so a call recorded
+    one-sided for an hour with no visible warning.
+
+    The windows are found by core.window_focus's match (a browser-owned
+    Chromium window whose caption ends with "Meeting Assistant"), not by the
+    caption alone: the app's own notification windows, a folder of that name
+    and an editor open on the repo all carry it too, and counting one of them
+    as "the app window" stopped the capture alert from opening the app when
+    it was closed.
+
+    Returns the number of windows flashed, so 0 means there is no app window.
+    Windows-only; never raises.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        from core import window_focus
+
+        user32 = ctypes.windll.user32
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("hwnd", wintypes.HWND),
+                ("dwFlags", wintypes.DWORD),
+                ("uCount", wintypes.UINT),
+                ("dwTimeout", wintypes.DWORD),
+            ]
+
+        FLASHW_ALL = 0x3          # caption and taskbar button
+        FLASHW_TIMERNOFG = 0xC    # keep flashing until the window comes to the foreground
+
+        user32.FlashWindowEx.argtypes = [ctypes.POINTER(FLASHWINFO)]
+        user32.FlashWindowEx.restype = ctypes.c_bool
+
+        flashed = 0
+        for hwnd in window_focus.app_windows():
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), wintypes.HWND(hwnd),
+                              FLASHW_ALL | FLASHW_TIMERNOFG, 0, 0)
+            user32.FlashWindowEx(ctypes.byref(info))
+            flashed += 1
+        if flashed:
+            log.info("notify", f"Flashed {flashed} app window(s) on the taskbar")
+        else:
+            log.warn("notify", "No app window to flash")
+        return flashed
+    except Exception as e:
+        log.warn("notify", f"Taskbar flash failed: {e}")
+        return 0
+
+
 def _osascript_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 

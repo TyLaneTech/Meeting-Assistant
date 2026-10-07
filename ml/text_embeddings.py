@@ -43,7 +43,12 @@ def _load_model():
 
         from sentence_transformers import SentenceTransformer
         log.info("Loading text embedding model %s …", MODEL_NAME)
-        m = SentenceTransformer(MODEL_NAME)
+        # Always CPU. With no device named, sentence-transformers picks CUDA
+        # whenever it exists, and this model stays loaded for the life of the
+        # app, so the NVIDIA card could never power down (2026-10-01: this one
+        # call is what kept the app listed in nvidia-smi all day). The model is
+        # small; CPU encoding takes milliseconds.
+        m = SentenceTransformer(MODEL_NAME, device="cpu")
         with _model_lock:
             _model = m
             _loading = False

@@ -31,6 +31,17 @@ Merging to `main` fires a pipeline that force-pushes `main` and tags to GitHub.
    deliberate and the app depends on it.
 6. **Do not commit unless asked.** Leave changes in the working tree by default.
 
+## Device selection is opt-in
+
+Any change to how the app picks or moves a capture device (desktop output or mic) must
+ship behind a setting that is **off by default**. Use an existing opt-in when it fits:
+anything that follows audio to another output goes behind `loopback_follow_output`
+(Settings > System, "Follow call audio to its output device"). Otherwise add a new setting.
+The only behavior without a setting is the baseline, the same for output and mic: the
+selected device is recorded, the Windows default device stands in while it is
+unavailable, and the capture returns to it when it comes back. Details under "Device selection changes are opt-in" in
+[AGENT.md](AGENT.md).
+
 ## Release notes
 
 End users read `CHANGELOG.md` (repo root) in **Settings → Changelog** and in the What's new

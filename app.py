@@ -38,6 +38,16 @@ import flask.cli
 flask.cli.show_server_banner = lambda *a, **kw: None
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+# ── Cap the OpenBLAS thread pools before numpy/scipy load ─────────────────────
+# numpy and scipy each ship their own OpenBLAS, and each pool spawns one thread
+# per logical CPU with a ~24 MB buffer committed up front. On a 32-thread
+# machine that is ~1.5 GB of commit charge for two pools the app barely uses
+# (transcription and diarization run on the GPU; the CPU-side numpy work is
+# audio resampling and 256-dim dot products). Measured 2026-09-05: 1548 MB
+# private after `import scipy.signal` with the default pool, 262 MB with 4
+# threads. setdefault so an explicit environment override still wins.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+
 import numpy as np
 
 from core import log as log
@@ -289,8 +299,7 @@ def _on_diarizer_error(message: str) -> None:
 
 _transcriber.on_diarizer_error = _on_diarizer_error
 
-# Apply saved model preferences
-_saved_whisper_preset = _saved_prefs.get("whisper_preset", "")
+# Apply saved model preferences (the Whisper preset is read by _load_model itself)
 _transcriber.diarization_enabled = _saved_prefs.get("diarization_enabled", True)
 del _saved_prefs
 
@@ -314,6 +323,7 @@ _state: dict = {
     "model_info": "",
     "diarizer_ready": False,
     "diarizer_failed": False,
+    "ml_sleeping": False,   # True while the idle sweep has the models unloaded (not a load error)
     "speaker_labels": {},   # speaker_key → display name for the active session
     "custom_prompt": "",    # user-supplied context appended to the summary system prompt
     "is_reanalyzing": False,
@@ -532,10 +542,14 @@ def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
     if kind == "dropped":
         msg = ("Call/desktop audio went silent. Your output device may have changed; "
                "check that the call still plays to your current output device.")
+    elif kind == "stalled":
+        msg = ("The recording file has stopped growing: audio is no longer reaching "
+               "disk. Stop the recording and start it again.")
     else:
         msg = ("Call/desktop audio is NOT being captured. Check that the call is "
                "playing to your current Windows output device (the one you hear it on).")
     log.warn("audio", f"CAPTURE ALERT ({kind}): {msg}")
+    _capture_alert_kind[session_id] = kind
     _push("capture_alert", {"level": "error", "kind": kind, "message": msg, "device": dev_name})
     try:
         # Stays up until the audio comes back (_alert_loopback_recovered takes
@@ -544,6 +558,43 @@ def _alert_loopback_silent(session_id: str, dev_name: str, kind: str) -> None:
                              tag=notifications.TAG_CAPTURE, timeout=0)
     except Exception as e:
         log.warn("audio", f"capture-alert notification failed: {e}")
+    # A second channel beside the notification: flash the app window's taskbar
+    # button, which nothing in Windows silences. If there is no app window at
+    # all, show one (once per recording) so the banner has somewhere to be seen
+    # (2026-09-15: three one-sided calls, every Windows toast dropped, app
+    # closed). Windows only: there flash_app_window() finds the app's windows
+    # exactly, so 0 really means none is open. Elsewhere it cannot tell, and
+    # raising the window over a call on every alarm is worse than the
+    # notification alone.
+    if sys.platform != "win32":
+        return
+    try:
+        flashed = notifications.flash_app_window()
+    except Exception as e:
+        log.warn("audio", f"capture-alert taskbar flash failed: {e}")
+        flashed = 0
+    if not flashed and session_id not in _capture_alert_opened:
+        _capture_alert_opened.add(session_id)
+        try:
+            app_window.show(f"{_server_url}/session", prefer_pwa=True,
+                            navigate=False, reason="capture-alert")
+        except Exception as e:
+            log.warn("audio", f"capture-alert could not open the app window: {e}")
+
+
+# Sessions for which the capture alert already opened the app window, so a
+# repeating alarm does not keep popping windows.
+_capture_alert_opened: set[str] = set()
+# The kind of the capture alarm last raised per session ("never", "dropped",
+# "stalled"). The banner and the notification are shared, so a clear for one
+# fault must not take down the warning about another.
+_capture_alert_kind: dict[str, str] = {}
+
+
+def _transcribe_after_enabled() -> bool:
+    """The transcribe_after_meeting preference: record now, transcribe when the
+    meeting ends. Read per call so a toggle applies to the next recording."""
+    return bool(settings.get("transcribe_after_meeting", False))
 
 
 def _alert_loopback_recovered(session_id: str, dev_name: str) -> None:
@@ -557,8 +608,28 @@ def _alert_loopback_recovered(session_id: str, dev_name: str) -> None:
     with _state_lock:
         if not _state.get("is_recording") or _state.get("session_id") != session_id:
             return
+    if _capture_alert_kind.get(session_id) == "stalled":
+        # The desktop side is back, but the warning up is about the file not
+        # growing, which this says nothing about. _audio_growth_loop clears it.
+        return
+    _capture_alert_kind.pop(session_id, None)
     _push("capture_alert", {"level": "clear", "kind": "recovered",
                             "cleared": True, "device": dev_name})
+    notifications.capture_recovered()
+
+
+def _alert_capture_stall_cleared(session_id: str) -> None:
+    """The recording file is growing again after a "stalled" alarm: take that
+    warning down, the banner and the notification, unless a newer alarm about
+    the desktop audio has replaced it since."""
+    with _state_lock:
+        if not _state.get("is_recording") or _state.get("session_id") != session_id:
+            return
+    if _capture_alert_kind.get(session_id) != "stalled":
+        return
+    _capture_alert_kind.pop(session_id, None)
+    log.info("audio", f"Recording file is growing again ({session_id[:8]})")
+    _push("capture_alert", {"level": "clear", "kind": "stalled", "cleared": True})
     notifications.capture_recovered()
 
 
@@ -569,14 +640,45 @@ def _recording_prereqs_locked() -> tuple[bool, str]:
         # same _on_segment path a live recording uses. Starting a recording now
         # interleaves two meetings into one transcript, so the record button and
         # the auto-start coordinator both wait for the reanalysis to finish.
+        # The exception is a post-meeting transcription pass: it is cancelled
+        # by the start (start_recording asks it to stop and it emits nothing
+        # further) and re-queued, so the next meeting is never held up by the
+        # previous one's transcript. Only when the session being rebuilt IS
+        # that pass's: a manual reanalysis has no cancel, and the worker can
+        # hold a session it picked for a moment before backing off for one.
+        running = _post_meeting.running_session
+        if running is not None and running == _state.get("session_id"):
+            return True, "Ready (the post-meeting transcription pauses for this recording)"
         return False, "Reanalysis in progress; recording can start when it finishes"
+    if _transcribe_after_enabled():
+        # Record-only: the models are used after the meeting, so a model that
+        # is still loading, sleeping, or failed never blocks the Record button.
+        return True, "Ready (transcription runs after the meeting)"
+    if _state["ml_sleeping"] and not _state["model_ready"]:
+        # Idle-unloaded is not "not ready": start_recording wakes the models
+        # and waits for them itself, so the Record button (and the auto-start
+        # coordinator behind it) stays live instead of showing "Preparing".
+        # That holds after a failed wake too: the next start tries again.
+        if _ml_wake_error:
+            return True, (f"Ready (models could not reload: {_ml_wake_error}; "
+                          f"starting a recording tries again)")
+        return True, "Ready (models sleeping after idle; they wake when recording starts)"
     if not _state["model_ready"]:
         info = (_state.get("model_info") or "").strip()
         return False, info or "Loading transcription model..."
-    needs_diarizer = _transcriber.diarization_enabled and bool(os.getenv("HUGGING_FACE_KEY"))
-    if needs_diarizer and not _state["diarizer_ready"] and not _state["diarizer_failed"]:
+    if not _ml_awake_locked():
         return False, "Loading speaker diarization..."
     return True, _state.get("model_info") or "Ready"
+
+
+def _ml_awake_locked() -> bool:
+    """True when everything a recording needs is loaded: Whisper, plus the
+    diarizer when it is enabled and possible (a failed diarizer load counts as
+    settled; recording then runs without speaker labels). Caller holds _state_lock."""
+    if not _state["model_ready"]:
+        return False
+    needs_diarizer = _transcriber.diarization_enabled and bool(os.getenv("HUGGING_FACE_KEY"))
+    return (not needs_diarizer) or _state["diarizer_ready"] or _state["diarizer_failed"]
 
 
 def _status_payload(extra: dict | None = None) -> dict:
@@ -588,8 +690,12 @@ def _status_payload(extra: dict | None = None) -> dict:
             "model_ready": _state["model_ready"],
             "model_info": _state["model_info"],
             "diarizer_ready": _state["diarizer_ready"],
+            "ml_sleeping": bool(_state.get("ml_sleeping")),
             "is_reanalyzing": bool(_state.get("is_reanalyzing")),
             "screen_recording": _screen_recorder.is_recording,
+            # True while the current recording is record-only (transcription
+            # deferred to the end of the meeting).
+            "transcribe_after": bool(_state.get("transcribe_after")),
         }
         recording_ready, recording_ready_reason = _recording_prereqs_locked()
         capture = _state["audio_capture"] if payload["recording"] else None
@@ -893,6 +999,7 @@ def _on_segment(
     source: str = "loopback",
     start_time: float = 0.0,
     end_time: float = 0.0,
+    owner_session: str | None = None,
 ) -> None:
     merged = False
     merge_seg_id = None
@@ -900,6 +1007,13 @@ def _on_segment(
     with _state_lock:
         sid = _state["session_id"]
         if not sid:
+            return
+        if owner_session is not None and (
+                sid != owner_session or not _state.get("is_reanalyzing")):
+            # A post-meeting transcription pass names the session it owns. The
+            # check runs under the same lock that reads the current session, so
+            # a recording that took over in between cannot receive this segment
+            # (review finding 2026-09-15: the earlier check-then-call had a gap).
             return
 
         # Auto-detect noise/filler segments from diarized speakers.
@@ -1550,25 +1664,31 @@ threading.Thread(target=_relabel_summary_worker, daemon=True).start()
 
 def _load_model() -> None:
     try:
-        if _saved_whisper_preset:
-            preset = next((p for p in WHISPER_PRESETS if p["id"] == _saved_whisper_preset), None)
+        # The preset saved now, not one read at import: a wake after an idle
+        # unload must bring back the model the user picked since the app started.
+        saved_preset = settings.get("whisper_preset", "") or ""
+        if saved_preset:
+            preset = next((p for p in WHISPER_PRESETS if p["id"] == saved_preset), None)
             if preset and (not preset["requires_cuda"] or get_cuda_available()):
                 _transcriber.device = preset["device"]
                 _transcriber.compute_type = preset["compute_type"]
                 _transcriber.model_size = preset["model_size"]
                 _transcriber._auto_model_config = False
-                log.info("settings", f"Restored whisper preset: {_saved_whisper_preset}")
+                log.info("settings", f"Restored whisper preset: {saved_preset}")
         _transcriber.load_model()
         info = _transcriber.device_info
         with _state_lock:
             _state["model_ready"] = True
             _state["model_info"] = info
+            _state["ml_sleeping"] = False
+        _touch_ml()  # a fresh load must not be re-slept by a stale idle clock
         _push_status()
     except Exception as e:
         log.error("whisper", f"Error loading model: {e}")
         with _state_lock:
             _state["model_ready"] = False
             _state["model_info"] = f"Error: {e}"
+            _state["ml_sleeping"] = False  # an honest error, not a nap
         _push_status()
 
 
@@ -1580,17 +1700,19 @@ def _load_diarizer() -> None:
     try:
         saved_device = settings.get("diarizer_device", "")
         # Validate the saved choice against what the current machine actually
-        # supports — accelerator strings ("cuda", "mps") only honored if probe
-        # succeeds, falling back to auto-detection otherwise.
+        # supports: accelerator strings ("cuda", "mps") only honored if probe
+        # succeeds, falling back to auto-detection otherwise. A saved "cpu"
+        # needs no probe, so the CPU diarizer never waits on the GPU check.
         from core.compute_device import best_torch_device
-        _accel_ok = best_torch_device() in ("cuda", "mps")
-        if saved_device and (saved_device == "cpu" or _accel_ok):
+        if saved_device and (saved_device == "cpu"
+                             or best_torch_device() in ("cuda", "mps")):
             log.info("settings", f"Restored diarizer device: {saved_device}")
             _transcriber.load_diarizer(hf_token, device=saved_device)
         else:
             _transcriber.load_diarizer(hf_token)
         with _state_lock:
             _state["diarizer_ready"] = True
+        _touch_ml()
         _push_status()
         log.info("diarizer", "Speaker diarization ready.")
         if fingerprint_db.ready:
@@ -1701,6 +1823,181 @@ def _preload_torch() -> None:
     except Exception as e:
         log.warn("models", f"torchaudio failed to import: {e}")
 
+# ── Idle model unload ─────────────────────────────────────────────────────────
+# The loaded ML stack (Whisper on the GPU, the CUDA context, the pyannote
+# diarizer, the fingerprint embedder) holds gigabytes of commit charge for as
+# long as the process lives: on Windows every VRAM allocation is backed by
+# system commit, so an idle process sat at 8.6 GB private with a 316 MB
+# working set (measured 2026-09-05). After `ml_idle_unload_minutes` (settings,
+# default 0, which keeps the models loaded; opt in with a number of minutes)
+# with no recording, test, reanalysis or summary, the models are dropped;
+# anything that needs them wakes them again:
+#   - start_recording wakes and WAITS, so a click or an auto-start lands a
+#     recording instead of bouncing. The capture opens once the models are
+#     back, so the first seconds after the press are not recorded: that is
+#     the cost of opting in;
+#   - the meeting-detect loop wakes on the first positive poll of a meeting,
+#     so the reload overlaps the debounce window;
+#   - reanalysis loads its own batch models and the fingerprint embedder
+#     reloads itself on demand, so neither needs a wake.
+# A wake that fails leaves the models asleep, not in an error state, so the
+# next press of Record tries again instead of being disabled until a restart.
+# The text-embeddings model is deliberately NOT unloaded: it is small next to
+# Whisper and `encode()` degrades silently rather than reloading.
+
+from core.ml_idle import IdleClock
+_ml_idle = IdleClock()
+_ml_wake_lock = threading.Lock()
+_ml_waking = False
+_ml_wake_done = threading.Event()   # the wake in flight, or the last one, has ended
+_ml_wake_done.set()
+_ml_wake_error = ""                 # why the last wake failed ("" when it did not)
+# Below both the browser's patience with a Record press (RECORD_START_PATIENCE_MS,
+# 60 s) and the start coordinator's ready grace (45 s), so a slow wake answers
+# the press instead of the client giving up and retrying into a Stop, or the
+# coordinator opening a second window.
+_ML_WAKE_TIMEOUT_SEC = 40.0
+
+
+def _touch_ml() -> None:
+    _ml_idle.touch()
+
+
+def _wake_ml(reason: str) -> threading.Event:
+    """Reload the unloaded ML stack in the background. Safe to call often.
+    Returns an event that is set once this wake (or the one already running)
+    has ended, successfully or not."""
+    global _ml_waking, _ml_wake_done
+    with _ml_wake_lock:
+        if _ml_waking:
+            return _ml_wake_done
+        with _state_lock:
+            if _state["model_ready"]:
+                return _ml_wake_done
+            _state["model_info"] = "Waking models..."
+        _ml_waking = True
+        _ml_wake_done = done = threading.Event()
+    log.info("idle", f"Waking ML models ({reason})")
+    _push_status()
+
+    def _run() -> None:
+        global _ml_waking, _ml_wake_error
+        # The loaders below must never be the first import of PyTorch (see
+        # _preload_torch); after boot this costs nothing.
+        _preload_torch()
+        try:
+            # The same loaders boot runs, in parallel like boot does; each is
+            # idempotent and owns its own state flags. The fingerprint
+            # embedder is pre-warmed here so the first live match is not
+            # delayed by a lazy load inside the transcription loop.
+            threads = [
+                threading.Thread(target=_load_model, daemon=True),
+                threading.Thread(target=_load_diarizer, daemon=True),
+                threading.Thread(target=fingerprint_db.ensure_model, daemon=True),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=_ML_WAKE_TIMEOUT_SEC)
+        finally:
+            with _state_lock:
+                woke = _state["model_ready"]
+                if woke:
+                    _ml_wake_error = ""
+                else:
+                    # Still asleep, not failed: _recording_prereqs_locked keeps
+                    # Record live and the next start wakes them again. Latching
+                    # the error here disabled Record until a restart.
+                    info = (_state.get("model_info") or "").strip()
+                    _ml_wake_error = info.removeprefix("Error: ") or "the models did not load"
+                    _state["ml_sleeping"] = True
+                    _state["model_info"] = (f"Models could not reload ({_ml_wake_error}); "
+                                            f"starting a recording tries again")
+            if not woke:
+                log.warn("idle", f"Waking ML models failed: {_ml_wake_error}")
+            with _ml_wake_lock:
+                _ml_waking = False
+            done.set()
+            _touch_ml()
+            _push_status()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return done
+
+
+def _wake_ml_and_wait(reason: str, timeout: float = _ML_WAKE_TIMEOUT_SEC) -> bool:
+    """If the models are idle-unloaded, wake them and block until a recording
+    can use them, or the wake ends without them. Returns True when awake.
+    A model that never loaded (boot in progress, or a load error) is left to
+    the prereq gate to report, so this returns True immediately for it."""
+    with _state_lock:
+        if _ml_awake_locked():
+            return True
+        if not _state["ml_sleeping"]:
+            return True
+    _wake_ml(reason).wait(timeout)
+    with _state_lock:
+        return _ml_awake_locked()
+
+
+def _ml_busy_locked() -> bool:
+    """Anything that is using, or about to use, the models. Caller holds _state_lock."""
+    return bool(
+        _state["is_recording"] or _state["is_testing"] or _state.get("is_starting")
+        or _state["is_reanalyzing"] or _state["summary_generating"]
+        or _state.get("chapters_generating")
+    )
+
+
+def _idle_unload_loop() -> None:
+    while True:
+        time.sleep(60)
+        try:
+            _idle_unload_tick()
+        except Exception as e:   # one bad tick must not end idle unloading for the session
+            log.warn("idle", f"Idle model check failed: {e}")
+
+
+def _idle_unload_tick() -> None:
+    try:
+        minutes = float(settings.get("ml_idle_unload_minutes", 0))
+    except (TypeError, ValueError):
+        minutes = 0.0
+    with _state_lock:
+        busy = _ml_busy_locked()
+        ready = _state["model_ready"]
+    if not _ml_idle.unload_due(minutes, busy=busy, ready=ready, waking=_ml_waking):
+        return
+    idle_min = _ml_idle.idle_minutes()
+    # Flags flip FIRST, under the lock and after re-checking both the busy
+    # flags and the idle clock, so no new start can pass the prereq gate
+    # against a model this pass is about to drop. start_recording stamps the
+    # idle clock as its first statement: a press that landed since the check
+    # above has reset it, and the second unload_due() sees that.
+    with _state_lock:
+        if _ml_busy_locked() or not _ml_idle.unload_due(
+                minutes, busy=False, ready=_state["model_ready"], waking=_ml_waking):
+            _touch_ml()
+            return
+        _state["model_ready"] = False
+        _state["diarizer_ready"] = False
+        _state["ml_sleeping"] = True
+        _state["model_info"] = "Models sleeping (idle) - they reload when a recording starts"
+    _transcriber.unload()
+    if _transcriber.model is not None:
+        # unload() refused (a capture is running after all): restore the
+        # honest flags and leave everything, fingerprints included, alone.
+        with _state_lock:
+            _state["model_ready"] = True
+            _state["ml_sleeping"] = False
+            _state["diarizer_ready"] = _transcriber.diarizer is not None
+            _state["model_info"] = _transcriber.device_info
+        _touch_ml()
+        return
+    fingerprint_db.unload()
+    log.info("idle", f"Models unloaded after {idle_min}m idle; a recording start wakes them.")
+    _push_status()
+
 
 def _start_background_initializers() -> None:
     global _startup_init_started
@@ -1716,11 +2013,21 @@ def _start_background_initializers() -> None:
     # time anything can be opened. Cheap (a glob over the backup folders) and
     # it must not wait on a model load.
     _rollback_interrupted_reanalyses()
+    # "Is there a GPU?" is answered by a short-lived child process (the app
+    # process never initializes CUDA); start it now so no caller waits.
+    from core import gpu_probe
+    gpu_probe.start()
     threading.Thread(target=_load_model, daemon=True).start()
     threading.Thread(target=_load_diarizer, daemon=True).start()
     threading.Thread(target=_load_fingerprint_db, daemon=True).start()
     threading.Thread(target=_load_text_embeddings, daemon=True).start()
     threading.Thread(target=_library_maintenance_loop, daemon=True).start()
+    threading.Thread(target=_idle_unload_loop, daemon=True).start()
+    # Record-only sessions: transcribe them once the meeting ends, and watch
+    # that a running recording keeps reaching disk.
+    threading.Thread(target=_post_meeting.worker, daemon=True, name="post-meeting").start()
+    threading.Thread(target=_audio_growth_loop, daemon=True, name="audio-growth").start()
+    _post_meeting.restore()
     # Warm the AI /models cache so the settings pane opens instantly on first
     # visit. Non-blocking; if the network is slow/unreachable the fallback
     # static lists are used until the fetch completes.
@@ -1994,6 +2301,18 @@ def _meeting_detect_loop() -> None:
         # A meeting looks active.
         clear_since = None
         consecutive += 1
+        # Wake sleeping models on the FIRST positive poll, before the debounce
+        # even completes: the load then runs during the debounce window, so an
+        # auto-started recording is not delayed (or missed) waiting on Whisper.
+        # Only the first: a meeting nobody records would otherwise reload them
+        # every time the idle sweep dropped them, for as long as it lasted. And
+        # not when transcription waits for the end of the meeting, which never
+        # uses the live models.
+        if consecutive == 1 and not _transcribe_after_enabled():
+            with _state_lock:
+                _ml_asleep = _state["ml_sleeping"] and not _state["model_ready"]
+            if _ml_asleep:
+                _wake_ml("meeting detected")
         if consecutive < debounce or prompted:
             continue
         if last_prompt_at and now - last_prompt_at < cooldown:
@@ -2026,6 +2345,12 @@ def _meeting_detect_loop() -> None:
 threading.Thread(target=_meeting_detect_loop, daemon=True).start()
 
 
+_heartbeat_stop = threading.Event()
+# Held around each write and around the stop, so a write already under way when
+# _stop_heartbeat() runs finishes before the file is removed, never after it.
+_heartbeat_write_lock = threading.Lock()
+
+
 def _heartbeat_loop() -> None:
     """Refresh the liveness heartbeat every few seconds so the external watchdog
     (watchdog.py) can tell a frozen app apart from one that was quit on purpose.
@@ -2033,15 +2358,40 @@ def _heartbeat_loop() -> None:
     while the process is still alive, that IS the freeze signal the watchdog acts
     on (2026-09-01: the app wedged and nothing noticed)."""
     port = int(os.getenv("PORT", 6969))
-    while True:
+    while not _heartbeat_stop.is_set():
         try:
             with _state_lock:
                 rec = bool(_state.get("is_recording"))
                 sid = _state.get("session_id")
-            heartbeat.write(recording=rec, session_id=sid, port=port)
+            with _heartbeat_write_lock:
+                if not _heartbeat_stop.is_set():
+                    heartbeat.write(recording=rec, session_id=sid, port=port)
         except Exception:
             pass
-        time.sleep(8)
+        _heartbeat_stop.wait(8)
+
+
+def _stop_heartbeat() -> None:
+    """Tell the watchdog this exit is on purpose: stop the writer, remove the file.
+
+    Every path that ends in os._exit(0) must call this BEFORE it spawns a
+    relaunch. The relaunch chain (vbs, bat, launch.py, app.py) takes about 20 s
+    to answer HTTP and the watchdog polls every 20 s, so a poll landing in that
+    gap used to find a dead pid with the heartbeat still present, log a crash,
+    toast the user and start a second, competing launch chain (2026-09-05).
+    Stopping the writer first, under its write lock, means a write cannot land
+    after the clear.
+    """
+    locked = _heartbeat_write_lock.acquire(timeout=2)   # a wedged disk must not hang the exit
+    try:
+        _heartbeat_stop.set()
+    finally:
+        if locked:
+            _heartbeat_write_lock.release()
+    try:
+        heartbeat.clear()
+    except Exception:
+        pass
 
 
 threading.Thread(target=_heartbeat_loop, daemon=True).start()
@@ -2181,9 +2531,14 @@ def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, sess
     log.info("fingerprint", f"Auto-applied {name!r} → {speaker_key} (sim={match['similarity']:.2f})")
 
 
-def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float) -> None:
+def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float, abs_end: float,
+                          owner_session: str | None = None) -> None:
     """Called from the transcriber thread for each recognized speaker segment.
     Accumulates audio per speaker_key; extracts embeddings once MIN_DURATION_SEC reached.
+
+    ``owner_session`` is set by a post-meeting transcription pass: the audio is
+    only accepted while that session is still the current reanalysis target,
+    checked under the same lock that reads the current session.
     """
     if not fingerprint_db.ready:
         return
@@ -2199,6 +2554,9 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
     with _state_lock:
         sid = _state.get("session_id")
         if not sid:
+            return
+        if owner_session is not None and (
+                sid != owner_session or not _state.get("is_reanalyzing")):
             return
         # Sticky manual reassignment: the user said this key's current audio
         # belongs to another speaker, so accumulate it under that key (it can
@@ -2331,6 +2689,12 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         top_sim = top["similarity"]
 
         with _state_lock:
+            if _state.get("session_id") != sid:
+                # The session this audio came from is no longer the current
+                # one (a recording started after a post-meeting pass launched
+                # this worker). Its streaks and suggestions belong to that
+                # session's live view only, so stop here.
+                return
             streaks = _state["fingerprint_streaks"]
             prev = streaks.get(speaker_key)
             if prev and prev[0] == top_gid:
@@ -2370,6 +2734,8 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
         if not matches:
             return
         with _state_lock:
+            if _state.get("session_id") != sid:
+                return
             current_name = _state["speaker_labels"].get(speaker_key, speaker_key)
             suggestion = {"session_id": sid, "speaker_key": speaker_key,
                           "current_name": current_name, "matches": matches,
@@ -2783,6 +3149,32 @@ def stop_audio_test():
 
 @app.route("/api/recording/start", methods=["POST"])
 def start_recording():
+    # Stamp the idle clock FIRST: a start landing exactly at the idle
+    # threshold must reset the sweep, never race it into unloading the model
+    # the capture is about to use. Then, if the sweep already dropped the
+    # models, wake them and wait here so the click (or the auto-start
+    # coordinator) starts the recording itself instead of bouncing off a 503.
+    _touch_ml()
+    defer_transcription = _transcribe_after_enabled()
+    # A post-meeting transcription pass that is still running is cancelled
+    # whatever the toggle says right now: it shares _state["session_id"] and
+    # the _on_segment path with a live recording, so left running it would
+    # write the previous meeting's speech into this one (found in review
+    # 2026-09-15). It re-queues itself and resumes once this recording ends.
+    _post_meeting.cancel_for_recording()
+    if defer_transcription:
+        # Record-only: the models are not needed until the meeting ends, so a
+        # sleeping model never delays the start.
+        pass
+    elif not _wake_ml_and_wait("recording start requested"):
+        with _state_lock:
+            whisper_back = _state["model_ready"]   # speaker detection still loading
+        if _ml_waking or whisper_back:
+            msg = "The transcription models are still loading; press Record again in a moment"
+        else:
+            msg = (f"The transcription models could not reload "
+                   f"({_ml_wake_error or 'no reason given'}); press Record to try again")
+        return jsonify({"error": msg}), 503
     with _state_lock:
         if _state["is_recording"]:
             return jsonify({"error": "Already recording"}), 400
@@ -2808,6 +3200,12 @@ def start_recording():
         test_cap = _state["test_capture"]
         _state["test_capture"] = None
         _state["is_testing"]   = False
+
+    # Second cancel, now that the start reservation is taken: a post-meeting
+    # pass admitted between the first cancel above and the reservation would
+    # otherwise run on (the prerequisites allow it) and interleave with this
+    # recording. The pass itself re-checks is_starting before taking ownership.
+    _post_meeting.cancel_for_recording()
 
     try:
         if test_cap:
@@ -3004,13 +3402,19 @@ def start_recording():
         else:
             _transcriber.me_label = None
 
-        _transcriber.start(capture.sample_rate, capture.channels,
-                           next_speaker_label=next_speaker_label)
+        if defer_transcription:
+            log.info("recording", "Transcription deferred to the end of the meeting "
+                                  "(transcribe_after_meeting): no live Whisper, speaker "
+                                  "detection, summary or chapters for this recording")
+        else:
+            _transcriber.start(capture.sample_rate, capture.channels,
+                               next_speaker_label=next_speaker_label)
 
         now_mono = time.monotonic()
         with _state_lock:
             _state.update({
                 "is_recording": True,
+                "transcribe_after": defer_transcription,
                 "is_starting": False,
                 "session_id": session_id,
                 "segments": existing_segments,
@@ -3039,6 +3443,15 @@ def start_recording():
                 "recording_started_at_monotonic": now_mono,
                 "capture_silent": False,   # start healthy; the level loop flips this
             })
+        if defer_transcription:
+            # Drain the bounded live queue while transcription is deferred so
+            # unused PCM does not accumulate or count as a live overrun.
+            threading.Thread(target=_drain_audio_queue, args=(session_id,),
+                             daemon=True, name="audio-drain").start()
+            # In the post-meeting queue from now, held until the stop has
+            # finished the files: a quit or crash before then leaves it queued
+            # for the next run instead of never transcribed.
+            _post_meeting.hold(session_id)
 
         # ── Compute video offset for resumed sessions ────────────────────────
         # When resuming, the WAV writer opened in append mode knows the existing
@@ -3197,6 +3610,9 @@ def stop_recording():
             return jsonify({"error": "Not recording"}), 400
         sid = _state["session_id"]
         capture: AudioCapture = _state["audio_capture"]
+        # Record-only session: its transcription runs after the files are final.
+        deferred = bool(_state.get("transcribe_after"))
+        _state["transcribe_after"] = False
         # Snapshot transcript now - state may change before cleanup thread runs
         # plain_snapshot is used for title generation (no source labels needed)
         plain_snapshot = " ".join(s["text"] for s in _state["segments"])
@@ -3296,6 +3712,13 @@ def stop_recording():
                     title_transcript = _build_transcript(
                         sess["segments"], sess.get("speaker_labels") or {})
                 log.info("recording", f"Transcription finished for session {sid}")
+
+            # Record-only session: the mixed WAV and the per-source tracks are
+            # final, so the post-meeting worker takes it from here (released in
+            # the finally below): it transcribes, diarizes, summarizes, titles
+            # and exports it exactly as the live path would have.
+            if deferred and sid:
+                return  # The worker owns title, export and chapters for this pass.
             # Auto-title: use full formatted transcript (with speaker labels) for better context.
             # Skip entirely if the user has manually renamed the session — their title wins.
             if sid and (title_transcript or plain_snapshot).strip():
@@ -3324,6 +3747,10 @@ def stop_recording():
             log.warn("recording", f"Post-stop tasks failed for session {sid}:")
             traceback.print_exc()
         finally:
+            if deferred and sid:
+                # The files are as final as they will get, even if a step above
+                # failed: let the worker have the session (held since the start).
+                _post_meeting.release(sid)
             _recording_cleanup_done.set()
 
     threading.Thread(target=_cleanup, daemon=True).start()
@@ -4798,6 +5225,7 @@ def set_whisper_model():
         return jsonify({"ok": True, "info": _transcriber.device_info})
 
     with _state_lock:
+        was_sleeping = _state["ml_sleeping"]
         _state["model_ready"] = False
         _state["model_info"] = f"Loading {preset['label']}…"
     _push_status()
@@ -4810,7 +5238,13 @@ def set_whisper_model():
             with _state_lock:
                 _state["model_ready"] = True
                 _state["model_info"] = info
+                _state["ml_sleeping"] = False
+            _touch_ml()
             _push_status()
+            if was_sleeping and _transcriber.diarizer is None:
+                # The idle sweep had dropped the diarizer too; bring it back so
+                # the prereq gate does not wait on a load nobody started.
+                _load_diarizer()
         except Exception as e:
             log.error("whisper", f"Error reloading model: {e}")
             with _state_lock:
@@ -4856,6 +5290,7 @@ def set_diarizer_model():
         return jsonify({"error": "HUGGING_FACE_KEY not set"}), 400
 
     with _state_lock:
+        was_sleeping = _state["ml_sleeping"] and not _state["model_ready"]
         _state["diarizer_ready"] = False
         _state["diarizer_failed"] = False   # reset - we're retrying
     _push_status()
@@ -4867,7 +5302,10 @@ def set_diarizer_model():
             with _state_lock:
                 _state["diarizer_ready"] = True
                 _state["diarizer_failed"] = False
+            _touch_ml()
             _push_status()
+            if was_sleeping and _transcriber.model is None:
+                _load_model()  # Whisper was asleep too; wake it alongside
         except Exception as e:
             log.error("diarizer", f"Error reloading: {e}")
             with _state_lock:
@@ -7812,6 +8250,8 @@ def delete_session(session_id: str):
     # If this is the last surviving member of a split group, the rollback
     # backup is now orphaned — clean it up to reclaim disk space.
     group_id = storage.get_session_split_group_id(session_id)
+    # A post-meeting pass on it would keep writing for a deleted id.
+    _post_meeting.forget(session_id)
     storage.delete_session(session_id)
     if group_id:
         try:
@@ -8632,15 +9072,60 @@ def _rollback_interrupted_reanalyses() -> None:
             log.warn("reanalysis",
                      f"Rollback sweep skipped {session_id[:8]}: {exc}")
 
+try:
+    from ml.batch_transcriber import ReanalysisCancelled
+except Exception:  # batch pipeline unavailable: nothing can raise it, keep the except clauses valid
+    class ReanalysisCancelled(Exception):
+        pass
+
+
+def _plan_reanalysis_devices(params: dict | None = None, automatic: bool = False) -> dict:
+    """Devices for one batch reanalysis, from the Reanalysis "Device" setting
+    (Whisper), the Reanalysis "Speaker Detection Device" setting (diarization)
+    and the power source. See core.compute_device.plan_batch_devices for the
+    rules; in short, CUDA only runs on the charger: an automatic pass waits for
+    it, a manual reanalysis on battery runs on the CPU.
+
+    The live Diarizer device setting is deliberately not read here: it is kept
+    on the CPU for live meetings, and inheriting it left an hour-long meeting's
+    after-meeting pass diarizing on the CPU for over an hour."""
+    if params is None:
+        from capture_audio.params import get_reanalysis_defaults
+        params = {**get_reanalysis_defaults(),
+                  **(settings.load().get("reanalysis_params") or {})}
+    from core import power
+    from core.compute_device import best_torch_device, plan_batch_devices
+    diar_pref = (params.get("reanalysis_diarization_device") or "auto").lower()
+    return plan_batch_devices(
+        params.get("reanalysis_device", "auto"),
+        "" if diar_pref == "auto" else diar_pref,
+        best_torch_device(),
+        power.on_ac_power(),
+        automatic,
+    )
+
 
 def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                     num_speakers: int | None = None,
-                    max_speakers: int | None = None) -> bool:
+                    max_speakers: int | None = None,
+                    cancel_event: "threading.Event | None" = None,
+                    post_meeting: bool = False,
+                    devices: dict | None = None) -> bool:
     """Worker: clear DB data, retranscribe the WAV, then regenerate summary.
 
     ``num_speakers`` forces the diarizer to exactly that many speakers for this
     one meeting; ``max_speakers`` only caps it (the diarizer picks up to N). Both
     are per-meeting overrides of the global reanalysis settings; None means auto.
+
+    ``cancel_event`` (a post-meeting pass) abandons the pass once set (the
+    batch worker process is killed); the caller re-queues it. ``post_meeting``
+    labels the progress events so the UI says "Transcribing" rather than
+    "Reanalyzing". ``devices`` is the plan from _plan_reanalysis_devices; the
+    post-meeting queue passes the one it checked the charger with, everyone
+    else gets a fresh plan here.
+
+    The pipeline runs in a child process (ml.batch_worker) that exits when
+    the job ends, so the GPU it used can power down again.
 
     Returns True when the pass completed. Callers that chain follow-up work off
     a reanalysis need to know whether the transcript was actually rebuilt.
@@ -8758,18 +9243,54 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                     if _state["session_id"] == session_id:
                         _state["speaker_labels"][ME_KEY] = me_profile["name"]
 
-            batch = BatchTranscriber(
-                on_text_callback=_on_segment,
-                fingerprint_callback=_on_fingerprint_audio if fingerprint_db.ready else None,
-                hf_token=os.getenv("HUGGING_FACE_KEY", ""),
-                on_progress_callback=lambda pct: _push(
+            def _owned_segment(*args, **kwargs) -> None:
+                # A post-meeting pass only writes while it still owns the
+                # session: _on_segment checks owner_session under its own
+                # lock, so a straggler segment that slipped past the cancel
+                # check is dropped instead of landing in the new meeting.
+                _on_segment(*args, owner_session=session_id, **kwargs)
+
+            def _owned_fingerprint(*args, **kwargs) -> None:
+                _on_fingerprint_audio(*args, owner_session=session_id, **kwargs)
+
+            plan = devices or _plan_reanalysis_devices(params, automatic=post_meeting)
+            params["reanalysis_device"] = plan["whisper"]
+            params["reanalysis_diarizer_device"] = plan["diarizer"]
+            log.info("reanalysis",
+                     f"Devices for {session_id[:8]}: diarization {plan['diarizer']}, "
+                     f"transcription {plan['whisper']}"
+                     + (" (on battery, so the GPU steps run on the CPU)"
+                        if plan.get("battery_cpu") else ""))
+
+            from ml.batch_worker import run_in_child
+            run_in_child(
+                wav_path, params,
+                on_text=_owned_segment if post_meeting else _on_segment,
+                on_fingerprint=((_owned_fingerprint if post_meeting else _on_fingerprint_audio)
+                                if fingerprint_db.ready else None),
+                on_progress=lambda pct: _push(
                     "reanalysis_progress",
-                    {"session_id": session_id, "progress": pct},
+                    {"session_id": session_id, "progress": pct,
+                     "post_meeting": post_meeting},
                 ),
+                cancel_event=cancel_event,
+                cuda="cuda" in (plan["whisper"], plan["diarizer"]),
+                tracks_root=media.tracks_root(session_id),
             )
-            batch.process_wav_file(wav_path, params,
-                                   tracks_root=media.tracks_root(session_id))
         except ImportError as ie:
+            if post_meeting:
+                # The real-time fallback has neither the cancel event nor the
+                # owner check, so a post-meeting pass must not take it: it
+                # could write into a recording that starts meanwhile.
+                raise RuntimeError(f"Batch pipeline unavailable ({ie}); the "
+                                   f"post-meeting transcription was not run") from ie
+            if _transcriber.model is None:
+                # The live model is not loaded (idle-unloaded, or it failed to
+                # load), so the real-time pipeline would emit nothing and this
+                # pass would "succeed" with an empty transcript after deleting
+                # the old one. Fail instead, so the rollback below restores it.
+                raise RuntimeError(f"Batch pipeline unavailable ({ie}) and the live "
+                                   f"transcription model is not loaded") from ie
             log.warn("reanalysis", f"Batch pipeline unavailable ({ie}), "
                      f"falling back to real-time pipeline")
             _transcriber.process_wav_file(wav_path)
@@ -8780,6 +9301,28 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
         guarded = False
         _push("reanalysis_done", {"session_id": session_id})
         ok = True
+        if not post_meeting:
+            # Rebuilt by hand: a post-meeting pass still queued for it would
+            # redo the same work later and wipe speaker names given since.
+            _post_meeting.discard(session_id)
+    except ReanalysisCancelled:
+        if guarded and storage.get_session_times(session_id) is None:
+            # Deleted while the pass ran: restoring would write rows for a
+            # meeting that no longer exists.
+            reanalysis_guard.clear(session_id)
+        elif guarded:
+            before = reanalysis_guard.load(session_id)
+            _rollback_reanalysis(session_id, "the pass was cancelled")
+            if post_meeting and before is not None and not before.get("segments"):
+                # A record-only meeting had no transcript before this pass, so
+                # the rollback (which never restores an empty snapshot) leaves
+                # what the pass wrote. Clear it, or the meeting shows half a
+                # transcript as if it were finished until the queue runs it again.
+                storage.reset_session_transcript(session_id)
+                _push("transcript_reset", {"session_id": session_id})
+        log.info("reanalysis", f"Transcription of {session_id[:8]} paused: a recording "
+                               f"started; it runs again when that recording ends")
+        _push("reanalysis_done", {"session_id": session_id, "cancelled": True})
     except Exception as e:
         log.error("reanalysis", f"{e}")
         import traceback; traceback.print_exc()
@@ -8793,6 +9336,391 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
             # was deleted mid-pass, say) would lock recording out entirely.
             _state["is_reanalyzing"] = False
     return ok
+
+
+def _drain_audio_queue(session_id: str) -> None:
+    """Discard the mixer's live PCM for the life of a record-only session.
+
+    The normal transcriber consumer is off. Discard unused live PCM so the
+    bounded queue stays empty and does not report artificial overruns. The
+    WAV writer sits inside the capture and is unaffected."""
+    while True:
+        with _state_lock:
+            if not _state["is_recording"] or _state["session_id"] != session_id:
+                return
+        try:
+            _audio_queue.get(timeout=0.5)
+        except queue.Empty:
+            pass
+
+
+_AUDIO_STALL_SEC = 45.0
+
+
+def _audio_growth_loop() -> None:
+    """Alarm when the recording's WAV stops growing while a recording runs.
+
+    Cheap insurance for the failure that matters most once transcription is
+    deferred: if the audio is not reaching disk, there is nothing to
+    transcribe later. Checked every 10 s; a file that has not grown for
+    _AUDIO_STALL_SEC raises the capture alert (kind "stalled"), at most once
+    every two minutes per recording, and the warning comes down once the file
+    grows again. Only a file that was growing can stall: until the first
+    audio arrives (no mic, nothing playing yet) the mixer writes nothing, and
+    the desktop-audio alarm already covers that."""
+    last_sid = None
+    last_size = -1
+    last_growth = 0.0
+    last_alarm = 0.0
+    grew = False
+    stalled = False
+    while True:
+        try:
+            time.sleep(10.0)
+            with _state_lock:
+                sid = _state["session_id"] if _state["is_recording"] else None
+            if not sid:
+                last_sid = None
+                continue
+            now = time.monotonic()
+            if sid != last_sid:
+                last_sid, last_size, last_growth, last_alarm = sid, -1, now, 0.0
+                grew = stalled = False
+            try:
+                audio_path = media.audio_path(sid)
+                size = audio_path.stat().st_size if audio_path is not None else -1
+            except OSError:
+                size = -1
+            if size > last_size:
+                grew = grew or last_size >= 0
+                last_size, last_growth = size, now
+                if stalled:
+                    stalled = False
+                    _alert_capture_stall_cleared(sid)
+                continue
+            if (grew and now - last_growth >= _AUDIO_STALL_SEC
+                    and now - last_alarm >= 120.0):
+                last_alarm = now
+                stalled = True
+                log.error("audio", f"Recording file has not grown for {now - last_growth:.0f}s "
+                                   f"({sid[:8]}.wav at {max(size, 0) / 1e6:.1f} MB)")
+                _alert_loopback_silent(sid, "", "stalled")
+        except Exception as e:   # one bad tick must not end the check for the session
+            log.warn("audio", f"Recording file check failed: {e}")
+
+
+class _PostMeetingTranscription:
+    """Transcribes recordings made with transcribe_after_meeting on, one at a
+    time, only while nothing is recording.
+
+    A recording that starts while a pass runs cancels it (start_recording calls
+    cancel_for_recording; the batch pipeline stops at its next checkpoint and
+    emits no further segment) and the session goes back to the front of the
+    queue. The queue is persisted in settings (post_meeting_pending) so a
+    restart resumes unfinished passes. Each completed pass then does what the
+    live path would have done at stop: title, full summary (with the Obsidian
+    export), chapters, and the search embedding.
+
+    A record-only session joins the queue when its recording starts, held
+    until its files are final (hold(), then release() at the end of the
+    stop). Queued only at the end of the stop, a quit, restart, update or
+    crash before that point lost the pass for good; now the next run finds it
+    in post_meeting_pending and transcribes what was recorded. A session that
+    is deleted (forget()) or rebuilt by a manual reanalysis (discard()) leaves
+    the queue and is never queued again, so a pass cannot write into a deleted
+    meeting or redo, over the user's edits, one that is already done."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._queue: list[str] = []
+        self.running_session: str | None = None
+        self._cancel = threading.Event()
+        self._wake = threading.Event()
+        # Queued but not ready: still recording, or its stop is finishing the
+        # files. In memory only, so after a restart every queued session is
+        # ready, which is exactly the crash case.
+        self._held: set[str] = set()
+        # Deleted, or rebuilt by hand: never (re)queued in this run.
+        self._settled: set[str] = set()
+        # Charger gate: a pass that would use the NVIDIA GPU waits while the
+        # machine is on battery. Power is re-checked at most once a minute,
+        # and only while something is queued.
+        from core.power import ChargerGate
+        self._charger = ChargerGate()
+        self._plan: dict | None = None
+
+    # ── queue ────────────────────────────────────────────────────────────
+    def _persist_locked(self) -> None:
+        pending = list(self._queue)
+        if self.running_session and self.running_session not in pending:
+            pending.insert(0, self.running_session)
+        try:
+            settings.put("post_meeting_pending", pending)
+        except Exception as e:
+            log.warn("reanalysis", f"Could not persist the post-meeting queue: {e}")
+
+    def restore(self) -> None:
+        """Re-queue the sessions a previous run left unfinished."""
+        pending = settings.get("post_meeting_pending", []) or []
+        with self._lock:
+            for sid in pending:
+                if isinstance(sid, str) and sid and sid not in self._queue:
+                    self._queue.append(sid)
+            n = len(self._queue)
+        if n:
+            log.info("reanalysis", f"Resuming {n} post-meeting transcription(s) left "
+                                   f"unfinished by the previous run")
+            self._wake.set()
+
+    def enqueue(self, session_id: str) -> None:
+        with self._lock:
+            if session_id in self._settled:
+                return
+            if session_id not in self._queue and session_id != self.running_session:
+                self._queue.append(session_id)
+            self._persist_locked()
+        log.info("reanalysis", f"Queued post-meeting transcription for {session_id[:8]}")
+        self._wake.set()
+
+    def hold(self, session_id: str) -> None:
+        """A record-only recording started (or resumed): queue it now,
+        persisted, but not ready until release()."""
+        with self._lock:
+            self._settled.discard(session_id)   # resumed: new audio to transcribe
+            self._held.add(session_id)
+            if session_id not in self._queue and session_id != self.running_session:
+                self._queue.append(session_id)
+            self._persist_locked()
+
+    def release(self, session_id: str) -> None:
+        """The recording's files are final: the worker may run it now."""
+        with self._lock:
+            self._held.discard(session_id)
+        self.enqueue(session_id)
+
+    def discard(self, session_id: str) -> None:
+        """A manual reanalysis rebuilt this meeting: its queued pass would only
+        redo the same work, wiping speaker names given since."""
+        with self._lock:
+            self._settled.add(session_id)
+            self._held.discard(session_id)
+            if session_id not in self._queue:
+                return
+            self._queue.remove(session_id)
+            self._persist_locked()
+        log.info("reanalysis", f"Dropped the queued post-meeting transcription of "
+                               f"{session_id[:8]}: it was reanalyzed by hand")
+
+    def forget(self, session_id: str, wait: float = 10.0) -> None:
+        """The meeting is being deleted: drop it from the queue and, if its
+        pass is running, stop it and wait for the pass to end, so nothing is
+        written for the deleted id afterwards. Call before deleting."""
+        with self._lock:
+            self._settled.add(session_id)
+            self._held.discard(session_id)
+            if session_id in self._queue:
+                self._queue.remove(session_id)
+            running = self.running_session == session_id
+            if running:
+                self._cancel.set()
+            self._persist_locked()
+        if not running:
+            return
+        log.info("reanalysis", f"Stopping the post-meeting transcription of "
+                               f"{session_id[:8]}: the meeting is being deleted")
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self.running_session != session_id:
+                    return
+            time.sleep(0.1)
+        log.warn("reanalysis", f"The post-meeting transcription of {session_id[:8]} "
+                               f"did not stop within {wait:.0f}s; deleting anyway")
+
+    def cancel_for_recording(self) -> None:
+        with self._lock:
+            running = self.running_session
+        if running:
+            log.info("reanalysis", f"A recording is starting; pausing the post-meeting "
+                                   f"transcription of {running[:8]}")
+            self._cancel.set()
+
+    def pending(self) -> list[str]:
+        with self._lock:
+            return list(self._queue)
+
+    # ── worker ───────────────────────────────────────────────────────────
+    def _ready_locked(self) -> list[str]:
+        return [s for s in self._queue if s not in self._held]
+
+    def _wait_timeout(self) -> float | None:
+        # Nothing ready: sleep until enqueue/release/restore/_finish wakes us.
+        # Queued but waiting for the charger: once a minute. Queued behind a
+        # recording or a reanalysis: every 5 s, as before.
+        with self._lock:
+            if not self._ready_locked():
+                return None
+        return 60.0 if self._charger.waiting else 5.0
+
+    def worker(self) -> None:
+        while True:
+            self._wake.wait(timeout=self._wait_timeout())
+            self._wake.clear()
+            sid = self._next_ready()
+            if sid:
+                try:
+                    self._run(sid)
+                except Exception as e:
+                    log.error("reanalysis", f"Post-meeting transcription of {sid[:8]} crashed: {e}")
+                    self._finish(sid, done=True)
+
+    def _busy(self) -> bool:
+        # The coordinator has its own lock: read it outside _state_lock.
+        pending_start = _start_coordinator.pending_command() is not None
+        with _state_lock:
+            busy = bool(_state["is_recording"] or _state.get("is_starting")
+                        or _state.get("is_reanalyzing"))
+        return busy or pending_start
+
+    def _power_plan(self) -> dict | None:
+        """The device plan when a pass may start now; None while it waits for
+        the charger. The session stays queued (and persisted in
+        post_meeting_pending) the whole time, so a restart keeps it."""
+        try:
+            return self._charger.check(lambda: _plan_reanalysis_devices(automatic=True))
+        except Exception as e:
+            log.warn("reanalysis", f"Could not plan the post-meeting devices: {e}")
+            return None
+
+    def _next_ready(self) -> str | None:
+        if self._busy():
+            return None
+        with self._lock:
+            if not self._ready_locked():
+                return None
+        plan = self._power_plan()
+        if plan is None:
+            return None
+        with self._lock:
+            ready = self._ready_locked()
+            if not ready:
+                return None
+            sid = ready[0]
+            self._queue.remove(sid)
+            self.running_session = sid
+            self._plan = plan
+            self._cancel.clear()
+            self._persist_locked()
+        return sid
+
+    def _finish(self, sid: str, done: bool) -> None:
+        with self._lock:
+            if self.running_session == sid:
+                self.running_session = None
+            if not done and sid not in self._queue and sid not in self._settled:
+                self._queue.insert(0, sid)
+            self._persist_locked()
+            more = bool(self._queue)
+        if more:
+            self._wake.set()
+
+    def _run(self, sid: str) -> None:
+        wav_path = media.audio_path(sid)
+        sess = storage.get_session(sid)
+        if not sess or wav_path is None:
+            log.warn("reanalysis", f"Post-meeting transcription skipped for {sid[:8]}: "
+                                   f"{'session gone' if not sess else 'no audio file'}")
+            self._finish(sid, done=True)
+            return
+        with _state_lock:
+            if (_state["is_recording"] or _state.get("is_starting")
+                    or _state.get("is_reanalyzing")):
+                self._finish(sid, done=False)
+                return
+            # Same ownership hand-off the manual reanalyze route does.
+            _state["session_id"] = sid
+            _state["is_reanalyzing"] = True
+            _state["segments"] = []
+            _state["pending_segments"] = 0
+            _state["summarized_seg_count"] = 0
+            _state["pending_chapter_segments"] = 0
+            _state["speaker_labels"] = {}
+        # The calendar's attendee count, when the recording matched an event,
+        # caps the diarizer the same way the Speakers workflow does.
+        max_speakers = sess.get("expected_speaker_count") or None
+        log.info("reanalysis", f"Post-meeting transcription starting for {sid[:8]}"
+                               + (f" (capped at {max_speakers} speakers from the calendar)"
+                                  if max_speakers else ""))
+        _push_status()
+        ok = _run_reanalysis(sid, str(wav_path), "", None, max_speakers,
+                             cancel_event=self._cancel, post_meeting=True,
+                             devices=self._plan)
+        if not ok and self._cancel.is_set():
+            # Cancelled before it finished: back to the front of the queue
+            # (unless the meeting was deleted meanwhile, see _finish). A pass
+            # that finished just as the cancel came in is kept; running it
+            # again would only redo the same transcript.
+            self._finish(sid, done=False)
+            return
+        with self._lock:
+            deleted = sid in self._settled
+        if ok and not deleted:
+            try:
+                self._follow_up(sid)
+            except Exception as e:
+                log.warn("reanalysis", f"Post-meeting follow-up for {sid[:8]} failed: {e}")
+        self._finish(sid, done=True)
+        _push_status()
+
+    def _follow_up(self, sid: str) -> None:
+        """Title, summary (+ Obsidian export), chapters and embedding, read back
+        from the database so a recording that started in the meantime cannot
+        leak into them."""
+        sess = storage.get_session(sid) or {}
+        segments = sess.get("segments") or []
+        labels = sess.get("speaker_labels") or {}
+        if not segments:
+            log.info("reanalysis", f"Post-meeting transcription of {sid[:8]} produced no "
+                                   f"speech; nothing to summarize")
+            return
+        transcript = _build_transcript(segments, labels)
+        meta = _build_session_meta(
+            segments, labels, session_title=sess.get("title") or "", is_live=False,
+            started_at=sess.get("started_at") or "", ended_at=sess.get("ended_at") or "",
+        )
+        try:
+            if storage.is_title_user_set(sid):
+                log.info("reanalysis", f"Keeping the user-set title of {sid[:8]}")
+            else:
+                title = ai.generate_title(
+                    transcript, context=storage.get_title_generation_context(sid),
+                    system_prompt=settings.get("title_system_prompt") or None,
+                )
+                if title:
+                    storage.update_session_title(sid, title, user_set=False)
+                    _push("session_title", {"session_id": sid, "title": title})
+        except Exception as e:
+            log.warn("reanalysis", f"Post-meeting title for {sid[:8]} failed: {e}")
+        if settings.get("auto_summary", True):
+            _run_summary(sid, "", transcript, len(segments), "", meta,
+                         is_auto=False, clears_pending=False, force_full=True,
+                         export_after=True)
+        else:
+            try:
+                obsidian.export_session(sid)
+            except Exception as e:
+                log.warn("reanalysis", f"Post-meeting export for {sid[:8]} failed: {e}")
+        if settings.get("chapters_auto", True):
+            _run_chapters(sid, transcript, _segment_times(segments), meta, is_auto=False)
+        try:
+            update_session_embedding(sid)
+        except Exception as e:
+            log.warn("reanalysis", f"Post-meeting embedding for {sid[:8]} failed: {e}")
+        log.info("reanalysis", f"Post-meeting transcription finished for {sid[:8]}: "
+                               f"{len(segments)} segments")
+
+
+_post_meeting = _PostMeetingTranscription()
 
 
 @app.route("/api/sessions/<session_id>/reanalyze", methods=["POST"])
@@ -8815,6 +9743,11 @@ def reanalyze_session(session_id: str):
         except ImportError:
             _batch_available = False
         if not _batch_available and not _state["model_ready"]:
+            if _state["ml_sleeping"]:
+                # Deferred to a thread because _wake_ml takes _state_lock,
+                # which this block already holds (the lock is not reentrant).
+                threading.Thread(target=_wake_ml, args=("reanalysis requested",), daemon=True).start()
+                return jsonify({"error": "Waking transcription model - retry in a few seconds"}), 503
             return jsonify({"error": "Transcription model not loaded yet"}), 503
         # Load the session into active state so _on_segment callbacks work
         sess = storage.get_session(session_id)
@@ -9012,6 +9945,14 @@ def patch_folder(folder_id: str):
 def delete_folder(folder_id: str):
     data = request.get_json(silent=True) or {}
     delete_contents = bool(data.get("delete_contents"))
+    if delete_contents:
+        # Stop any post-meeting pass on a meeting about to go with the folder.
+        try:
+            doomed = storage.list_session_ids_in_folder(str(folder_id), recursive=True)
+        except Exception:
+            doomed = []
+        for sid in doomed:
+            _post_meeting.forget(sid)
     deleted_ids = storage.delete_folder(folder_id, delete_contents=delete_contents)
     # Clear active session state if it was deleted
     if deleted_ids:
@@ -9067,6 +10008,7 @@ def bulk_sessions():
             gid = storage.get_session_split_group_id(sid)
             if gid:
                 touched_groups.add(gid)
+            _post_meeting.forget(sid)
             storage.delete_session(sid)
             # Clear active session state if it was one of the deleted sessions
             with _state_lock:
@@ -10050,6 +10992,11 @@ def smart_cleanup(session_id: str):
         except ImportError:
             _batch_available = False
         if not _batch_available and not _state["model_ready"]:
+            if _state["ml_sleeping"]:
+                # Deferred to a thread because _wake_ml takes _state_lock,
+                # which this block already holds (the lock is not reentrant).
+                threading.Thread(target=_wake_ml, args=("reanalysis requested",), daemon=True).start()
+                return jsonify({"error": "Waking transcription model - retry in a few seconds"}), 503
             return jsonify({"error": "Transcription model not loaded yet"}), 503
         if not storage.get_session_times(session_id):
             return jsonify({"error": "Session not found"}), 404
@@ -10538,6 +11485,19 @@ def fp_unlink_session_speaker(session_id: str, speaker_key: str):
     return jsonify({"ok": True})
 
 
+def _end_batch_workers() -> None:
+    """Kill every reanalysis worker process (ml.batch_worker) and its children.
+    Every exit path calls this before os._exit, which ends the app's threads
+    but not a child process. Never raises."""
+    try:
+        from ml import batch_worker
+        n = batch_worker.kill_all()
+        if n:
+            log.info("reanalysis", f"Ended {n} reanalysis worker process(es) before exiting")
+    except Exception as e:
+        log.warn("reanalysis", f"Could not end the reanalysis worker: {e}")
+
+
 def _force_quit(delay: float = 0) -> None:
     """Stop any active recording/test, clean up resources, and exit immediately.
 
@@ -10560,10 +11520,12 @@ def _force_quit(delay: float = 0) -> None:
     finally:
         if got_lock:
             _state_lock.release()
-    # The reanalysis worker is a daemon thread: os._exit below kills it where
-    # it stands, with the old transcript already deleted. Put it back now
-    # rather than leaving the meeting empty until the next startup sweep finds
-    # it. Bounded work (one DB write) and it must never block the exit.
+    # The reanalysis runs in a child process (ml.batch_worker) that os._exit
+    # below would leave running. End it first, so no rebuilt segment lands
+    # after the rollback, then put the old transcript back rather than leaving
+    # the meeting empty until the next startup sweep finds it. Bounded work
+    # (one DB write) and it must never block the exit.
+    _end_batch_workers()
     if reanalyzing and sid:
         try:
             _rollback_reanalysis(sid, "the app was quit mid-reanalysis")
@@ -10594,10 +11556,7 @@ def _force_quit(delay: float = 0) -> None:
         except Exception:
             pass
         _tray = None
-    try:
-        heartbeat.clear()  # signal a CLEAN quit so the watchdog does not relaunch
-    except Exception:
-        pass
+    _stop_heartbeat()  # signal a CLEAN quit so the watchdog does not relaunch
     os._exit(0)
 
 
@@ -10731,8 +11690,10 @@ def restart():
         if capture:
             capture.stop()
         _transcriber.stop()
-        # Same reason as _force_quit: the reanalysis worker dies with the
-        # process, mid-rebuild, with the old transcript already deleted.
+        # Same reason as _force_quit: end the reanalysis worker process (it
+        # would outlive os._exit), then put back the transcript it had already
+        # deleted.
+        _end_batch_workers()
         if reanalyzing and sid:
             try:
                 _rollback_reanalysis(sid, "the app was restarted mid-reanalysis")
@@ -10742,6 +11703,7 @@ def restart():
             storage.end_session(sid)
         time.sleep(0.5)
 
+        _stop_heartbeat()  # a restart is a clean quit to the watchdog
         _relaunch_app()
 
         if _tray is not None:
@@ -10876,8 +11838,10 @@ def update_apply():
         if capture:
             capture.stop()
         _transcriber.stop()
-        # Same reason as _force_quit: the reanalysis worker dies with the
-        # process, mid-rebuild, with the old transcript already deleted.
+        # Same reason as _force_quit: end the reanalysis worker process (it
+        # would outlive os._exit), then put back the transcript it had already
+        # deleted.
+        _end_batch_workers()
         if reanalyzing and sid:
             try:
                 _rollback_reanalysis(sid, "the app was restarted mid-reanalysis")
@@ -10888,6 +11852,7 @@ def update_apply():
         time.sleep(0.5)  # let the HTTP response reach the browser
 
         # Relaunch so the experience matches a normal start (cross-platform).
+        _stop_heartbeat()  # a restart is a clean quit to the watchdog
         _relaunch_app()
 
         if _tray is not None:
@@ -11155,6 +12120,12 @@ def main() -> None:
     # first import. About 1.2 s, which is where that time was spent before the
     # tray moved ahead of the imports. See _preload_torch for the crash.
     _preload_torch()
+
+    if sys.platform == "win32":
+        # Start the desktop audio helper now (capture_audio/loopback_child.py), so
+        # the first recording does not wait the 3 to 5 s a new process takes here.
+        from capture_audio.windows import prewarm_loopback_helper
+        prewarm_loopback_helper()
 
     # Start Flask in a daemon thread so the main thread is free for the tray
     flask_thread = threading.Thread(

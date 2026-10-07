@@ -19,6 +19,35 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Fixed calls recorded with only your side, and added transcribing after the meeting (2026-10-07)
+
+### Recording
+
+- **The other side of a call is recorded** on headphones or any output connected after the app started.
+- **If your selected output or microphone goes away**, recording uses your default one within seconds, and switches back when it returns.
+- **With `Follow call audio to its output device` on**, a call on another output than Windows' communications device is followed there.
+- **No more popping or crackling** in the other side's audio.
+- **The call audio warning also flashes the taskbar**, and opens the app if it is closed.
+- **A recording whose file stops growing** for 45 seconds raises the same warning until it grows again.
+
+### Transcription
+
+- **`Transcribe after the meeting`** in `Settings > System` records audio and screen only, then transcribes and summarizes when the meeting ends.
+- **A recording that starts meanwhile** pauses that transcription until it ends.
+- **On battery**, it waits for the charger before using the graphics card.
+- **`Speaker Detection Device`** in `Settings > Reanalysis` sets where speakers are found after a meeting.
+
+### Speakers
+
+- **`Fold Short Replies Into Speakers`**, off by default in `Settings > Reanalysis`, stops "mm-hmm" becoming an extra person.
+- **A speaker count from you or your calendar** now includes you.
+
+### System
+
+- **Restarting from inside the app** no longer reports a false crash.
+- **Deleting a meeting** also removes its per-speaker audio and video leftovers.
+
+
 ## Added the app's own notifications, plus fixes for Record and Speakers (2026-10-01)
 
 ### Notifications

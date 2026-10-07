@@ -186,6 +186,27 @@ class _SpeechBrainIntegrationStubFinder(_importlib_abc.MetaPathFinder):
 # Install early, before any pyannote / diart import triggers speechbrain lazy loads
 _sys.meta_path.insert(0, _SpeechBrainIntegrationStubFinder())
 
+
+def neutralise_speechbrain_lazy_modules() -> None:
+    """Replace speechbrain LazyModules already in sys.modules with inert stubs.
+
+    Runs when the streaming diarizer loads, and in the batch worker child
+    process (ml.batch_worker), which has no streaming diarizer but needs the
+    same pyannote environment as the app process."""
+    try:
+        from speechbrain.utils.importutils import LazyModule as _LM
+        for _key in list(_sys.modules):
+            if _key.startswith("speechbrain."):
+                _mod = _sys.modules[_key]
+                if isinstance(_mod, _LM):
+                    _stub = _types.ModuleType(_key)
+                    _stub.__path__ = []
+                    _stub.__package__ = _key
+                    _sys.modules[_key] = _stub
+    except ImportError:
+        pass
+
+
 def _merge_turns(
     turns: list[tuple[str, float, float]],
     merge_gap: float = 0.1,
@@ -288,19 +309,7 @@ class StreamingDiarizer:
         self._dev = torch.device(device)
         log.info("diarizer", f"Loading streaming diarizer on {self._dev}…")
 
-        # ── Neutralise speechbrain LazyModules already in sys.modules ────────
-        try:
-            from speechbrain.utils.importutils import LazyModule as _LM
-            for _key in list(_sys.modules):
-                if _key.startswith("speechbrain."):
-                    _mod = _sys.modules[_key]
-                    if isinstance(_mod, _LM):
-                        _stub = _types.ModuleType(_key)
-                        _stub.__path__ = []
-                        _stub.__package__ = _key
-                        _sys.modules[_key] = _stub
-        except ImportError:
-            pass
+        neutralise_speechbrain_lazy_modules()
 
         # ── Load segmentation model ─────────────────────────────────────────
         log.info("diarizer", "Loading segmentation model…")

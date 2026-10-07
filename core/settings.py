@@ -195,6 +195,20 @@ DEFAULTS: dict = {
     # the probe is a no-op.
     "loopback_follow_output": False,
 
+    # Record now, transcribe when the meeting ends. ON records the audio (and
+    # the screen) only: no live Whisper, diarizer, summary or chapters while
+    # the meeting runs. When the recording stops, the batch reanalysis pipeline
+    # transcribes and diarizes it, then the summary, chapters and title are
+    # generated as they would have been live. Keeps every inference workload
+    # off the machine while the user is presenting (2026-09-15: the RTX 5080
+    # hung mid-webinar with live CUDA transcription on it). A recording that
+    # starts while that pass is running cancels the pass, which resumes after
+    # the new recording ends; a restart resumes unfinished passes too.
+    "transcribe_after_meeting": False,
+    # Machine-managed: session ids whose post-meeting transcription has not
+    # completed yet, so an app restart picks them back up.
+    "post_meeting_pending": [],
+
     # The icon set in use (Settings > Icons): "default" (the owner's logo),
     # "wave" (Pat Gordon's), or the id of a custom set under <data>/icons/sets.
     # It drives the sidebar, the tab, the installed app, the tray and the
@@ -209,6 +223,15 @@ DEFAULTS: dict = {
     # last_run is machine-managed (UTC ISO timestamp of the last applied run).
     "library_maintenance_enabled": True,
     "library_maintenance_days": 7,
+
+    # Minutes with no recording, test, reanalysis or summary before the ML
+    # stack (Whisper, diarizer, fingerprint embedder) is unloaded to give its
+    # commit charge back to the machine. Anything that needs the models wakes
+    # them; a recording start waits for the reload (about 3 to 10 s), and the
+    # capture only opens once they are back, so those seconds of the meeting
+    # are not recorded. 0 (the default) keeps them loaded; opt in with a
+    # number of minutes.
+    "ml_idle_unload_minutes": 0,
     "library_maintenance_last_run": "",
 
     # Calendar (published Outlook ICS feed). The owner publishes his calendar

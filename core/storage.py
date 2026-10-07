@@ -1336,8 +1336,19 @@ def delete_session(session_id: str) -> None:
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM media_encodes WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-    # Every media file the session owns, in whatever format it ended up in.
+    # Every media file the session owns, in whatever format it ended up in,
+    # leftovers included (per-source temp WAVs, video fragments and merge parts).
     media.delete_session_media(session_id)
+    # Nothing below may run for an id that is not a real one: "*" or an id
+    # with "..\" in it reaches other meetings' files or outside the data
+    # folder (the notes folder is removed with rmtree).
+    if not media.is_session_id(session_id):
+        return
+    try:
+        (paths.data_dir() / "resolution_candidates" / f"{session_id}.json").unlink(
+            missing_ok=True)
+    except OSError:
+        pass
     # Notes attachments live in data_dir()/notes/<session_id>/
     notes_dir = paths.data_dir() / "notes" / session_id
     if notes_dir.exists():
@@ -1891,7 +1902,8 @@ def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
 def get_session(session_id: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute(
-            "SELECT id, title, started_at, ended_at, folder_id, notes, notes_updated_at "
+            "SELECT id, title, started_at, ended_at, folder_id, notes, notes_updated_at, "
+            "expected_speaker_count "
             "FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
@@ -1936,7 +1948,8 @@ def get_session(session_id: str) -> dict | None:
             notes_payload = None
 
     return {
-        **{k: row[k] for k in ("id", "title", "started_at", "ended_at", "folder_id")},
+        **{k: row[k] for k in ("id", "title", "started_at", "ended_at", "folder_id",
+                               "expected_speaker_count")},
         "segments": [
             {"id": r["id"], "text": r["text"], "source": r["source"],
              "start_time": r["start_time"], "end_time": r["end_time"],

@@ -48,6 +48,16 @@ PCM_RATE = 48_000
 _PCM_SUBDIR = "pcm"
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_SESSION_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def is_session_id(value: str | None) -> bool:
+    """True for a well-formed session id (a UUID). Anything that turns an id
+    into file names or file patterns checks this first: "*" as an id matched
+    every recording in the folder, and an id with path separators or ".."
+    reaches outside it."""
+    return bool(value) and _SESSION_ID_RE.fullmatch(value) is not None
 
 _decode_locks: dict[str, threading.Lock] = {}
 _decode_locks_guard = threading.Lock()
@@ -317,9 +327,18 @@ def prune_pcm_cache(max_age_sec: float = 24 * 3600) -> int:
 
 def delete_session_media(session_id: str) -> list[Path]:
     """Remove every media file a session owns: the mixed audio in any format,
-    the per-source tracks, the video and any encoder fragment left beside it,
-    and the PCM decode. Returns what was removed. Never raises."""
+    the per-source tracks and their temporary WAVs and decodes, the video, any
+    encoder fragment ({sid}.mp4.frag.mp4) and the parts an interrupted merge
+    left ({sid}_part1.mp4, {sid}_concat.txt, {sid}_merged.mp4), and the PCM
+    decode. Returns what was removed. Never raises.
+
+    The leftovers are found by pattern ("{sid}.*", "{sid}_*"), which stays
+    inside one session only for a well-formed id, so anything else is refused
+    outright (see is_session_id)."""
     removed: list[Path] = []
+    if not is_session_id(session_id):
+        log.warn("media", f"Not deleting media for a malformed session id {session_id!r}")
+        return removed
     candidates: list[Path] = list(audio_candidates(session_id))
     audio_dir = paths.audio_dir()
     for suffix in (".opus", ".wav"):
@@ -327,10 +346,12 @@ def delete_session_media(session_id: str) -> list[Path]:
         candidates.append(audio_dir / f"{session_id}_mic{suffix}")
     video = video_path(session_id)
     candidates.append(video)
-    try:
-        candidates.extend(p for p in video.parent.glob(f"{session_id}.mp4.*"))
-    except OSError:
-        pass
+    for folder in (audio_dir, video.parent):
+        for pattern in (f"{session_id}.*", f"{session_id}_*"):
+            try:
+                candidates.extend(folder.glob(pattern))
+            except OSError:
+                pass
     for p in candidates:
         try:
             if p.exists():
