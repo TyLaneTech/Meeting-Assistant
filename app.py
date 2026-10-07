@@ -1692,20 +1692,31 @@ def _load_model() -> None:
         _push_status()
 
 
+def _saved_diarizer_device() -> str | None:
+    """The saved diarizer device if this machine can honor it, else None (the
+    diarizer then picks the best device itself).
+
+    Validate the saved choice against what the current machine actually
+    supports: accelerator strings ("cuda", "mps") only honored if probe
+    succeeds, falling back to auto-detection otherwise. A saved "cpu" needs no
+    probe, so the CPU diarizer never waits on the GPU check."""
+    saved_device = settings.get("diarizer_device", "")
+    if not saved_device:
+        return None
+    if saved_device == "cpu":
+        return saved_device
+    from core.compute_device import best_torch_device
+    return saved_device if best_torch_device() in ("cuda", "mps") else None
+
+
 def _load_diarizer() -> None:
     hf_token = os.getenv("HUGGING_FACE_KEY")
     if not hf_token:
         log.warn("diarizer", "HUGGING_FACE_KEY not set - speaker diarization disabled.")
         return
     try:
-        saved_device = settings.get("diarizer_device", "")
-        # Validate the saved choice against what the current machine actually
-        # supports: accelerator strings ("cuda", "mps") only honored if probe
-        # succeeds, falling back to auto-detection otherwise. A saved "cpu"
-        # needs no probe, so the CPU diarizer never waits on the GPU check.
-        from core.compute_device import best_torch_device
-        if saved_device and (saved_device == "cpu"
-                             or best_torch_device() in ("cuda", "mps")):
+        saved_device = _saved_diarizer_device()
+        if saved_device:
             log.info("settings", f"Restored diarizer device: {saved_device}")
             _transcriber.load_diarizer(hf_token, device=saved_device)
         else:
@@ -5176,12 +5187,14 @@ def get_models():
     with _state_lock:
         diarizer_ready = _state["diarizer_ready"]
 
-    # If the diarizer hasn't loaded yet but an HF key exists, infer the
-    # device from accelerator availability so the dropdown shows the right
-    # value instead of "Disabled".
+    # If the diarizer is not loaded (still loading, or unloaded after idle) but
+    # an HF key exists, show the device it loads on, so the dropdown shows the
+    # right value instead of "Disabled". That is the saved device when this
+    # machine can honor it: the best device alone showed "GPU" for a user who
+    # had picked the CPU, whenever the idle unload had the models asleep.
     if diarizer_device is None and has_hf_key:
         from core.compute_device import best_torch_device
-        diarizer_device = best_torch_device()
+        diarizer_device = _saved_diarizer_device() or best_torch_device()
 
     return jsonify({
         "cuda_available": cuda_available,
@@ -9187,7 +9200,9 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                 _state["source_redirects"] = {}
                 _state["_confirmed_speakers"] = set()
 
-        _push("reanalysis_start", {"session_id": session_id})
+        # post_meeting tells the page apart from a manual reanalysis: a start
+        # pauses this pass (see _recording_prereqs_locked), so Record stays live.
+        _push("reanalysis_start", {"session_id": session_id, "post_meeting": post_meeting})
         _push("transcript_reset", {"session_id": session_id})
 
         # Run batch pipeline (transformers + pyannote) if available,

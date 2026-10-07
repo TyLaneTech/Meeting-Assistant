@@ -33,7 +33,7 @@ How to write one:
 ### Transcription
 
 - **`Transcribe after the meeting`** in `Settings > System` records audio and screen only, then transcribes and summarizes when the meeting ends.
-- **A recording that starts meanwhile** pauses that transcription until it ends.
+- **Record stays available while it runs**: a new recording pauses that transcription until it ends.
 - **On battery**, it waits for the charger before using the graphics card.
 - **`Speaker Detection Device`** in `Settings > Reanalysis` sets where speakers are found after a meeting.
 

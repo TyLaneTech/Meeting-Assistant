@@ -1703,6 +1703,10 @@ const state = {
   isTesting:      false,
   isViewingPast:  false,
   isReanalyzing:  false,
+  // The reanalysis on this page is the after-meeting transcription pass. A
+  // recording start pauses that pass (the server's recording_ready allows it),
+  // so unlike a manual reanalysis it must not hold the Record button.
+  isPostMeetingPass: false,
   // The meeting stopped but the transcriber is still working through audio it
   // had not caught up with. Segments keep arriving for that session, so the
   // transcript view must keep appending them the way it does for a reanalysis.
@@ -5068,6 +5072,7 @@ async function handleAudioUpload(input) {
     state.sessionId     = sessionId;
     state.isViewingPast = false;
     state.isReanalyzing = true;
+    state.isPostMeetingPass = false;
     history.pushState({}, '', '/session?id=' + sessionId);
 
     // Clear display for incoming transcript
@@ -5790,6 +5795,7 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing = true;
+    state.isPostMeetingPass = !!d.post_meeting;
     state.isViewingPast = false;  // Allow live transcript updates during reanalysis
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
@@ -5814,6 +5820,7 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing   = false;
+    state.isPostMeetingPass = false;
     state.isViewingPast   = true;  // Back to viewing past session
     state.sessionHasAudio = true;
     const dot  = document.getElementById('status-dot');
@@ -5834,6 +5841,7 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing = false;
+    state.isPostMeetingPass = false;
     state.isViewingPast = true;
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
@@ -6175,11 +6183,18 @@ function _syncReliabilityToggles() {
 }
 
 /* ── Status ──────────────────────────────────────────────────────────────── */
+/** A manual reanalysis holds Record until it finishes. The after-meeting
+ *  transcription pass does not: a recording start pauses it, and holding the
+ *  button here left Record disabled on that meeting's own page only. */
+function _reanalysisHoldsRecord() {
+  return state.isReanalyzing && !state.isPostMeetingPass;
+}
+
 function _syncRecordBtnDisabled() {
   const btn = document.getElementById('record-btn');
   if (!btn) return;
   btn.disabled = !state.isRecording
-    && (state.isStartingRecording || state.isReanalyzing || !state.recordingReady);
+    && (state.isStartingRecording || _reanalysisHoldsRecord() || !state.recordingReady);
 }
 
 /** Returns a promise that resolves once the record button is enabled
@@ -6442,7 +6457,7 @@ function updateRecordBtn() {
   // the press answered while the server opens the devices: already the red it
   // is about to be, and disabled until the server says it is recording.
   const starting = !state.isRecording && state.isStartingRecording;
-  const preparing = !state.isRecording && !starting && (state.isReanalyzing || !state.recordingReady);
+  const preparing = !state.isRecording && !starting && (_reanalysisHoldsRecord() || !state.recordingReady);
   if (state.isRecording) {
     const elapsed = _recordingStartTime ? fmtDuration((Date.now() - _recordingStartTime) / 1000) : '0:00';
     btn.innerHTML = '<span class="record-pulse" aria-hidden="true"></span> Stop · '

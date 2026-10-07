@@ -300,6 +300,9 @@ Notes:
   recording and take effect on next app start.
 - API keys (Anthropic/OpenAI/HuggingFace) are **not** readable or writable
   here; they live in the app UI only.
+- Machine-managed bookkeeping (`video_offsets`, the after-meeting queue
+  `post_meeting_pending`) and the calendar link are not writable either; the
+  schema marks them `writable: false`. List settings take an array of strings.
 
 ### Live and recording
 

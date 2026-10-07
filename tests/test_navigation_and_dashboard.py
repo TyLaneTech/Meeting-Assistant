@@ -495,8 +495,9 @@ with (scope) {
 }
 const compileInPage = globalThis.__compileInPage;
 delete globalThis.__compileInPage;
-for (const name of ['updateRecordBtn', '_syncRecordBtnDisabled', '_setRecordStarting',
-                    '_reconcileRecordStart', 'toggleRecording', 'startNewRecording']) {
+for (const name of ['updateRecordBtn', '_syncRecordBtnDisabled', '_reanalysisHoldsRecord',
+                    '_setRecordStarting', '_reconcileRecordStart', 'toggleRecording',
+                    'startNewRecording']) {
   page[name] = compileInPage(grab(name));
 }
 const realOnStatus = compileInPage(grab('onStatus'));

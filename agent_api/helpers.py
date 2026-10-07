@@ -517,6 +517,7 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "calendar_title_from_event": "Name a new recording after the calendar meeting it starts in, instead of the date and time. The name then counts as user-set, so auto-titling leaves it alone; private appointments are skipped.",
     "calendar_last_refresh": "Machine-managed: UTC timestamp of the last successful calendar refresh.",
     "calendar_last_error": "Machine-managed: message from the last failed calendar refresh.",
+    "post_meeting_pending": "Machine-managed: ids of meetings still waiting for their after-meeting transcription, so a restart picks them up. Not writable through this API.",
     "agent_api_enabled": "Master switch for this Agent API. When false every /api/agent/v1 endpoint returns 503.",
     "agent_api_token": "Optional bearer token required on Agent API requests when non-empty.",
     "agent_api_allow_recording_control": "Allow agents to start/stop recordings (off by default).",
@@ -539,7 +540,10 @@ RESTART_REQUIRED_KEYS = {
 }
 
 # Internal bookkeeping and credentials the agent may not write directly.
-SETTINGS_WRITE_DENYLIST = {"video_offsets", "calendar_ics_url"}
+# post_meeting_pending is the after-meeting transcription queue: an agent
+# write could drop a meeting from it or queue one that was never recorded
+# record-only.
+SETTINGS_WRITE_DENYLIST = {"video_offsets", "calendar_ics_url", "post_meeting_pending"}
 
 
 def settings_schema() -> list[dict]:
@@ -556,6 +560,8 @@ def settings_schema() -> list[dict]:
             typ = "number"
         elif isinstance(default, dict):
             typ = "object"
+        elif isinstance(default, list):
+            typ = "array"
         else:
             typ = "string"
         out.append({
@@ -604,6 +610,12 @@ def coerce_setting(key: str, value):
         if isinstance(value, dict):
             return True, value
         return False, "Expected an object."
+    if isinstance(default, list):
+        # Turning a list setting into a string broke every reader that
+        # iterates it (a string iterates as characters).
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return True, value
+        return False, "Expected an array of strings."
     if isinstance(value, (str, int, float)):
         return True, str(value)
     return False, "Expected a string."
