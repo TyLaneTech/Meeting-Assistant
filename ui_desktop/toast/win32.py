@@ -39,7 +39,6 @@ HWND_MESSAGE = -3
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
 SPI_GETWORKAREA = 0x0030
 SPI_SETWORKAREA = 0x002F
-SPI_GETCLIENTAREAANIMATION = 0x1042
 MONITOR_DEFAULTTOPRIMARY = 1
 MDT_EFFECTIVE_DPI = 0
 IDC_ARROW, IDC_HAND = 32512, 32649
@@ -231,12 +230,8 @@ class WindowHost:
         return 0, 0, self._user32.GetSystemMetrics(0), self._user32.GetSystemMetrics(1)
 
     def animations(self) -> bool:
-        flag = wt.BOOL(1)
-        try:
-            if self._user32.SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(flag), 0):
-                return bool(flag.value)
-        except Exception:
-            pass
+        # Toasts always slide and fade: the Windows "Show animations" setting
+        # (the one behind reduced motion) is deliberately not consulted.
         return True
 
     def create(self) -> int:

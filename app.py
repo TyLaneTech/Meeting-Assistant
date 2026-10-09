@@ -6,7 +6,9 @@ Opens http://localhost:6969 automatically.
 import faulthandler
 faulthandler.enable()  # dump traceback on native crashes (SIGSEGV, etc.)
 
+import contextlib
 import fnmatch
+import io
 import json
 import logging
 import mimetypes
@@ -25,6 +27,7 @@ import time
 import uuid
 import webbrowser
 from collections import Counter
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
@@ -226,6 +229,13 @@ if __name__ == "__main__":
 from ai.assistant import AIAssistant
 from ai import assistant as ai_assistant
 from ai import speaker_relabel as speaker_relabel
+from ai.speaker_detect import instructions as speaker_instructions
+from ai.speaker_detect import observations as speaker_observations
+from ai.speaker_detect import routes as speaker_routes
+from ai.speaker_detect import runs as speaker_runs
+from ai.speaker_detect import tools as speaker_tools
+from ai.speaker_detect import voices as speaker_voices
+from core import speaker_journal as speaker_journal
 from capture_audio import (
     AudioCapture, enumerate_audio_devices, enumerate_dshow_audio_devices,
     auto_detect_devices,
@@ -237,6 +247,7 @@ from capture_audio.params import (
     DIARIZATION_PRESETS, DIARIZATION_DEFAULT_PRESET,
 )
 from capture_video import ScreenRecorder, enumerate_displays, extract_frame, capture_live_frame, flash_display_border, find_ffmpeg, kill_stale_ffmpeg, PRESETS as SCREEN_PRESETS, H264_PRESETS, DEFAULT_PRESET as SCREEN_DEFAULT_PRESET
+from capture_video import frames as video_frames
 from ml.speaker_db import SpeakerFingerprintDB, ME_SPEAKER_KEY
 from ml import text_embeddings as text_embeddings
 from ml.transcriber import (
@@ -327,6 +338,7 @@ _state: dict = {
     "speaker_labels": {},   # speaker_key → display name for the active session
     "custom_prompt": "",    # user-supplied context appended to the summary system prompt
     "is_reanalyzing": False,
+    "reanalysis_job": None,   # devices and progress of the running batch pass, for the status line
     "summary_generating": False,   # True while any _run_summary call is executing
     "summary_manual_pending": False,  # True when /api/summarize was triggered; clears when it runs
     "pending_chapter_segments": 0,  # segments since last auto-chapters run
@@ -681,8 +693,45 @@ def _ml_awake_locked() -> bool:
     return (not needs_diarizer) or _state["diarizer_ready"] or _state["diarizer_failed"]
 
 
+def _reanalysis_label(job: dict | None) -> str:
+    """What the running batch pass is doing and on which device, or "" when
+    none runs (or it fell back to the live pipeline). The page's status line
+    and the tray show it."""
+    if not job:
+        return ""
+    from core.compute_device import batch_progress_label
+    return batch_progress_label(job["whisper"], job["diarizer"],
+                                job.get("progress", 0.0), job.get("on_battery", False))
+
+
+def _meeting_title(session_id: str, transcript: str) -> tuple[str, bool]:
+    """The name for a finished meeting, as (title, from_calendar).
+
+    The calendar event's subject when one matches the recording confidently
+    (calendar_sync.title_for_start: Settings > Calendar opt-in, never a private
+    appointment), checked here at the end with the real start and end, so a
+    recording started early or late still finds its event, and only when what
+    was said fits it: a call taken during a scheduled slot matches that slot
+    by time alone. Otherwise an AI title from what was said. A calendar name
+    is locked like a rename, so a later auto-title never replaces it."""
+    sess = storage.get_session(session_id) or {}
+    cal = calendar_sync.title_for_start(sess.get("started_at"), sess.get("ended_at"))
+    if cal:
+        if ai.calendar_fits(cal, transcript) is not False:   # None: cannot tell, keep it
+            return cal, True
+        log.info("recording", f"{session_id[:8]} overlaps calendar event {cal!r} but the "
+                              f"conversation is something else; titling it from what was said")
+    title = ai.generate_title(
+        transcript, context=storage.get_title_generation_context(session_id),
+        system_prompt=settings.get("title_system_prompt") or None,
+    )
+    return title, False
+
+
 def _status_payload(extra: dict | None = None) -> dict:
     with _state_lock:
+        job = _state.get("reanalysis_job")
+        job = dict(job) if job and _state.get("is_reanalyzing") else None
         payload = {
             "recording": _state["is_recording"],
             "is_testing": _state["is_testing"],
@@ -702,6 +751,7 @@ def _status_payload(extra: dict | None = None) -> dict:
         started_mono = _state.get("recording_started_at_monotonic") or 0.0
     payload["recording_ready"] = recording_ready
     payload["recording_ready_reason"] = recording_ready_reason
+    payload["reanalysis_label"] = _reanalysis_label(job)
     # How long this recording has been running, from the server. The browser
     # used to start its own clock at zero, so a reload mid-meeting showed
     # "Stop - 0:00" on a recording that was an hour old. The WAV writer's
@@ -1745,6 +1795,12 @@ def _load_fingerprint_db() -> None:
     # Register the "Me" speaker guard so its profile stays embedding-free even
     # before the first recording (e.g. an import that arrives at startup).
     _sync_me_id()
+    # Profiles that share a name are one person shown twice: fold any that
+    # an older version left behind (two threads could each make one).
+    try:
+        _merge_same_name_profiles()
+    except Exception as e:  # noqa: BLE001 - a library that loads is worth more
+        log.warn("fingerprint", f"Duplicate profile check failed: {e}")
     # Wire callback if diarizer already finished loading before we did
     with _state_lock:
         diarizer_ready = _state.get("diarizer_ready", False)
@@ -2452,10 +2508,8 @@ def _ensure_me_profile() -> dict | None:
     me_id = settings.get("me_speaker_global_id")
     prof = fingerprint_db.get_global_speaker(me_id) if me_id else None
     if prof is None:
-        prof = fingerprint_db.find_by_name("You")
-        if prof is None:
-            gid = fingerprint_db.create_global_speaker("You")
-            prof = fingerprint_db.get_global_speaker(gid)
+        gid, _made = fingerprint_db.find_or_create("You")
+        prof = fingerprint_db.get_global_speaker(gid)
         settings.put("me_speaker_global_id", prof["id"])
     fingerprint_db.set_me_id(prof["id"])
     # Backstop: keep the Me profile embedding-free so it never matches desktop
@@ -2526,9 +2580,11 @@ def _auto_apply_fingerprint(speaker_key: str, match: dict, emb: np.ndarray, sess
     if speaker_key == ME_KEY or (fingerprint_db._me_id and global_id == fingerprint_db._me_id):
         return
     if reinforce:
-        fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0)
+        fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0,
+                                     origin="voice_auto")
     fingerprint_db.link_session_speaker(session_id, speaker_key, global_id)
-    storage.save_speaker_label(session_id, speaker_key, name=name, color=color)
+    storage.save_speaker_label(session_id, speaker_key, name=name, color=color,
+                               set_by="voice_auto")
     with _state_lock:
         if _state["session_id"] == session_id:
             _state["speaker_labels"][speaker_key] = name
@@ -2756,7 +2812,43 @@ def _on_fingerprint_audio(speaker_key: str, audio: np.ndarray, abs_start: float,
             _state["fingerprint_suggestions"][speaker_key] = suggestion
         _push("fingerprint_match", suggestion)
 
-    threading.Thread(target=_extract_and_match, daemon=True).start()
+    _fp_inflight_change(sid, +1)
+
+    def _counted():
+        try:
+            _extract_and_match()
+        finally:
+            _fp_inflight_change(sid, -1)
+    threading.Thread(target=_counted, daemon=True).start()
+
+
+# Voice matches in flight per meeting. AI speaker detection waits for a
+# meeting's to finish (_wait_voice_matches) before it decides anything, or a
+# late voice match could overwrite a name it just set.
+_fp_inflight: dict[str, int] = {}
+_fp_inflight_cond = threading.Condition()
+
+
+def _fp_inflight_change(sid: str, delta: int) -> None:
+    with _fp_inflight_cond:
+        n = _fp_inflight.get(sid, 0) + delta
+        if n <= 0:
+            _fp_inflight.pop(sid, None)
+        else:
+            _fp_inflight[sid] = n
+        _fp_inflight_cond.notify_all()
+
+
+def _wait_voice_matches(sid: str, timeout: float = 60.0) -> bool:
+    """True once no voice match for ``sid`` is still running."""
+    deadline = time.monotonic() + timeout
+    with _fp_inflight_cond:
+        while _fp_inflight.get(sid):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _fp_inflight_cond.wait(left)
+    return True
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -3464,13 +3556,17 @@ def start_recording():
             # for the next run instead of never transcribed.
             _post_meeting.hold(session_id)
 
-        # ── Compute video offset for resumed sessions ────────────────────────
-        # When resuming, the WAV writer opened in append mode knows the existing
-        # sample count. Use it so video sync knows the audio offset.
-        video_offset = 0.0
-        if resume_session_id and capture.wav_writer:
-            video_offset = capture.wav_writer.elapsed_seconds
-        settings.put_video_offset(session_id, video_offset)
+        # ── Video offset ─────────────────────────────────────────────────────
+        # Where the video's first frame sits on the meeting timeline (the
+        # WAV's clock). It is measured once the screen recorder is capturing
+        # (_settle_video_offset), because the WAV starts first: up to a second
+        # on Windows, up to 6 s on macOS. A fresh session starts at 0 until
+        # then. A resume leaves the offset alone unless the screen recording
+        # actually starts again: setting it to the WAV position regardless
+        # left a resume without screen recording pointing the earlier video
+        # at the wrong time.
+        if not resume_session_id:
+            settings.put_video_offset(session_id, 0.0)
 
         # ── Screen recording (optional) ────────────────────────────────────────
         screen_recording_active = False
@@ -3500,6 +3596,11 @@ def start_recording():
                             part_num += 1
                         part_path = video_dir / f"{session_id}_part{part_num}.mp4"
                         existing_video.rename(part_path)
+                        # The part keeps the start the whole video had, so a
+                        # moment from before the resume is found in it, and
+                        # the stop's join keeps the first part's start.
+                        settings.put_video_part_offset(
+                            session_id, part_num, settings.get_video_offset(session_id))
                         log.info("screen", f"Preserved previous video as {part_path.name}")
 
                 _screen_recorder.start(
@@ -3511,6 +3612,12 @@ def start_recording():
                     scale=scale,
                 )
                 screen_recording_active = True
+                wav_at_start = (capture.wav_writer.elapsed_seconds
+                                if capture.wav_writer else 0.0)
+                threading.Thread(
+                    target=_settle_video_offset,
+                    args=(session_id, capture, wav_at_start),
+                    daemon=True, name="video-offset").start()
             except Exception as e:
                 log.warn("screen", f"Could not start screen recording: {e}")
 
@@ -3532,6 +3639,34 @@ def start_recording():
         # start, which is worse than the race it prevents.
         with _state_lock:
             _state["is_starting"] = False
+
+
+def _settle_video_offset(session_id: str, capture, wav_at_start: float) -> None:
+    """Store where the screen recording's first frame sits on the meeting
+    timeline as the session's video offset.
+
+    The WAV starts before the screen recorder, so video second 0 is not
+    meeting second 0 (about 0.1 to 0.9 s on Windows, measured 2026-10-08, and
+    up to 6 s on macOS, whose recorder waits for the first frame). On Windows
+    ffmpeg prints the wall-clock time of the first frame (gdigrab's "start:"),
+    and the WAV's position now, less the time since then, places it exactly.
+    Otherwise, or if ffmpeg says nothing within 5 s, the WAV position when the
+    recorder's start() returned stands in (on macOS that is when frames began
+    to flow)."""
+    offset, how = wav_at_start, "recorder start"
+    waiter = getattr(_screen_recorder, "wait_first_frame", None)
+    epoch = waiter(5.0) if waiter else None
+    now = time.time()
+    # A wall-clock stamp is close to now; anything else is stream time.
+    if epoch is not None and abs(now - epoch) < 30.0 and capture.wav_writer:
+        try:
+            offset = float(capture.wav_writer.elapsed_seconds) - (now - epoch)
+            how = "first frame"
+        except Exception:  # noqa: BLE001 - keep the stand-in
+            pass
+    offset = max(0.0, offset)
+    settings.put_video_offset(session_id, round(offset, 3))
+    log.info("screen", f"Video starts {offset:.2f} s into the recording ({how})")
 
 
 def _concat_video_parts(session_id: str) -> None:
@@ -3601,8 +3736,12 @@ def _concat_video_parts(session_id: str) -> None:
             for p in parts:
                 if p.exists() and p != final_path:
                     p.unlink()
-            # Video now starts at audio time 0 (full session coverage)
-            settings.put_video_offset(session_id, 0.0)
+            # The joined video starts where its first part did: the meeting's
+            # first frame came a moment after the WAV started (_settle_video_
+            # offset), and this used to reset it to 0.
+            first_start = settings.get_video_part_offsets(session_id).get(0, 0.0)
+            settings.put_video_offset(session_id, first_start)
+            settings.put_video_part_offset(session_id, None)
             log.info("screen", f"Video concat complete: {len(parts)} parts merged")
         else:
             log.warn("screen", f"Video concat failed (rc={result.returncode}): "
@@ -3730,20 +3869,19 @@ def stop_recording():
             # and exports it exactly as the live path would have.
             if deferred and sid:
                 return  # The worker owns title, export and chapters for this pass.
+            # The transcript is final: AI speaker detection, when Settings ask
+            # for it after meetings (its own thread; waits for voice matches).
+            if sid:
+                _speaker_ai_after_meeting(sid)
             # Auto-title: use full formatted transcript (with speaker labels) for better context.
             # Skip entirely if the user has manually renamed the session — their title wins.
             if sid and (title_transcript or plain_snapshot).strip():
                 if storage.is_title_user_set(sid):
                     log.info("recording", f"Skipping auto-title for {sid}: user-set title is locked")
                 else:
-                    ctx = storage.get_title_generation_context(sid)
-                    title = ai.generate_title(
-                        title_transcript or plain_snapshot,
-                        context=ctx,
-                        system_prompt=settings.get("title_system_prompt") or None,
-                    )
+                    title, from_calendar = _meeting_title(sid, title_transcript or plain_snapshot)
                     if title:
-                        storage.update_session_title(sid, title, user_set=False)
+                        storage.update_session_title(sid, title, user_set=from_calendar)
                         _push("session_title", {"session_id": sid, "title": title})
             # Drop the finalized transcript into the Obsidian vault (after
             # title generation so the file carries the real title).
@@ -6986,27 +7124,22 @@ def chat():
         # Build frame extractor - works for both live and completed recordings.
         # Returns (jpeg_bytes, url) so ai_assistant can show the image to the
         # model AND give it a markdown-embeddable URL for inline screenshots.
+        # The frame is this meeting's at transcript second ts (capture_video.
+        # frames applies the video offset and reads the live file only when
+        # this meeting is the one recording). It used to read whatever was
+        # recording, so a chat about an older meeting during a call was shown
+        # the call, and it ignored the offset of a resumed meeting.
         fe = None
-        video_path = paths.video_dir() / f"{session_id}.mp4"
-        live_path = _screen_recorder.live_video_path
 
-        display_idx = int(settings.get("screen_display", 0))
-
-        def _saving_extractor(ts, sid=session_id, _didx=display_idx):
+        def _saving_extractor(ts, sid=session_id):
             """Extract frame, save to disk, return (jpeg_bytes, url)."""
-            jpeg = None
-            if live_path:
-                jpeg = extract_frame(live_path, ts)
-                if not jpeg:
-                    jpeg = capture_live_frame(display_index=_didx)
-            elif video_path.exists():
-                jpeg = extract_frame(str(video_path), ts)
+            jpeg = video_frames.grab(sid, float(ts), width=1280, live=_agent_live_media())
             if not jpeg:
                 return None
             url = _save_screenshot(sid, ts, jpeg)
             return (jpeg, url)
 
-        if live_path or video_path.exists():
+        if video_frames.available(session_id, _agent_live_media()):
             fe = _saving_extractor
 
         cp, cm = _resolve_tool_ai("chat")
@@ -7024,14 +7157,23 @@ def chat():
         if context_roots:
             chat_tools += list(_CONTEXT_TOOLS)
             chat_tools_oai += list(_CONTEXT_TOOLS_OAI)
+        # Speaker detection from the screen, when Settings turned it on. Its
+        # autonomy comes from this message, the user's own words.
+        speaker_ai_on = bool(settings.get("speaker_ai_enabled"))
+        if speaker_ai_on:
+            chat_tools += list(speaker_tools.TOOLS)
+            chat_tools_oai += list(speaker_tools.TOOLS_OAI)
         chat_executor = _compose_tool_executors(
             _make_relabel_executor(request_id, "session", session_id),
+            _make_speaker_ai_executor(question, session_id) if speaker_ai_on else None,
             context_executor,
         )
         # A custom system prompt replaces the built-in QA prompt, and with it
         # the plan/confirm/apply contract, so re-state the contract here.
         if effective_prompt:
             context_prompt = (context_prompt or "") + ai_assistant._RELABEL_CONTRACT_SESSION
+        if speaker_ai_on:
+            context_prompt = (context_prompt or "") + speaker_tools.CONTRACT
         ai.ask(transcript, chat_history, on_token, on_done, meta=meta,
                cancel=cancel_event, frame_extractor=fe,
                on_tool_event=on_tool_event,
@@ -7730,7 +7872,7 @@ def _relabel_deps() -> "speaker_relabel.RelabelDeps":
         bulk_link=_apply_bulk_link,
         merge_profiles=_apply_profile_merge,
         patch_session=lambda session_id, speaker_keys, name: _patch_session_speakers(
-            session_id, speaker_keys, name, None, queue_summary=False),
+            session_id, speaker_keys, name, None, queue_summary=False, set_by="chat"),
         linked_labels=lambda global_id: (
             fingerprint_db.get_linked_labels(global_id)
             if fingerprint_db.ready and global_id else []),
@@ -8229,12 +8371,23 @@ def global_chat():
             _push("global_chat_done", {"request_id": request_id})
 
         cp, cm = _resolve_tool_ai("global_chat")
+        speaker_ai_on = bool(settings.get("speaker_ai_enabled"))
+        speaker_exec = _make_speaker_ai_executor(question, None) if speaker_ai_on else None
+
+        def _execute(n, i, _rid=request_id):
+            if speaker_exec is not None and n in speaker_tools.NAMES:
+                return speaker_exec(n, i)
+            return _global_tool_executor(n, i, _rid)
+
         ai.ask_global(
             chat_history, on_token, on_done,
             cancel=cancel_event,
             on_tool_event=on_tool_event,
-            tool_executor=lambda n, i, _rid=request_id: _global_tool_executor(n, i, _rid),
+            tool_executor=_execute,
             provider=cp, model=cm,
+            extra_tools_anthropic=speaker_tools.TOOLS if speaker_ai_on else None,
+            extra_tools_openai=speaker_tools.TOOLS_OAI if speaker_ai_on else None,
+            extra_system=speaker_tools.CONTRACT if speaker_ai_on else "",
         )
 
     threading.Thread(target=run_global_chat, daemon=True).start()
@@ -8309,21 +8462,29 @@ def _relabel_segment(seg_id: int, label: str, source_override: "str | None", *,
                 return
             if seg["end_time"] - seg["start_time"] < fingerprint_db.MIN_DURATION_SEC:
                 return
-            profile = fingerprint_db.find_by_name(label)
-            if profile is None:
-                gid = fingerprint_db.create_global_speaker(label)
-            else:
-                gid = profile["id"]
+            # The line now belongs to source_override; seg["source"] is the
+            # speaker it was taken FROM. Linking that one (as this used to)
+            # pointed the rest of the old speaker's lines at the new person's
+            # profile. A target that already has a profile trains that one, so
+            # a duplicate-named profile is never picked up by name.
+            target = source_override
+            gid = fingerprint_db.get_link(seg["session_id"], target) if target else None
+            if gid is None:
+                # Found or made under one lock: moving several lines to a new
+                # name trains them on two workers, next to the rename's own
+                # profile sync, and each used to make a profile of its own.
+                gid, _made = fingerprint_db.find_or_create(label)
             emb = fingerprint_db.extract_embedding_from_wav(
                 str(wav_path), seg["start_time"], seg["end_time"])
             if emb is not None:
-                fingerprint_db.add_embedding(gid, seg["session_id"], seg["source"], emb,
-                                             seg["end_time"] - seg["start_time"])
-                fingerprint_db.link_session_speaker(seg["session_id"], seg["source"], gid)
-                _push("speaker_linked", {
-                    "session_id": seg["session_id"], "speaker_key": seg["source"],
-                    "global_id": gid, "name": label,
-                })
+                fingerprint_db.add_embedding(gid, seg["session_id"], target or seg["source"],
+                                             emb, seg["end_time"] - seg["start_time"])
+                if target:
+                    fingerprint_db.link_session_speaker(seg["session_id"], target, gid)
+                    _push("speaker_linked", {
+                        "session_id": seg["session_id"], "speaker_key": target,
+                        "global_id": gid, "name": label,
+                    })
                 log.info("fingerprint", f"Trained from segment override: {label!r} (seg {seg_id})")
         _fp_executor.submit(_train_from_override)
 
@@ -8384,6 +8545,9 @@ def _patch_session_speakers(
     queue_summary: bool = True,
     global_id: "str | None" = None,
     train_profile: bool = True,
+    link_profile: bool = True,
+    set_by: "str | None" = None,
+    effects: "dict | None" = None,
 ) -> list:
     """Rename and/or recolor speaker keys in one session.
 
@@ -8396,7 +8560,15 @@ def _patch_session_speakers(
     voice profile to link (the Agent API passes it, so a duplicate-named
     profile is never picked up by name); ``train_profile`` False links the
     profile without extracting embeddings from this audio, for a label whose
-    identity is not certain enough to teach the library.
+    identity is not certain enough to teach the library. ``link_profile``
+    False renames only, with no profile found, created or linked.
+    ``set_by`` records who chose the name (user, agent, chat, ai).
+
+    ``effects``, when given, runs the profile link and training on this
+    thread instead of the fingerprint executor and fills it with what they
+    did: ``global_id``, ``created_profile`` (the id when one was made) and
+    ``embedding_ids`` (the voice samples added), which is what lets the
+    speaker journal (core.speaker_journal) undo a change exactly.
 
     Returns the updated speaker dicts. Inputs are assumed validated.
     """
@@ -8408,11 +8580,20 @@ def _patch_session_speakers(
             continue
         seen.add(speaker_key)
         previous = storage.get_speaker_profile(session_id, speaker_key) or {}
-        updated = storage.save_speaker_label(session_id, speaker_key, name=name, color=color)
+        updated = storage.save_speaker_label(session_id, speaker_key, name=name, color=color,
+                                             set_by=set_by)
         updated_speakers.append(updated)
         previous_name = (previous.get("name") or speaker_key).strip()
         if name is not None and previous_name != updated["name"] and not _is_custom_speaker_key(speaker_key):
             rename_changes.append((previous_name, updated["name"]))
+
+    # A name chosen by a person, or by an agent or the chat for them, answers
+    # the AI's name suggestions still waiting for those speakers.
+    if name is not None and set_by in ("user", "agent", "chat"):
+        try:
+            speaker_journal.retire_name_suggestions(session_id, list(seen))
+        except Exception as e:  # noqa: BLE001 - the name itself is what matters
+            log.warn("speakers", f"Could not retire name suggestions: {e}")
 
     with _state_lock:
         if _state["session_id"] == session_id:
@@ -8448,21 +8629,30 @@ def _patch_session_speakers(
     # ── Auto-create or link global voice profile ───────────────────────────────
     # For every speaker key that now has a user-assigned name (not a default
     # "Speaker N"), ensure a global profile exists and the key is linked to it.
-    if fingerprint_db._ready and name and not _is_default_speaker_name(name):
-        def _sync_voice_profile(sid, keys, label, col, gid_hint, train):
+    if (fingerprint_db._ready and link_profile and name
+            and not _is_default_speaker_name(name)):
+        def _sync_voice_profile(sid, keys, label, col, gid_hint, train, out=None):
+            out = out if out is not None else {}
+            origin = out.get("origin")
+            out.setdefault("embedding_ids", [])
             try:
                 profile = fingerprint_db.get_global_speaker(gid_hint) if gid_hint else None
+                made = False
                 if profile is None:
-                    profile = fingerprint_db.find_by_name(label)
-                if profile is None:
-                    gid = fingerprint_db.create_global_speaker(label, col)
+                    # Found or made under one lock: this runs alongside the
+                    # training of the lines just moved to the same name.
+                    gid, made = fingerprint_db.find_or_create(label, col)
+                    profile = None if made else fingerprint_db.get_global_speaker(gid)
+                if made:
                     global_color = col
+                    out["created_profile"] = gid
                     log.info("fingerprint", f"Auto-created profile {label!r} from session label")
                 else:
                     gid = profile["id"]
                     # Inherit the global profile's color unless the user explicitly
                     # set one in this request.
                     global_color = col or profile.get("color")
+                out["global_id"] = gid
                 for k in keys:
                     existing = fingerprint_db.get_link(sid, k)
                     if existing != gid:
@@ -8480,6 +8670,9 @@ def _patch_session_speakers(
                     })
                 if not train:
                     return
+                # Lines chosen by the caller (AI speaker detection passes the
+                # ones whose own voice matched), else the key's lines.
+                chosen = out.get("train_segment_ids")
                 # Extract embeddings to strengthen the profile
                 for k in keys:
                     # Try live accumulator first
@@ -8487,16 +8680,25 @@ def _patch_session_speakers(
                         accum = _state.get("speaker_audio_accum", {})
                         seg_audio = accum.get(k, {}).get("audio")
                         seg_audio = seg_audio.copy() if seg_audio is not None else None
+                    if chosen:
+                        seg_audio = None
                     if seg_audio is not None and len(seg_audio) / 16000 >= fingerprint_db.MIN_DURATION_SEC:
                         emb = fingerprint_db.extract_embedding(seg_audio)
                         if emb is not None:
-                            fingerprint_db.add_embedding(gid, sid, k, emb, len(seg_audio) / 16000)
+                            row_id = fingerprint_db.add_embedding(
+                                gid, sid, k, emb, len(seg_audio) / 16000, origin=origin)
+                            if row_id:
+                                out["embedding_ids"].append(row_id)
                             log.info("fingerprint", f"Added embedding from accumulator for {label!r}")
                             continue
                     # Fallback: extract from WAV file (past session or accumulator empty)
                     wav_path = media.pcm_wav_path(sid)
                     if wav_path is not None:
-                        segments = storage.get_segments_by_speaker(sid, k)
+                        if chosen:
+                            segments = [s for s in (storage.get_segment(i) for i in chosen)
+                                        if s and (s.get("source_override") or s.get("source")) == k]
+                        else:
+                            segments = storage.get_segments_by_speaker(sid, k)
                         added = 0
                         for seg in segments:
                             if added >= 5:
@@ -8504,19 +8706,27 @@ def _patch_session_speakers(
                             emb = fingerprint_db.extract_embedding_from_wav(
                                 str(wav_path), seg["start_time"], seg["end_time"])
                             if emb is not None:
-                                fingerprint_db.add_embedding(gid, sid, k, emb,
-                                                             seg["end_time"] - seg["start_time"])
+                                row_id = fingerprint_db.add_embedding(
+                                    gid, sid, k, emb, seg["end_time"] - seg["start_time"],
+                                    origin=origin)
+                                if row_id:
+                                    out["embedding_ids"].append(row_id)
                                 added += 1
                         if added:
                             log.info("fingerprint", f"Added {added} embeddings from WAV for {label!r}")
             except Exception as e:
                 log.error("fingerprint", f"_sync_voice_profile failed: {e}")
                 import traceback; traceback.print_exc()
-        _fp_executor.submit(
-            _sync_voice_profile,
-            session_id, [s["speaker_key"] for s in updated_speakers],
-            name, color, global_id, train_profile,
-        )
+                out["error"] = str(e)
+        keys = [s["speaker_key"] for s in updated_speakers]
+        if effects is not None:
+            effects.setdefault("origin", set_by)
+            _sync_voice_profile(session_id, keys, name, color, global_id, train_profile, effects)
+        else:
+            _fp_executor.submit(
+                _sync_voice_profile, session_id, keys, name, color, global_id, train_profile,
+                {"origin": set_by},
+            )
     # ── End auto-link ──────────────────────────────────────────────────────────
 
     obsidian.queue_export(session_id)
@@ -8557,7 +8767,8 @@ def update_speaker_label(session_id: str):
     if name is None and color is None:
         return jsonify({"error": "name and/or color required"}), 400
 
-    updated_speakers = _patch_session_speakers(session_id, speaker_keys, name, color)
+    updated_speakers = _patch_session_speakers(session_id, speaker_keys, name, color,
+                                               set_by="user")
     return jsonify({"ok": True, "speakers": updated_speakers})
 
 
@@ -9173,6 +9384,9 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
             affected_ids = fingerprint_db.remove_session_embeddings(session_id)
             for gid in affected_ids:
                 fingerprint_db.recompute_centroid(gid)
+            # And the unnamed speakers' vectors: the pass hands out the same
+            # "Speaker N" keys to new voices, which inherited the old vectors.
+            fingerprint_db.clear_unlabeled_embeddings(session_id)
             log.info("reanalysis", f"Cleared {len(affected_ids)} speaker profiles' "
                      f"embeddings for session {session_id[:8]}")
 
@@ -9277,22 +9491,49 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
                      + (" (on battery, so the GPU steps run on the CPU)"
                         if plan.get("battery_cpu") else ""))
 
+            # The status line names the step and its device ("Transcribing on
+            # GPU · 63%"). It starts from the plan and takes the child's own
+            # answer once it reports one: a GPU the child cannot use falls back
+            # to the CPU there, and the page has to say so.
+            job = {"whisper": plan["whisper"], "diarizer": plan["diarizer"],
+                   "on_battery": bool(plan.get("battery_cpu")), "progress": 0.0}
+            with _state_lock:
+                _state["reanalysis_job"] = job
+
+            def _push_progress() -> None:
+                _push("reanalysis_progress",
+                      {"session_id": session_id, "progress": job["progress"],
+                       "post_meeting": post_meeting, "label": _reanalysis_label(job)})
+
+            def _on_progress(pct: float) -> None:
+                with _state_lock:
+                    job["progress"] = pct
+                _push_progress()
+
+            def _on_devices(devices: dict) -> None:
+                with _state_lock:
+                    job["whisper"] = devices.get("whisper") or job["whisper"]
+                    job["diarizer"] = devices.get("diarizer") or job["diarizer"]
+                _push_progress()
+
+            _push_progress()
+
             from ml.batch_worker import run_in_child
             run_in_child(
                 wav_path, params,
                 on_text=_owned_segment if post_meeting else _on_segment,
                 on_fingerprint=((_owned_fingerprint if post_meeting else _on_fingerprint_audio)
                                 if fingerprint_db.ready else None),
-                on_progress=lambda pct: _push(
-                    "reanalysis_progress",
-                    {"session_id": session_id, "progress": pct,
-                     "post_meeting": post_meeting},
-                ),
+                on_progress=_on_progress,
                 cancel_event=cancel_event,
                 cuda="cuda" in (plan["whisper"], plan["diarizer"]),
                 tracks_root=media.tracks_root(session_id),
+                on_devices=_on_devices,
             )
         except ImportError as ie:
+            # The batch devices no longer describe what runs.
+            with _state_lock:
+                _state["reanalysis_job"] = None
             if post_meeting:
                 # The real-time fallback has neither the cancel event nor the
                 # owner check, so a post-meeting pass must not take it: it
@@ -9320,6 +9561,9 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
             # Rebuilt by hand: a post-meeting pass still queued for it would
             # redo the same work later and wipe speaker names given since.
             _post_meeting.discard(session_id)
+            # New speaker keys: name them again (the screen's earlier readings
+            # are kept against meeting time, so this mostly re-reads voices).
+            _speaker_ai_after_meeting(session_id)
     except ReanalysisCancelled:
         if guarded and storage.get_session_times(session_id) is None:
             # Deleted while the pass ran: restoring would write rows for a
@@ -9350,6 +9594,7 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
             # the flag now gates recording too, so a sticky True (the session
             # was deleted mid-pass, say) would lock recording out entirely.
             _state["is_reanalyzing"] = False
+            _state["reanalysis_job"] = None
     return ok
 
 
@@ -9698,6 +9943,7 @@ class _PostMeetingTranscription:
             log.info("reanalysis", f"Post-meeting transcription of {sid[:8]} produced no "
                                    f"speech; nothing to summarize")
             return
+        _speaker_ai_after_meeting(sid)
         transcript = _build_transcript(segments, labels)
         meta = _build_session_meta(
             segments, labels, session_title=sess.get("title") or "", is_live=False,
@@ -9707,13 +9953,12 @@ class _PostMeetingTranscription:
             if storage.is_title_user_set(sid):
                 log.info("reanalysis", f"Keeping the user-set title of {sid[:8]}")
             else:
-                title = ai.generate_title(
-                    transcript, context=storage.get_title_generation_context(sid),
-                    system_prompt=settings.get("title_system_prompt") or None,
-                )
+                title, from_calendar = _meeting_title(sid, transcript)
                 if title:
-                    storage.update_session_title(sid, title, user_set=False)
+                    storage.update_session_title(sid, title, user_set=from_calendar)
                     _push("session_title", {"session_id": sid, "title": title})
+                    log.info("reanalysis", f"Titled {sid[:8]} {title!r}"
+                             + (" from the calendar" if from_calendar else ""))
         except Exception as e:
             log.warn("reanalysis", f"Post-meeting title for {sid[:8]} failed: {e}")
         if settings.get("auto_summary", True):
@@ -10471,13 +10716,7 @@ def _import_speaker_embeddings(session_id: str, pkg: dict) -> None:
                 continue
 
             # Find or create a matching global speaker profile
-            existing = fingerprint_db.find_by_name(global_name)
-            if existing:
-                global_id = existing["id"]
-            else:
-                global_id = fingerprint_db.create_global_speaker(
-                    global_name, global_color
-                )
+            global_id, _made = fingerprint_db.find_or_create(global_name, global_color)
 
             fingerprint_db.add_embedding(
                 global_id, session_id, speaker_key, embedding, duration
@@ -10517,8 +10756,9 @@ def fp_create_speaker():
         color = _normalize_speaker_color(data.get("color"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    gid = fingerprint_db.create_global_speaker(name, color)
-    return jsonify({"ok": True, "global_id": gid}), 201
+    # A name a profile already has is that profile, not a second one.
+    gid, made = fingerprint_db.find_or_create(name, color)
+    return jsonify({"ok": True, "global_id": gid, "existing": not made}), 201 if made else 200
 
 
 def _rename_profile(global_id: str, name: "str | None" = None, color=...) -> dict:
@@ -10538,6 +10778,9 @@ def _rename_profile(global_id: str, name: "str | None" = None, color=...) -> dic
                 "session_id": sid, "speaker_key": label["speaker_key"],
                 "name": resolved["name"], "color": resolved["color"],
             })
+        if name:
+            # Renamed to a name another profile has: one person, one profile.
+            _merge_same_name_profiles(name)
     return resolved or {}
 
 
@@ -10597,12 +10840,8 @@ def set_me_speaker():
         name = (data.get("name") or "").strip()
         if not name:
             return jsonify({"error": "name is required"}), 400
-        existing = fingerprint_db.find_by_name(name)
-        if existing is not None:
-            profile = _set_me_speaker(existing["id"])
-        else:
-            gid = fingerprint_db.create_global_speaker(name)
-            profile = _set_me_speaker(gid)
+        gid, _made = fingerprint_db.find_or_create(name)
+        profile = _set_me_speaker(gid)
     else:
         return jsonify({"error": "mode must be 'existing' or 'name'"}), 400
 
@@ -10707,6 +10946,37 @@ def _apply_profile_merge(keep_id: str, merge_id: str) -> dict:
     return resolved or {}
 
 
+def _me_profile_id() -> str | None:
+    return fingerprint_db._me_id or settings.get("me_speaker_global_id") or None
+
+
+def _merge_same_name_profiles(name: "str | None" = None) -> list:
+    """Fold voice profiles that share a name (case-insensitive) into the one
+    with the most voice samples: two profiles of one name are one person
+    shown twice (two groups in Cleanup, two rows in the Voice Library), and
+    the transcript cannot tell them apart anyway. The Me profile is never
+    folded, either way. ``name`` limits it to that name. Returns the
+    (kept, merged) id pairs."""
+    if not fingerprint_db.ready:
+        return []
+    me = _me_profile_id()
+    done = []
+    for group in fingerprint_db.same_name_groups(exclude={me} if me else ()):
+        if name and group[0]["name"].strip().lower() != name.strip().lower():
+            continue
+        keep = group[0]
+        for other in group[1:]:
+            try:
+                _apply_profile_merge(keep["id"], other["id"])
+            except Exception as e:  # noqa: BLE001 - the rest still merge
+                log.warn("fingerprint", f"Could not merge duplicate profile {other['name']!r}: {e}")
+                continue
+            done.append((keep["id"], other["id"]))
+            log.info("fingerprint", f"Merged duplicate profile {other['name']!r} "
+                                    f"{other['id'][:8]} into {keep['id'][:8]}")
+    return done
+
+
 @app.route("/api/fingerprint/speakers/<global_id>/merge", methods=["POST"])
 def fp_merge_speaker(global_id: str):
     if not fingerprint_db.ready:
@@ -10715,6 +10985,14 @@ def fp_merge_speaker(global_id: str):
     source_id = (data.get("source_id") or "").strip()
     if not source_id:
         return jsonify({"error": "source_id is required"}), 400
+    # The Me profile stays out of merges, as the Agent API already enforces:
+    # merged into another profile it disappears and leaves the
+    # me_speaker_global_id setting pointing at nothing, and another profile
+    # merged into it gives it voice samples it must never have (they would
+    # let desktop voices match the owner).
+    me_id = _me_profile_id()
+    if me_id and me_id in (global_id, source_id):
+        return jsonify({"error": "The Me profile can't be merged."}), 403
     _apply_profile_merge(global_id, source_id)
     return jsonify({"ok": True})
 
@@ -11246,11 +11524,7 @@ def fp_bulk_link():
         return jsonify({"error": "global_id or create_new is required"}), 400
 
     if create_new:
-        existing = fingerprint_db.find_by_name(name)
-        if existing:
-            global_id = existing["id"]
-        else:
-            global_id = fingerprint_db.create_global_speaker(name)
+        global_id, _made = fingerprint_db.find_or_create(name)
 
     result = _apply_bulk_link(name, global_id)
     return jsonify({"ok": True, "linked_count": result["linked_count"],
@@ -11278,11 +11552,7 @@ def fp_bulk_link_all():
             continue
 
         if create_new:
-            existing = fingerprint_db.find_by_name(name)
-            if existing:
-                global_id = existing["id"]
-            else:
-                global_id = fingerprint_db.create_global_speaker(name)
+            global_id, _made = fingerprint_db.find_or_create(name)
 
         affected = fingerprint_db.bulk_link_by_name(name, global_id)
         profile = fingerprint_db.get_global_speaker(global_id)
@@ -11323,6 +11593,10 @@ def fp_confirm():
     profile = fingerprint_db.get_global_speaker(global_id)
     if not profile:
         return jsonify({"error": "Global speaker not found"}), 404
+    # Voice matches never suggest the Me profile (it has no voice to match),
+    # so a confirm that names it or the owner's microphone key is not one.
+    if speaker_key == ME_KEY or global_id == _me_profile_id():
+        return jsonify({"error": "The Me speaker is not set from a voice match."}), 403
 
     name  = profile["name"]
     color = profile.get("color")
@@ -11340,7 +11614,7 @@ def fp_confirm():
 
     for key in keys_to_link:
         fingerprint_db.link_session_speaker(session_id, key, global_id)
-        storage.save_speaker_label(session_id, key, name=name, color=color)
+        storage.save_speaker_label(session_id, key, name=name, color=color, set_by="user")
         if sid == session_id:
             with _state_lock:
                 _state["speaker_labels"][key] = name
@@ -11367,7 +11641,8 @@ def fp_confirm():
             def _add_emb():
                 emb = fingerprint_db.extract_embedding(seg_audio)
                 if emb is not None:
-                    fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0)
+                    fingerprint_db.add_embedding(global_id, session_id, speaker_key, emb, 0.0,
+                                                 origin="confirm")
             _fp_executor.submit(_add_emb)
         else:
             # Fallback: extract from WAV file
@@ -11984,6 +12259,573 @@ def _agent_changelog(limit: int) -> list:
     return (payload.get("entries") or [])[:limit]
 
 
+# ── AI speaker detection ──────────────────────────────────────────────────────
+# Reads who the meeting app showed as speaking off the screen recording,
+# checks it against the turns' own voices, and names or corrects the
+# meeting's speakers (ai/speaker_detect). Off until Settings turns it on.
+# Every write goes through the UI's own speaker functions and is journaled
+# (core.speaker_journal), so a run or any one change undoes exactly.
+
+def _speaker_ai_owner() -> str | None:
+    """The user's own name, as the Me profile carries it."""
+    me = _me_profile_id()
+    try:
+        prof = fingerprint_db.get_global_speaker(me) if me else None
+    except Exception:
+        prof = None
+    return (prof or {}).get("name") or None
+
+
+def _speaker_ai_candidates(_sid: str) -> dict:
+    """Voice Library names, for matching what the screen shows to profiles."""
+    try:
+        return {p["name"]: p["id"] for p in fingerprint_db.list_global_speakers() if p.get("name")}
+    except Exception:
+        return {}
+
+
+def _speaker_ai_expected(sid: str) -> list[str]:
+    """Who the calendar invite says was there (organizer included)."""
+    match = storage.get_calendar_match(sid) or {}
+    out = [a.get("name") for a in match.get("attendees") or []
+           if isinstance(a, dict) and a.get("name")]
+    org = match.get("organizer")
+    if isinstance(org, dict) and org.get("name"):
+        out.append(org["name"])
+    return out
+
+
+def _speaker_ai_voices(sid: str, keys: list[str]) -> tuple[dict, dict]:
+    if not fingerprint_db.ready:
+        return {}, {}
+    me = _me_profile_id()
+    return speaker_voices.key_voices(
+        fingerprint_db, sid, keys, storage.get_speaker_label_rows(sid),
+        storage.get_speaker_segments(sid), wav_path=media.pcm_wav_path(sid),
+        exclude={me} if me else None)
+
+
+def _speaker_ai_turn_vectors(sid: str, spans: list) -> dict:
+    if not fingerprint_db.ready:
+        return {}
+    return speaker_voices.turn_vectors(fingerprint_db, media.pcm_wav_path(sid), spans)
+
+
+_speaker_ai_locks: dict[str, threading.Lock] = {}
+_speaker_ai_locks_guard = threading.Lock()
+
+
+def _speaker_ai_lock(sid: str) -> threading.Lock:
+    """One meeting's speaker-change lock: a run applying its changes, an
+    accept and an undo never interleave on the same rows."""
+    with _speaker_ai_locks_guard:
+        return _speaker_ai_locks.setdefault(sid, threading.Lock())
+
+
+def _speaker_ai_busy(sid: str) -> "str | None":
+    """Why this meeting's speakers must not change under it right now. While
+    it records, a new key would collide with the live diarizer's next one and
+    a moved line would redirect its live speaker; a reanalysis is about to
+    replace every key."""
+    with _state_lock:
+        if _state.get("session_id") != sid:
+            return None
+        if _state.get("is_recording") or _state.get("is_starting"):
+            return "This meeting is still recording. Its speakers can be identified when it ends."
+        if _state.get("is_reanalyzing"):
+            return "This meeting is being reanalyzed. Try again when it finishes."
+    return None
+
+
+def _speaker_ai_apply_name(sid, keys, name, gid, link, train, effects) -> None:
+    # A suggestion someone accepted is theirs now: a user's name is left
+    # alone by later runs, and an agent's or the chat's says who chose it.
+    origin = effects.get("origin")
+    set_by = origin if origin in ("user", "agent", "chat") else "ai"
+    _patch_session_speakers(sid, list(keys), name, None, queue_summary=False, global_id=gid,
+                            train_profile=train, link_profile=link, set_by=set_by,
+                            effects=effects)
+
+
+def _speaker_ai_apply_move(seg_id: int, name: str, to_key: str) -> None:
+    _relabel_segment(int(seg_id), name, to_key, train=False)
+
+
+def _speaker_ai_ensure_key(sid: str, key: str, name: str) -> None:
+    storage.save_speaker_label(sid, key, name=name, set_by="ai")
+
+
+def _speakers_updated(sid: str, segment_ids=()) -> None:
+    """Tell open pages a meeting's speakers changed. The lines that moved go
+    with it, as they are now, so a page repaints them where they are (a
+    reload of the meeting would close the Speakers dialog it was made from);
+    the names arrive as speaker_label events."""
+    _push("speakers_updated", {"session_id": sid,
+                               "segments": storage.get_segment_speakers(segment_ids)})
+
+
+def _speaker_ai_after_session(sid: str, renames: list, moved: int = 0,
+                              segment_ids=()) -> None:
+    """A meeting's speakers changed under it: patch the summary, re-export,
+    and tell open pages which lines moved."""
+    context = _speaker_summary_update_context(
+        [(a, b) for a, b in renames if a and b and a != b])
+    if moved:
+        context = (context + "\n" if context else "") + (
+            f"{moved} transcript lines were moved to the speaker who actually said them. "
+            "Update speaker attributions in the summary to match the transcript.")
+    if context:
+        _relabel_summary_queue.put((sid, context))
+    obsidian.queue_export(sid)
+    _speakers_updated(sid, segment_ids)
+
+
+speaker_detector = speaker_runs.Detector(speaker_runs.Deps(
+    segments=storage.get_speaker_segments,
+    labels=lambda sid: storage.get_speaker_label_rows(sid),
+    owner_name=_speaker_ai_owner,
+    candidates=_speaker_ai_candidates,
+    live_media=_agent_live_media,
+    client_for=lambda provider: ai._get_client(provider),
+    setting=settings.get,
+    push=_push,
+    voices=_speaker_ai_voices,
+    turn_vectors=_speaker_ai_turn_vectors,
+    apply_name=_speaker_ai_apply_name,
+    apply_move=_speaker_ai_apply_move,
+    ensure_key=_speaker_ai_ensure_key,
+    after_session=_speaker_ai_after_session,
+    fingerprint_db=fingerprint_db,
+    recording=lambda: bool(_state.get("is_recording")),
+    lock_for=_speaker_ai_lock,
+    constraints=storage.list_speaker_constraints,
+    prompt_people=_speaker_ai_expected,
+    save_run=storage.save_speaker_ai_run,
+))
+
+
+def _speaker_ai_defaults() -> "speaker_runs.RunSpec":
+    """A run's spec from Settings, before the user's words for it."""
+    return speaker_runs.RunSpec(
+        autonomy=settings.get("speaker_ai_autonomy", "apply_confident"),
+        library_writes=settings.get("speaker_ai_library_writes", "follow_autonomy"),
+        depth=settings.get("speaker_ai_depth", "standard"),
+        recheck_user_labels=not settings.get("speaker_ai_respect_user_labels", True),
+    )
+
+
+def _speaker_ai_read_request(system: str, prompt: str, tool: dict, schema: dict) -> dict:
+    """The structured call that turns a typed request into a run spec, on the
+    detection's fast model."""
+    provider, fast, _strong = speaker_runs.models(settings.get)
+    return ai._complete_structured(system, prompt, provider=provider, model=fast, tool=tool,
+                                   oai_schema=schema, oai_schema_name="run_spec",
+                                   max_tokens=600)
+
+
+def _speaker_ai_start(sessions: list[str], trigger: str, instructions: str = "",
+                      overrides: dict | None = None, *, wait: float = 0.0,
+                      targets: list[str] | None = None, capped: bool = False):
+    """Start a detection run. The user's words adjust the Settings defaults;
+    explicit ``overrides`` (autonomy, library_writes, depth) have the last say,
+    and ``targets`` (speaker keys or names) narrow what is looked at.
+    ``capped`` (agents) never lets the run do more on its own, or teach the
+    voice library more, than Settings allow, whatever the words say.
+    Raises RuntimeError when the feature is off or nothing can be read."""
+    if not settings.get("speaker_ai_enabled"):
+        raise RuntimeError("AI speaker detection is off. Turn it on in Settings > Speakers.")
+    for sid in sessions:
+        busy = _speaker_ai_busy(sid)
+        if busy:
+            raise RuntimeError(busy)
+    provider, _fast, _strong = speaker_runs.models(settings.get)
+    if ai._get_client(provider) is None:
+        raise RuntimeError(f"No {provider.title()} API key is set, so the screen can't be read.")
+    spec, chips = speaker_instructions.compile_spec(
+        instructions, _speaker_ai_defaults(),
+        complete=_speaker_ai_read_request if instructions.strip() else None)
+    for k, allowed in (("autonomy", speaker_instructions.AUTONOMY),
+                       ("library_writes", speaker_instructions.LIBRARY),
+                       ("depth", speaker_instructions.DEPTHS)):
+        v = (overrides or {}).get(k)
+        if v in allowed:
+            setattr(spec, k, v)
+    if targets:
+        spec.targets = list(dict.fromkeys(list(spec.targets) + list(targets)))
+    if capped:
+        spec = speaker_instructions.cap(spec, _speaker_ai_defaults())
+    return speaker_detector.start(sessions, trigger=trigger, instructions=instructions,
+                                  spec=spec, wait=wait, chips=chips)
+
+
+def _speaker_ai_after_meeting(sid: str) -> None:
+    """After a meeting, when Settings ask for it: wait for the voice library's
+    own matches (a late one could overwrite a name the run sets) and for any
+    new recording to end, then run on the meeting's screen recording."""
+    if not (settings.get("speaker_ai_enabled") and settings.get("speaker_ai_after_meeting", True)):
+        return
+
+    def _go() -> None:
+        _wait_voice_matches(sid, timeout=180.0)
+        deadline = time.monotonic() + 4 * 3600
+        while time.monotonic() < deadline:
+            with _state_lock:
+                busy = bool(_state["is_recording"] or _state.get("is_starting")
+                            or _state.get("is_reanalyzing"))
+            if not busy:
+                break
+            time.sleep(10)
+        if not video_frames.available(sid, _agent_live_media()):
+            return
+        if not storage.get_session_times(sid):
+            return
+        try:
+            _speaker_ai_start([sid], "after_meeting")
+        except RuntimeError as e:
+            log.info("speakers", f"Speaker detection after {sid[:8]} skipped: {e}")
+        except Exception as e:
+            log.warn("speakers", f"Speaker detection after {sid[:8]} failed to start: {e}")
+
+    threading.Thread(target=_go, daemon=True, name=f"speaker-ai-after-{sid[:8]}").start()
+
+
+def _speaker_ai_change_view(ch: dict) -> dict:
+    """A journal row as the meeting page shows it."""
+    op = ch.get("op") or {}
+    return {
+        "id": ch["id"], "run_id": ch.get("run_id"), "session_id": ch["session_id"],
+        "actor": ch.get("actor"), "state": ch.get("state"), "summary": ch.get("summary"),
+        "reason": op.get("reason"),
+        "confidence": ch.get("confidence"), "risk": ch.get("risk"), "type": op.get("type"),
+        "keys": op.get("keys") or [], "name": op.get("name"),
+        "to_key": op.get("to_key") or op.get("new_key"),
+        "lines": len(op.get("segment_ids") or []),
+        "train": bool(op.get("train")),
+        "evidence": (ch.get("evidence") or [])[:8],
+        "trained": bool((ch.get("effects") or {}).get("embedding_ids")),
+        "created_at": ch.get("created_at"), "applied_at": ch.get("applied_at"),
+        "undone_at": ch.get("undone_at"),
+    }
+
+
+def _speaker_ai_insights(sid: str) -> dict:
+    """What the meeting page's panel shows: the latest run (live while it
+    runs), suggestions waiting, the history of changes, standing hints, and
+    every speaker in the meeting as it stands."""
+    saved = storage.latest_speaker_ai_run(sid)
+    live = speaker_detector.get(saved["id"]) if saved else None
+    run = live.as_dict() if live else saved
+    changes = speaker_journal.list_changes(session_id=sid, limit=200)
+    speakers = storage.speaker_roster(sid)
+    for sp in speakers:
+        sp["owner"] = sp["key"] == ME_KEY
+    return {
+        "enabled": bool(settings.get("speaker_ai_enabled")),
+        "has_video": video_frames.available(sid, _agent_live_media()),
+        "run": run,
+        "suggestions": [_speaker_ai_change_view(c) for c in changes if c["state"] == "suggested"],
+        "history": [_speaker_ai_change_view(c) for c in changes
+                    if c["state"] in ("applied", "undone")][:60],
+        "constraints": storage.list_speaker_constraints(sid),
+        "speakers": speakers,
+        "recording": bool(_speaker_ai_busy(sid)),
+    }
+
+
+def _speaker_ai_refresh(sid: str, keys: list[str], segment_ids=()) -> None:
+    """After an undo puts rows back: the live labels, pages and summary."""
+    rows = storage.get_speaker_label_rows(sid, keys)
+    with _state_lock:
+        live = _state.get("session_id") == sid
+        if live:
+            for k, row in rows.items():
+                if _is_custom_speaker_key(k):
+                    continue
+                if row:
+                    _state["speaker_labels"][k] = row["name"]
+                else:
+                    _state["speaker_labels"].pop(k, None)    # a split's key, undone
+    for k, row in rows.items():
+        if row:
+            _push("speaker_label", {"session_id": sid, "speaker_key": k,
+                                    "name": row["name"], "color": row["color"]})
+    _speakers_updated(sid, segment_ids)
+    obsidian.queue_export(sid)
+    _relabel_summary_queue.put((sid, "Speaker labels were changed back to what they were "
+                                     "before. Update speaker attributions to match."))
+
+
+def _speaker_ai_undo_change(change_id: int, force: bool) -> dict:
+    ch = speaker_journal.get(change_id)
+    if not ch:
+        raise ValueError("No such change.")
+    busy = _speaker_ai_busy(ch["session_id"])
+    if busy:
+        raise ValueError(busy)
+    with _speaker_ai_lock(ch["session_id"]):
+        res = speaker_journal.undo(change_id, fingerprint_db, force=force)
+    _speaker_ai_refresh(res["session_id"], res["keys"], res.get("segment_ids") or [])
+    return res
+
+
+def _speaker_ai_undo_run(run_id: str) -> dict:
+    sessions = sorted({ch["session_id"] for ch in speaker_journal.list_changes(run_id=run_id)})
+    for sid in sessions:
+        busy = _speaker_ai_busy(sid)
+        if busy:
+            raise ValueError(busy)
+    with contextlib.ExitStack() as stack:
+        for sid in sessions:
+            stack.enter_context(_speaker_ai_lock(sid))
+        res = speaker_journal.undo_run(run_id, fingerprint_db)
+    for sid in res["sessions"]:
+        changes = speaker_journal.list_changes(session_id=sid, run_id=run_id)
+        keys = sorted({k for ch in changes for k in (ch["before"]["labels"] or {})})
+        seg_ids = sorted({i for ch in changes for i in (ch["before"]["segments"] or {})})
+        _speaker_ai_refresh(sid, keys, seg_ids)
+    return res
+
+
+def _speaker_ai_accept_trains(run_id: "str | None") -> bool:
+    """Whether accepting a suggestion may teach the voice library: never when
+    Settings or the run's own words said not to."""
+    if settings.get("speaker_ai_library_writes", "follow_autonomy") == "never":
+        return False
+    saved = storage.get_speaker_ai_run(run_id) if run_id else None
+    return ((saved or {}).get("spec") or {}).get("library_writes") != "never"
+
+
+def _speaker_ai_apply_change(change_id: int, actor: str = "user") -> dict:
+    """Accept a suggestion: applied as the run would have, and journaled. The
+    user's accept may teach the voice library (see _speaker_ai_accept_trains);
+    an agent's or the chat's never does, as their own labels don't."""
+    ch = speaker_journal.get(change_id)
+    if not ch or ch["state"] != "suggested":
+        raise ValueError("That suggestion is no longer waiting.")
+    sid = ch["session_id"]
+    busy = _speaker_ai_busy(sid)
+    if busy:
+        raise ValueError(busy)
+    op = ch["op"]
+    with _speaker_ai_lock(sid):
+        if not speaker_journal.claim(change_id):
+            raise ValueError("That suggestion is no longer waiting.")
+        try:
+            train = (actor == "user" and bool(op.get("train"))
+                     and _speaker_ai_accept_trains(ch.get("run_id")))
+            speaker_detector.apply(sid, op, train=train, run_id=ch.get("run_id"),
+                                   actor=actor, change_id=change_id)
+        except Exception:
+            speaker_journal.set_state(change_id, "suggested")
+            raise
+    done = speaker_journal.get(change_id)
+    renames = []
+    if op.get("type") == "name":
+        renames = [((row or {}).get("name") or k, op.get("name"))
+                   for k, row in (done["before"]["labels"] or {}).items()]
+    moved = [] if op.get("type") == "name" else list(op.get("segment_ids") or [])
+    _speaker_ai_after_session(ch["session_id"], renames, len(moved), moved)
+    return {"change": _speaker_ai_change_view(done)}
+
+
+def _speaker_ai_dismiss_change(change_id: int) -> dict:
+    """Dismiss a suggestion, and remember it: the same name is not suggested
+    for those speakers again."""
+    ch = speaker_journal.get(change_id)
+    if not ch or not speaker_journal.claim(change_id, "suggested", "dismissed"):
+        raise ValueError("That suggestion is no longer waiting.")
+    op = ch["op"]
+    if op.get("type") == "name" and op.get("name"):
+        for k in op.get("keys") or []:
+            storage.add_speaker_constraint(ch["session_id"], "is_not", {"key": k}, op["name"],
+                                           source="dismissed", run_id=ch.get("run_id"))
+    return {"dismissed": change_id}
+
+
+def _speaker_ai_add_constraint(sid: str, kind: str, subject: dict, value) -> dict:
+    cid = storage.add_speaker_constraint(sid, kind, subject, value, source="user_edit")
+    return {"ok": True, "id": cid}
+
+
+def _speaker_ai_evidence(sid: str, obs_id: int, full: bool) -> "bytes | None":
+    """The frame an observation was read from, with the tile it named boxed."""
+    got = speaker_observations.get(obs_id)
+    if not got or got[0] != sid:
+        return None
+    _sid, o = got
+    img = video_frames.image(sid, o.t, width=None, live=_agent_live_media())
+    if img is None:
+        return None
+    from PIL import ImageDraw
+    img = img.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    # Stored boxes are in video pixels; the frame may come back another size.
+    boxes = []
+    for s in o.speaking:
+        if not s.box or len(s.box) != 4:
+            continue
+        x0, y0, x1, y1 = (float(v) for v in s.box)
+        x0, x1 = sorted((max(0.0, min(img.width, x0)), max(0.0, min(img.width, x1))))
+        y0, y1 = sorted((max(0.0, min(img.height, y0)), max(0.0, min(img.height, y1))))
+        if x1 - x0 >= 4 and y1 - y0 >= 4:
+            boxes.append([x0, y0, x1, y1])
+    for b in boxes:
+        draw.rectangle(b, outline=(255, 196, 0), width=max(3, img.width // 400))
+    if boxes and not full:
+        x0 = max(0, min(b[0] for b in boxes) - 160)
+        y0 = max(0, min(b[1] for b in boxes) - 120)
+        x1 = min(img.width, max(b[2] for b in boxes) + 160)
+        y1 = min(img.height, max(b[3] for b in boxes) + 120)
+        img = img.crop((int(x0), int(y0), int(x1), int(y1)))
+    if img.width > 1280:
+        img = img.resize((1280, round(img.height * 1280 / img.width)))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=82)
+    return buf.getvalue()
+
+
+def _speaker_ai_run_report(run) -> dict:
+    """A run as the chat model and the Agent API read it: per meeting what was
+    applied (with change ids), what waits as a suggestion, what was flagged."""
+    d = run.as_dict() if hasattr(run, "as_dict") else dict(run or {})
+    meetings = []
+    for s in (d.get("report") or {}).get("sessions") or []:
+        meetings.append({
+            "session_id": s.get("session_id"), "status": s.get("status"),
+            "applied": [{"change_id": a.get("change_id"), "summary": a.get("summary"),
+                         "confidence": a.get("confidence")} for a in s.get("applied", [])],
+            "suggested": [{"change_id": a.get("change_id"), "summary": a.get("summary"),
+                           "confidence": a.get("confidence")} for a in s.get("suggested", [])],
+            "flagged": [f.get("summary") for f in s.get("findings", [])],
+            "frames_read": s.get("frames"),
+            "screen_misreads_set_aside": s.get("misreads"),
+            "errors": (s.get("errors") or [])[:3],
+        })
+    return {"run_id": d.get("id"), "status": d.get("status"), "error": d.get("error") or None,
+            "read_as": d.get("chips"), "seconds": (d.get("stats") or {}).get("seconds"),
+            "meetings": meetings}
+
+
+def _make_speaker_ai_executor(user_text: str, default_session_id: "str | None"):
+    """Chat tool executor for speaker detection. The run's autonomy comes from
+    ``user_text``, the user's own message, never from the tool input, and a
+    suggestion from a run started in this reply cannot be accepted in it: the
+    user has to have seen it."""
+    started_here: set[str] = set()
+
+    def _execute(name: str, tool_input: dict) -> tuple:
+        if name not in speaker_tools.NAMES:
+            raise ToolNotHandled(name)
+        try:
+            tool_input = tool_input or {}
+            sid = (tool_input.get("session_id") or "").strip() or default_session_id
+            if name == "identify_speakers":
+                if not sid or not storage.get_session_times(sid):
+                    return ("Pass the session_id of a meeting that exists.", True,
+                            "Meeting not found", None)
+                if not video_frames.available(sid, _agent_live_media()):
+                    return ("This meeting has no screen recording, so speakers can't be read "
+                            "from the screen. The Speakers dialog and the voice library are "
+                            "the way to name them.", True, "No screen recording", None)
+                focus = [str(f) for f in tool_input.get("focus") or [] if str(f).strip()][:20]
+                try:
+                    run = _speaker_ai_start([sid], "chat", user_text, {}, targets=focus)
+                except RuntimeError as e:
+                    return (str(e), True, "Speaker detection unavailable", None)
+                started_here.add(run.id)
+                run.done.wait(150)
+                rep = _speaker_ai_run_report(run)
+                if not run.done.is_set():
+                    rep["note"] = ("Still running. The meeting page shows its progress and "
+                                   "result; get_speaker_insights reads it later.")
+                applied = sum(len(m["applied"]) for m in rep["meetings"])
+                suggested = sum(len(m["suggested"]) for m in rep["meetings"])
+                return (json.dumps(rep, indent=2), False,
+                        f"Speakers: {applied} applied, {suggested} suggested",
+                        {"speaker_ai_run": {"run_id": run.id, "session_id": sid}})
+            if name == "get_speaker_insights":
+                if not sid or not storage.get_session_times(sid):
+                    return ("Pass the session_id of a meeting that exists.", True,
+                            "Meeting not found", None)
+                ins = _speaker_ai_insights(sid)
+                out = {
+                    "enabled": ins["enabled"], "has_screen_recording": ins["has_video"],
+                    "latest_run": _speaker_ai_run_report(ins["run"]) if ins["run"] else None,
+                    "suggestions": [{"change_id": c["id"], "summary": c["summary"],
+                                     "confidence": c["confidence"]} for c in ins["suggestions"]],
+                    "history": [{"change_id": c["id"], "run_id": c["run_id"],
+                                 "summary": c["summary"], "state": c["state"],
+                                 "by": c["actor"]} for c in ins["history"][:25]],
+                }
+                return (json.dumps(out, indent=2), False, "Read the speaker detection", None)
+            if name == "apply_speaker_changes":
+                if not tool_input.get("user_confirmed"):
+                    return ("user_confirmed must be true, and only when the user asked for "
+                            "exactly these.", True, "Not confirmed by the user", None)
+                action = tool_input.get("action")
+                fn = {"accept": lambda c: _speaker_ai_apply_change(c, "chat"),
+                      "dismiss": _speaker_ai_dismiss_change}.get(action)
+                if fn is None:
+                    return ("action must be accept or dismiss.", True, "Bad action", None)
+                done, failed = [], []
+                for cid in tool_input.get("change_ids") or []:
+                    try:
+                        ch = speaker_journal.get(int(cid))
+                        if action == "accept" and ch and ch.get("run_id") in started_here:
+                            raise ValueError("suggested in this same reply. Show it to the user "
+                                             "and accept it only after they say so in a later "
+                                             "message.")
+                        fn(int(cid))
+                        done.append(int(cid))
+                    except (ValueError, TypeError) as e:
+                        failed.append({"change_id": cid, "error": str(e)})
+                verb = "Accepted" if action == "accept" else "Dismissed"
+                return (json.dumps({"done": done, "failed": failed}), bool(failed and not done),
+                        f"{verb} {len(done)} suggestion(s)", None)
+            # undo_speaker_changes
+            if tool_input.get("run_id"):
+                try:
+                    res = _speaker_ai_undo_run(str(tool_input["run_id"]))
+                except ValueError as e:
+                    return (str(e), True, "Not undone", None)
+                return (json.dumps(res), False, f"Undid {len(res['undone'])} change(s)", None)
+            undone, conflicts = [], []
+            for cid in tool_input.get("change_ids") or []:
+                try:
+                    _speaker_ai_undo_change(int(cid), False)
+                    undone.append(int(cid))
+                except speaker_journal.Conflict as c:
+                    conflicts.append({"change_id": cid, "detail": c.detail})
+                except (ValueError, TypeError) as e:
+                    conflicts.append({"change_id": cid, "detail": str(e)})
+            return (json.dumps({"undone": undone, "not_undone": conflicts}), False,
+                    f"Undid {len(undone)} change(s)", None)
+        except Exception as e:
+            import traceback
+            log.error("speakers", f"{name} raised: {e}")
+            traceback.print_exc()
+            return (f"{name} failed: {e}", True, "Speaker detection failed", None)
+    return _execute
+
+
+speaker_routes.register(app, speaker_routes.Hooks(
+    detector=speaker_detector,
+    enabled=lambda: bool(settings.get("speaker_ai_enabled")),
+    session_exists=lambda sid: storage.get_session_times(sid) is not None,
+    has_video=lambda sid: video_frames.available(sid, _agent_live_media()),
+    start=lambda sessions, trigger, instructions, overrides: _speaker_ai_start(
+        sessions, trigger, instructions, {k: v for k, v in overrides.items() if k != "targets"},
+        targets=overrides.get("targets")),
+    insights=_speaker_ai_insights,
+    undo_change=_speaker_ai_undo_change,
+    undo_run=_speaker_ai_undo_run,
+    apply_change=_speaker_ai_apply_change,
+    dismiss_change=_speaker_ai_dismiss_change,
+    add_constraint=_speaker_ai_add_constraint,
+    evidence_jpeg=_speaker_ai_evidence,
+))
+
+
 app.register_blueprint(dashboard_api.bp)
 app.register_blueprint(calendar_events_api.bp)
 app.register_blueprint(storage_api.bp)
@@ -12024,13 +12866,30 @@ register_agent_api(app, AgentContext(
     # Speakers and organisation: every write goes through the UI's own path.
     voice_library=fingerprint_db,
     label_speaker=lambda sid, keys, name, color, gid, train: _patch_session_speakers(
-        sid, keys, name, color, global_id=gid, train_profile=train),
+        sid, keys, name, color, global_id=gid, train_profile=train, set_by="agent"),
     apply_speaker_corrections=_apply_speaker_corrections,
     relabel_segment=_relabel_segment,
     rename_profile=_rename_profile,
     merge_profiles=_apply_profile_merge,
     relabel_deps=_relabel_deps,
     me_profile_id=lambda: fingerprint_db._me_id or settings.get("me_speaker_global_id") or None,
+    # AI speaker detection: an agent's run is capped at what Settings allow.
+    speaker_ai=SimpleNamespace(
+        enabled=lambda: bool(settings.get("speaker_ai_enabled")),
+        has_video=lambda sid: video_frames.available(sid, _agent_live_media()),
+        start=lambda sid, instructions, autonomy, library, targets: _speaker_ai_start(
+            [sid], "agent", instructions,
+            {k: v for k, v in (("autonomy", autonomy), ("library_writes", library)) if v},
+            targets=targets, capped=True),
+        report=_speaker_ai_run_report,
+        get_run=lambda run_id: (speaker_detector.get(run_id)
+                                or storage.get_speaker_ai_run(run_id)),
+        insights=_speaker_ai_insights,
+        accept=lambda cid: _speaker_ai_apply_change(cid, "agent"),
+        dismiss=_speaker_ai_dismiss_change,
+        undo_change=lambda cid: _speaker_ai_undo_change(cid, False),
+        undo_run=_speaker_ai_undo_run,
+    ),
 ))
 
 

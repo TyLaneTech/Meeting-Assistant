@@ -796,6 +796,25 @@ REANALYSIS_DEFAULTS = {
         "step": 1,
         "type": "toggle",
     },
+    "reanalysis_mic_speech_check": {
+        "value": 1,
+        "label": "Skip Silent Mic Stretches",
+        "description": "Stop made-up lines like \"Thank you.\" when you were not talking.",
+        "tooltip": (
+            "Transcribing your microphone on a stretch with sound but no speech "
+            "(breathing, typing, a muted mic in a quiet room) makes the speech "
+            "model invent short lines such as \"Thank you.\" or \"I'll see you "
+            "next time.\". When this is on, a speech detector checks each "
+            "stretch of your microphone first, and stretches it hears no speech "
+            "in are not transcribed.<br><br>"
+            "Only your microphone is checked; the other side of the call is "
+            "transcribed as before."
+        ),
+        "min": 0,
+        "max": 1,
+        "step": 1,
+        "type": "toggle",
+    },
     "reanalysis_merge_gap": {
         "value": 0.8,
         "label": "Merge Gap",

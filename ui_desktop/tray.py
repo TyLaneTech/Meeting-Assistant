@@ -339,6 +339,12 @@ class MeetingTray:
             "reanalyzing":      "Meeting Assistant | Reanalyzing a meeting",
             "loading":          "Meeting Assistant | Loading models…",
         }
+        if key == "reanalyzing":
+            # The step and its device ("Transcribing on GPU · 63%") when the
+            # batch pass has reported them.
+            label = self._get_state().get("reanalysis_label")
+            if label:
+                return f"Meeting Assistant | {label}"
         return tooltips.get(key, "Meeting Assistant")
 
     def _build_menu(self) -> "pystray.Menu":
@@ -375,7 +381,7 @@ class MeetingTray:
         if st.get("is_recording"):
             return "Recording..."
         if st.get("is_reanalyzing"):
-            return "Reanalyzing a meeting"
+            return st.get("reanalysis_label") or "Reanalyzing a meeting"
         if st.get("recording_ready"):
             return "Ready"
         return st.get("recording_ready_reason", "Loading models...")

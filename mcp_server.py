@@ -47,7 +47,7 @@ import urllib.request
 from pathlib import Path
 
 SERVER_NAME = "meeting-assistant"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 _ROOT = Path(__file__).parent
 
@@ -559,6 +559,58 @@ TOOLS: list[dict] = [
         ["meeting_id", "speaker_keys"],
     ),
     _tool(
+        "identify_meeting_speakers",
+        "Let the app work out who is speaking from the meeting's screen "
+        "recording: it reads who the meeting app (Zoom, Teams, Meet) showed as "
+        "speaking, checks every reading against the voices, then names the "
+        "speakers, corrects wrong names and moves lines when one speaker holds "
+        "two people. Usually 10 to 60 seconds. It never does more on its own, or "
+        "trains voice profiles more, than the user's Settings allow; you may ask "
+        "for less (autonomy 'suggest', library_writes 'never'). Pass the user's "
+        "own words as instructions when they gave any (hints like 'Bob never "
+        "turns his camera on' help). Returns what was applied (undoable), "
+        "suggestions with change ids, and anything flagged. Needs the user to "
+        "have turned it on (Settings > Speakers) and a screen recording.",
+        {"meeting_id": _MID,
+         "instructions": {"type": "string", "description":
+                          "The user's own words for this run (optional)."},
+         "focus": {"type": "array", "items": {"type": "string"}, "description":
+                   "Speaker keys or names to look at (optional; default all)."},
+         "autonomy": {"type": "string", "enum": ["suggest", "apply_confident", "act_fully"],
+                      "description": "At most what Settings allow."},
+         "library_writes": {"type": "string",
+                            "enum": ["never", "on_accept", "follow_autonomy"],
+                            "description": "At most what Settings allow."}},
+        ["meeting_id"],
+    ),
+    _tool(
+        "get_speaker_detection",
+        "The latest AI speaker detection for a meeting: status and report, the "
+        "suggestions still waiting (change ids), and the history of speaker "
+        "changes with ids for undo_speaker_changes. Read-only.",
+        {"meeting_id": _MID},
+        ["meeting_id"],
+    ),
+    _tool(
+        "review_speaker_suggestions",
+        "Accept or dismiss suggestions from identify_meeting_speakers by change "
+        "id. Accepting applies them as if the user clicked Apply (undoable); "
+        "dismissing is remembered so the same name is not suggested again. Ask "
+        "the user first.",
+        {"change_ids": {"type": "array", "items": {"type": "integer"}},
+         "action": {"type": "string", "enum": ["accept", "dismiss"]}},
+        ["change_ids", "action"],
+    ),
+    _tool(
+        "undo_speaker_changes",
+        "Undo AI speaker detection changes: a whole run (run_id) or single "
+        "changes (change_ids). Names, moved lines and voice samples go back "
+        "exactly; only what those changes added is removed. A change whose "
+        "speakers were edited again since is reported and left alone.",
+        {"run_id": {"type": "string"},
+         "change_ids": {"type": "array", "items": {"type": "integer"}}},
+    ),
+    _tool(
         "relabel_segment",
         "Reattribute one transcript line to another speaker in the same "
         "meeting (speaker_key), or give that single line a one-off name. For "
@@ -805,6 +857,9 @@ def _get_started() -> list[dict]:
         "  create_folder, update_folder (rename/move a folder). Nothing deletes.",
         "- Speakers: list_meetings_needing_speakers -> review_meeting_speakers",
         "  -> get_speaker_frames (see the screen) -> label_speaker / relabel_segment;",
+        "  with a screen recording, identify_meeting_speakers does all of that in one",
+        "  call (when the user turned it on) -> get_speaker_detection,",
+        "  review_speaker_suggestions, undo_speaker_changes;",
         "  the library: get_speaker_profile, rename_speaker_profile,",
         "  merge_speaker_profiles (confirm), get_voice_library_health,",
         "  plan_speaker_relabel -> apply_speaker_relabel (confirm) / cancel",
@@ -954,6 +1009,28 @@ def call_tool(name: str, a: dict) -> tuple[list[dict], bool]:
                 body[dst] = a[src]
         return _json_text(_http("POST", f"/meetings/{mid}/speakers/label",
                                 body=body, timeout=120)), False
+
+    if name == "identify_meeting_speakers":
+        mid = a.get("meeting_id")
+        body = {k: a.get(k) for k in ("instructions", "focus", "autonomy", "library_writes")
+                if a.get(k)}
+        body["wait"] = 240
+        return _json_text(_http("POST", f"/meetings/{mid}/speakers/identify", body=body,
+                                timeout=300)), False
+
+    if name == "get_speaker_detection":
+        mid = a.get("meeting_id")
+        return _json_text(_http("GET", f"/meetings/{mid}/speakers/insights")), False
+
+    if name == "review_speaker_suggestions":
+        body = {"change_ids": a.get("change_ids") or [], "action": a.get("action")}
+        return _json_text(_http("POST", "/speaker-changes/apply", body=body,
+                                timeout=120)), False
+
+    if name == "undo_speaker_changes":
+        body = {k: a.get(k) for k in ("run_id", "change_ids") if a.get(k)}
+        return _json_text(_http("POST", "/speaker-changes/undo", body=body,
+                                timeout=120)), False
 
     if name == "relabel_segment":
         mid = a.get("meeting_id")

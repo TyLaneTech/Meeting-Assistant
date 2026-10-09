@@ -518,6 +518,17 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "calendar_last_refresh": "Machine-managed: UTC timestamp of the last successful calendar refresh.",
     "calendar_last_error": "Machine-managed: message from the last failed calendar refresh.",
     "post_meeting_pending": "Machine-managed: ids of meetings still waiting for their after-meeting transcription, so a restart picks them up. Not writable through this API.",
+    "video_part_offsets": "Machine-managed: where each video part of a paused and resumed meeting starts on its timeline, until the parts are joined. Not writable through this API.",
+    "speaker_ai_enabled": "AI speaker detection from the screen recording (sends frames to the AI provider). The user's switch; not writable through this API.",
+    "speaker_ai_after_meeting": "Run AI speaker detection after each meeting and after a reanalysis. Not writable through this API.",
+    "speaker_ai_autonomy": "What AI speaker detection may change on its own: suggest, apply_confident, act_fully. An agent's runs never exceed it. Not writable through this API.",
+    "speaker_ai_library_writes": "Whether AI speaker detection trains voice profiles: follow_autonomy, on_accept, never. Not writable through this API.",
+    "speaker_ai_respect_user_labels": "Names the user typed are only questioned, never changed, by AI speaker detection. Not writable through this API.",
+    "speaker_ai_depth": "How much of a meeting AI speaker detection reads: quick, standard, thorough. Not writable through this API.",
+    "speaker_ai_provider": "AI provider for speaker detection; empty follows the app's. Not writable through this API.",
+    "speaker_ai_model": "Vision model that reads most frames; empty uses the provider's default. Not writable through this API.",
+    "speaker_ai_strong_model": "Vision model for the full-frame layout reads; empty uses the provider's default. Not writable through this API.",
+    "speaker_ai_concurrency": "Requests AI speaker detection starts with in flight (1 to 16, adapted to rate limits). Not writable through this API.",
     "agent_api_enabled": "Master switch for this Agent API. When false every /api/agent/v1 endpoint returns 503.",
     "agent_api_token": "Optional bearer token required on Agent API requests when non-empty.",
     "agent_api_allow_recording_control": "Allow agents to start/stop recordings (off by default).",
@@ -542,8 +553,17 @@ RESTART_REQUIRED_KEYS = {
 # Internal bookkeeping and credentials the agent may not write directly.
 # post_meeting_pending is the after-meeting transcription queue: an agent
 # write could drop a meeting from it or queue one that was never recorded
-# record-only.
-SETTINGS_WRITE_DENYLIST = {"video_offsets", "calendar_ics_url", "post_meeting_pending"}
+# record-only. video_part_offsets places the video parts of a resumed
+# meeting on its timeline. The speaker_ai_* keys are the user's grant to AI
+# speaker detection (whether screen frames leave the computer, and what it
+# may do on its own): an agent's runs are capped at them, so an agent must
+# not be able to raise them.
+SPEAKER_AI_KEYS = {"speaker_ai_enabled", "speaker_ai_after_meeting", "speaker_ai_autonomy",
+                   "speaker_ai_library_writes", "speaker_ai_respect_user_labels",
+                   "speaker_ai_depth", "speaker_ai_provider", "speaker_ai_model",
+                   "speaker_ai_strong_model", "speaker_ai_concurrency"}
+SETTINGS_WRITE_DENYLIST = {"video_offsets", "video_part_offsets", "calendar_ics_url",
+                           "post_meeting_pending"} | SPEAKER_AI_KEYS
 
 
 def settings_schema() -> list[dict]:

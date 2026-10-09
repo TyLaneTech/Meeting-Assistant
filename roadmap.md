@@ -109,3 +109,21 @@ The Agent API (agent_api/ + mcp_server.py, docs/AGENT_API.md) shipped with REST 
 ## ~~Notes pane: export/import bundling~~ — done
 
 The export zip now bundles `notes_attachments/<file>` for every file in `storage/data/notes/<session_id>/`, gated on the new `notes` checkbox in the export modal. On import the directory is restored under the new session id and the notes Delta has its `/api/sessions/<old>/notes/attachments/` URLs rewritten to the new id, mirroring the existing screenshot-URL rewrite.
+
+---
+
+## AI speaker detection: follow-ons
+
+Shipped 2026-10-08 (`ai/speaker_detect`, Settings > Speakers, off by default): screen readings checked against per-turn voices, names and line moves through the UI's own functions, exact undo through `core/speaker_journal.py`, the Identify tab, chat tools, Agent API and MCP. The full design is in the gitignored `update_plans/ai-speaker-detection/`. Deferred, in rough impact order:
+
+- **Live mode.** Read the live fragmented MP4 a few frames a minute during the recording so desktop lines carry names as people talk and the after-meeting run has little left to do (`speaker_ai_live`, `speaker_ai_live_frames_per_min`, backing off when the recorder reports a stall).
+- **Richer person cards.** Who's who (2026-10-09) has a card per person with the screen's verdict, suggestions in place and quick fixes for the unnamed. Still to add: evidence chips (`Screen 9/10`, `Voice 0.86`, `On the invite`), inline rename of a named person, `Not Tom` (the `is_not` constraint and route already exist), and an avatar cropped from the person's video tile.
+- **Cleanup shows the screen's verdict.** Cleanup's member pills could carry the same status as Who's who (`Seen on screen`, `Screen showed Jason Palmer once`), so either tab answers "who is this".
+- **One count in the Speakers dialog.** The header counts speaker keys (`17 speakers: 17 named`) while Cleanup and Who's who count people (`6 named · 20 voices`); one vocabulary for all three.
+- **A split editor.** The person's timeline with turns colored by suggested identity and a draggable split point, for the mixed keys the voices could not sort out (today a `two_people` finding).
+- **Identify all.** Multi-meeting runs from the speaker work queue and the chat ("name everyone in last week's meetings"); `Detector.start` already takes several sessions.
+- **Privacy: participants only.** Record the meeting window's position at capture time so even scouts send a crop, never the whole screen.
+- **A spending cap.** `speaker_ai_monthly_budget`, pausing runs rather than asking, with per-run token stats in the report (`usage` is already measured).
+- **One journal for every speaker writer.** Voice auto-apply, the Agent API's `label_speaker`, the chat bulk relabel and Cleanup still write without a journal entry, so only AI changes can be undone from the history.
+- **Embeddings on the GPU.** Turn voices are embedded on the CPU (about 0.1 s a turn); the fingerprint model on the GPU would make the voice check near free.
+- **Turn voices from the batch child.** The reanalysis pipeline already computes embeddings; keeping them per turn would spare the detection run its own embedding pass.

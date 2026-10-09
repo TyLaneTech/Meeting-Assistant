@@ -23,6 +23,7 @@ import numpy as np
 from scipy import signal as scipy_signal
 
 from core import log as log
+from core.compute_device import BATCH_SPEAKERS_DONE
 
 # ── Hallucination detection (shared with transcriber.py) ─────────────────────
 from ml.transcriber import (
@@ -92,6 +93,19 @@ SHORT_REPLY_MAX_MEDIAN_S = 1.2
 SHORT_REPLY_MAX_TURN_S = 8.0
 SHORT_REPLY_MAX_SHARE = 0.10
 SHORT_REPLY_MIN_TOTAL_S = 5.0
+
+# A microphone span is transcribed only when the speech detector hears speech
+# in at least this share of it (see BatchTranscriber._keep_spoken).
+MIC_MIN_SPEECH_FRAC = 0.1
+
+
+def speech_fraction(start: float, end: float,
+                    regions: list[tuple[float, float]]) -> float:
+    """Share of [start, end] covered by the (start, end) speech regions."""
+    if end <= start:
+        return 0.0
+    covered = sum(max(0.0, min(end, b) - max(start, a)) for a, b in regions)
+    return min(1.0, covered / (end - start))
 # A fragment whose voice is less similar than this (cosine, speaker centroids)
 # to every real speaker is somebody else who only spoke briefly, not one of
 # them saying "mm-hmm", so it is never folded. Duration alone folded a
@@ -196,6 +210,7 @@ class BatchTranscriber:
         hf_token: str = "",
         on_progress_callback: Callable[[float], None] | None = None,
         cancel_event=None,
+        on_devices_callback: Callable[[str, str], None] | None = None,
     ):
         self._user_on_text = on_text_callback
         self.on_text_callback = self._guarded_on_text
@@ -207,6 +222,9 @@ class BatchTranscriber:
         self.fingerprint_callback = self._guarded_fingerprint if fingerprint_callback else None
         self.hf_token = hf_token
         self.on_progress_callback = on_progress_callback
+        # Told (diarization device, transcription device) once they are
+        # resolved, so the app's status line names the devices really in use.
+        self.on_devices_callback = on_devices_callback
         # threading.Event (or None). Set by the app to abandon the pass, e.g.
         # when a new recording starts while a post-meeting transcription runs.
         # Diarization is one uninterruptible call; the Whisper phase stops at
@@ -271,6 +289,11 @@ class BatchTranscriber:
         torch_device = torch.device(diar_device)
 
         log.info("batch", f"Device: diarization {diar_device}, transcription {device}")
+        if self.on_devices_callback:
+            try:
+                self.on_devices_callback(diar_device, device)
+            except Exception as e:
+                log.warn("batch", f"Device callback failed: {e}")
 
         # ── Source-aware path ("mic = Me") ────────────────────────────────────
         # When per-source tracks exist (recorded with the feature on), diarize
@@ -305,7 +328,7 @@ class BatchTranscriber:
 
         # ── Run diarization ───────────────────────────────────────────────────
         segments = self._run_diarization(audio, params, torch_device, total_duration)
-        self._report_progress(0.40)
+        self._report_progress(BATCH_SPEAKERS_DONE)
 
         if not segments:
             # No diarization results - transcribe the whole file as one segment
@@ -405,6 +428,38 @@ class BatchTranscriber:
                 pass
 
     @staticmethod
+    def _keep_spoken(audio: np.ndarray, spans: list[tuple[float, float]],
+                     min_speech_frac: float = MIC_MIN_SPEECH_FRAC,
+                     ) -> list[tuple[float, float]]:
+        """Drop microphone spans a speech detector hears no speech in.
+
+        Energy alone cannot tell speech from breathing, typing or a quiet
+        room, and Whisper fills a speechless span with stock lines ("Thank
+        you.", "I'll see you next time."). Measured on a 1 h 49 m meeting
+        (2026-10-07): of 181 such lines on a muted mic, 180 had no speech
+        detected, while every line the owner really spoke had speech over 30%
+        of its length. Uses faster-whisper's bundled Silero model (CPU, no
+        download); without it the spans pass through unchanged."""
+        if not spans:
+            return spans
+        try:
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+            regions = get_speech_timestamps(
+                np.ascontiguousarray(audio, dtype=np.float32),
+                VadOptions(threshold=0.5, min_silence_duration_ms=300, speech_pad_ms=100),
+                sampling_rate=TARGET_RATE)
+        except Exception as e:  # noqa: BLE001 - a missing detector must not cost the transcript
+            log.warn("batch", f"Mic speech check skipped: {e}")
+            return spans
+        speech = [(r["start"] / TARGET_RATE, r["end"] / TARGET_RATE) for r in regions]
+        kept = [(s, e) for s, e in spans
+                if speech_fraction(s, e, speech) >= min_speech_frac]
+        if len(kept) < len(spans):
+            log.info("batch", f"Mic: skipped {len(spans) - len(kept)} of {len(spans)} "
+                              f"stretches with no speech in them")
+        return kept
+
+    @staticmethod
     def _energy_segments(audio: np.ndarray, rms_thresh: float,
                          frame_sec: float = 0.03, merge_gap_sec: float = 0.6,
                          min_seg_sec: float = 0.3, pad_sec: float = 0.15
@@ -464,7 +519,7 @@ class BatchTranscriber:
         # mic track and never in the desktop audio, so the desktop gets one less.
         desktop_segs = self._run_diarization(
             desktop_audio, desktop_speaker_params(params), torch_device, total_duration)
-        self._report_progress(0.40)
+        self._report_progress(BATCH_SPEAKERS_DONE)
 
         # Fingerprint only desktop speakers (Me is never fingerprinted).
         if self.fingerprint_callback:
@@ -481,6 +536,8 @@ class BatchTranscriber:
         rms_thresh = float(params.get("silence_threshold", 0.008) or 0.008)
         me_spans = self._energy_segments(mic_audio, rms_thresh)
         log.info("batch", f"Mic (Me) utterances: {len(me_spans)}")
+        if params.get("reanalysis_mic_speech_check", 1):
+            me_spans = self._keep_spoken(mic_audio, me_spans)
 
         # Build the combined, time-sorted segment list with per-source audio.
         seg_list: list[tuple[str, float, float, np.ndarray]] = []

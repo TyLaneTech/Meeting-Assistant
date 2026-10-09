@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -11,6 +12,10 @@ from pathlib import Path
 
 from core import log as log
 from capture_video.ffmpeg_util import find_ffmpeg, subprocess_no_window_flag
+
+# "Duration: N/A, start: 1791481075.754982, bitrate: ..." in ffmpeg's input
+# banner. For gdigrab the start is the wall-clock time of the first frame.
+_INPUT_START_RE = re.compile(r"Duration: [^,]*, start: (\d+\.\d+)")
 
 
 # ── DPI awareness ────────────────────────────────────────────────────────────
@@ -269,6 +274,20 @@ class ScreenRecorder:
         self._frag_path: str | None = None
         self._lock = threading.Lock()
         self._monitor_thread: threading.Thread | None = None
+        # Wall-clock time (epoch seconds) of the first captured frame, from the
+        # "start:" ffmpeg prints for the gdigrab input: gdigrab stamps frames
+        # with the wall clock. None until ffmpeg has printed it.
+        self._first_frame_epoch: float | None = None
+        self._first_frame_seen = threading.Event()
+
+    @property
+    def first_frame_epoch(self) -> float | None:
+        return self._first_frame_epoch
+
+    def wait_first_frame(self, timeout: float) -> float | None:
+        """The first frame's wall-clock time, waiting up to ``timeout`` s."""
+        self._first_frame_seen.wait(timeout)
+        return self._first_frame_epoch
 
     @property
     def is_recording(self) -> bool:
@@ -360,6 +379,8 @@ class ScreenRecorder:
 
         log.info("screen", f"Starting: {' '.join(cmd)}")
 
+        self._first_frame_epoch = None
+        self._first_frame_seen.clear()
         with self._lock:
             self._proc = subprocess.Popen(
                 cmd,
@@ -380,9 +401,15 @@ class ScreenRecorder:
             return
         try:
             for line in proc.stderr:
-                pass
+                if self._first_frame_epoch is None:
+                    m = _INPUT_START_RE.search(line.decode("utf-8", "replace"))
+                    if m:
+                        self._first_frame_epoch = float(m.group(1))
+                        self._first_frame_seen.set()
         except Exception:
             pass
+        finally:
+            self._first_frame_seen.set()   # never leave a waiter hanging
 
     def stop(self) -> str | None:
         with self._lock:

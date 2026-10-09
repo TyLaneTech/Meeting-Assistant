@@ -11,6 +11,7 @@ child answers on its stdout with length-prefixed pickled frames:
     ("text", (text, speaker, start, end))      a transcript segment
     ("fp", (speaker, audio, start, end))       audio for voice fingerprinting
     ("progress", fraction)
+    ("devices", {"diarizer", "whisper"})       the devices the child actually resolved
     ("log", (level, tag, message))             core.log lines, re-logged by the parent
     ("done", info) | ("error", (type_name, message))
 Anything else the child prints (library warnings, tracebacks) goes to its
@@ -117,11 +118,15 @@ def run_in_child(
     cancel_event: "threading.Event | None" = None,
     cuda: bool = True,
     tracks_root: str | None = None,
+    on_devices: Callable[[dict], None] | None = None,
 ) -> None:
     """Run BatchTranscriber.process_wav_file(wav_path, params, tracks_root)
     in a child process, delivering its callbacks on the calling thread.
     ``tracks_root`` is where the per-source tracks live (media.tracks_root):
     the WAV can be a decode in tmp/, so the tracks cannot be found from it.
+    ``on_devices`` gets {"diarizer", "whisper"} once the child has resolved
+    them; a GPU the plan asked for that the child cannot use shows up there
+    as "cpu".
 
     cuda=False hides the NVIDIA card from the child (CUDA_VISIBLE_DEVICES=-1)
     for a job planned entirely on the CPU. Measured 2026-10-01: merely
@@ -224,6 +229,12 @@ def run_in_child(
                         on_progress(payload)
                     except Exception:
                         pass
+            elif kind == "devices":
+                if on_devices is not None:
+                    try:
+                        on_devices(payload)
+                    except Exception:
+                        pass
             elif kind == "log":
                 level, tag, msg = payload
                 getattr(log, level if level in ("info", "warn", "error") else "info")(tag, msg)
@@ -314,6 +325,8 @@ def _child_main() -> int:
             fingerprint_callback=(lambda *a: send("fp", a)) if job.get("fingerprints") else None,
             hf_token=os.getenv("HUGGING_FACE_KEY", ""),
             on_progress_callback=lambda p: send("progress", p),
+            on_devices_callback=lambda diar, whisper: send(
+                "devices", {"diarizer": diar, "whisper": whisper}),
         )
         bt.process_wav_file(job["wav_path"], job["params"],
                             tracks_root=job.get("tracks_root"))

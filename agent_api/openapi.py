@@ -262,6 +262,51 @@ def build_spec(server_url: str) -> dict:
             "reinforce": {"type": "boolean", "default": False},
             "evidence": {"type": "string", "description": "Why; logged."},
         }}, tags=["speakers"]))
+    add("/meetings/{session_id}/speakers/identify", "post", _op(
+        "AI speaker detection from the screen recording",
+        "Reads who the meeting app showed as speaking, checks each reading "
+        "against the voices, then names speakers, corrects wrong names and moves "
+        "lines when one key holds two people. Never does more on its own, or "
+        "trains voice profiles more, than the user's Settings allow: autonomy and "
+        "library_writes can only lower them. Waits up to `wait` seconds (default "
+        "120, max 300); an unfinished run returns `poll`. 409 when the feature is "
+        "off (Settings > Speakers) or there is no screen recording.",
+        [_SID],
+        body={"type": "object", "properties": {
+            "instructions": {"type": "string",
+                             "description": "The user's own words for this run."},
+            "focus": {"type": "array", "items": {"type": "string"},
+                      "description": "Speaker keys or names to look at."},
+            "autonomy": {"type": "string",
+                         "enum": ["suggest", "apply_confident", "act_fully"]},
+            "library_writes": {"type": "string",
+                               "enum": ["never", "on_accept", "follow_autonomy"]},
+            "wait": {"type": "number", "default": 120},
+        }}, tags=["speakers"]))
+    add("/meetings/{session_id}/speakers/insights", "get", _op(
+        "The latest AI speaker detection, suggestions waiting, change history",
+        "", [_SID], tags=["speakers"]))
+    add("/speaker-runs/{run_id}", "get", _op(
+        "One AI speaker detection run's status and report",
+        "", [_p("run_id", "Run id from /speakers/identify.")], tags=["speakers"]))
+    add("/speaker-changes/apply", "post", _op(
+        "Accept or dismiss AI speaker suggestions by change id",
+        "Accepting applies a suggestion as the meeting page's Apply does "
+        "(journaled, undoable); dismissing is remembered so the same name is not "
+        "suggested again.",
+        body={"type": "object", "properties": {
+            "change_ids": {"type": "array", "items": {"type": "integer"}},
+            "action": {"type": "string", "enum": ["accept", "dismiss"]},
+        }, "required": ["change_ids", "action"]}, tags=["speakers"]))
+    add("/speaker-changes/undo", "post", _op(
+        "Undo AI speaker changes: a run (run_id) or single changes (change_ids)",
+        "Puts names, moved lines and voice samples back exactly; removes only "
+        "what those changes added. A change whose speakers were edited again "
+        "since is reported under not_undone and left alone.",
+        body={"type": "object", "properties": {
+            "run_id": {"type": "string"},
+            "change_ids": {"type": "array", "items": {"type": "integer"}},
+        }}, tags=["speakers"]))
     add("/meetings/{session_id}/segments/{segment_id}/speaker", "post", _op(
         "Reattribute one transcript line to another speaker, or label just that line",
         "", [_SID, _p("segment_id", "Segment id from the JSON transcript.")],

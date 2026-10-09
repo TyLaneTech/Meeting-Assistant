@@ -362,20 +362,6 @@
   animation-timing-function: var(--fa-animation-timing, steps(8));
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .fa-beat,
-  .fa-bounce,
-  .fa-fade,
-  .fa-beat-fade,
-  .fa-flip,
-  .fa-pulse,
-  .fa-shake,
-  .fa-spin,
-  .fa-spin-pulse {
-    animation: none !important;
-    transition: none !important;
-  }
-}
 @keyframes fa-beat {
   0%, 90% {
     transform: scale(1);

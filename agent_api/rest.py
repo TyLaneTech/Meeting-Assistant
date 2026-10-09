@@ -50,6 +50,7 @@ from agent_api import speakers as speaker_evidence
 from agent_api.context import AgentContext
 from ai import speaker_relabel
 from capture_video import capture_live_frame, extract_frame, find_ffmpeg
+from capture_video import frames as video_frames
 from capture_video.ffmpeg_util import subprocess_no_window_flag
 from core import attention, calendar_feed, config, log, paths, recording_request, settings, storage
 from core import media as media
@@ -1182,14 +1183,29 @@ def _frame_at(session_id: str, t: float, width: int,
                        hasn't flushed it yet
     """
     mp4, live = _frame_sources(session_id)
-    offset = 0.0 if raw else settings.get_video_offset(session_id)
-    video_t = max(0.0, t - offset)
+    if not raw:
+        # capture_video.frames knows which file holds the moment: during a
+        # resumed recording a moment from before the resume is in a part kept
+        # aside ({sid}_partN.mp4), not in the live file or {sid}.mp4 (which the
+        # resume renamed), so it used to come back as the live file's first frame.
+        located = video_frames.locate(session_id, t, live)
+        if located is None:
+            return None, max(0.0, t), "video"
+        src, video_t = located
+        jpeg = video_frames.grab_at(src, video_t, width=width)
+        if jpeg or not src.live:
+            return jpeg, video_t, "live_file" if src.live else "video"
+        elapsed = live.get("elapsed_sec") if live else None
+        if elapsed is None or t >= elapsed - _LIVE_HEAD_WINDOW_SEC:
+            jpeg = capture_live_frame(
+                display_index=int(settings.get("screen_display", 0)),
+                max_width=width)
+            if jpeg:
+                return jpeg, video_t, "live_screen"
+        return None, video_t, "live_file"
 
+    video_t = max(0.0, t)
     if live and live.get("live_video_path"):
-        if not raw and mp4.exists() and t < offset:
-            # Resumed session: the moment predates the current live file, so
-            # the earlier finished video is the right source for it.
-            return extract_frame(str(mp4), t, max_width=width), t, "video"
         jpeg = extract_frame(live["live_video_path"], video_t, max_width=width)
         if jpeg:
             return jpeg, video_t, "live_file"
@@ -2213,6 +2229,142 @@ def _resolve_profile(spec: str):
                          "session_count": counts.get(s["id"], {}).get("session_count", 0)}
                         for s in matched])
     return matched[0], None
+
+
+# ── AI speaker detection (screen recording + voices) ─────────────────────────
+# The app reads who the meeting app showed as speaking and checks it against
+# the voices (ai/speaker_detect). An agent never gets more autonomy than the
+# user's own Settings grant: it can ask for less (suggestions only, no voice
+# training), never more. Every change is journaled and undoable.
+
+_AUTONOMY_ORDER = ["suggest", "apply_confident", "act_fully"]
+_LIBRARY_ORDER = ["never", "on_accept", "follow_autonomy"]
+
+
+def _speaker_ai_or_err():
+    sai = _ctx.speaker_ai
+    if sai is None:
+        return None, _needs("speaker_ai", None)
+    if not sai.enabled():
+        return None, _err("AI speaker detection is off. The user turns it on in Settings > "
+                          "Speakers; it sends screen-recording frames to their AI provider.",
+                          409)
+    return sai, None
+
+
+@bp.route("/meetings/<session_id>/speakers/identify", methods=["POST"])
+def meeting_speakers_identify(session_id: str):
+    """Run AI speaker detection on one meeting and (by default) wait for it."""
+    sai, blocked = _speaker_ai_or_err()
+    if blocked:
+        return blocked
+    if not storage.get_session_times(session_id):
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    if not sai.has_video(session_id):
+        return _err("This meeting has no screen recording to read speakers from. Use "
+                    "/meetings/{id}/speakers/review and /speakers/label instead.", 409)
+    if _session_busy(session_id) == "reanalyzing":
+        return _err("This meeting is being reanalysed; try again when it finishes.", 409)
+    body = request.get_json(silent=True) or {}
+    autonomy = body.get("autonomy") if body.get("autonomy") in _AUTONOMY_ORDER else None
+    library = body.get("library_writes") if body.get("library_writes") in _LIBRARY_ORDER else None
+    focus = body.get("focus") or []
+    if isinstance(focus, str):
+        focus = [focus]
+    focus = [str(f).strip() for f in focus if str(f).strip()][:20]
+    try:
+        wait = max(0.0, min(300.0, float(body.get("wait", 120))))
+    except (TypeError, ValueError):
+        wait = 120.0
+    try:
+        run = sai.start(session_id, str(body.get("instructions") or "")[:2000], autonomy,
+                        library, focus)
+    except RuntimeError as e:
+        return _err(str(e), 409)
+    if wait:
+        run.done.wait(wait)
+    out = sai.report(run)
+    out["finished"] = run.done.is_set()
+    if not out["finished"]:
+        out["poll"] = f"{_ctx.server_url}{_PREFIX}/speaker-runs/{run.id}"
+    return jsonify(out)
+
+
+@bp.route("/meetings/<session_id>/speakers/insights")
+def meeting_speakers_insights(session_id: str):
+    """The latest detection run, suggestions waiting, and the change history."""
+    sai = _ctx.speaker_ai
+    if sai is None:
+        return _needs("speaker_ai", None)
+    if not storage.get_session_times(session_id):
+        return _err(f"Meeting '{session_id}' not found.", 404)
+    return jsonify(sai.insights(session_id))
+
+
+@bp.route("/speaker-runs/<run_id>")
+def speaker_run_get(run_id: str):
+    sai = _ctx.speaker_ai
+    if sai is None:
+        return _needs("speaker_ai", None)
+    run = sai.get_run(run_id)
+    if run is None:
+        return _err(f"No speaker detection run '{run_id}'.", 404)
+    out = sai.report(run)
+    out["finished"] = out.get("status") not in ("queued", "running")
+    return jsonify(out)
+
+
+@bp.route("/speaker-changes/apply", methods=["POST"])
+def speaker_changes_apply():
+    """Accept or dismiss suggestions by change id."""
+    sai = _ctx.speaker_ai
+    if sai is None:
+        return _needs("speaker_ai", None)
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if action not in ("accept", "dismiss"):
+        return _err("action must be 'accept' or 'dismiss'.")
+    ids = body.get("change_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return _err("change_ids: the suggestion ids from /speakers/insights or /identify.")
+    fn = sai.accept if action == "accept" else sai.dismiss
+    done, failed = [], []
+    for cid in ids[:100]:
+        try:
+            fn(int(cid))
+            done.append(int(cid))
+        except (ValueError, TypeError) as e:
+            failed.append({"change_id": cid, "error": str(e)})
+    return jsonify({"action": action, "done": done, "failed": failed})
+
+
+@bp.route("/speaker-changes/undo", methods=["POST"])
+def speaker_changes_undo():
+    """Undo a detection run, or single changes. Restores names, lines and the
+    voice samples exactly; removes only what those changes added."""
+    sai = _ctx.speaker_ai
+    if sai is None:
+        return _needs("speaker_ai", None)
+    body = request.get_json(silent=True) or {}
+    if body.get("run_id"):
+        try:
+            return jsonify(sai.undo_run(str(body["run_id"])))
+        except ValueError as e:
+            return _err(str(e), 409)
+    ids = body.get("change_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return _err("Pass run_id, or change_ids from /speakers/insights.")
+    from core import speaker_journal
+    undone, not_undone = [], []
+    for cid in ids[:200]:
+        try:
+            sai.undo_change(int(cid))
+            undone.append(int(cid))
+        except speaker_journal.Conflict as c:
+            not_undone.append({"change_id": cid, "detail": c.detail})
+        except (ValueError, TypeError) as e:
+            not_undone.append({"change_id": cid, "detail": str(e)})
+    return jsonify({"undone": undone, "not_undone": not_undone})
 
 
 @bp.route("/speakers/library/health")

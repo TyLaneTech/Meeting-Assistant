@@ -1271,37 +1271,63 @@ class AIAssistant:
         tool_executor: "ToolExecutor | None" = None,
         provider: str | None = None,
         model: str | None = None,
+        extra_tools_anthropic: list | None = None,
+        extra_tools_openai: list | None = None,
+        extra_system: str = "",
     ) -> None:
-        """Stream an answer for the Global Chat (cross-session Q&A)."""
+        """Stream an answer for the Global Chat (cross-session Q&A). The
+        ``extra_*`` arguments add optional tools (and their guidance) the app
+        turns on, such as speaker detection."""
         self._stream_with_tools(
-            self._SYSTEM_GLOBAL_QA,
+            self._SYSTEM_GLOBAL_QA + (extra_system or ""),
             chat_history,
             on_token,
             on_done,
             cancel=cancel,
             on_tool_event=on_tool_event,
-            tools_anthropic=_GLOBAL_TOOLS_ALL,
-            tools_openai=_GLOBAL_TOOLS_ALL_OAI,
+            tools_anthropic=_GLOBAL_TOOLS_ALL + list(extra_tools_anthropic or []),
+            tools_openai=_GLOBAL_TOOLS_ALL_OAI + list(extra_tools_openai or []),
             tool_executor=tool_executor,
             provider=provider, model=model,
         )
 
     _SYSTEM_TITLE = (
-        "You generate ultra-short meeting titles. "
-        "Reply with ONLY 2-4 words in Title Case. "
-        "No punctuation, no quotes, no explanation.\n\n"
+        "You name meetings. Reply with ONLY the title: 2 to 6 words in Title "
+        "Case, no quotes, no explanation.\n\n"
         "Guidance:\n"
-        "- The transcript is the primary signal for what the meeting was about.\n"
-        "- If past meeting titles are provided, infer the user's naming style "
-        "(e.g. \"Product Standup\", \"Design Review\", \"1:1 with Alice\") and "
-        "match it when the signals indicate a recurring series.\n"
-        "- Meetings with the same participants AND similar day/time are "
-        "almost certainly the same recurring meeting — reuse or closely "
-        "mirror the existing title.\n"
-        "- One-off meetings with unfamiliar participants should get a fresh, "
-        "content-specific title.\n"
-        "- Prefer specificity over generic words like \"Meeting\" or \"Call\"."
+        "- The title says what THIS meeting was about. Read the whole excerpt: "
+        "the opening minutes are usually small talk, and the topic comes later.\n"
+        "- Past meeting titles, when given, show the user's naming style. Reuse "
+        "one only when this meeting is clearly another session of that same "
+        "series about the same subject; sharing people or a time slot is not "
+        "enough on its own.\n"
+        "- Name the group or the subject (\"Leadership Team Update\", \"Carrier "
+        "Contract Review\", \"1:1 with Alice\"), not generic words like "
+        "\"Meeting\" or \"Call\"."
     )
+
+    # Characters of transcript the title model sees: the opening, then
+    # windows spread evenly through the rest. It used to see the first 1,000
+    # characters only, which for a long meeting is the small talk before it
+    # starts, and it fell back on a past meeting's title (2026-10-07: a
+    # leadership update titled after an unrelated "PMO Planning Session").
+    _TITLE_OPENING = 1500
+    _TITLE_WINDOWS = 10
+    _TITLE_WINDOW = 500
+
+    @classmethod
+    def _title_excerpt(cls, transcript: str) -> str:
+        text = transcript.strip()
+        budget = cls._TITLE_OPENING + cls._TITLE_WINDOWS * cls._TITLE_WINDOW
+        if len(text) <= budget:
+            return text
+        parts = [text[:cls._TITLE_OPENING]]
+        rest = len(text) - cls._TITLE_OPENING
+        step = rest / cls._TITLE_WINDOWS
+        for k in range(cls._TITLE_WINDOWS):
+            start = cls._TITLE_OPENING + int(k * step + (step - cls._TITLE_WINDOW) / 2)
+            parts.append(text[start:start + cls._TITLE_WINDOW])
+        return "\n[...]\n".join(parts)
 
     def generate_title(
         self,
@@ -1328,7 +1354,7 @@ class AIAssistant:
         """
         if not transcript.strip():
             return ""
-        snippet = transcript[:1000].strip()
+        snippet = self._title_excerpt(transcript)
 
         # ── Build the context block ─────────────────────────────────────────
         ctx_lines: list[str] = []
@@ -1395,10 +1421,40 @@ class AIAssistant:
             raw = self._complete(system, user_msg)
             # Strip quotes / punctuation the model sometimes emits despite instructions
             cleaned = raw.strip().strip('"\'`').rstrip(".!?,:;")
-            words = cleaned.split()[:4]
+            words = cleaned.split()[:6]
             return " ".join(words)
         except Exception:
             return ""
+
+    _SYSTEM_CALENDAR_FIT = (
+        "You check whether a recorded conversation is the calendar meeting that was "
+        "scheduled at that time. Reply with ONLY yes or no.\n"
+        "- yes: the conversation plausibly is that meeting: its subject, its group "
+        "or its purpose fits, even loosely (meetings wander off topic).\n"
+        "- no: the conversation is clearly something else that happened in that "
+        "slot, such as a different call or an unrelated conversation."
+    )
+
+    def calendar_fits(self, subject: str, transcript: str) -> bool | None:
+        """Whether the recording is the calendar meeting it overlaps. A call
+        taken during a scheduled slot matches that slot's event by time alone
+        (2026-10-07: a 3-minute deal call during "Proposal tool Presentation").
+        None when it cannot tell (no text, or the AI is unreachable): the caller
+        keeps the calendar's name then."""
+        if not subject.strip() or not transcript.strip():
+            return None
+        user_msg = (f'Calendar meeting: "{subject.strip()}"\n\n'
+                    f"Transcript excerpt:\n{self._title_excerpt(transcript)}\n\n"
+                    "Is this conversation that meeting?")
+        try:
+            raw = self._complete(self._SYSTEM_CALENDAR_FIT, user_msg).strip().lower()
+        except Exception:
+            return None
+        if raw.startswith("yes"):
+            return True
+        if raw.startswith("no"):
+            return False
+        return None
 
     # ── Anthropic prompt caching ─────────────────────────────────────────────
 
@@ -1764,14 +1820,33 @@ class AIAssistant:
             text = (response.output_text or "").strip()
             return json.loads(text) if text else {}
         else:
-            response = client.messages.create(
-                model=mdl,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[tool],
-                tool_choice={"type": "tool", "name": tool["name"]},
-            )
+            try:
+                response = client.messages.create(
+                    model=mdl,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": tool["name"]},
+                )
+            except Exception as e:
+                # Sonnet 5.5, Opus 5.5 and Fable 5.1 refuse a forced tool
+                # choice (400 "tool_choice: type tool and any are not
+                # supported for this model"); structured outputs give the
+                # same schema-bound answer there. The strict schema (every
+                # object closed with additionalProperties false) is the one
+                # structured outputs accept.
+                if "tool_choice" not in str(e):
+                    raise
+                response = client.messages.create(
+                    model=mdl,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": prompt}],
+                    output_config={"format": {"type": "json_schema", "schema": oai_schema}},
+                )
+                text = next((b.text for b in response.content if b.type == "text"), "")
+                return json.loads(text) if text.strip() else {}
             for block in response.content:
                 if block.type == "tool_use":
                     return block.input or {}

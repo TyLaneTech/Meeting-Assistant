@@ -1325,6 +1325,10 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 .col-body::-webkit-scrollbar-thumb:hover { background: var(--accent, #7c8ff0); }
 
 .empty-hint { color: var(--fg-subtle); font-size: 13px; font-style: italic; margin-top: 6px; line-height: 1.6; }
+/* Reanalysis placeholder: the step and its device, then why the Models panel
+   says something else. */
+#reanalysis-hint .reanalysis-hint-step { display: block; color: var(--fg-muted); }
+#reanalysis-hint .reanalysis-hint-note { display: block; font-size: 12px; }
 
 /* While the transcript streams in, sweep a brighter band across the hint text so
    the pane reads as actively loading rather than frozen. Theme-aware (uses the
@@ -1342,9 +1346,6 @@ textarea::-webkit-scrollbar-thumb { background: var(--fg-subtle); border-radius:
 @keyframes loading-hint-shimmer {
   from { background-position: 130% 0; }
   to   { background-position: -130% 0; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .loading-hint { animation: pulse 1.6s ease-in-out infinite; }
 }
 
 /* ── Summary prompt area ───────────────────────────────────────────────────── */
@@ -6268,9 +6269,6 @@ img#shutdown-icon.brand-icon {
 .cleanup-cluster.has-hidden-selected { border-color: var(--accent, #58a6ff); }
 .cleanup-cluster.has-hidden-selected .cleanup-cluster-toggle,
 .cleanup-cluster.has-hidden-selected .cleanup-cluster-more { color: var(--accent, #58a6ff); }
-@media (prefers-reduced-motion: reduce) {
-  .cleanup-cluster-toggle i { transition: none; }
-}
 
 .cleanup-assign-btn {
   appearance: none;
@@ -10800,9 +10798,6 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
 .ui-toast-leaving { animation: uiToastOut .18s ease both; }
 @keyframes uiToastIn { from { opacity: 0; transform: translateY(8px); } }
 @keyframes uiToastOut { to { opacity: 0; transform: translateX(12px); } }
-@media (prefers-reduced-motion: reduce) {
-  .ui-dialog-overlay, .ui-dialog, .ui-toast, .ui-toast-leaving { animation: none; transition: none; }
-}
 @media (max-width: 560px) {
   .ui-toast-container { right: 16px; bottom: 16px; }
   .ui-dialog { padding: 21px 20px; }
@@ -11419,11 +11414,6 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   .cal-detail { width: auto; max-height: 60vh; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .cal-day,
-  .cal-chip,
-  .home-conv-sidebar.conv-animated { transition: none; }
-}
 /* One-line statement of the Cleanup surface's commit model. */
 #speaker-manager-overlay .speaker-commit-note {
   display: flex;
@@ -11560,10 +11550,6 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   text-align: left;
 }
 @keyframes uiComboIn { from { opacity: 0; transform: translateY(-4px); } }
-@media (prefers-reduced-motion: reduce) {
-  .ui-combobox-list { animation: none; }
-  .ui-combobox-field { transition: none; }
-}
 
 /* ══════════════════════════════════════════════════════════════════════════
    The app shell
@@ -12654,14 +12640,6 @@ body.is-recording .app-header .record-group {
   box-shadow: var(--shadow-md);
 }
 
-/* ── Views: the crossfade ─────────────────────────────────────────────────── */
-
-@media (prefers-reduced-motion: reduce) {
-  .view { transition: none !important; }
-  .status-dot.recording,
-  .record-pulse { animation: none; }
-  .header-refresh-btn.is-spinning i { animation: none; }
-}
 
 /* ── Home ─────────────────────────────────────────────────────────────────── */
 

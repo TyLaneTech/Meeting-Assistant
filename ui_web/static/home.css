@@ -553,11 +553,6 @@
 .dash-next-connect a { color: var(--accent); text-decoration: none; }
 .dash-next-connect a:hover { text-decoration: underline; }
 
-@media (prefers-reduced-motion: reduce) {
-  .next-focus-dot { animation: none; }
-  .dash-next-join { transition: none; }
-}
-
 /* ── B. Needs attention rows: speaker avatars ─────────────────────────────── */
 
 .dash-attention-row-text { flex: 1 1 auto; min-width: 0; }
@@ -903,9 +898,6 @@
 @keyframes dash-shimmer {
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .skeleton { animation: none; }
 }
 
 .dash-skeleton-row { border-top: 1px solid var(--border-sub); }

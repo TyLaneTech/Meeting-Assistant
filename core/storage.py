@@ -219,6 +219,88 @@ def init_db() -> None:
             # segments table (seconds per query on large libraries).
             "CREATE INDEX IF NOT EXISTS idx_segments_session_source"
             " ON transcript_segments(session_id, source)",
+            # Voice-sample provenance: which kind of write added a sample
+            # (voice_auto, confirm, user, agent, ai) and, for journaled
+            # changes, which change, so an undo removes exactly its samples.
+            "ALTER TABLE speaker_embeddings ADD COLUMN origin TEXT DEFAULT NULL",
+            "ALTER TABLE speaker_embeddings ADD COLUMN change_id INTEGER DEFAULT NULL",
+            # Who set a meeting speaker's name (user, voice_auto, agent, ai;
+            # NULL for rows written before this was recorded), so AI speaker
+            # detection can leave names the user chose alone.
+            "ALTER TABLE speaker_labels ADD COLUMN set_by TEXT DEFAULT NULL",
+            # AI speaker detection (ai/speaker_detect): runs, the visual
+            # timeline they read off the screen recording, and the journal of
+            # speaker changes with everything needed to undo them.
+            """CREATE TABLE IF NOT EXISTS speaker_ai_runs (
+                id           TEXT PRIMARY KEY,
+                trigger      TEXT NOT NULL,
+                scope        TEXT,
+                instructions TEXT,
+                spec         TEXT,
+                status       TEXT NOT NULL,
+                progress     TEXT,
+                stats        TEXT,
+                report       TEXT,
+                error        TEXT,
+                created_at   TEXT NOT NULL,
+                started_at   TEXT,
+                finished_at  TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS speaker_observations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id      TEXT NOT NULL,
+                t_audio         REAL NOT NULL,
+                t_video         REAL,
+                kind            TEXT NOT NULL,
+                crop            TEXT,
+                model           TEXT,
+                prompt_version  TEXT,
+                meeting_visible INTEGER,
+                app             TEXT,
+                layout          TEXT,
+                speaking        TEXT,
+                roster          TEXT,
+                flags           TEXT,
+                run_id          TEXT,
+                created_at      TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_speaker_obs_session"
+            " ON speaker_observations(session_id, t_audio)",
+            """CREATE TABLE IF NOT EXISTS speaker_changes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id      TEXT,
+                session_id  TEXT NOT NULL,
+                seq         INTEGER NOT NULL DEFAULT 0,
+                actor       TEXT NOT NULL,
+                op          TEXT NOT NULL,
+                risk        TEXT,
+                confidence  REAL,
+                evidence    TEXT,
+                summary     TEXT,
+                state       TEXT NOT NULL,
+                before      TEXT,
+                after       TEXT,
+                effects     TEXT,
+                created_at  TEXT NOT NULL,
+                applied_at  TEXT,
+                undone_at   TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_speaker_changes_session"
+            " ON speaker_changes(session_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_speaker_changes_run ON speaker_changes(run_id)",
+            """CREATE TABLE IF NOT EXISTS speaker_constraints (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                subject     TEXT NOT NULL,
+                value       TEXT,
+                source      TEXT NOT NULL,
+                run_id      TEXT,
+                created_at  TEXT NOT NULL,
+                revoked_at  TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_speaker_constraints_session"
+            " ON speaker_constraints(session_id)",
         ]:
             try:
                 conn.execute(migration)
@@ -968,10 +1050,14 @@ def get_title_generation_context(session_id: str, limit: int = 8) -> dict:
         except Exception:
             cur_dt, cur_dow, cur_hour = None, None, None
 
-        # Candidate past sessions: the most recent completed ones with a title
+        # Candidate past sessions: the most recent ones whose title the user
+        # chose (renamed, or taken from their calendar). An AI title is not the
+        # user's naming style, and offering it as one copied a wrong guess onto
+        # every later meeting with the same people (2026-10-07: a leadership
+        # update titled after an AI-named "PMO Planning Session" from August).
         past = conn.execute(
             "SELECT id, title, started_at FROM sessions "
-            "WHERE id != ? AND title IS NOT NULL AND title != '' "
+            "WHERE id != ? AND title IS NOT NULL AND title != '' AND title_user_set = 1 "
             "ORDER BY started_at DESC LIMIT 50",
             (session_id,),
         ).fetchall()
@@ -1187,6 +1273,13 @@ def trim_session_segments(session_id: str, start_sec: float, end_sec: float) -> 
             kept += 1
         conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM session_embeddings WHERE session_id = ?", (session_id,))
+        # The cached screen readings follow the lines onto the trimmed timeline
+        # (the video is cut the same way); the change history does not.
+        conn.execute("DELETE FROM speaker_observations WHERE session_id = ? "
+                     "AND (t_audio < ? OR t_audio > ?)", (session_id, start_sec, end_sec))
+        conn.execute("UPDATE speaker_observations SET t_audio = t_audio - ? "
+                     "WHERE session_id = ?", (start_sec, session_id))
+        _speaker_ai_outdated(conn, session_id)
     rebuild_session_fts(session_id)
     return kept
 
@@ -1326,6 +1419,30 @@ def folder_with_descendants(folder_id: str, *, recursive: bool = True) -> list[s
     return folder_ids
 
 
+def _speaker_ai_outdated(conn, session_id: str, *, readings: bool = False) -> None:
+    """The meeting's speaker keys or line ids were rebuilt under AI speaker
+    detection: its waiting suggestions and applied changes name keys that
+    now mean other voices, so none can be accepted or undone any more, and
+    hints tied to a key are dropped. ``readings``: the timeline moved too, so
+    the cached screen readings go (they are kept against meeting time)."""
+    conn.execute("UPDATE speaker_changes SET state = 'expired' WHERE session_id = ? "
+                 "AND state IN ('suggested', 'applied', 'applying')", (session_id,))
+    conn.execute("UPDATE speaker_constraints SET revoked_at = ? WHERE session_id = ? "
+                 "AND revoked_at IS NULL AND subject LIKE '%\"key\"%'", (_now(), session_id))
+    if readings:
+        conn.execute("DELETE FROM speaker_observations WHERE session_id = ?", (session_id,))
+
+
+def _delete_speaker_ai_rows(conn, session_id: str) -> None:
+    """A deleted meeting's AI speaker detection rows: its screen readings (they
+    hold names read off the screen), its changes, hints, and the runs that
+    covered only it."""
+    conn.execute("DELETE FROM speaker_observations WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM speaker_changes WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM speaker_constraints WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM speaker_ai_runs WHERE scope = ?", (json.dumps([session_id]),))
+
+
 def delete_session(session_id: str) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM search_fts WHERE session_id = ?", (session_id,))
@@ -1334,6 +1451,10 @@ def delete_session(session_id: str) -> None:
         conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+        # Voice vectors of the meeting's unnamed speakers: they belong to its
+        # speaker keys and nothing else reads them once the meeting is gone.
+        conn.execute("DELETE FROM unlabeled_embeddings WHERE session_id = ?", (session_id,))
+        _delete_speaker_ai_rows(conn, session_id)
         conn.execute("DELETE FROM media_encodes WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     # Every media file the session owns, in whatever format it ended up in,
@@ -1654,6 +1775,8 @@ def delete_folder(folder_id: str, delete_contents: bool = False) -> list[str]:
                 conn.execute("DELETE FROM summaries WHERE session_id=?", (sid,))
                 conn.execute("DELETE FROM chat_messages WHERE session_id=?", (sid,))
                 conn.execute("DELETE FROM speaker_labels WHERE session_id=?", (sid,))
+                conn.execute("DELETE FROM unlabeled_embeddings WHERE session_id=?", (sid,))
+                _delete_speaker_ai_rows(conn, sid)
                 conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
 
             # Delete all collected folders
@@ -1742,6 +1865,9 @@ def reset_session_transcript(session_id: str) -> None:
             "DELETE FROM search_fts WHERE session_id = ? AND kind = 'segment'",
             (session_id,),
         )
+        # New keys for new voices: AI changes and hints about the old ones
+        # are void. The screen readings stay (they follow meeting time).
+        _speaker_ai_outdated(conn, session_id)
 
 
 def snapshot_session_transcript(session_id: str) -> dict:
@@ -1848,6 +1974,8 @@ def restore_session_snapshot(session_id: str, snapshot: dict) -> None:
         conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM speaker_labels WHERE session_id = ?", (session_id,))
+        # Restoring the original puts back another timeline and new line ids.
+        _speaker_ai_outdated(conn, session_id, readings=True)
 
         for seg in segments:
             conn.execute(
@@ -1986,11 +2114,15 @@ def get_segment(segment_id: int) -> dict | None:
 
 
 def get_segments_by_speaker(session_id: str, speaker_key: str) -> list[dict]:
-    """Return all segments for a given speaker_key in a session, with timing info."""
+    """Return all segments for a given speaker_key in a session, with timing info.
+
+    A line moved to another speaker (source_override) belongs to that speaker:
+    reading the raw source trained a profile on lines moved away from it and
+    never on lines moved to it."""
     with _conn() as conn:
         rows = conn.execute(
             "SELECT id, start_time, end_time FROM transcript_segments "
-            "WHERE session_id = ? AND source = ? ORDER BY id",
+            "WHERE session_id = ? AND COALESCE(source_override, source) = ? ORDER BY id",
             (session_id, speaker_key),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -2164,6 +2296,196 @@ def get_speaker_profile(session_id: str, speaker_key: str) -> dict | None:
     return dict(row) if row else None
 
 
+# ── AI speaker detection (ai/speaker_detect) ─────────────────────────────────
+
+def get_speaker_segments(session_id: str) -> list[dict]:
+    """Every timed line of a meeting with the speaker it shows under now
+    ({id, key, start_time, end_time}), for planning which frames to read."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, COALESCE(source_override, source) AS key, start_time, end_time "
+            "FROM transcript_segments WHERE session_id = ? AND end_time > start_time "
+            "ORDER BY start_time", (session_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_speaker_constraint(session_id: str, kind: str, subject: dict, value: str | None,
+                           source: str = "user_edit", run_id: str | None = None) -> int:
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO speaker_constraints (session_id, kind, subject, value, source, run_id, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, kind, json.dumps(subject), value, source, run_id, _now()))
+        return int(cur.lastrowid)
+
+
+def list_speaker_constraints(session_id: str) -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, kind, subject, value, source FROM speaker_constraints "
+            "WHERE session_id = ? AND revoked_at IS NULL ORDER BY id", (session_id,)).fetchall()
+    return [{"id": r["id"], "kind": r["kind"], "subject": json.loads(r["subject"] or "{}"),
+             "value": r["value"], "source": r["source"]} for r in rows]
+
+
+def revoke_speaker_constraint(constraint_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE speaker_constraints SET revoked_at = ? WHERE id = ?",
+                     (_now(), constraint_id))
+
+
+def save_speaker_ai_run(run: dict) -> None:
+    """Upsert a run's record (ai.speaker_detect.runs keeps the live state)."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO speaker_ai_runs (id, trigger, scope, instructions, spec, status, "
+            "progress, stats, report, error, created_at, started_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "status=excluded.status, progress=excluded.progress, stats=excluded.stats, "
+            "report=excluded.report, error=excluded.error, finished_at=excluded.finished_at",
+            (run["id"], run["trigger"], json.dumps(run.get("sessions") or []),
+             run.get("instructions") or "",
+             json.dumps({**(run.get("spec") or {}), "chips": run.get("chips") or []}),
+             run["status"],
+             json.dumps(run.get("progress") or {}), json.dumps(run.get("stats") or {}),
+             json.dumps(run.get("report") or {}), run.get("error") or "",
+             run.get("created_at") or _now(), run.get("started_at"), run.get("finished_at")))
+
+
+def get_speaker_ai_run(run_id: str) -> dict | None:
+    with _conn() as conn:
+        r = conn.execute("SELECT * FROM speaker_ai_runs WHERE id = ?", (run_id,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    for k in ("scope", "spec", "progress", "stats", "report"):
+        try:
+            d[k] = json.loads(d[k]) if d[k] else None
+        except ValueError:
+            d[k] = None
+    # The live run's shape (ai.speaker_detect.runs.Run.as_dict) for readers.
+    d["sessions"] = d.get("scope") or []
+    d["chips"] = (d.get("spec") or {}).pop("chips", None) or []
+    return d
+
+
+def latest_speaker_ai_run(session_id: str) -> dict | None:
+    with _conn() as conn:
+        r = conn.execute(
+            "SELECT id FROM speaker_ai_runs WHERE scope LIKE ? ORDER BY created_at DESC LIMIT 1",
+            (f'%"{session_id}"%',)).fetchone()
+    return get_speaker_ai_run(r["id"]) if r else None
+
+
+# ── Speaker journal snapshots (core.speaker_journal) ─────────────────────────
+
+_LABEL_FIELDS = ("name", "color", "global_id", "is_noise", "set_by")
+
+
+def get_speaker_label_rows(session_id: str, keys: list[str] | None = None) -> dict:
+    """{speaker_key: {name, color, global_id, is_noise, set_by}} for the given
+    keys (every key when None). A key with no row maps to None, which is how
+    a snapshot says "this row did not exist"."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT speaker_key, name, color, global_id, is_noise, set_by FROM speaker_labels "
+            "WHERE session_id = ?", (session_id,)).fetchall()
+    found = {r["speaker_key"]: {f: r[f] for f in _LABEL_FIELDS} for r in rows}
+    if keys is None:
+        return found
+    return {k: found.get(k) for k in keys}
+
+
+def put_speaker_label_rows(session_id: str, rows: dict) -> None:
+    """Write label rows back exactly (None deletes the row): the undo of a
+    journaled speaker change."""
+    with _conn() as conn:
+        for key, row in rows.items():
+            if row is None:
+                conn.execute("DELETE FROM speaker_labels WHERE session_id = ? AND speaker_key = ?",
+                             (session_id, key))
+                continue
+            conn.execute(
+                "INSERT INTO speaker_labels "
+                "(session_id, speaker_key, name, color, global_id, is_noise, set_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, speaker_key) DO UPDATE SET name=excluded.name, "
+                "color=excluded.color, global_id=excluded.global_id, "
+                "is_noise=excluded.is_noise, set_by=excluded.set_by",
+                (session_id, key, row.get("name") or key, row.get("color"), row.get("global_id"),
+                 int(row.get("is_noise") or 0), row.get("set_by")),
+            )
+
+
+def get_segment_overrides(segment_ids: list[int]) -> dict:
+    """{segment id: {source_override, label_override}}."""
+    ids = [int(i) for i in segment_ids or []]
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT id, source_override, label_override FROM transcript_segments "
+            f"WHERE id IN ({marks})", ids).fetchall()
+    return {r["id"]: {"source_override": r["source_override"],
+                      "label_override": r["label_override"]} for r in rows}
+
+
+def put_segment_overrides(overrides: dict) -> None:
+    with _conn() as conn:
+        for seg_id, ov in overrides.items():
+            conn.execute(
+                "UPDATE transcript_segments SET source_override = ?, label_override = ? "
+                "WHERE id = ?",
+                (ov.get("source_override"), ov.get("label_override"), int(seg_id)))
+
+
+def get_segment_speakers(segment_ids) -> list[dict]:
+    """[{id, key, label, source}] for lines: the speaker each shows under now
+    and its one-off label, for a page to repaint them where they are."""
+    ids = sorted({int(i) for i in segment_ids or []})
+    if not ids:
+        return []
+    out = []
+    with _conn() as conn:
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            rows = conn.execute(
+                f"SELECT id, source, COALESCE(source_override, source) AS key, label_override "
+                f"FROM transcript_segments WHERE id IN ({','.join('?' * len(chunk))})",
+                chunk).fetchall()
+            out += [{"id": r["id"], "key": r["key"], "label": r["label_override"],
+                     "source": r["source"]} for r in rows]
+    return out
+
+
+def speaker_roster(session_id: str) -> list[dict]:
+    """Every speaker a meeting's transcript shows, with its label row: lines,
+    seconds of speech, first line, name, colour, voice-profile link, who
+    named it and whether it is noise. Keys with no lines are left out."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(ts.source_override, ts.source) AS key, COUNT(*) AS lines, "
+            "SUM(MAX(ts.end_time - ts.start_time, 0)) AS seconds, MIN(ts.start_time) AS first, "
+            "sl.name, sl.color, sl.global_id, sl.set_by, COALESCE(sl.is_noise, 0) AS is_noise "
+            "FROM transcript_segments ts LEFT JOIN speaker_labels sl "
+            "ON sl.session_id = ts.session_id "
+            "AND sl.speaker_key = COALESCE(ts.source_override, ts.source) "
+            "WHERE ts.session_id = ? AND COALESCE(ts.source_override, ts.source) IS NOT NULL "
+            "AND COALESCE(ts.source_override, ts.source) != '' "
+            "GROUP BY 1 ORDER BY seconds DESC", (session_id,)).fetchall()
+        noise_lines = dict(conn.execute(
+            "SELECT COALESCE(source_override, source), COUNT(*) FROM transcript_segments "
+            "WHERE session_id = ? AND label_override = '[Noise]' GROUP BY 1",
+            (session_id,)).fetchall())
+    return [{"key": r["key"], "lines": r["lines"], "seconds": round(r["seconds"] or 0.0, 1),
+             "first": r["first"], "name": r["name"] or r["key"], "color": r["color"],
+             "global_id": r["global_id"], "set_by": r["set_by"],
+             "is_noise": bool(r["is_noise"]) or r["key"] == "[Noise]"
+             or noise_lines.get(r["key"], 0) >= r["lines"]}
+            for r in rows]
+
+
 def list_speaker_profiles(session_id: str) -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
@@ -2193,15 +2515,22 @@ def save_speaker_label(
     speaker_key: str,
     name: str | None = None,
     color: str | None = None,
+    set_by: str | None = None,
 ) -> dict:
+    """Upsert a meeting speaker's name and colour. ``set_by`` (user,
+    voice_auto, agent, chat, ai) records who chose the name when the name is
+    being set; None leaves the record as it was."""
     existing = get_speaker_profile(session_id, speaker_key) or {}
     final_name = (name or existing.get("name") or speaker_key).strip()
     final_color = (color.strip() if isinstance(color, str) else existing.get("color"))
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO speaker_labels (session_id, speaker_key, name, color) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(session_id, speaker_key) DO UPDATE SET name=excluded.name, color=excluded.color",
-            (session_id, speaker_key, final_name, final_color),
+            "INSERT INTO speaker_labels (session_id, speaker_key, name, color, set_by) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id, speaker_key) DO UPDATE SET name=excluded.name, "
+            "color=excluded.color, set_by=COALESCE(excluded.set_by, speaker_labels.set_by)",
+            (session_id, speaker_key, final_name, final_color,
+             set_by if name is not None else None),
         )
     return {
         "speaker_key": speaker_key,

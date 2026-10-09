@@ -317,10 +317,6 @@ a.cal-chip--live:hover {
   font-size: 12.5px;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .cal-chip { transition: none; }
-}
-
 /* ── Day panel width follows the window ───────────────────────────────────── */
 
 .cal-detail { width: clamp(300px, 24vw, 440px); }

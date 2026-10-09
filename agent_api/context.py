@@ -107,3 +107,12 @@ class AgentContext:
 
     me_profile_id: "Callable[[], Any] | None" = None
     """() -> the owner's own voice-profile id, or None."""
+
+    speaker_ai: Any = None
+    """AI speaker detection (ai/speaker_detect), app-owned. An object with:
+    enabled() -> bool; has_video(sid) -> bool; start(sid, instructions,
+    autonomy, library_writes, targets) -> run (raises RuntimeError when it
+    cannot run); report(run) -> dict; get_run(run_id) -> run or saved dict or
+    None; insights(sid) -> dict; accept(change_id) / dismiss(change_id) ->
+    dict (ValueError when not waiting); undo_change(change_id) -> dict (raises
+    core.speaker_journal.Conflict); undo_run(run_id) -> dict."""

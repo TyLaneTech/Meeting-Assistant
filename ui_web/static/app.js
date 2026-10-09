@@ -618,10 +618,10 @@ const Views = {
         ? o.state.scroll
         : (this._scroll[name] || 0);
       el.scrollTop = restore;
-      // 90 ms opacity crossfade. Skipped for Back, repeated selection and
-      // reduced motion; nothing translates.
-      const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
-      if (!repeat && !o.popstate && !o.noFade && !reduce) {
+      // 90 ms opacity crossfade, skipped for Back and repeated selection;
+      // nothing translates. Animations always play: the OS reduced-motion
+      // setting is deliberately not consulted anywhere in this app.
+      if (!repeat && !o.popstate && !o.noFade) {
         el.style.opacity = '0';
         requestAnimationFrame(() => {
           el.style.transition = 'opacity 90ms linear';
@@ -1707,6 +1707,9 @@ const state = {
   // recording start pauses that pass (the server's recording_ready allows it),
   // so unlike a manual reanalysis it must not hold the Record button.
   isPostMeetingPass: false,
+  // The server's status line for the running reanalysis: the step and the
+  // device it runs on ("Transcribing on GPU · 63%"). Empty until it reports.
+  reanalysisLabel: '',
   // The meeting stopped but the transcriber is still working through audio it
   // had not caught up with. Segments keep arriving for that session, so the
   // transcript view must keep appending them the way it does for a reanalysis.
@@ -5282,6 +5285,12 @@ function connectSSE(afterSegId = 0) {
   // Loud, persistent banner when the desktop/call audio is not being captured
   // (dead loopback). This must never pass unnoticed again (2026-09-01).
   src.addEventListener('capture_alert', e => { try { _showCaptureAlert(JSON.parse(e.data)); } catch (_) {} });
+  // AI speaker detection runs (speakers_ai.js).
+  src.addEventListener('speaker_run_start', e => { try { window.SpeakerAI?.onRunStart(JSON.parse(e.data)); } catch (_) {} });
+  src.addEventListener('speaker_run_progress', e => { try { window.SpeakerAI?.onRunProgress(JSON.parse(e.data)); } catch (_) {} });
+  src.addEventListener('speaker_run_frames', e => { try { window.SpeakerAI?.onRunFrames(JSON.parse(e.data)); } catch (_) {} });
+  src.addEventListener('speaker_run_done', e => { try { window.SpeakerAI?.onRunDone(JSON.parse(e.data)); } catch (_) {} });
+  src.addEventListener('speakers_updated', e => { try { window.SpeakerAI?.onSpeakersUpdated(JSON.parse(e.data)); } catch (_) {} });
   src.addEventListener('transcription_backlog', e => { try { _showTranscriptionBacklog(JSON.parse(e.data)); } catch (_) {} });
   // A rolled-back reanalysis put the previous transcript back: reload it so the
   // view stops showing the empty rebuild it was watching.
@@ -5785,8 +5794,14 @@ function connectSSE(afterSegId = 0) {
     if (_fpToastTimer) { clearTimeout(_fpToastTimer); _fpToastTimer = null; }
     _fpUpdateBell();
     _fpRenderNotifPanel();
+    // The step line is filled in from the server's progress events, which
+    // name the device. The note is there because the Models panel, the only
+    // other device on screen, shows the live choices, which this pass ignores.
     document.getElementById('transcript').innerHTML =
-      '<p class="empty-hint">Reanalyzing audio…</p>';
+      '<p class="empty-hint" id="reanalysis-hint">'
+      + `<span class="reanalysis-hint-step">${escapeHtml(state.reanalysisLabel || 'Reanalyzing audio…')}</span>`
+      + '<span class="reanalysis-hint-note">Whisper and Diarizer in the Models panel apply to live transcription only.</span>'
+      + '</p>';
     // Keep summary and chat intact - only the transcript is retranscribed
     // Keep playback active - the WAV file still exists during reanalysis
   });
@@ -5796,6 +5811,7 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing = true;
     state.isPostMeetingPass = !!d.post_meeting;
+    state.reanalysisLabel = '';
     state.isViewingPast = false;  // Allow live transcript updates during reanalysis
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
@@ -5812,8 +5828,14 @@ function connectSSE(afterSegId = 0) {
     const d = JSON.parse(e.data);
     if (d.session_id !== state.sessionId) return;
     const pct = Math.round((d.progress || 0) * 100);
+    // The server's label names the step and its device; an older server
+    // sends none.
+    if (d.label) state.reanalysisLabel = d.label;
+    const label = d.label || `${d.post_meeting ? 'Transcribing' : 'Reanalyzing'}… ${pct}%`;
     const text = document.getElementById('status-text');
-    if (text) text.textContent = `${d.post_meeting ? 'Transcribing' : 'Reanalyzing'}… ${pct}%`;
+    if (text) text.textContent = label;
+    const hintStep = document.querySelector('#reanalysis-hint .reanalysis-hint-step');
+    if (hintStep && d.label) hintStep.textContent = d.label;
   });
 
   src.addEventListener('reanalysis_done', e => {
@@ -5821,6 +5843,7 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing   = false;
     state.isPostMeetingPass = false;
+    state.reanalysisLabel = '';
     state.isViewingPast   = true;  // Back to viewing past session
     state.sessionHasAudio = true;
     const dot  = document.getElementById('status-dot');
@@ -5842,6 +5865,7 @@ function connectSSE(afterSegId = 0) {
     if (d.session_id !== state.sessionId) return;
     state.isReanalyzing = false;
     state.isPostMeetingPass = false;
+    state.reanalysisLabel = '';
     state.isViewingPast = true;
     const dot  = document.getElementById('status-dot');
     const text = document.getElementById('status-text');
@@ -6234,6 +6258,7 @@ function onStatus(d) {
   if (d.recording_ready_reason !== undefined) {
     state.recordingReadyReason = d.recording_ready_reason || 'Loading transcription model...';
   }
+  if (d.reanalysis_label !== undefined) state.reanalysisLabel = d.reanalysis_label || '';
 
   // "Me" speaker (microphone = app user). Cache the global id locally so the
   // transcript can show a "(You)" badge ONLY for this instance's own mic
@@ -6368,8 +6393,11 @@ function onStatus(d) {
   if (!state.isRecording && dot && text) {
     const row = dot.parentElement;
     if (state.isReanalyzing) {
+      // A status push mid-pass used to put this back to a bare "Reanalyzing
+      // a meeting" until the next progress event, which during speaker
+      // detection can be minutes away.
       dot.className = 'status-dot recording';
-      text.textContent = 'Reanalyzing a meeting';
+      text.textContent = state.reanalysisLabel || 'Reanalyzing a meeting';
       row.removeAttribute('title');
     } else if (!state.recordingReady) {
       dot.className = 'status-dot loading';
@@ -6406,6 +6434,9 @@ let _autoResolvedSession = null;
 async function _maybeAutoOpenResolution(sessionId) {
   if (!sessionId || _autoResolvedSession === sessionId) return;
   _autoResolvedSession = sessionId;
+  // AI speaker detection names the speakers after the meeting and reports in
+  // the Speakers dialog's Identify tab; Cleanup stays a click away.
+  if (_prefs.speaker_ai_enabled) return;
   try {
     const r = await fetch(`/api/agent/v1/meetings/${encodeURIComponent(sessionId)}/speakers`);
     if (!r.ok) return;
@@ -7263,10 +7294,14 @@ function _partitionSpeakerGroupsByNoise(groups) {
  * its only job that Cleanup could not already do, picking a speaker's colour,
  * moved onto the colour square in each group header. Callers still pass a tab
  * name; it is accepted and ignored so older entry points keep working. */
-function openSpeakerManager() {
+function openSpeakerManager(tab) {
   document.getElementById('speaker-manager-overlay').classList.remove('hidden');
+  // With AI speaker detection on, the dialog opens on its Identify tab
+  // (speakers_ai.js), which loads Cleanup's clusters only when switched to.
+  const pane = window.SpeakerAI ? SpeakerAI.paneFor(tab) : 'cleanup';
+  if (window.SpeakerAI) SpeakerAI.showPane(pane);
   // Load (or reload) whenever there's no state or it's stale for another session.
-  if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();
+  if (pane === 'cleanup' && (!_cleanupState || _cleanupState.sessionId !== state.sessionId)) loadSpeakerClusters();
   _cleanupVideoSyncToggleBtn();
   _cleanupSyncFooter();
   _speakerModalFocus();
@@ -10230,7 +10265,7 @@ function _fpShowNextToast() {
   const top   = _fpToastActive.matches[0];
 
   document.getElementById('fp-toast-label').innerHTML =
-    `${_fpToastActive.current_name || _fpToastActive.speaker_key} sounds like <strong id="fp-toast-name">${top.name}</strong>`;
+    `${escapeHtml(_fpToastActive.current_name || _fpToastActive.speaker_key)} sounds like <strong id="fp-toast-name">${escapeHtml(top.name)}</strong>`;
   document.getElementById('fp-toast-sim').textContent = `${Math.round(top.similarity * 100)}%`;
 
   const otherList = document.getElementById('fp-toast-other-list');
@@ -10411,8 +10446,8 @@ function _fpRenderProfileList() {
 
     const main = document.createElement('div');
     main.className = 'fp-profile-row-main';
-    main.innerHTML = `<div class="fp-profile-name">${p.name}</div>
-      <div class="fp-profile-meta">${p.emb_count} sample${p.emb_count === 1 ? '' : 's'}</div>`;
+    main.innerHTML = `<div class="fp-profile-name">${escapeHtml(p.name)}</div>
+      <div class="fp-profile-meta">${escapeHtml(p.emb_count)} sample${p.emb_count === 1 ? '' : 's'}</div>`;
 
     row.appendChild(cb);
     row.appendChild(swatch);
@@ -11461,6 +11496,100 @@ function _bulkReassignSelectedTo(name) {
   _tnRefreshSpeakerPills();
   _tnRefreshReassignDropdowns();
 }
+
+/* Lines that moved to another speaker somewhere else (AI speaker detection,
+ * or the undo of one of its changes): each is repainted where it is, the way
+ * a reassignment made here would be. Reloading the meeting instead closed the
+ * Speakers dialog the change was made from, and reset playback and scroll.
+ * Each entry is {id, key, label, source}: the speaker the line shows under
+ * now, its one-off label, and the diarizer's own key. */
+function applySpeakerSegments(list) {
+  if (!Array.isArray(list) || !list.length) return 0;
+  const byId = new Map(list.map(s => [String(s.id), s]));
+  let painted = 0;
+  for (const segEl of _segmentRegistry) {
+    const s = byId.get(segEl.dataset.segId);
+    if (!s || !s.key || s.key in SOURCE_META) continue;
+    _repaintSegmentSpeaker(segEl, s);
+    painted += 1;
+  }
+  if (painted) {
+    applyTranscriptFilter();
+    _tnRefreshSpeakerPills();
+    _tnRefreshReassignDropdowns();
+    _updateLinkedBadges();
+    _refreshMinimap(true);
+  }
+  return painted;
+}
+
+function _repaintSegmentSpeaker(segEl, s) {
+  const badge = segEl.querySelector('.src-badge');
+  if (!badge) return;
+  const segId = segEl.dataset.segId;
+  const key = s.key;
+  segEl.dataset.transcriptSource = key;
+  if (s.source && s.source !== key) segEl.dataset.originalSource = s.source;
+  else delete segEl.dataset.originalSource;
+  if (key === _NOISE_LABEL || s.label === _NOISE_LABEL) {
+    if (key !== _NOISE_LABEL) _manualNoiseKeys.add(key);
+    _applyNoiseStyle(segEl, badge, segId);
+    return;
+  }
+  segEl.classList.remove('noise-segment');
+  _ensureSpeakerProfile(key);
+  const color = speakerColor(key);
+  segEl.style.setProperty('--seg-color', color);
+  const fresh = badge.cloneNode(false);   // drops the old listeners
+  fresh.className = 'src-badge src-speaker';
+  fresh.dataset.speakerKey = key;
+  if (segId) fresh.dataset.segId = segId;
+  fresh.title = 'Click to rename';
+  if (s.label) {
+    fresh.dataset.override = '1';
+    fresh.textContent = s.label;
+  } else {
+    delete fresh.dataset.override;
+    _setBadgeLabel(fresh, key);
+  }
+  if (!_isMeSpeaker(key)) {
+    const idIcon = document.createElement('i');
+    idIcon.className = 'fa-solid fa-fingerprint speaker-identify-icon';
+    idIcon.title = 'Identify speaker';
+    fresh.appendChild(idIcon);
+  }
+  fresh.style.backgroundColor = color + '26';
+  fresh.style.color = color;
+  fresh.style.borderColor = color + '60';
+  fresh.addEventListener('click', e => {
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      e.preventDefault(); e.stopPropagation();
+      _toggleTranscriptSegSelection(segEl, { range: e.shiftKey });
+      return;
+    }
+    editSpeakerLabel(fresh, key);
+  });
+  badge.replaceWith(fresh);
+}
+
+/* A meeting's speakers changed on the server without this page asking (AI
+ * speaker detection and its undo): repaint the lines that moved, refresh the
+ * Speakers dialog's header, and let Cleanup reread its groups, now when they
+ * are on screen and hold nothing staged, else the next time they show. The
+ * names themselves arrive as speaker_label events. */
+function onSpeakersChangedElsewhere(sessionId, segments) {
+  if (!sessionId || sessionId !== state.sessionId) return;
+  applySpeakerSegments(segments);
+  _simIndex = null;
+  _simIndexPromise = null;
+  if (_speakerModalIsOpen()) onSpeakerDataChanged();
+  if (_cleanupState && _cleanupState.sessionId === sessionId && !_cleanupState.dirty) {
+    _cleanupState = null;
+    const pane = document.getElementById('speaker-pane-cleanup');
+    if (_speakerModalIsOpen() && pane && !pane.hidden) loadSpeakerClusters();
+  }
+}
+window.onSpeakersChangedElsewhere = onSpeakersChangedElsewhere;
 
 /* === SPEAKER-MODAL-SHELL START ===========================================
  * The Speakers modal's shell: the header (meeting + status line) and the
@@ -18464,6 +18593,8 @@ async function loadSession(sessionId) {
 
   // Load pending speaker suggestions
   _fpLoadSuggestions();
+  // AI speaker detection: its suggestions dot on the Speakers button.
+  if (window.SpeakerAI) SpeakerAI.onSessionLoaded(sessionId);
 
   // Render the transcript WITHOUT blocking the lighter Summary/Chat panes below.
   // On a long session the chunked render spans many frames; awaiting it here used
@@ -21704,6 +21835,9 @@ function switchSettingsSection(btn) {
   }
   if (btn.dataset.target === 'section-system') {
     _syncReliabilityToggles();
+  }
+  if (btn.dataset.target === 'section-speakers' && window.SpeakerAI) {
+    SpeakerAI.syncSettings();
   }
 }
 

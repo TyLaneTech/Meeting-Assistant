@@ -96,3 +96,29 @@ def plan_batch_devices(reanalysis_device: str, diarizer_device: str,
     wait = automatic and uses_cuda and not on_ac_power
     return {"whisper": whisper, "diarizer": diarizer,
             "wait_for_charger": wait, "battery_cpu": False}
+
+
+# The batch pipeline reports this fraction when speaker detection ends and
+# transcription begins (ml.batch_transcriber), which is where the status line
+# switches from one step, and one device, to the next.
+BATCH_SPEAKERS_DONE = 0.40
+
+
+def batch_progress_label(whisper: str, diarizer: str, progress: float,
+                         on_battery: bool = False) -> str:
+    """The status line for a running batch pass: the step, the device it runs
+    on, and how far the pass has got. "Detecting speakers on GPU · 5%",
+    "Transcribing on CPU (on battery) · 63%".
+
+    The Whisper and Diarizer choices in the Models panel are the live ones and
+    never apply to this pass, so this is the only place the page names the
+    device a reanalysis or an after-the-meeting transcription really uses."""
+    if progress < BATCH_SPEAKERS_DONE:
+        step, device = "Detecting speakers", diarizer
+    else:
+        step, device = "Transcribing", whisper
+    where = "GPU" if is_gpu_device(device) else "CPU"
+    if on_battery and where == "CPU":
+        where += " (on battery)"
+    pct = int(round(max(0.0, min(1.0, progress)) * 100))
+    return f"{step} on {where}" + (f" · {pct}%" if pct else "…")

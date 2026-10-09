@@ -19,6 +19,36 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Added AI speaker detection from the screen recording (2026-10-09)
+
+### Speakers
+
+- **AI speaker detection** names speakers from who Zoom, Teams or Meet shows talking (`Settings > Speakers`, off by default).
+- **It checks each reading against the voices**, fixes wrong names and moves lines to whoever said them.
+- **The `Identify` tab** shows each frame as it is read and lists every speaker, named or not, with fixes in place.
+- **Every change can be undone**, voice profile training included.
+- **Ask the chat** to fix a meeting's speakers; your words decide how much it does alone.
+- **Voice profiles with the same name** are merged, and naming someone new no longer makes two.
+- **Moving one line** no longer re-links the rest of the speaker it came from.
+- **Moved lines count for their new speaker** in Cleanup and voice training.
+- **Unlinking a speaker in Cleanup** gives it back its `Speaker N` name.
+- **Cleanup shows noise as noise**, not as an unnamed group.
+
+### Screen recording
+
+- **Chat screenshots show the meeting you are in** and line up after a pause.
+- **The screen recording lines up with the audio** from the first second.
+
+### Titles
+
+- **Recordings take their calendar meeting's name** when they end, too (`Name recordings after the meeting`).
+- **AI titles describe the whole meeting** and no longer copy an older meeting's title.
+
+### Transcription
+
+- **No more made-up "Thank you." lines** from a silent microphone (`Skip Silent Mic Stretches`).
+- **The status line names the step and device**, like `Transcribing on GPU · 63%`.
+
 ## Fixed calls recorded with only your side, and added transcribing after the meeting (2026-10-07)
 
 ### Recording

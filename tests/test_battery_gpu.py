@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from core import log, power
-from core.compute_device import plan_batch_devices
+from core.compute_device import batch_progress_label, plan_batch_devices
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -77,6 +77,28 @@ def test_mps_is_not_gated_by_the_battery():
 def test_requested_cuda_without_a_gpu_falls_back_to_cpu():
     p = plan_batch_devices("cuda", "cuda", "cpu", on_ac_power=True, automatic=False)
     assert (p["whisper"], p["diarizer"]) == ("cpu", "cpu")
+
+
+# ── Status line ───────────────────────────────────────────────────────────────
+
+def test_label_names_the_speaker_step_and_its_device_until_it_ends():
+    assert batch_progress_label("cuda", "cpu", 0.0) == "Detecting speakers on CPU…"
+    assert batch_progress_label("cuda", "cpu", 0.05) == "Detecting speakers on CPU · 5%"
+
+
+def test_label_switches_to_the_whisper_device_when_transcription_starts():
+    # The pipeline reports 0.40 the moment speaker detection ends.
+    assert batch_progress_label("cuda", "cpu", 0.40) == "Transcribing on GPU · 40%"
+    assert batch_progress_label("cuda", "cuda", 0.634) == "Transcribing on GPU · 63%"
+
+
+def test_label_says_when_the_battery_moved_the_pass_to_the_cpu():
+    assert batch_progress_label("cpu", "cpu", 0.5, on_battery=True) == \
+        "Transcribing on CPU (on battery) · 50%"
+
+
+def test_label_calls_a_mac_gpu_a_gpu():
+    assert batch_progress_label("mps", "mps", 1.0) == "Transcribing on GPU · 100%"
 
 
 # ── Power source ──────────────────────────────────────────────────────────────
@@ -143,14 +165,17 @@ class FakeBatch:
     """Stands in for BatchTranscriber inside the child (MA_BATCH_WORKER_IMPL)."""
 
     def __init__(self, on_text_callback, fingerprint_callback=None, hf_token="",
-                 on_progress_callback=None):
+                 on_progress_callback=None, on_devices_callback=None):
         self.on_text = on_text_callback
         self.fp = fingerprint_callback
         self.progress = on_progress_callback
+        self.devices = on_devices_callback
 
     def process_wav_file(self, wav_path, params, tracks_root=None):
         from core import log
         mode = params.get("mode")
+        # What the real pipeline does when CUDA is not usable in the child.
+        self.devices("cpu", "cpu" if mode == "no_cuda" else "cuda")
         if mode == "fail":
             raise ValueError("boom")
         if mode == "import":
@@ -182,7 +207,7 @@ def fake_impl(monkeypatch):
 
 def _run(params, cancel=None, fingerprints=True, cuda=True):
     from ml.batch_worker import run_in_child
-    got = {"text": [], "fp": [], "progress": []}
+    got = {"text": [], "fp": [], "progress": [], "devices": []}
     run_in_child(
         "x.wav", params,
         on_text=lambda *a: got["text"].append(a),
@@ -190,6 +215,7 @@ def _run(params, cancel=None, fingerprints=True, cuda=True):
         on_progress=lambda p: got["progress"].append(p),
         cancel_event=cancel,
         cuda=cuda,
+        on_devices=lambda d: got["devices"].append(d),
     )
     return got
 
@@ -207,6 +233,13 @@ def test_child_delivers_text_fingerprints_and_progress(fake_impl):
     spk, audio, s, e = got["fp"][0]
     assert spk == "Speaker 1" and np.array_equal(audio, np.arange(4, dtype=np.float32))
     assert got["progress"] == [0.4, 1.0]
+
+
+def test_child_reports_the_devices_it_actually_resolved(fake_impl):
+    # The status line takes these over the plan, so a GPU the child could not
+    # use is never shown as the GPU.
+    assert _run({})["devices"] == [{"diarizer": "cpu", "whisper": "cuda"}]
+    assert _run({"mode": "no_cuda"})["devices"] == [{"diarizer": "cpu", "whisper": "cpu"}]
 
 
 def test_child_skips_fingerprints_when_the_parent_has_no_library(fake_impl):

@@ -51,6 +51,12 @@ _STREAK_FLOOR = 0.66   # min sim for a streak-based auto-apply
 # ME_KEY — keep them identical.
 ME_SPEAKER_KEY        = "me"
 
+# The diarizer's bucket for sounds that are nobody (app.py's _NOISE_LABEL).
+NOISE_KEY             = "[Noise]"
+
+# Held across "is there a profile called X" and "make one", in every thread.
+_PROFILE_LOCK = threading.Lock()
+
 _SPEAKER_PALETTE = [
     '#58a6ff', '#f47067', '#00b464', '#d2a8ff', '#f0883e', '#db61a2',
     '#e3b341', '#2dd4bf', '#a78bfa', '#79c0ff', '#ef6e4e', '#86e89d',
@@ -406,15 +412,52 @@ class SpeakerFingerprintDB:
             ).fetchone()
         return dict(row) if row else None
 
-    def find_by_name(self, name: str) -> dict | None:
-        """Case-insensitive lookup of a global profile by name. Returns first match or None."""
+    def _named(self, name: str) -> list[dict]:
+        """Every profile called ``name`` (case-insensitive), the one with the
+        most voice samples first, then the oldest, so every caller lands on
+        the same one when two share a name."""
         with _conn(self._db_path) as c:
-            row = c.execute(
+            rows = c.execute(
                 "SELECT id, name, color, emb_count, created_at, updated_at "
-                "FROM global_speakers WHERE lower(name) = lower(?)",
-                (name.strip(),),
-            ).fetchone()
-        return dict(row) if row else None
+                "FROM global_speakers WHERE lower(trim(name)) = lower(?) "
+                "ORDER BY emb_count DESC, created_at ASC",
+                ((name or "").strip(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_by_name(self, name: str) -> dict | None:
+        """Case-insensitive lookup of a global profile by name. Returns the first match or None."""
+        found = self._named(name)
+        return found[0] if found else None
+
+    def find_or_create(self, name: str, color: str | None = None, *,
+                       avoid=()) -> tuple[str, bool]:
+        """The profile called ``name`` (case-insensitive), made if there is
+        none: (global_id, created). ``avoid`` ids (the Me profile, for a
+        desktop speaker) never count as found. One lock covers the look and
+        the make: naming a new person starts the rename's profile sync and
+        each moved line's training at once, and two looks before either make
+        left two profiles with the same name."""
+        with _PROFILE_LOCK:
+            for p in self._named(name):
+                if p["id"] not in avoid:
+                    return p["id"], False
+            return self.create_global_speaker(name, color), True
+
+    def same_name_groups(self, exclude=()) -> list[list[dict]]:
+        """Profiles that share a name (case-insensitive), two or more to a
+        group, the one to keep first: the most voice samples, then the
+        oldest. ``exclude`` ids (the Me profile) are left out of every group."""
+        with _conn(self._db_path) as c:
+            rows = c.execute(
+                "SELECT id, name, color, emb_count, created_at FROM global_speakers "
+                "ORDER BY emb_count DESC, created_at ASC").fetchall()
+        groups: dict[str, list[dict]] = {}
+        for r in rows:
+            key = (r["name"] or "").strip().lower()
+            if key and r["id"] not in exclude:
+                groups.setdefault(key, []).append(dict(r))
+        return [g for g in groups.values() if len(g) > 1]
 
     def get_profile_sessions(self, global_id: str) -> list[dict]:
         """Return sessions where this speaker appeared, with speaker_keys and segment counts."""
@@ -578,6 +621,48 @@ class SpeakerFingerprintDB:
             traceback.print_exc()
             return None
 
+    def embed_spans(self, wav_path: str, spans: list[tuple[int, float, float]], *,
+                    min_sec: float = 1.5, max_sec: float = 8.0) -> dict[int, np.ndarray]:
+        """Embeddings for many ``(id, start, end)`` slices of one WAV, opened
+        once. Shorter slices than ``min_sec`` are skipped (below the library's
+        own floor, since these vote on one turn each rather than teach a
+        profile); longer ones keep their middle ``max_sec``. Never raises."""
+        out: dict[int, np.ndarray] = {}
+        if not spans or not self.ensure_model():
+            return out
+        try:
+            import wave
+            from scipy import signal as scipy_signal
+            with wave.open(wav_path, "rb") as wf:
+                rate = wf.getframerate()
+                channels = wf.getnchannels()
+                total = wf.getnframes()
+                for sid, start, end in spans:
+                    if end - start < min_sec:
+                        continue
+                    if end - start > max_sec:
+                        mid = (start + end) / 2
+                        start, end = mid - max_sec / 2, mid + max_sec / 2
+                    first = int(start * rate)
+                    if first >= total:
+                        continue
+                    wf.setpos(first)
+                    raw = wf.readframes(min(int((end - start) * rate), total - first))
+                    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                    if channels > 1:
+                        audio = audio[: len(audio) // channels * channels]
+                        audio = audio.reshape(-1, channels).mean(axis=1)
+                    if len(audio) < min_sec * rate:
+                        continue
+                    if rate != 16000:
+                        audio = scipy_signal.resample_poly(audio, 16000, rate)
+                    emb = self.extract_embedding(audio.astype(np.float32))
+                    if emb is not None:
+                        out[sid] = emb
+        except Exception as e:
+            log.warn("fingerprint", f"Turn embeddings failed for {wav_path}: {e}")
+        return out
+
     # ── Embedding storage ─────────────────────────────────────────────────────
 
     def add_embedding(
@@ -587,13 +672,21 @@ class SpeakerFingerprintDB:
         speaker_key: str,
         embedding: np.ndarray,
         duration_sec: float,
-    ) -> None:
-        """Store embedding and incrementally update centroid. All embeddings are kept."""
+        *,
+        origin: str | None = None,
+        change_id: int | None = None,
+    ) -> int | None:
+        """Store embedding and incrementally update centroid. All embeddings are kept.
+
+        Returns the new row's id (None when nothing was stored). ``origin``
+        says which kind of write added it (voice_auto, confirm, user, agent,
+        ai) and ``change_id`` the journaled change, so an undo can remove
+        exactly the samples it added (core.speaker_journal)."""
         # The "Me" speaker (microphone = app user) must never accumulate
         # embeddings — it has to stay out of desktop clustering/matching. This is
         # a defensive backstop; callers should also skip fingerprinting Me audio.
         if self._me_id is not None and global_id == self._me_id:
-            return
+            return None
         now = _now()
         with _conn(self._db_path) as c:
             row = c.execute(
@@ -601,17 +694,20 @@ class SpeakerFingerprintDB:
                 (global_id,),
             ).fetchone()
             if row is None:
-                return
+                return None
 
             old_count    = row["emb_count"]
             old_centroid = _blob_to_emb(row["centroid"]) if row["centroid"] else None
 
-            c.execute(
+            cur = c.execute(
                 "INSERT INTO speaker_embeddings "
-                "(global_id, session_id, speaker_key, embedding, duration_sec, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (global_id, session_id, speaker_key, _emb_to_blob(embedding), duration_sec, now),
+                "(global_id, session_id, speaker_key, embedding, duration_sec, created_at, "
+                "origin, change_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (global_id, session_id, speaker_key, _emb_to_blob(embedding), duration_sec, now,
+                 origin, change_id),
             )
+            row_id = cur.lastrowid
 
             new_count = old_count + 1
 
@@ -625,6 +721,33 @@ class SpeakerFingerprintDB:
                 "UPDATE global_speakers SET centroid=?, emb_count=?, updated_at=? WHERE id=?",
                 (_emb_to_blob(new_centroid), new_count, now, global_id),
             )
+        return row_id
+
+    def profile_in_use(self, global_id: str) -> bool:
+        """True while any meeting speaker links to the profile or it holds
+        voice samples (core.speaker_journal removes a profile a change
+        created only once neither is left)."""
+        with _conn(self._db_path) as c:
+            if c.execute("SELECT 1 FROM speaker_labels WHERE global_id = ? LIMIT 1",
+                         (global_id,)).fetchone():
+                return True
+            return c.execute("SELECT 1 FROM speaker_embeddings WHERE global_id = ? LIMIT 1",
+                             (global_id,)).fetchone() is not None
+
+    def remove_embeddings(self, ids: list[int]) -> list[str]:
+        """Delete these voice samples (an undo of the change that added them)
+        and rebuild the centroids they fed. Returns the profiles touched."""
+        ids = [int(i) for i in ids or []]
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        with _conn(self._db_path) as c:
+            gids = [r["global_id"] for r in c.execute(
+                f"SELECT DISTINCT global_id FROM speaker_embeddings WHERE id IN ({marks})", ids)]
+            c.execute(f"DELETE FROM speaker_embeddings WHERE id IN ({marks})", ids)
+        for gid in gids:
+            self.recompute_centroid(gid)
+        return gids
 
     # ── Matching ──────────────────────────────────────────────────────────────
 
@@ -707,12 +830,31 @@ class SpeakerFingerprintDB:
     def link_session_speaker(
         self, session_id: str, speaker_key: str, global_id: str
     ) -> None:
+        """Link a meeting's speaker key to a voice profile.
+
+        A key with no label row yet gets one, named and coloured after the
+        profile. The link used to be an UPDATE only, so a voice match on a
+        key new to the meeting (a fresh Speaker N in an after-meeting pass,
+        where the label is saved after the link) named the speaker without
+        linking it: 13 of 370 named speakers in one library (2026-10-08)."""
         with _conn(self._db_path) as c:
-            c.execute(
+            cur = c.execute(
                 "UPDATE speaker_labels SET global_id = ? "
                 "WHERE session_id = ? AND speaker_key = ?",
                 (global_id, session_id, speaker_key),
             )
+            if cur.rowcount == 0:
+                prof = c.execute(
+                    "SELECT name, color FROM global_speakers WHERE id = ?",
+                    (global_id,),
+                ).fetchone()
+                if prof is not None:
+                    c.execute(
+                        "INSERT OR IGNORE INTO speaker_labels "
+                        "(session_id, speaker_key, name, color, global_id) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (session_id, speaker_key, prof["name"], prof["color"], global_id),
+                    )
 
     def unlink_session_speaker(self, session_id: str, speaker_key: str) -> None:
         with _conn(self._db_path) as c:
@@ -1345,16 +1487,19 @@ class SpeakerFingerprintDB:
         speaker_labels row yet — reanalysis only writes labels for matched
         speakers, so unlabeled ones (Speaker 4, 6, 7…) live only in the
         segments table until the user names them.
+
+        A line moved to another speaker (source_override) is listed under the
+        speaker it was moved to, the one the transcript shows it under.
         """
         with _conn(self._db_path) as c:
             rows = c.execute(
                 """
                 WITH used_keys AS (
-                    SELECT DISTINCT source AS speaker_key
+                    SELECT DISTINCT COALESCE(source_override, source) AS speaker_key
                     FROM transcript_segments
                     WHERE session_id = ?
-                      AND source IS NOT NULL
-                      AND source != ''
+                      AND COALESCE(source_override, source) IS NOT NULL
+                      AND COALESCE(source_override, source) != ''
                     UNION
                     SELECT speaker_key FROM speaker_labels WHERE session_id = ?
                 )
@@ -1385,7 +1530,8 @@ class SpeakerFingerprintDB:
                     continue
                 segs = c.execute(
                     "SELECT id, start_time, end_time, text FROM transcript_segments "
-                    "WHERE session_id = ? AND source = ? ORDER BY start_time",
+                    "WHERE session_id = ? AND COALESCE(source_override, source) = ? "
+                    "ORDER BY start_time",
                     (session_id, r["speaker_key"]),
                 ).fetchall()
                 if not segs:
@@ -1397,7 +1543,9 @@ class SpeakerFingerprintDB:
                     "global_id":    r["global_id"],
                     "global_name":  r["global_name"],
                     "global_color": r["global_color"],
-                    "is_noise":     bool(r["is_noise"]),
+                    # The diarizer's own noise bucket is noise without a label
+                    # row saying so; as a speaker it showed as an unnamed group.
+                    "is_noise":     bool(r["is_noise"]) or r["speaker_key"] == NOISE_KEY,
                     "segments":     [dict(s) for s in segs],
                 })
         return speakers
@@ -1830,7 +1978,9 @@ class SpeakerFingerprintDB:
                 if cur and cur["global_id"]:
                     touched_profiles.add(cur["global_id"])
 
-        # Pass 1: create new profiles from new_name clusters.
+        # Pass 1: create new profiles from new_name clusters. A name a profile
+        # already has is that profile: two profiles with one name show as two
+        # groups of the same person.
         for cluster in proposed:
             if cluster.get("global_id"):
                 continue
@@ -1838,10 +1988,12 @@ class SpeakerFingerprintDB:
             if not new_name:
                 continue
             color = cluster.get("color")
-            gid = self.create_global_speaker(new_name, color=color)
+            me = getattr(self, "_me_id", None)
+            gid, made = self.find_or_create(new_name, color=color, avoid={me} if me else ())
             cluster["global_id"] = gid
             touched_profiles.add(gid)
-            created.append({"global_id": gid, "name": new_name})
+            if made:
+                created.append({"global_id": gid, "name": new_name})
 
         # Pass 1b: an explicit colour on a cluster that already has a profile is
         # a recolour of that profile, the same write the Voice Library's own
@@ -1875,11 +2027,11 @@ class SpeakerFingerprintDB:
                         # speaker_keys with no speaker_labels row yet.
                         c.execute(
                             "INSERT INTO speaker_labels "
-                            "(session_id, speaker_key, name, color, global_id, is_noise) "
-                            "VALUES (?, ?, ?, ?, ?, 0) "
+                            "(session_id, speaker_key, name, color, global_id, is_noise, set_by) "
+                            "VALUES (?, ?, ?, ?, ?, 0, 'user') "
                             "ON CONFLICT(session_id, speaker_key) DO UPDATE SET "
                             "name=excluded.name, color=excluded.color, "
-                            "global_id=excluded.global_id, is_noise=0",
+                            "global_id=excluded.global_id, is_noise=0, set_by='user'",
                             (session_id, k, profile_row["name"], profile_row["color"], target_gid),
                         )
                         # Migrate any unlabeled embeddings for this key into
@@ -1927,12 +2079,21 @@ class SpeakerFingerprintDB:
                                 "WHERE session_id=? AND speaker_key=? AND global_id=?",
                                 (session_id, k, cur["global_id"]),
                             )
+                        # Back to "Speaker N": the name goes with the link.
+                        # Keeping the old name (as this did) left the meeting
+                        # showing the person it had just been told is not
+                        # this speaker, unlinked. A custom key keeps its name:
+                        # the user typed it, and its key is not a name.
                         c.execute(
                             "INSERT INTO speaker_labels "
                             "(session_id, speaker_key, name, color, global_id, is_noise) "
                             "VALUES (?, ?, ?, NULL, NULL, 0) "
                             "ON CONFLICT(session_id, speaker_key) DO UPDATE SET "
-                            "global_id=NULL, is_noise=0",
+                            "name=CASE WHEN speaker_labels.speaker_key LIKE 'custom:%' "
+                            "THEN speaker_labels.name ELSE excluded.name END, "
+                            "color=CASE WHEN speaker_labels.speaker_key LIKE 'custom:%' "
+                            "THEN speaker_labels.color ELSE NULL END, "
+                            "global_id=NULL, is_noise=0, set_by=NULL",
                             (session_id, k, k),
                         )
                         unlinked_members += 1

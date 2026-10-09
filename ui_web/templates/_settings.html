@@ -22,6 +22,9 @@
         <button class="settings-nav-item" data-target="section-diarization" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-users"></i><span>Diarization</span>
         </button>
+        <button class="settings-nav-item" data-target="section-speakers" onclick="switchSettingsSection(this)">
+          <i class="fa-solid fa-sparkles"></i><span>Speakers</span>
+        </button>
         <button class="settings-nav-item" data-target="section-reanalysis" onclick="switchSettingsSection(this)">
           <i class="fa-solid fa-arrows-rotate"></i><span>Reanalysis</span>
         </button>
@@ -275,6 +278,103 @@
             <button class="ap-reset-all-btn" onclick="resetSection('diarization')">
               <i class="fa-solid fa-rotate-right"></i> Reset all to defaults
             </button>
+          </div>
+        </div>
+
+        <!-- Speakers: AI speaker detection (speakers_ai.js) -->
+        <div class="settings-panel" id="section-speakers">
+          <div class="settings-group-title">AI speaker detection</div>
+          <div class="spai-privacy">
+            <i class="fa-solid fa-shield-halved" aria-hidden="true"></i>
+            <div>Reads who Zoom, Teams or Meet shows as speaking in the screen recording, checks each reading against the voices, and names the speakers. While it is on, frames from the screen recording (whatever was on screen, cropped to the meeting's participants once found) are sent to your AI provider. Nothing is sent while it is off.</div>
+          </div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Identify speakers with AI</div>
+                <div class="settings-row-desc">Adds Identify to the Speakers dialog and lets the chat and agents use it. Needs a screen recording of the meeting.</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="spai-enabled" onchange="SpeakerAI.setEnabled(this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+          <div id="spai-settings-deps">
+            <div class="settings-group">
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">Run after each meeting</div>
+                  <div class="settings-row-desc">Names the speakers as soon as the meeting's transcript is final, and again after a reanalysis.</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="spai-after" onchange="savePref('speaker_ai_after_meeting', this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">What it may do on its own</div>
+                  <div class="settings-row-desc">Every change is listed in the Speakers dialog and can be undone. Your own words for a run (in the dialog or the chat) can ask for more or less.</div>
+                </div>
+                <select class="spai-settings-select" id="spai-autonomy" onchange="savePref('speaker_ai_autonomy', this.value)">
+                  <option value="suggest">Suggest only</option>
+                  <option value="apply_confident">Apply confident changes</option>
+                  <option value="act_fully">Act fully</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">Update voice profiles</div>
+                  <div class="settings-row-desc">Whether names it is sure of also teach the Voice Library, so the next meeting recognizes them by voice. Undo removes exactly the samples it added.</div>
+                </div>
+                <select class="spai-settings-select" id="spai-library" onchange="savePref('speaker_ai_library_writes', this.value)">
+                  <option value="follow_autonomy">Automatically</option>
+                  <option value="on_accept">When I accept</option>
+                  <option value="never">Never</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">Leave names I set alone</div>
+                  <div class="settings-row-desc">A name you typed is only ever questioned, never changed, unless a run's instructions say to recheck them.</div>
+                </div>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="spai-respect" onchange="savePref('speaker_ai_respect_user_labels', this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">Speed and depth</div>
+                  <div class="settings-row-desc">Thorough reads more of the meeting (slower, costs more); Quick reads less.</div>
+                </div>
+                <select class="spai-settings-select" id="spai-depth" onchange="savePref('speaker_ai_depth', this.value)">
+                  <option value="quick">Quick</option>
+                  <option value="standard">Standard</option>
+                  <option value="thorough">Thorough</option>
+                </select>
+              </div>
+            </div>
+            <div class="settings-group-title">Models</div>
+            <div class="settings-group">
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">Reading frames</div>
+                  <div class="settings-row-desc">A fast vision model reads most frames. Blank uses the default for your AI provider.</div>
+                </div>
+                <input class="spai-settings-input" id="spai-model" placeholder="claude-haiku-5-5" spellcheck="false"
+                       onchange="savePref('speaker_ai_model', this.value.trim())">
+              </div>
+              <div class="settings-row">
+                <div class="settings-row-info">
+                  <div class="settings-row-label">Learning the layout</div>
+                  <div class="settings-row-desc">A stronger model reads a few full frames to find the meeting window and who is in it.</div>
+                </div>
+                <input class="spai-settings-input" id="spai-strong-model" placeholder="claude-sonnet-5-5" spellcheck="false"
+                       onchange="savePref('speaker_ai_strong_model', this.value.trim())">
+              </div>
+            </div>
           </div>
         </div>
 
@@ -858,11 +958,11 @@
               <div class="settings-row-info">
                 <div class="settings-row-label">Name recordings after the meeting</div>
                 <div class="settings-row-desc">
-                  Start a recording during a meeting on your calendar and it takes that
-                  meeting's subject as its name, instead of the date and time. The name
-                  is yours from then on, so the AI title written when the recording ends
-                  leaves it alone. Private appointments are skipped and keep the default
-                  name.
+                  A recording made during a meeting on your calendar takes that
+                  meeting's subject as its name, checked when it starts and again when it
+                  ends. The name is yours from then on, so the AI title leaves it alone.
+                  With no matching meeting, the AI names it from what was said. Private
+                  appointments are skipped.
                 </div>
               </div>
               <label class="toggle-switch">

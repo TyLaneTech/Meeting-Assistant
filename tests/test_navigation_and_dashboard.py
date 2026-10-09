@@ -971,8 +971,10 @@ def test_the_recording_state_machine_is_implemented():
 def test_the_view_switch_is_an_opacity_crossfade_that_can_be_skipped():
     js = _read(STATIC / "app.js")
     show = js[js.index("  show(name, opts) {"):js.index("  _writeHistory(")]
-    assert "prefers-reduced-motion: reduce" in show
-    assert "if (!repeat && !o.popstate && !o.noFade && !reduce)" in show
+    # Skipped for Back and a repeated selection only, never for the OS's
+    # reduced-motion setting: animations always play (the user's call).
+    assert "matchMedia" not in show
+    assert "if (!repeat && !o.popstate && !o.noFade)" in show
     assert "opacity 90ms linear" in show
     assert "translateY" not in show
     assert "transform:" not in show
@@ -1242,12 +1244,21 @@ def test_the_header_priority_rules_are_container_queries():
         assert "record" not in block.lower(), block
 
 
-def test_reduced_motion_covers_the_shell_animations():
-    css = _read(STATIC / "style.css")
-    blocks = re.findall(r"@media \(prefers-reduced-motion: reduce\) \{(.*?)\n\}", css, re.S)
-    joined = "\n".join(blocks)
-    for selector in (".record-pulse", ".status-dot.recording"):
-        assert selector in joined, selector
+def test_animations_never_wait_on_the_reduced_motion_setting():
+    """Animations always play (the user's call, 2026-10-09): nothing in the
+    app switches one off for the OS's reduced-motion setting, and that
+    includes the bundled Font Awesome, whose spinners stopped under it, and
+    the desktop toasts, which read Windows' "Show animations"."""
+    pages = list(TEMPLATES.glob("*.html")) + list(STATIC.glob("*.js")) + list(STATIC.glob("*.css"))
+    pages += list((STATIC / "fontAwesome" / "css").glob("*.css"))
+    for path in pages:
+        text = _read(path)
+        assert "prefers-reduced-motion" not in text, path.name
+        assert "reduced-motion: reduce" not in text, path.name
+    toast_host = _read(STATIC.parents[1] / "ui_desktop" / "toast" / "win32.py")
+    animations = toast_host[toast_host.index("    def animations(self)"):]
+    animations = animations[:animations.index("\n    def ")]
+    assert "return True" in animations and "SystemParametersInfoW" not in animations
 
 
 def test_no_em_or_en_dashes_in_the_ui():

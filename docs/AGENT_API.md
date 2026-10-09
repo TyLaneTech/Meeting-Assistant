@@ -138,6 +138,8 @@ non-default app URL (e.g. `http://127.0.0.1:7000`).
 | `get_speaker_profile` / `rename_speaker_profile` / `merge_speaker_profiles` | Profile detail; rename everywhere at once; fold duplicates together (confirm required). |
 | `get_voice_library_health` | Read-only report: duplicates, foreign samples, split profiles, confusable pairs. |
 | `plan_speaker_relabel` / `apply_speaker_relabel` / `cancel_speaker_relabel` | Bulk rename across meetings: plan, confirm, apply. |
+| `identify_meeting_speakers` | AI speaker detection from the screen recording, checked against the voices: names speakers, corrects wrong names, moves lines. Never does more on its own than the user's Settings allow. Needs the feature on (Settings > Speakers). |
+| `get_speaker_detection` / `review_speaker_suggestions` / `undo_speaker_changes` | The latest detection with its suggestions and history; accept or dismiss suggestions; undo a run or single changes exactly. |
 | `get_ai_chats` | Global Chat conversations (list or one conversation's messages). |
 | `get_live_status` | Recording state; live transcript tail with an incremental cursor. |
 | `get_app_info` | Version, uptime, models, AI config, library counts, storage usage. |
@@ -281,6 +283,11 @@ app start; `semantic_ready: false` in responses (or a 503 for
 | `POST /speakers/relabel/plan` | `{"from_name", "to_name", "scope": "library|session", "session_id", "match": "exact|contains"}` + shared filters. Returns a single-use `token` (10 minutes) and the plan. |
 | `POST /speakers/relabel/apply` | `{"token": "...", "confirm": true}`. |
 | `POST /speakers/relabel/cancel` | `{"token": "..."}`. |
+| `POST /meetings/{id}/speakers/identify` | AI speaker detection. `{"instructions": "the user's words", "focus": ["Speaker 4"], "autonomy": "suggest|apply_confident|act_fully", "library_writes": "never|on_accept|follow_autonomy", "wait": 120}`. Autonomy and library writes only lower what Settings allow. Waits up to `wait` seconds (max 300) and returns the report (`meetings[].applied`, `suggested`, `flagged`, each change with its `change_id`); an unfinished run returns `poll`. 409 when the feature is off or there is no screen recording. |
+| `GET /meetings/{id}/speakers/insights` | The latest run, the suggestions waiting, the change history, standing hints, and every speaker in the meeting (`speakers`: key, name, lines, seconds, who named it, noise). |
+| `GET /speaker-runs/{run_id}` | One run's status and report. |
+| `POST /speaker-changes/apply` | `{"change_ids": [..], "action": "accept|dismiss"}`. Accepting applies a suggestion as the meeting page's Apply does; dismissing is remembered. |
+| `POST /speaker-changes/undo` | `{"run_id": "..."}` or `{"change_ids": [..]}`. Exact undo, voice samples included; a change whose speakers were edited since is listed under `not_undone`. |
 | `GET /chats` | Global Chat conversations (cross-meeting AI chats in the app). |
 | `GET /chats/{conversation_id}` | One conversation's messages. |
 
@@ -515,11 +522,29 @@ confirms (irreversible; without `confirm` it only describes what would move);
 across meetings goes through `POST /speakers/relabel/plan`, the user's
 confirmation, then `POST /speakers/relabel/apply` with the token.
 
+**AI speaker detection.** When the user has turned it on (Settings >
+Speakers) and the meeting has a screen recording, one call does the loop
+above for the whole meeting: `POST /meetings/{id}/speakers/identify`
+(`identify_meeting_speakers`). The app reads who the meeting app showed as
+speaking, checks every reading against that turn's own voice (a misread is
+set aside, a tile lit for several voices is not believed), names the
+speakers, corrects names the voice library got wrong, and moves lines to the
+right person when the diarizer put two people in one key. What it does on
+its own follows the user's Settings; an agent can ask for less (`autonomy:
+"suggest"`, `library_writes: "never"`), never more. Pass the user's own words
+as `instructions` when they gave any ("Bob never turns his camera on").
+Changes below the bar come back as suggestions with a `change_id`: show them
+to the user and `POST /speaker-changes/apply` only the ones they accept.
+Everything it applied is undoable, exactly, with `POST /speaker-changes/undo`
+(a run or single changes), voice samples included. It takes 10 to 60 seconds
+and costs the user AI spend, so run it once per meeting, not per speaker.
+
 **What the API never does here.** The owner's own microphone speaker (`me`)
 is never relabelled, and their profile is never linked to, renamed or merged.
 Every label is per meeting; other meetings change only through the plan /
 apply relabel or a profile rename, both of which say what they will touch
-first. Speaker labels are reversible with `reset`.
+first. Speaker labels are reversible with `reset`, and AI detection's changes
+with undo.
 
 ---
 
@@ -579,6 +604,6 @@ loud that recording is starting/stopping.
 
 ---
 
-*Version 1.1.0. Served live (with your real base URL substituted) at
+*Version 1.2.0. Served live (with your real base URL substituted) at
 `GET /api/agent/v1/docs`. Implementation: `agent_api/` package +
 `mcp_server.py`; developer notes in `AGENT.md`.*

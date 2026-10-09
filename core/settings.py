@@ -162,6 +162,28 @@ DEFAULTS: dict = {
     # `video_offset_<session_id>` flat-key scheme — `_migrate_video_offsets()`
     # auto-migrates older settings files at load time.
     "video_offsets": {},
+    # AI speaker detection (ai/speaker_detect): a vision model reads who the
+    # meeting app showed as speaking off the screen recording and names the
+    # speakers. Off by default: it sends cropped screen frames to the AI
+    # provider. Every change it makes is journaled and can be undone.
+    "speaker_ai_enabled": False,
+    "speaker_ai_after_meeting": True,          # run once a meeting is transcribed
+    "speaker_ai_autonomy": "apply_confident",  # suggest | apply_confident | act_fully
+    "speaker_ai_library_writes": "follow_autonomy",   # follow_autonomy | on_accept | never
+    "speaker_ai_respect_user_labels": True,    # never rename a speaker the user named
+    "speaker_ai_depth": "standard",            # quick | standard | thorough
+    "speaker_ai_provider": "",                 # "" = the app's AI provider
+    "speaker_ai_model": "",                    # "" = the provider's fast vision model
+    "speaker_ai_strong_model": "",             # "" = the provider's stronger model
+    "speaker_ai_concurrency": 6,               # requests in flight to start with
+
+    # Where each video part kept across a pause and resume starts on the
+    # meeting timeline: {session_id: {"0": seconds, "1": seconds, ...}}, part n
+    # being {session_id}_part{n}.mp4. Written when a resume renames the
+    # previous video aside, read while the resumed recording runs (a moment
+    # from before the resume lives in a part) and when the stop joins the
+    # parts, then dropped. Machine-managed.
+    "video_part_offsets": {},
 
     # Obsidian export: drop finalized transcripts as markdown into a vault
     # folder, and keep the file current when the transcript is edited after.
@@ -274,10 +296,10 @@ def _migrate_video_offsets(settings: dict) -> bool:
     Mutates ``settings`` in place. Returns True if anything changed (caller
     can use this to decide whether to persist).
     """
+    # A copy, never DEFAULTS' own dict (see put_video_offset).
     offsets = settings.get("video_offsets")
-    if not isinstance(offsets, dict):
-        offsets = {}
-        settings["video_offsets"] = offsets
+    offsets = dict(offsets) if isinstance(offsets, dict) else {}
+    settings["video_offsets"] = offsets
     changed = False
     legacy_keys = [k for k in settings if k.startswith("video_offset_")]
     for k in legacy_keys:
@@ -391,10 +413,12 @@ def put_video_offset(session_id: str, value: float | None) -> None:
             except (json.JSONDecodeError, OSError):
                 pass
         _migrate_video_offsets(settings)
-        offsets = settings.setdefault("video_offsets", {})
-        if not isinstance(offsets, dict):
-            offsets = {}
-            settings["video_offsets"] = offsets
+        # A copy: with no "video_offsets" in the file yet, settings holds
+        # DEFAULTS' own dict (dict(DEFAULTS) is shallow), and writing into it
+        # gave every later read in this process that session's offset.
+        offsets = settings.get("video_offsets")
+        offsets = dict(offsets) if isinstance(offsets, dict) else {}
+        settings["video_offsets"] = offsets
         if value is None:
             offsets.pop(session_id, None)
         else:
@@ -403,3 +427,48 @@ def put_video_offset(session_id: str, value: float | None) -> None:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
         return dict(settings)
+
+
+def get_video_part_offsets(session_id: str) -> dict[int, float]:
+    """{part number: meeting second where that part starts} for a session
+    whose video was split by a pause and resume (``video_part_offsets``)."""
+    raw = (load().get("video_part_offsets") or {}).get(session_id) or {}
+    out: dict[int, float] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def put_video_part_offset(session_id: str, part: int | None, value: float | None = None) -> None:
+    """Record where part ``part`` starts. ``part`` None drops the session's
+    entries (the parts were joined or the session is gone)."""
+    with _lock:
+        settings = dict(DEFAULTS)
+        p = _path()
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                if isinstance(saved, dict):
+                    settings.update(saved)
+            except (json.JSONDecodeError, OSError):
+                pass
+        _migrate_video_offsets(settings)
+        parts = settings.get("video_part_offsets")
+        if not isinstance(parts, dict):
+            parts = {}
+        parts = dict(parts)
+        if part is None:
+            parts.pop(session_id, None)
+        else:
+            entry = dict(parts.get(session_id) or {})
+            entry[str(int(part))] = float(value or 0.0)
+            parts[session_id] = entry
+        settings["video_part_offsets"] = parts
+        _ensure_dir()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)

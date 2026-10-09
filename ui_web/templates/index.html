@@ -20,6 +20,7 @@
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/home.css">
   <link rel="stylesheet" href="/static/calendar.css">
+  <link rel="stylesheet" href="/static/speakers_ai.css">
   <link rel="stylesheet" id="hljs-theme" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -652,6 +653,36 @@
         <button class="icon-btn speaker-manager-close" onclick="closeSpeakerManager()" aria-label="Close speakers"><i class="fa-solid fa-xmark"></i></button>
       </div>
       <p class="speaker-manager-status" id="speaker-manager-status">Reading speaker stats…</p>
+      <!-- Shown when AI speaker detection is on (speakers_ai.js). -->
+      <div class="speaker-modal-modes" id="speaker-modal-modes" role="tablist" aria-label="Speaker tools" hidden>
+        <button type="button" role="tab" data-pane="ai" aria-selected="false" onclick="showSpeakerModalPane('ai')">
+          <i class="fa-solid fa-sparkles"></i> Identify
+        </button>
+        <button type="button" role="tab" data-pane="cleanup" aria-selected="true" onclick="showSpeakerModalPane('cleanup')">
+          <i class="fa-solid fa-layer-group"></i> Cleanup
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Identify view: AI speaker detection (speakers_ai.js) ─────────────── -->
+    <div class="speaker-ai-body" id="speaker-pane-ai" hidden>
+      <!-- The composer: the user's words for a run, and the run's settings as
+           menus that save to Settings > Speakers. -->
+      <div class="spai-composer" id="spai-compose">
+        <div class="spai-composer-field">
+          <i class="fa-solid fa-sparkles" aria-hidden="true"></i>
+          <textarea id="spai-input" rows="1" autocomplete="off" spellcheck="false"
+                    aria-label="Instructions for identifying speakers"
+                    placeholder="Anything I should know? For example: Antonio never turns his camera on"></textarea>
+        </div>
+        <div class="spai-composer-bar">
+          <div class="spai-options" id="spai-options" aria-label="How runs work"></div>
+          <button type="button" class="speaker-manager-btn speaker-manager-btn-primary" id="spai-run">
+            <i class="fa-solid fa-sparkles"></i> Identify speakers
+          </button>
+        </div>
+      </div>
+      <div id="spai-body"></div>
     </div>
 
     <!-- ── Cleanup view (drag-drop cluster rectification) ─────────────────── -->
@@ -1060,6 +1091,7 @@
 <script src="/static/ui-dialog.js"></script>
 <script src="/static/ui-combobox.js"></script>
 <script src="/static/app.js"></script>
+<script src="/static/speakers_ai.js"></script>
 <script src="/static/home.js"></script>
 <script src="/static/calendar.js"></script>
 <script src="/static/attention.js"></script>

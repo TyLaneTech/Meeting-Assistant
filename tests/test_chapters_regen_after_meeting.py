@@ -68,7 +68,7 @@ def test_it_runs_last_in_the_stop_tail():
     tail = _fn(APP_PY, "# ── Deferred tail:", "        except Exception:")
     assert "_final_chapters_pass(sid)" in tail
     assert tail.index("obsidian.export_session(sid)") < tail.index("_final_chapters_pass(sid)")
-    assert tail.index("ai.generate_title(") < tail.index("_final_chapters_pass(sid)")
+    assert tail.index("_meeting_title(") < tail.index("_final_chapters_pass(sid)")
     # And the tail runs on the stop's own thread, after the gate that lets a
     # new recording start, so this never delays pressing Record again.
     assert "threading.Thread(target=_cleanup, daemon=True).start()" in APP_PY

@@ -859,13 +859,15 @@ def test_mcp_tools_cover_the_new_surface(monkeypatch):
                      "review_meeting_speakers", "get_speaker_frames", "label_speaker",
                      "relabel_segment", "get_speaker_profile", "rename_speaker_profile",
                      "merge_speaker_profiles", "get_voice_library_health",
-                     "plan_speaker_relabel", "apply_speaker_relabel", "cancel_speaker_relabel"):
+                     "plan_speaker_relabel", "apply_speaker_relabel", "cancel_speaker_relabel",
+                     "identify_meeting_speakers", "get_speaker_detection",
+                     "review_speaker_suggestions", "undo_speaker_changes"):
         assert expected in names, expected
     assert len(names) == len(set(names))
     src = _read("mcp_server.py")
     for n in names:
         assert f'if name == "{n}":' in src, f"{n} has no dispatch branch"
-    assert mcp_server.SERVER_VERSION == "1.1.0"
+    assert mcp_server.SERVER_VERSION == "1.2.0"
     # The orientation teaches the loop and the evidence rule.
     text = mcp_server._get_started()[0]["text"]
     assert "review_meeting_speakers" in text and "reinforce" in text
@@ -937,7 +939,7 @@ def test_app_wires_the_ui_write_paths_into_the_agent_context():
     # The UI's own paths took the two agent knobs and nothing else changed shape.
     sig = src[src.index("def _patch_session_speakers("):src.index("    updated_speakers = []")]
     assert 'global_id: "str | None" = None' in sig and "train_profile: bool = True" in sig
-    body = src[src.index("def _sync_voice_profile(sid, keys, label, col, gid_hint, train):"):
+    body = src[src.index("def _sync_voice_profile(sid, keys, label, col, gid_hint, train, out=None):"):
                src.index("    # ── End auto-link")]
     assert "fingerprint_db.get_global_speaker(gid_hint) if gid_hint else None" in body
     assert "if not train:\n                    return" in body
@@ -974,3 +976,82 @@ def test_new_storage_helpers(data):
     assert storage.get_folder("nope") is None
     att = storage.attention_by_session()
     assert att[s["s1"]]["needs"] is True and att[s["s2"]]["needs"] is False
+
+
+# ── AI speaker detection over the Agent API ─────────────────────────────────
+
+class _FakeSpeakerAI:
+    """The app-side hooks the speaker detection routes call (AgentContext.speaker_ai)."""
+
+    def __init__(self):
+        import threading
+        from types import SimpleNamespace
+        self.on = True
+        self.started = []
+        self.run = SimpleNamespace(id="r1", done=threading.Event())
+        self.run.done.set()
+
+    def enabled(self):
+        return self.on
+
+    def has_video(self, sid):
+        return True
+
+    def start(self, sid, instructions, autonomy, library, targets):
+        self.started.append((sid, instructions, autonomy, library, targets))
+        return self.run
+
+    def report(self, run):
+        return {"run_id": "r1", "status": "done", "meetings": []}
+
+    def get_run(self, run_id):
+        return self.run if run_id == "r1" else None
+
+    def insights(self, sid):
+        return {"suggestions": [], "history": []}
+
+    def accept(self, cid):
+        if cid == 2:
+            raise ValueError("That suggestion is no longer waiting.")
+        return {}
+
+    def dismiss(self, cid):
+        return {}
+
+    def undo_change(self, cid):
+        from core import speaker_journal
+        raise speaker_journal.Conflict(cid, "Those speakers were changed again.")
+
+    def undo_run(self, run_id):
+        return {"undone": [1, 2], "conflicts": [], "sessions": ["s"]}
+
+
+def test_agents_run_speaker_detection_and_undo_it(api):
+    sid = api["s1"]
+    assert _post(api, f"/meetings/{sid}/speakers/identify", {})[0] == 501   # not wired
+    fake = _FakeSpeakerAI()
+    rest._ctx.speaker_ai = fake
+    try:
+        code, body = _post(api, f"/meetings/{sid}/speakers/identify",
+                           {"instructions": "Bob is on mute", "autonomy": "act_fully",
+                            "library_writes": "bogus", "focus": "Speaker 2", "wait": 1})
+        assert code == 200 and body["finished"] is True and body["run_id"] == "r1"
+        # The app caps autonomy at Settings (instructions.cap); a value it
+        # does not know never reaches it.
+        assert fake.started == [(sid, "Bob is on mute", "act_fully", None, ["Speaker 2"])]
+        assert _post(api, "/meetings/nope/speakers/identify", {})[0] == 404
+        code, body = _post(api, "/speaker-changes/apply", {"action": "accept", "change_ids": [1, 2]})
+        assert body["done"] == [1] and body["failed"][0]["change_id"] == 2
+        assert _post(api, "/speaker-changes/apply", {"action": "nope", "change_ids": [1]})[0] == 400
+        code, body = _post(api, "/speaker-changes/undo", {"change_ids": [5]})
+        assert code == 200 and body["undone"] == [] and body["not_undone"][0]["change_id"] == 5
+        assert _post(api, "/speaker-changes/undo", {"run_id": "r1"})[1]["undone"] == [1, 2]
+        assert _post(api, "/speaker-changes/undo", {})[0] == 400
+        assert _get(api, "/speaker-runs/r1")[1]["finished"] is True
+        assert _get(api, "/speaker-runs/nope")[0] == 404
+        assert _get(api, f"/meetings/{sid}/speakers/insights")[0] == 200
+        fake.on = False
+        code, body = _post(api, f"/meetings/{sid}/speakers/identify", {})
+        assert code == 409 and "Settings > Speakers" in body["error"]
+    finally:
+        rest._ctx.speaker_ai = None

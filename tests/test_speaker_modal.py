@@ -43,8 +43,13 @@ def test_header_states_the_meeting_and_the_speaker_stats():
 
 def test_the_tab_strip_and_the_manage_pane_are_gone():
     markup = _modal_markup()
-    assert 'role="tablist"' not in markup
-    assert 'role="tab"' not in markup
+    # The only switch left is AI speaker detection's Identify / Cleanup pair
+    # (speakers_ai.js), hidden unless that feature is on.
+    switch = markup[markup.index('id="speaker-modal-modes"'):]
+    switch = switch[:switch.index("</div>")]
+    assert ' hidden>' in switch
+    assert markup.count('role="tab"') == 2
+    assert "showSpeakerModalPane('ai')" in switch and "showSpeakerModalPane('cleanup')" in switch
     assert 'role="tabpanel"' not in markup
     assert "speaker-manager-tabs" not in INDEX
     assert "data-tab-view" not in INDEX
@@ -95,14 +100,16 @@ def test_status_line_uses_the_shared_attention_definition():
 
 # ── B. opening lands on the one surface ─────────────────────────────────────
 
-def test_open_takes_no_tab_and_loads_the_clusters():
-    block = APP_JS[APP_JS.index("function openSpeakerManager()"):]
+def test_open_loads_the_clusters_unless_it_opens_on_identify():
+    block = APP_JS[APP_JS.index("function openSpeakerManager(tab)"):]
     block = block[:block.index("\n}")]
-    assert "loadSpeakerClusters()" in block
+    # With AI speaker detection off (no SpeakerAI, or paneFor says cleanup) it
+    # opens on Cleanup and loads the clusters, as it always did.
+    assert "const pane = window.SpeakerAI ? SpeakerAI.paneFor(tab) : 'cleanup';" in block
+    assert ("if (pane === 'cleanup' && (!_cleanupState || _cleanupState.sessionId !== "
+            "state.sessionId)) loadSpeakerClusters();") in block
     assert "_cleanupSyncFooter()" in block
     assert "refreshSpeakerModalHeader()" in block
-    # Old callers still pass 'cleanup'; the signature ignores it rather than
-    # branching on a tab that no longer exists.
     assert "openSpeakerManager('cleanup')" in APP_JS
 
 
@@ -756,9 +763,10 @@ def test_a_successful_apply_closes_the_dialog_and_a_failed_one_does_not():
         assert "uiToast(" in path
     assert "closeSpeakerManager" not in body[:body.index("const resp = await fetch(")]
     # Reopening reloads, because the state is gone.
-    open_fn = APP_JS[APP_JS.index("function openSpeakerManager()"):]
+    open_fn = APP_JS[APP_JS.index("function openSpeakerManager(tab)"):]
     open_fn = open_fn[:open_fn.index("\n}")]
-    assert "if (!_cleanupState || _cleanupState.sessionId !== state.sessionId) loadSpeakerClusters();" in open_fn
+    assert ("(!_cleanupState || _cleanupState.sessionId !== state.sessionId)) "
+            "loadSpeakerClusters();") in open_fn
     # And the transcript behind it learns the names from the apply route's events.
     app_py = (ROOT / "app.py").read_text(encoding="utf-8")
     corrections = app_py[app_py.index("def _apply_speaker_corrections("):]
@@ -785,12 +793,13 @@ def test_no_api_surface_was_invented():
     assert '/speaker_clusters/apply", methods=["POST"]' in app_py
 
 
-def test_new_styles_use_theme_tokens_and_respect_reduced_motion():
+def test_new_styles_use_theme_tokens_and_always_animate():
     section = CSS[CSS.index("/* ── Speakers modal shell"):]
     for token in ("--surface", "--border", "--fg", "--fg-muted", "--fg-subtle",
                   "--accent", "--yellow", "--radius-sm", "--font-ui"):
         assert f"var({token})" in section
-    assert "prefers-reduced-motion" in section
+    # Animations always play: nothing waits on the OS's reduced-motion setting.
+    assert "prefers-reduced-motion" not in section
 
 
 def test_no_native_dialogs_in_the_modal_scripts():
