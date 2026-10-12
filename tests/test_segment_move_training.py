@@ -14,6 +14,7 @@ Run: .venv/Scripts/python -m pytest tests/test_segment_move_training.py
 from __future__ import annotations
 
 import ast
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -89,6 +90,7 @@ def _relabel(fp, seg, label, target):
         "_push": lambda kind, data: pushed.append((kind, data)),
         "obsidian": type("O", (), {"queue_export": staticmethod(lambda sid: None)}),
         "log": type("L", (), {"info": staticmethod(lambda *a: None)}),
+        "_state_lock": threading.Lock(), "_state": {"segments": []},
     }
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<app._relabel_segment>", "exec"),
          scope)

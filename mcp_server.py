@@ -256,7 +256,8 @@ TOOLS: list[dict] = [
     _tool(
         "get_meeting",
         "Load one meeting as a bundle: metadata, folder, duration, "
-        "per-speaker talk-time stats, AI summary, chapter markers, user "
+        "per-speaker talk-time stats (a name the user gave to individual "
+        "lines is its own speaker, per_line true), AI summary, chapter markers, user "
         "notes (as markdown), and media availability. Add "
         "include='transcript' or 'chat' (comma-separated, or 'all') for the "
         "full diarized transcript / AI chat history. For very long meetings "

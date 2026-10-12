@@ -199,8 +199,8 @@ Log tags you will see: `app`, `recording`, `whisper`, `transcriber`,
 
 | Endpoint | Notes |
 |---|---|
-| `GET /meetings` | Newest first. Shared filters + `limit` (default 50) / `offset`. Items carry `session_id`, title, times, `duration_min`, folder path, speakers, summary preview, `has_audio` / `has_video` / `has_notes`. |
-| `GET /meetings/{id}` | Bundle. Default parts: summary, chapters, speakers (talk-time stats), notes (markdown), media flags. `?include=transcript,chat,summary_history,calendar,attention` or `?include=all`. |
+| `GET /meetings` | Newest first. Shared filters + `limit` (default 50) / `offset`. Items carry `session_id`, title, times, `duration_min`, folder path, speakers (every name the transcript shows, names given to single lines included), summary preview, `has_audio` / `has_video` / `has_notes`. |
+| `GET /meetings/{id}` | Bundle. Default parts: summary, chapters, speakers (talk-time stats; a name the user gave to individual lines gets its own row with `per_line: true` and the `speaker_key` those lines sit under), notes (markdown), media flags. `?include=transcript,chat,summary_history,calendar,attention` or `?include=all`. |
 | `PATCH /meetings/{id}` | Body: `{"title": "...", "folder": "id|name|path|null"}`. |
 | `POST /meetings/move` | Body: `{"meeting_ids": [...], "folder": "id|name|path|null"}`. Up to 500 ids; reports `moved`, `already_there`, `missing`. |
 | `GET /meetings/{id}/transcript` | See section 5. |

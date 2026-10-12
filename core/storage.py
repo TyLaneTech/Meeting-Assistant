@@ -219,6 +219,12 @@ def init_db() -> None:
             # segments table (seconds per query on large libraries).
             "CREATE INDEX IF NOT EXISTS idx_segments_session_source"
             " ON transcript_segments(session_id, source)",
+            # The few lines that carry a name of their own, for the participant
+            # filter and search (list_session_ids, search_speakers), which
+            # otherwise scanned every line of every meeting.
+            "CREATE INDEX IF NOT EXISTS idx_segments_label_override"
+            " ON transcript_segments(label_override, session_id)"
+            " WHERE label_override IS NOT NULL",
             # Voice-sample provenance: which kind of write added a sample
             # (voice_auto, confirm, user, agent, ai) and, for journaled
             # changes, which change, so an undo removes exactly its samples.
@@ -414,6 +420,14 @@ _SPEAKER_EXPR = (
     "COALESCE(ts.label_override, sl.name, ts.source_override, ts.source)"
 )
 
+# The person's name a line shows, or NULL when it shows only a raw key: its
+# own name (one line renamed or moved on its own), else its speaker's label
+# unless that speaker is marked as noise. Needs ts and sl joined as above.
+_SPEAKER_NAME_SQL = (
+    "CASE WHEN NULLIF(ts.label_override, '') IS NOT NULL THEN ts.label_override"
+    " WHEN COALESCE(sl.is_noise, 0) = 0 THEN sl.name END"
+)
+
 
 def search_sessions(
     query: str,
@@ -547,11 +561,15 @@ def list_session_ids(
         where.append("s.started_at <= ?")
         params.append(end)
     if speaker:
+        # A label, or a name given to lines one at a time.
         where.append(
-            "EXISTS (SELECT 1 FROM speaker_labels sp"
+            "(EXISTS (SELECT 1 FROM speaker_labels sp"
             " WHERE sp.session_id = s.id AND sp.name LIKE ? COLLATE NOCASE)"
+            " OR s.id IN (SELECT tso.session_id FROM transcript_segments tso"
+            " WHERE tso.label_override IS NOT NULL"
+            " AND tso.label_override LIKE ? COLLATE NOCASE))"
         )
-        params.append(f"%{speaker}%")
+        params += [f"%{speaker}%"] * 2
 
     sql = (f"SELECT s.id FROM sessions s WHERE {' AND '.join(where)}"
            f" ORDER BY s.started_at DESC")
@@ -595,9 +613,16 @@ def get_sessions_meta(session_ids: "list[str] | set[str]") -> dict[str, dict]:
             f" FROM transcript_segments WHERE session_id IN ({ph})"
             f" GROUP BY session_id", ids
         ).fetchall()
+        # The names the transcript lines show (_SPEAKER_NAME_SQL), so a line
+        # named on its own counts and a label whose lines all moved does not.
         speakers = conn.execute(
-            f"SELECT session_id, name FROM speaker_labels"
-            f" WHERE session_id IN ({ph}) AND name != ''"
+            f"SELECT session_id, MIN(name) AS name FROM ("
+            f" SELECT ts.session_id, {_SPEAKER_NAME_SQL} AS name"
+            f" FROM transcript_segments ts LEFT JOIN speaker_labels sl"
+            f" ON sl.session_id = ts.session_id"
+            f" AND sl.speaker_key = COALESCE(NULLIF(ts.source_override, ''), ts.source)"
+            f" WHERE ts.session_id IN ({ph}))"
+            f" WHERE name IS NOT NULL AND name != '' AND name != '[Noise]'"
             f" GROUP BY session_id, lower(name)"
             f" ORDER BY session_id, lower(name)", ids
         ).fetchall()
@@ -627,25 +652,30 @@ def get_sessions_meta(session_ids: "list[str] | set[str]") -> dict[str, dict]:
 
 
 def search_speakers(query: str, limit: int = 20) -> list[dict]:
-    """Search speaker_labels by name. Returns sessions grouped by speaker match,
-    each with a 'participant' kind match entry."""
+    """Search speaker names (labels, and names given to lines one at a time).
+    Returns sessions grouped by speaker match, each with a 'participant' kind
+    match entry."""
     if not query or not query.strip():
         return []
     pattern = f"%{query.strip()}%"
     with _conn() as conn:
         rows = conn.execute(
             """
-            SELECT sl.session_id, sl.name AS speaker_name,
-                   s.title, s.started_at
-            FROM speaker_labels sl
-            JOIN sessions s ON s.id = sl.session_id
-            WHERE sl.name LIKE ? COLLATE NOCASE
-              AND sl.name != ''
-            GROUP BY sl.session_id, lower(sl.name)
+            SELECT n.session_id, n.speaker_name, s.title, s.started_at
+            FROM (
+                SELECT session_id, name AS speaker_name FROM speaker_labels
+                WHERE name LIKE ? COLLATE NOCASE AND name != ''
+                UNION ALL
+                SELECT session_id, label_override FROM transcript_segments
+                WHERE label_override IS NOT NULL AND label_override LIKE ? COLLATE NOCASE
+                  AND label_override != '' AND label_override != '[Noise]'
+            ) n
+            JOIN sessions s ON s.id = n.session_id
+            GROUP BY n.session_id, lower(n.speaker_name)
             ORDER BY s.started_at DESC
             LIMIT ?
             """,
-            (pattern, limit * 3),
+            (pattern, pattern, limit * 3),
         ).fetchall()
 
     from collections import OrderedDict
@@ -2417,6 +2447,22 @@ def put_speaker_label_rows(session_id: str, rows: dict) -> None:
             )
 
 
+def saved_speakers(session_id: str) -> tuple[dict, dict]:
+    """({segment id: {source, source_override, label_override}},
+    {speaker_key: name}): who each line of a meeting is under as saved, for a
+    caller that holds the lines in memory as they were transcribed."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT id, source, source_override, label_override FROM transcript_segments "
+            "WHERE session_id = ?", (session_id,)).fetchall()
+        labels = conn.execute(
+            "SELECT speaker_key, name FROM speaker_labels WHERE session_id = ?",
+            (session_id,)).fetchall()
+    return ({r["id"]: {"source": r["source"], "source_override": r["source_override"],
+                       "label_override": r["label_override"]} for r in rows},
+            {r["speaker_key"]: r["name"] for r in labels})
+
+
 def get_segment_overrides(segment_ids: list[int]) -> dict:
     """{segment id: {source_override, label_override}}."""
     ids = [int(i) for i in segment_ids or []]
@@ -2947,17 +2993,29 @@ def sessions_have_notes(session_ids: "list[str] | set[str]") -> set[str]:
     return {r["id"] for r in rows}
 
 
-def speaker_time_stats(session_id: str) -> list[dict]:
+def speaker_time_stats(session_id: str, *, per_line: bool = False) -> list[dict]:
     """Per-speaker stats for one session, grouped by effective speaker key.
 
     Effective key = source_override when set, else source (matching how the
     transcript resolves speakers). Returns [{speaker_key, name, color,
     global_id, segment_count, talk_seconds, word_count}] sorted by talk time.
+
+    ``per_line`` gives each name that lines carry on their own (renamed or
+    moved one at a time) and that differs from their speaker's label a row of
+    its own, flagged ``per_line``, under the key those lines sit under and
+    with no colour or voice profile; the key's row counts the rest. Every row
+    then carries ``per_line``.
     """
+    line_name = (
+        "CASE WHEN NULLIF(ts.label_override, '') IS NOT NULL"
+        " AND ts.label_override != '[Noise]'"
+        " AND lower(ts.label_override) != lower(COALESCE(sl.name, ''))"
+        " THEN ts.label_override END") if per_line else "NULL"
     with _conn() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT COALESCE(NULLIF(ts.source_override, ''), ts.source) AS speaker_key,
+                   {line_name} AS line_name,
                    sl.name, sl.color, sl.global_id,
                    COUNT(*) AS segment_count,
                    COALESCE(SUM(MAX(ts.end_time - ts.start_time, 0)), 0) AS talk_seconds,
@@ -2972,23 +3030,27 @@ def speaker_time_stats(session_id: str) -> list[dict]:
             -- resolves a bare name to the joined sl.speaker_key column first,
             -- which is NULL for every unlabeled speaker and would collapse
             -- them all into one row.
-            GROUP BY COALESCE(NULLIF(ts.source_override, ''), ts.source)
+            GROUP BY COALESCE(NULLIF(ts.source_override, ''), ts.source), lower({line_name})
             ORDER BY talk_seconds DESC
             """,
             (session_id,),
         ).fetchall()
-    return [
-        {
+    out = []
+    for r in rows:
+        own = r["line_name"]
+        row = {
             "speaker_key": r["speaker_key"],
-            "name": r["name"],
-            "color": r["color"],
-            "global_id": r["global_id"],
+            "name": own or r["name"],
+            "color": None if own else r["color"],
+            "global_id": None if own else r["global_id"],
             "segment_count": r["segment_count"],
             "talk_seconds": round(r["talk_seconds"] or 0.0, 1),
             "word_count": r["word_count"] or 0,
         }
-        for r in rows
-    ]
+        if per_line:
+            row["per_line"] = bool(own)
+        out.append(row)
+    return out
 
 
 def _name_predicate(match: str) -> str:

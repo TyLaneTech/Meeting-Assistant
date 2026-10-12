@@ -181,7 +181,8 @@ def _meeting_item(meta: dict, labels: dict, notes_set: set[str],
 
 
 def _resolved_speakers(session_id: str) -> list[dict]:
-    stats = storage.speaker_time_stats(session_id)
+    # A name given to lines one at a time is a speaker of the meeting too.
+    stats = storage.speaker_time_stats(session_id, per_line=True)
     for s in stats:
         if not s["name"]:
             s["name"] = _ctx.source_labels.get(s["speaker_key"], s["speaker_key"])

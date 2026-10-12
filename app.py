@@ -816,24 +816,26 @@ def _fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m}:{s:02d}"
 
-def _fmt_segment(seg: dict, speaker_labels: dict | None = None) -> str:
-    """Format a {text, source} segment dict as a labelled line for AI context.
+def _segment_speaker(seg: dict, speaker_labels: dict | None = None) -> str:
+    """The speaker a line shows under, with per-segment overrides:
 
-    Respects per-segment overrides:
     - label_override: a display name manually assigned to this segment
     - source_override: a speaker-key reassignment (look up in speaker_labels)
     """
     # Check for per-segment label override first (highest priority)
     label_override = seg.get("label_override")
     if label_override:
-        label = label_override
-    else:
-        # Use source_override if set, otherwise original source
-        source = seg.get("source_override") or seg["source"]
-        if speaker_labels and source in speaker_labels:
-            label = speaker_labels[source]
-        else:
-            label = _SOURCE_LABELS.get(source, source)
+        return label_override
+    # Use source_override if set, otherwise original source
+    source = seg.get("source_override") or seg["source"]
+    if speaker_labels and source in speaker_labels:
+        return speaker_labels[source]
+    return _SOURCE_LABELS.get(source, source)
+
+
+def _fmt_segment(seg: dict, speaker_labels: dict | None = None) -> str:
+    """Format a {text, source} segment dict as a labelled line for AI context."""
+    label = _segment_speaker(seg, speaker_labels)
     start = seg.get("start_time", 0) or 0
     end = seg.get("end_time", 0) or 0
     if start > 0 or end > 0:
@@ -856,24 +858,20 @@ def _build_session_meta(
     current_summary: str = "",
 ) -> dict:
     """Gather rich metadata about the session for AI context."""
-    # Compute speaker roster - only show user-assigned display names.
-    # If multiple raw keys map to the same name, deduplicate.
-    sources = set()
-    for s in segments:
-        src = s.get("source", "loopback")
-        sources.add(src)
+    # The speaker roster: every name the transcript lines show, in order of
+    # first appearance, so a line named on its own (or moved to a speaker key
+    # that only exists as an override, like a new name typed in Reassign) is
+    # listed. Built from the raw source keys, it missed those and kept keys
+    # whose every line had moved. Noise is not a speaker.
     seen_names = set()
     speakers = []
-    for src in sorted(sources):
-        if speaker_labels and src in speaker_labels:
-            display = speaker_labels[src]
-        elif src in _SOURCE_LABELS:
-            display = _SOURCE_LABELS[src]
-        else:
-            display = src
-        if display not in seen_names:
-            seen_names.add(display)
-            speakers.append(display)
+    for s in segments:
+        display = _segment_speaker({**s, "source": s.get("source") or "loopback"},
+                                   speaker_labels)
+        if not display or display == _NOISE_LABEL or display.lower() in seen_names:
+            continue
+        seen_names.add(display.lower())
+        speakers.append(display)
 
     # Duration
     times = [s.get("start_time", 0) or 0 for s in segments] + [s.get("end_time", 0) or 0 for s in segments]
@@ -900,6 +898,41 @@ def _build_session_meta(
         "custom_prompt": custom_prompt,
         "current_summary": current_summary,
     }
+
+
+def _saved_speakers_if_active(session_id: str) -> "tuple[dict, dict] | None":
+    """The active meeting's speakers as saved (storage.saved_speakers), read
+    outside _state_lock for _live_lines; None for any other meeting."""
+    with _state_lock:
+        if not session_id or _state["session_id"] != session_id:
+            return None
+    try:
+        return storage.saved_speakers(session_id)
+    except Exception as e:
+        log.warn("speakers", f"Could not read the saved speakers of {session_id[:8]}: {e}")
+        return None
+
+
+def _live_lines(saved: "tuple[dict, dict] | None") -> tuple[list[dict], dict]:
+    """The active meeting's lines and speaker labels for AI context, with the
+    speakers from _saved_speakers_if_active laid over them. Call with
+    _state_lock held.
+
+    _state keeps each line as it was transcribed, and everything that changes
+    speakers afterwards (a line renamed or moved on its own, Cleanup, AI
+    speaker detection and its undo, the voice library) writes the database.
+    Read from _state alone, the chat and summaries of the last meeting
+    recorded or reanalysed kept the old speakers until the app restarted.
+    """
+    segments = list(_state["segments"])
+    labels = dict(_state["speaker_labels"])
+    if not saved:
+        return segments, labels
+    rows, saved_labels = saved
+    segments = [{**s, **rows[s["_seg_id"]]} if s.get("_seg_id") in rows else s
+                for s in segments]
+    labels.update(saved_labels)
+    return segments, labels
 
 
 # ── Chapter helpers ───────────────────────────────────────────────────────────
@@ -1613,6 +1646,7 @@ def _speaker_summary_args(session_id: str, update_context: str) -> "tuple | None
     if not settings.get("auto_summary", True):
         return
 
+    saved = _saved_speakers_if_active(session_id)
     with _state_lock:
         # custom_prompt mirrors whichever session the user is viewing in the
         # textarea — always honor it regardless of active recording session.
@@ -1621,8 +1655,7 @@ def _speaker_summary_args(session_id: str, update_context: str) -> "tuple | None
             existing_summary = _state["summary"]
             if not existing_summary:
                 return
-            segments = list(_state["segments"])
-            labels = dict(_state["speaker_labels"])
+            segments, labels = _live_lines(saved)
             transcript = _build_transcript(segments, labels)
             seg_count = len(segments)
             meta = _build_session_meta(
@@ -3933,12 +3966,12 @@ def summarize():
     # custom_prompt is taken from _state regardless of whether this session
     # is the active recording — the summary textarea always POSTs its value
     # via /api/custom-prompt for whichever session the user is viewing.
+    saved = _saved_speakers_if_active(session_id)
     with _state_lock:
         active_sid = _state["session_id"]
         custom_prompt = _state["custom_prompt"]
         if session_id == active_sid:
-            segments = list(_state["segments"])
-            labels = dict(_state["speaker_labels"])
+            segments, labels = _live_lines(saved)
             transcript = _build_transcript(segments, labels)
             seg_count = len(segments)
             meta = _build_session_meta(
@@ -7008,11 +7041,11 @@ def chat():
     request_id = str(uuid.uuid4())
 
     # Determine transcript, chat history, and metadata for context
+    saved = _saved_speakers_if_active(session_id)
     with _state_lock:
         active_sid = _state["session_id"]
         if session_id == active_sid:
-            segments = list(_state["segments"])
-            labels = dict(_state["speaker_labels"])
+            segments, labels = _live_lines(saved)
             transcript = _build_transcript(segments, labels)
             chat_history = list(_state["chat_history"])
             meta = _build_session_meta(
@@ -7296,11 +7329,11 @@ def api_generate_chapters():
 
     # Live session → in-memory segments; otherwise load from DB (mirrors
     # /api/summarize so chapters work during and after a recording).
+    saved = _saved_speakers_if_active(session_id)
     with _state_lock:
         active_sid = _state["session_id"]
         if session_id == active_sid:
-            segments = list(_state["segments"])
-            labels = dict(_state["speaker_labels"])
+            segments, labels = _live_lines(saved)
             transcript = _build_transcript(segments, labels)
             seg_times = _segment_times(segments)
             meta = _build_session_meta(
@@ -8443,6 +8476,18 @@ def _relabel_segment(seg_id: int, label: str, source_override: "str | None", *,
     """
     storage.save_segment_label_override(seg_id, label)
     storage.save_segment_source_override(seg_id, source_override)
+
+    # The open meeting's chat, summary and chapters read its lines from
+    # _state, which kept the old speaker until the meeting was reloaded.
+    with _state_lock:
+        for live in _state["segments"]:
+            if live.get("_seg_id") == seg_id:
+                live["label_override"] = label
+                if source_override:
+                    live["source_override"] = source_override
+                else:
+                    live.pop("source_override", None)
+                break
 
     # A reassignment of a live speaker's recent output sticks: future segments
     # from the same diarizer key follow the user's correction automatically.

@@ -11157,10 +11157,12 @@ let _bulkPicker = null;   // { el, input, hint, anchorKey } or null
 function _openBulkSpeakerPicker(anchorSeg) {
   const badge = anchorSeg.querySelector('.src-badge');
   if (!badge) return;
-  // Already open → just follow the latest click and refresh the count.
+  // Already open → just follow the latest click and refresh the count, and
+  // keep the field focused so a name can be typed straight after the clicks.
   if (_bulkPicker) {
     _bulkPickerUpdateCount(_transcriptSelectedSegs.size);
     _positionPicker(_bulkPicker.el, badge.getBoundingClientRect(), 'right');
+    _bulkPicker.input.focus();
     return;
   }
   document.querySelector('.speaker-picker')?.remove();  // close any single-rename picker
@@ -11245,7 +11247,12 @@ function _bulkPickerOutside(e) {
   if (_bulkPicker.el.contains(e.target)) return;
   // Keep the picker open while the user grows the selection by
   // ctrl/⌘/shift-clicking more pills; only a plain click elsewhere cancels.
-  if (e.target.closest('.src-badge') && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
+  // The pill's mousedown must not take focus from the field (or start a
+  // shift-click text selection); the click that follows still selects.
+  if (e.target.closest('.src-badge') && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+    e.preventDefault();
+    return;
+  }
   clearTranscriptSelection();  // clears selection → closes the picker
 }
 
@@ -11656,7 +11663,11 @@ function _voiceAudioEl(sessionId) {
 
 /** Pick the longest few clips that add up to a short, representative sample. */
 function _pickVoiceClips(segments, opts) {
-  const o = Object.assign({}, _VOICE_CLIP_DEFAULTS, opts || {});
+  // Only the options a caller actually set. Object.assign copied an undefined
+  // over the default, every clip ended at NaN, and the sample stopped before
+  // it made a sound (the Identify tab's play button).
+  const o = Object.assign({}, _VOICE_CLIP_DEFAULTS);
+  for (const [k, v] of Object.entries(opts || {})) if (v != null) o[k] = v;
   const usable = (segments || [])
     .map(s => ({ start: Number(s.start), end: Number(s.end) }))
     .filter(s => isFinite(s.start) && isFinite(s.end) && s.end - s.start > 0.15)
@@ -11712,11 +11723,13 @@ function _voicePlaySeq(audio, clips, idx, token) {
     }
   };
   audio.addEventListener('timeupdate', onTU);
-  // Safety net if timeupdate stalls (tab blur / decode hiccup).
+  // Safety net if timeupdate stalls (tab blur / decode hiccup). The slack
+  // covers the seek: landing in a long recording took about a second, which
+  // cut the clip short with 0.7 s.
   timer = setTimeout(() => {
     audio.removeEventListener('timeupdate', onTU);
     _voicePlaySeq(audio, clips, idx + 1, token);
-  }, (clip.end - clip.start + 0.7) * 1000);
+  }, (clip.end - clip.start + 3) * 1000);
 }
 
 /**

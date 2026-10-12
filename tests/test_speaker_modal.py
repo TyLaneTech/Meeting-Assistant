@@ -741,6 +741,74 @@ def test_the_recording_preview_follows_the_audio_and_a_pause_holds():
     assert not closed["audioPaused"]
 
 
+# The same clock and media elements, driving the one voice-sample player.
+_VOICE_HARNESS = _PLAYBACK_HARNESS[:_PLAYBACK_HARNESS.index("function el(")] + r"""
+const btn = { classList: { toggle() {} }, innerHTML: '' };
+const page = {
+  document: { querySelectorAll: () => [] },
+  setTimeout: setTimeoutFake, clearTimeout: clearTimeoutFake,
+  state: { sessionId: 's1' },
+  Audio: function () { const a = new FakeMedia('audio'); a.duration = 3600; return a; },
+  _voiceSampleAudio: null, _voicePlayToken: 0, _voicePlayButton: null,
+  _voicePlayRender: null, _voiceMetaHandler: null,
+  _cleanupStopPlayback() {},
+};
+const scope = new Proxy(page, {
+  has: (t, k) => typeof k === 'string' && (k in t || !(k in globalThis)),
+  get: (t, k) => (typeof k === 'symbol' ? undefined : t[k]),
+  set: (t, k, v) => { t[k] = v; return true; },
+});
+with (scope) {
+  globalThis.__compileInPage = function (__code) { return eval('(' + __code + ')'); };
+}
+const compileInPage = globalThis.__compileInPage;
+delete globalThis.__compileInPage;
+page._VOICE_CLIP_DEFAULTS = eval('(' + src.match(/\nconst _VOICE_CLIP_DEFAULTS = (\{[^\n]*\});/)[1] + ')');
+for (const name of ['stopSpeakerVoice', '_voiceDefaultRender', '_voiceSetButton', '_voiceAudioEl',
+                    '_pickVoiceClips', '_voicePlaySeq', 'playSpeakerVoice']) {
+  page[name] = compileInPage(grab(name));
+}
+
+(async () => {
+  const s = {};
+  // What the Identify tab's play button passes: options it did not set.
+  s.clips = page._pickVoiceClips([{ start: 10, end: 30 }, { start: 50, end: 52 }],
+                                 { maxTotalSec: undefined, maxClipSec: undefined });
+  page.playSpeakerVoice({ sessionId: 's1', speakerKeys: ['Speaker 1'], button: btn,
+                         segments: [{ start: 100, end: 110 }, { start: 200, end: 204 }] });
+  const a = page._voiceSampleAudio;
+  await advance(3000);
+  s.first = { paused: a.paused, t: +a.currentTime.toFixed(2) };
+  await advance(4500);    // the first clip's 6 s are up, the second clip plays
+  s.second = { paused: a.paused, t: +a.currentTime.toFixed(2) };
+  await advance(6000);    // the second clip ends the sample
+  s.done = { paused: a.paused, button: !!page._voicePlayButton };
+  console.log(JSON.stringify(s));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_a_voice_sample_plays_its_clips_through():
+    """Report 2026-10-12: the Identify tab's play button played nothing. It
+    passes maxTotalSec / maxClipSec it never set, Object.assign copied those
+    undefineds over the defaults, every clip ended at NaN, and the NaN safety
+    timer fired at once, so each clip was skipped before it made a sound."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "voice_sample.cjs"
+        path.write_text(_VOICE_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(ROOT / "ui_web/static/app.js")],
+                             capture_output=True, encoding="utf-8", timeout=60)
+    assert out.returncode == 0, out.stderr
+    s = json.loads(out.stdout.strip().splitlines()[-1])
+    assert s["clips"] == [{"start": 10, "end": 16}, {"start": 50, "end": 52}]
+    assert not s["first"]["paused"] and 102 < s["first"]["t"] < 104, s
+    assert not s["second"]["paused"] and 200 < s["second"]["t"] < 204, s
+    assert s["done"] == {"paused": True, "button": False}, s
+
+
 def test_a_successful_apply_closes_the_dialog_and_a_failed_one_does_not():
     # The post-meeting auto-open used to stay up on the reloaded groups after
     # Apply, to be closed by hand. Apply is the commit, so it closes now.
