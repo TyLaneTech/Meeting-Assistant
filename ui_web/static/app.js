@@ -16927,7 +16927,9 @@ async function _relabelCancel(btn) {
 
 function _toolInputSummary(name, input) {
   if (name === 'get_screenshot' && input?.timestamp != null) {
-    return `at ${Number(input.timestamp).toFixed(1)}s`;
+    // Models sometimes pass the transcript's clock time ("2:45") instead of seconds.
+    const secs = Number(input.timestamp);
+    return Number.isFinite(secs) ? `at ${secs.toFixed(1)}s` : `at ${input.timestamp}`;
   }
   if (name === 'search_transcripts' && input?.query) return `"${input.query}"`;
   if (name === 'semantic_search' && input?.query) return `"${input.query}"`;

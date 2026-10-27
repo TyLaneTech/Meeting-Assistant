@@ -5,6 +5,7 @@ Provider and model are runtime-configurable via reload_client().
 """
 import base64
 import json
+import math
 import re
 import threading
 import traceback
@@ -162,13 +163,41 @@ _SCREENSHOT_TOOL = {
                 "type": "number",
                 "description": (
                     "Time in seconds from the start of the recording. "
-                    "Use timestamps from the transcript to target specific moments."
+                    "Use timestamps from the transcript to target specific moments "
+                    "(a line at [2:45] is 165)."
                 ),
             },
         },
         "required": ["timestamp"],
     },
 }
+
+
+def _screenshot_seconds(value) -> float | None:
+    """Seconds for a get_screenshot timestamp, or None when it can't be read.
+
+    The schema asks for seconds, but models copy the transcript's clock
+    format, so "2:45", "[1:02:45]" and "165s" are read as well as 165.
+    """
+    if isinstance(value, (int, float)):
+        secs = float(value)
+    else:
+        text = str(value or "").strip().strip("[]").strip()
+        if text[-1:] in ("s", "S"):
+            text = text[:-1].rstrip()
+        try:
+            secs = 0.0
+            for part in text.split(":"):
+                secs = secs * 60 + float(part)
+        except ValueError:
+            return None
+    return secs if math.isfinite(secs) and secs >= 0 else None
+
+
+def _unreadable_screenshot_ts(value) -> str:
+    return (f"Could not read the timestamp {value!r}. Pass seconds from the start "
+            "of the recording (165), or the transcript's time (\"2:45\").")
+
 
 # OpenAI-compatible function definition for the same tool
 _SCREENSHOT_FUNC_OAI = {
@@ -1963,8 +1992,21 @@ class AIAssistant:
 
         # Built-in: get_screenshot
         if tu["name"] == "get_screenshot" and frame_extractor:
-            ts = tu["input"].get("timestamp", 0)
-            result = frame_extractor(float(ts))
+            raw_ts = tu["input"].get("timestamp", 0)
+            ts = _screenshot_seconds(raw_ts)
+            if ts is None:
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "id": tu_id, "name": tu["name"], "success": False,
+                        "summary": "Unreadable timestamp",
+                    })
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": tu_id,
+                    "content": _unreadable_screenshot_ts(raw_ts),
+                    "is_error": True,
+                }
+            result = frame_extractor(ts)
             # frame_extractor returns (jpeg_bytes, url) or just jpeg_bytes for compat
             if result:
                 if isinstance(result, tuple):
@@ -2171,7 +2213,20 @@ class AIAssistant:
 
         # Built-in: get_screenshot
         if tc_name == "get_screenshot" and frame_extractor:
-            ts = float(parsed_args.get("timestamp", 0))
+            raw_ts = parsed_args.get("timestamp", 0)
+            ts = _screenshot_seconds(raw_ts)
+            if ts is None:
+                msgs.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _unreadable_screenshot_ts(raw_ts),
+                })
+                if on_tool_event:
+                    on_tool_event("tool_result", {
+                        "id": call_id, "name": tc_name, "success": False,
+                        "summary": "Unreadable timestamp",
+                    })
+                return
             result = frame_extractor(ts)
             if result:
                 if isinstance(result, tuple):
