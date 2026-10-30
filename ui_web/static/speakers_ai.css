@@ -538,6 +538,35 @@
   letter-spacing: .04em;
 }
 .spai-section-head > .spai-link:last-child { margin-left: auto; }
+.spai-section-head > .spai-video-toggle ~ .spai-link:last-child { margin-left: 4px; }
+
+/* Video or audio only: what a play button brings up (speakers_ai.js). */
+.spai-video-toggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  margin-left: auto;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface3);
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color .12s, background .12s, color .12s;
+}
+.spai-video-toggle i { font-size: 10.5px; }
+.spai-video-toggle:hover { border-color: var(--fg-muted); color: var(--fg); }
+.spai-video-toggle.is-on {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface3));
+  color: var(--fg);
+}
+.spai-video-toggle.is-on i { color: var(--accent); }
+.spai-video-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .spai-roster-sum { color: var(--fg-muted); }
 .spai-roster-sum b { font-weight: 600; color: var(--fg); }
 .spai-link {
@@ -765,6 +794,7 @@
   border-top: 1px solid var(--border-sub);
 }
 .spai-voice-head { display: flex; align-items: baseline; gap: 8px; }
+.spai-voice-play { align-self: center; width: 22px; height: 22px; margin-left: auto; font-size: 9.5px; }
 .spai-voice-key { font-size: 12px; font-weight: 600; color: var(--fg); }
 .spai-voice-meta { font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
 .spai-voice-why { margin-top: 2px; font-size: 12px; line-height: 1.45; color: var(--fg-muted); }

@@ -13010,6 +13010,37 @@ def _keepalive_loop() -> None:
         _force_quit()
 
 
+def _serve_ipv6_loopback(port: int) -> None:
+    """Serve the app on [::1] as well as 127.0.0.1, for as long as it runs.
+
+    The page lives at http://localhost, and Windows resolves localhost to ::1
+    first. With nothing listening there, Chromium waits out its 300 ms fallback
+    before it tries 127.0.0.1, and Werkzeug closes the connection after every
+    response, so every request the page made paid it again (measured
+    2026-10-30: 301 ms to connect, 3 ms to answer). Loopback only, like the
+    IPv4 bind. Best effort: without IPv6, or with the port taken there, the
+    browser still reaches 127.0.0.1 the slow way.
+    """
+    import socket
+    if not socket.has_ipv6:
+        return
+    # make_server() reports a failed bind with sys.exit(1), so try the address
+    # with a bare socket first.
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", port))
+    except OSError as e:
+        log.info("app", f"Not serving [::1]:{port} ({e}); localhost falls back to 127.0.0.1")
+        return
+    from werkzeug.serving import make_server
+    try:
+        server = make_server("::1", port, app, threaded=True)
+    except (OSError, SystemExit) as e:
+        log.info("app", f"Not serving [::1]:{port} ({e!r}); localhost falls back to 127.0.0.1")
+        return
+    server.serve_forever()
+
+
 def main() -> None:
     global _tray, _server_url
 
@@ -13052,6 +13083,8 @@ def main() -> None:
         daemon=True,
     )
     flask_thread.start()
+    threading.Thread(target=_serve_ipv6_loopback, args=(port,), daemon=True,
+                     name="http-ipv6").start()
 
     # Hand the tray the real state. Up to here it has been reading an empty
     # dict and showing "Loading models...", which is what it should have been

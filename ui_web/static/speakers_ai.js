@@ -8,7 +8,9 @@
  *  - after a run, what it did, with Apply all and Undo all;
  *  - who's who: every speaker in the meeting, grouped by person the way
  *    Cleanup groups them, named or not, with what the screen showed for each,
- *    the run's suggestions in place, and quick fixes for the unnamed;
+ *    the run's suggestions in place, and quick fixes for the unnamed; its
+ *    play buttons bring up the screen recording beside the speaker unless
+ *    the header's toggle says audio only (app.js showIdentifyVideoPreview);
  *  - the meeting's speaker history, with undo for every change.
  * Plus the frame lightbox, Settings > Speakers, and the amber dot on the
  * Speakers button when suggestions are waiting.
@@ -33,10 +35,12 @@
     people: {},         // roster group id -> its details shown
     historyOpen: false,
     naming: null,       // speaker key whose name field is open
-    library: null,      // Voice Library profiles, read once per page for the name field
+    library: null,      // Voice Library profiles for the name field, read ahead of it
+    libraryStale: false,// a name was saved since, which may have made a profile
     loading: false,
   };
   let roster = null;    // the last buildRoster(), for the click handlers
+  let painted = null;   // the insights the tab last drew
 
   const esc = s => (typeof escapeHtml === 'function' ? escapeHtml(s)
     : String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])));
@@ -72,6 +76,8 @@
 
   const pct = c => (c == null ? '' : `${Math.round(c * 100)}%`);
   const safeColor = c => (/^#[0-9a-f]{3,8}$/i.test(String(c || '')) ? c : null);
+  // Play shows the screen recording beside the speaker unless this is off.
+  const videoOn = () => prefs().identify_video_preview !== false;
 
   function generic(name, key) {
     const n = String(name || '').trim();
@@ -160,6 +166,8 @@
     if (!sid) return;
     S.sid = sid;
     S.loading = true;
+    // The name field's Voice Library list, ahead of the click that needs it.
+    if (enabled() && (!S.library || S.libraryStale)) refreshLibrary();
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/speakers/insights`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -337,6 +345,10 @@
     const compose = $('spai-compose');
     if (!body || !compose) return;
     if (!mine && S.naming && body.querySelector('.spai-name-field')) return;
+    // A redraw keeps what was typed in the name field, and takes its open
+    // list (which floats on <body>) with the old field.
+    const typed = S.naming && nameCombo ? nameCombo.getValue() : '';
+    dropNameField();
     syncComposer();
     if (!enabled()) {
       compose.hidden = true;
@@ -356,6 +368,7 @@
     }
     compose.hidden = !ins.has_video;
     roster = buildRoster(ins);
+    painted = ins;
     const top = body.scrollTop;
     body.innerHTML = [
       ins.has_video ? (S.running ? liveHtml() : summaryHtml(ins)) : noVideoHtml(),
@@ -364,7 +377,7 @@
     ].join('');
     body.scrollTop = top;
     wire();
-    mountNameField();
+    mountNameField(typed);
     tick();
   }
 
@@ -663,11 +676,22 @@
         <div class="spai-section-head">
           <h4>Who's who</h4>
           <span class="spai-roster-sum">${sum.join(' · ')}</span>
+          ${ins.has_video ? videoToggleHtml() : ''}
           <button class="spai-link" data-act="cleanup" title="Merge, split or relink groups by voice">Edit groups in Cleanup <i class="fa-solid fa-arrow-right"></i></button>
         </div>
         ${orphans}
         <div class="spai-people">${R.groups.map(personHtml).join('')}${noiseHtml(R.noise)}</div>
       </section>`;
+  }
+
+  // Whether a play button brings up the screen recording too. It only says
+  // what the next play does; it never opens the preview itself.
+  function videoToggleHtml() {
+    const on = videoOn();
+    const title = on ? 'Play shows the screen recording beside the speaker. Click for audio only.'
+      : 'Play is audio only. Click to see the screen recording too.';
+    return `<button type="button" class="spai-video-toggle ${on ? 'is-on' : ''}" data-act="video" aria-pressed="${on}" title="${title}">
+      <i class="fa-solid ${on ? 'fa-video' : 'fa-video-slash'}" aria-hidden="true"></i><span>${on ? 'Video' : 'Audio only'}</span></button>`;
   }
 
   function personHtml(g) {
@@ -733,6 +757,7 @@
   const canLook = () => !S.running && !!(S.insights && S.insights.has_video && !S.insights.recording);
 
   function detailHtml(g) {
+    const several = g.members.length > 1;
     return `<div class="spai-voices">${g.members.map(m => {
       const d = roster.decisions[m.key];
       let why = 'The screen was not read while this voice spoke.';
@@ -745,9 +770,13 @@
       const named = !generic(m.name, m.key) && norm(m.name) !== norm(g.name) ? ` (${esc(m.name)})` : '';
       const by = NAMED_BY[m.set_by] ? ` · ${NAMED_BY[m.set_by]}` : '';
       const ev = d && (d.evidence || []).length ? filmHtml(d.evidence) : '';
+      // One voice of several on its own; the row's play button plays them all.
+      const playOne = several
+        ? `<button type="button" class="spai-icon-btn spai-voice-play" data-act="play" data-key="${esc(m.key)}" title="Play a sample of this voice" aria-label="Play ${esc(m.key)}"><i class="fa-solid fa-play"></i></button>`
+        : '';
       return `
         <div class="spai-voice">
-          <div class="spai-voice-head"><span class="spai-voice-key">${esc(m.key)}${named}</span><span class="spai-voice-meta">${plural(m.lines, 'line')} · ${clock(m.seconds)}${by}</span></div>
+          <div class="spai-voice-head"><span class="spai-voice-key">${esc(m.key)}${named}</span><span class="spai-voice-meta">${plural(m.lines, 'line')} · ${clock(m.seconds)}${by}</span>${playOne}</div>
           <div class="spai-voice-why">${esc(why)}</div>
           ${ev}
         </div>`;
@@ -872,8 +901,8 @@
     if (!b || b.disabled) return;
     const id = b.dataset.id ? parseInt(b.dataset.id, 10) : null;
     switch (b.dataset.act) {
-      case 'apply': return act(`/api/speaker-changes/${id}/apply`, b, 'Applied.');
-      case 'dismiss': return act(`/api/speaker-changes/${id}/dismiss`, b, 'Dismissed. It won\u2019t be suggested again.');
+      case 'apply': return decide(id, 'apply', b);
+      case 'dismiss': return decide(id, 'dismiss', b);
       case 'undo': return undo(id, b);
       case 'undo-run': return undoRun(b.dataset.run, b);
       case 'apply-all': return applyAll(b);
@@ -889,13 +918,14 @@
         return render(true);
       }
       case 'play': return play(b);
+      case 'video': return toggleVideo(b);
       case 'look': {
         const g = roster && roster.groups.find(x => x.id === b.dataset.group);
         if (g) identify({ targets: g.members.map(m => m.key), depth: 'thorough' });
         return;
       }
-      case 'name': S.naming = b.dataset.key; return render(true);
-      case 'name-cancel': S.naming = null; return render(true);
+      case 'name': return setNaming(b.dataset.key);
+      case 'name-cancel': return setNaming(null);
       case 'name-save': return saveName(b.dataset.key, nameFieldValue());
       case 'name-as': return saveName(b.dataset.key, b.dataset.name);
       case 'noise': return markNoise(b.dataset.key, b);
@@ -922,90 +952,180 @@
   // ── Naming an unnamed speaker in place ────────────────────────────────────
 
   let nameCombo = null;
+  let libraryFetch = null;
 
-  async function libraryPeople() {
-    if (S.library) return S.library;
-    try {
-      const r = await fetch('/api/fingerprint/speakers');
-      const list = r.ok ? await r.json() : [];
-      const me = typeof window._meSpeakerGlobalId === 'string' ? window._meSpeakerGlobalId : null;
-      S.library = (Array.isArray(list) ? list : []).filter(p => p.name && p.id !== me);
-    } catch (_) {
-      S.library = [];
-    }
-    return S.library;
+  // The Voice Library, read when the tab loads rather than when the field
+  // opens, so the field never waits on it. A field already open takes the
+  // list when it lands.
+  function refreshLibrary() {
+    if (libraryFetch) return libraryFetch;
+    libraryFetch = (async () => {
+      try {
+        const r = await fetch('/api/fingerprint/speakers');
+        const list = r.ok ? await r.json() : null;
+        if (Array.isArray(list)) {
+          const me = typeof window._meSpeakerGlobalId === 'string' ? window._meSpeakerGlobalId : null;
+          S.library = list.filter(p => p.name && p.id !== me);
+          S.libraryStale = false;
+        }
+      } catch (_) { /* the field still takes a typed name */ }
+      libraryFetch = null;
+      if (!S.library) S.library = [];
+      if (nameCombo) nameCombo.setItems(nameItems());
+    })();
+    return libraryFetch;
   }
 
-  async function mountNameField() {
+  // Named people in this meeting first, then everyone else the Voice Library knows.
+  function nameItems() {
+    const here = (roster ? roster.groups : []).filter(g => g.named)
+      .map(g => ({ id: g.id, label: g.name, sublabel: 'In this meeting', color: g.color }));
+    const seen = new Set(here.map(i => norm(i.label)));
+    return here.concat((S.library || []).filter(p => !seen.has(norm(p.name)))
+      .map(p => ({ id: p.id, label: p.name, sublabel: 'Voice Library', color: safeColor(p.color) || undefined })));
+  }
+
+  function mountNameField(value = '') {
     const slot = document.querySelector('#spai-body .spai-name-field');
     if (!slot || typeof uiCombobox !== 'function') { nameCombo = null; return; }
     const key = slot.dataset.key;
-    const here = (roster ? roster.groups : []).filter(g => g.named)
-      .map(g => ({ id: g.id, label: g.name, sublabel: 'In this meeting', color: g.color }));
     // Enter takes the highlighted match, so a half-typed name finds the
     // person; with no match, or with Save, it is the name as typed.
     nameCombo = uiCombobox({
-      mount: slot, items: here, placeholder: 'Who is this? Type a name', ariaLabel: `Name ${key}`,
+      mount: slot, items: nameItems(), value, placeholder: 'Who is this? Type a name', ariaLabel: `Name ${key}`,
       emptyText: 'A new name: press Enter to use it',
       onSelect: item => saveName(key, item.label),
     });
     nameCombo.input.addEventListener('keydown', ev => {
       if (ev.defaultPrevented) return;
       if (ev.key === 'Enter') { ev.preventDefault(); saveName(key, nameCombo.getValue()); }
-      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); S.naming = null; render(true); }
+      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); setNaming(null); }
     });
     nameCombo.focus();
-    const lib = await libraryPeople();
-    if (!nameCombo || S.naming !== key) return;
-    const seen = new Set(here.map(i => norm(i.label)));
-    nameCombo.setItems(here.concat(lib.filter(p => !seen.has(norm(p.name)))
-      .map(p => ({ id: p.id, label: p.name, sublabel: 'Voice Library', color: safeColor(p.color) || undefined }))));
+    if (!S.library || S.libraryStale) refreshLibrary();
+  }
+
+  function dropNameField() {
+    if (nameCombo) nameCombo.destroy();
+    nameCombo = null;
   }
 
   const nameFieldValue = () => (nameCombo ? nameCombo.getValue() : '');
+
+  // Open the name field on a speaker, or close it (null). Only the rows it
+  // opens and closes are redrawn, so it is there the moment Name is clicked
+  // and nothing else on the tab moves. A reload that waited while the field
+  // was open is drawn once it closes.
+  function setNaming(key) {
+    const rows = [S.naming, key].filter(Boolean);
+    dropNameField();
+    S.naming = key;
+    const body = $('spai-body');
+    if (!key && painted !== S.insights) return render(true);
+    for (const k of rows) {
+      const g = roster && roster.byKey.get(k);
+      const card = g && body && body.querySelector(`.spai-person[data-group="${CSS.escape(g.id)}"]`);
+      const row = card && card.querySelector('.spai-fixes');
+      if (!row || g.named) return render(true);
+      row.outerHTML = fixesHtml(g);
+    }
+    mountNameField();
+  }
+
+  function speakerRow(key) {
+    return ((S.insights && S.insights.speakers) || []).find(s => s.key === key) || null;
+  }
 
   async function saveName(key, name) {
     name = String(name || '').trim();
     if (!key || !name) return;
     if (generic(name, key)) { toast('Type the person\u2019s name.', 'warn', 'spai'); return; }
+    dropNameField();
     S.naming = null;
+    // Named on screen at once, here and in the transcript. The reload below
+    // brings the rest (a Voice Library link, the colour); a failed write
+    // reloads the name back off.
+    if (typeof applySpeakerProfileUpdate === 'function') applySpeakerProfileUpdate({ speaker_key: key, name });
+    const row = speakerRow(key);
+    if (row) { row.name = name; row.set_by = 'user'; }
+    render(true);
     try {
-      if (typeof applySpeakerProfileUpdate === 'function') applySpeakerProfileUpdate({ speaker_key: key, name });
       if (typeof persistSpeakerLabel === 'function') await persistSpeakerLabel(key, name);
       toast(`Named ${key} ${name}.`, 'success', 'spai');
     } catch (e) {
       toast(e.message || 'Could not name the speaker.', 'error', 'spai');
     }
+    S.libraryStale = true;   // a new name can be a new Voice Library profile
     load(S.sid);
   }
 
   async function markNoise(key, btn) {
     if (!key || typeof _markSpeakerAsNoise !== 'function') return;
     btn.disabled = true;
+    // Off the list at once; read back only once every line is written.
+    const row = speakerRow(key);
+    if (row) row.is_noise = true;
+    render(true);
     await _markSpeakerAsNoise(key);
     toast(`${key} is marked as noise. Its lines are hidden from the transcript.`, 'success', 'spai');
-    setTimeout(() => load(S.sid), 400);
+    load(S.sid);
   }
 
+  // A row's play button plays every voice of that person; a voice's own
+  // button in the details plays just that one. With Video on, the sample
+  // brings the screen recording up beside the row when it starts.
   function play(btn) {
-    const g = roster && roster.groups.find(x => x.id === btn.dataset.group);
-    if (!g || typeof window.playSpeakerVoice !== 'function') return;
-    window.playSpeakerVoice({ sessionId: S.sid, speakerKeys: g.members.map(m => m.key), button: btn });
+    if (typeof window.playSpeakerVoice !== 'function') return;
+    let keys, anchor;
+    if (btn.dataset.key) {
+      keys = [btn.dataset.key];
+      anchor = btn.closest('.spai-voice');
+    } else {
+      const g = roster && roster.groups.find(x => x.id === btn.dataset.group);
+      if (!g) return;
+      keys = g.members.map(m => m.key);
+      anchor = btn.closest('.spai-person-head');
+    }
+    const starting = !btn.classList.contains('playing');
+    window.playSpeakerVoice({ sessionId: S.sid, speakerKeys: keys, button: btn });
+    if (starting && videoOn() && S.insights && S.insights.has_video
+        && typeof window.showIdentifyVideoPreview === 'function') {
+      window.showIdentifyVideoPreview(anchor || btn);
+    }
+  }
+
+  function toggleVideo(btn) {
+    const on = !videoOn();
+    if (typeof savePref === 'function') savePref('identify_video_preview', on);
+    // Audio only from now on, so a preview already up goes. Turning Video on
+    // opens nothing: the next play does.
+    if (!on && typeof window.closeIdentifyVideoPreview === 'function') window.closeIdentifyVideoPreview();
+    const focused = document.activeElement === btn;
+    btn.outerHTML = videoToggleHtml();
+    const next = $('spai-body') && $('spai-body').querySelector('.spai-video-toggle');
+    if (next && focused) next.focus();
   }
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
-  async function identify() {
+  // ``opts``: {targets, depth} for a closer look at some speakers (Look
+  // again). It used to be dropped, so Look again on one speaker read the
+  // whole meeting at the usual depth. The button's click event is not opts.
+  async function identify(opts) {
+    const o = opts && !(opts instanceof Event) ? opts : {};
     const sid = S.sid || curSid();
     if (!sid || S.running) return;
     const input = $('spai-input');
     const instructions = (input && input.value || '').trim();
     const btn = $('spai-run');
     if (btn) btn.disabled = true;
+    const req = { instructions };
+    if (Array.isArray(o.targets) && o.targets.length) req.targets = o.targets;
+    if (o.depth) req.depth = o.depth;
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/speakers/identify`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instructions }),
+        body: JSON.stringify(req),
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
@@ -1037,15 +1157,27 @@
     setTimeout(() => { if (btn) btn.disabled = false; }, 1500);
   }
 
-  async function act(url, btn, done) {
-    btn.disabled = true;
-    const card = btn.closest('.spai-suggest');
-    if (card) card.classList.add('is-busy');
+  // Apply or dismiss one suggestion. It leaves the list at once, and a name
+  // it gives shows at once; the reload after the write settles the rest (a
+  // move's line counts), and puts it back if the write was refused.
+  async function decide(id, verb, btn) {
+    const ins = S.insights;
+    const c = ins && (ins.suggestions || []).find(x => x.id === id);
+    if (c) {
+      ins.suggestions = ins.suggestions.filter(x => x !== c);
+      if (verb === 'apply' && c.type === 'name') {
+        for (const sp of ins.speakers || []) if ((c.keys || []).includes(sp.key)) sp.name = c.name;
+      }
+      render(true);
+      badge(S.sid);
+    } else {
+      btn.disabled = true;
+    }
     try {
-      const r = await fetch(url, { method: 'POST' });
+      const r = await fetch(`/api/speaker-changes/${id}/${verb}`, { method: 'POST' });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-      toast(done, 'success', 'spai');
+      toast(verb === 'apply' ? 'Applied.' : 'Dismissed. It won\u2019t be suggested again.', 'success', 'spai');
     } catch (e) {
       toast(e.message, 'error', 'spai');
     }
@@ -1487,6 +1619,7 @@
     S.open = {};
     S.people = {};
     S.naming = null;
+    dropNameField();
     if (S.sid !== sid) {
       S.insights = null; S.running = null; S.frames = new Map(); S.framesRun = null; S.framesShown = false;
     }

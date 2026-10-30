@@ -527,7 +527,10 @@ class FakeMedia {
       this.duration = 3600; this.readyState = 4; this._fire('loadedmetadata'); this._fire('loadeddata');
     }, 50);
   }
-  addEventListener(ev, fn, o) { (this._l[ev] = this._l[ev] || []).push({ fn, once: !!(o && o.once) }); }
+  addEventListener(ev, fn, o) {
+    const list = (this._l[ev] = this._l[ev] || []);
+    if (!list.some(x => x.fn === fn)) list.push({ fn, once: !!(o && o.once) });   // as the browser: once per listener
+  }
   removeEventListener(ev, fn) { this._l[ev] = (this._l[ev] || []).filter(x => x.fn !== fn); }
   _fire(ev) {
     for (const x of [...(this._l[ev] || [])]) { if (x.once) this.removeEventListener(ev, x.fn); x.fn({ type: ev }); }
@@ -592,6 +595,7 @@ const page = {
   _cleanupState: { sessionId: 's1' }, _cleanupPlayQueueState: null,
   _cleanupVideoLoadedFor: null, _cleanupVideoUserClosed: false, _cleanupVideoAudioBound: false,
   _cvSeekPending: false, _cvSeekWatchdog: 0, _cvRAF: 0, _cvLastSeekAt: 0,
+  _cvFollowEl: null, _cvFollowed: new WeakSet(), _cvDock: null, _cvPendingDock: null,
   stopSpeakerVoice() {}, savePref() {}, flashStatus() {}, _cvResetZoom() {},
   _cleanupVideoApplySavedPosition() {}, _cleanupVideoEnsureDragWired() {}, _cleanupVideoSyncToggleBtn() {},
 };
@@ -611,8 +615,8 @@ for (const name of [
   '_cleanupClearPlayingButtons', '_cleanupSyncPlayButtons', '_cleanupStopPlayback',
   '_cleanupDetachSegment', '_cleanupPlayQueue', '_cleanupPlayCurrent',
   '_cleanupVideoEl', '_cleanupVideoPopupEl', '_cvAudio', '_cvShown', '_cleanupVideoAvailable',
-  '_cleanupVideoEnsureLoaded', '_cvBindAudio', '_cvSetStatus', '_cleanupVideoUpdateTime',
-  'showCleanupVideoPopup', 'closeCleanupVideoPopup', '_cvVideoTime', '_cvClampTarget',
+  '_cleanupVideoEnsureLoaded', '_cvBindAudio', '_cvFollow', '_cvSetStatus', '_cleanupVideoUpdateTime',
+  'showCleanupVideoPopup', 'closeCleanupVideoPopup', '_cvUndock', '_cvVideoTime', '_cvClampTarget',
   '_cvSeekLanded', '_cvOnError', '_cvHardSeek', '_cvSyncOnce', '_cvSyncLoop', '_cvStart',
   '_cvKick', '_cvStop',
 ]) {
@@ -807,6 +811,258 @@ def test_a_voice_sample_plays_its_clips_through():
     assert not s["first"]["paused"] and 102 < s["first"]["t"] < 104, s
     assert not s["second"]["paused"] and 200 < s["second"]["t"] < 204, s
     assert s["done"] == {"paused": True, "button": False}, s
+
+
+# The same clock and media, driving the Identify tab's docked preview: the
+# voice-sample player and the recording popup together, on a 1600 x 900 window
+# with the dialog's 970 px in the middle.
+_DOCK_HARNESS = _PLAYBACK_HARNESS[:_PLAYBACK_HARNESS.index("function el(")] + r"""
+const rect = (left, top, width, height) => ({ left, top, width, height, right: left + width, bottom: top + height });
+function box(r, extra) {
+  const classes = new Set();
+  return Object.assign({
+    hidden: false, textContent: '', style: {}, dataset: {}, isConnected: true, _r: r,
+    classList: { add: (...c) => c.forEach(x => classes.add(x)), remove: (...c) => c.forEach(x => classes.delete(x)),
+                 toggle: (c, f) => (f ? classes.add(c) : classes.delete(c)), contains: c => classes.has(c) },
+    querySelector() { return null; },
+    getBoundingClientRect() { return this._r; },
+    get offsetHeight() { return this.getBoundingClientRect().height; },
+  }, extra || {});
+}
+const px = v => parseFloat(v) || 0;
+const popup = box(null, { hidden: true });
+popup.getBoundingClientRect = function () { const s = this.style; return rect(px(s.left), px(s.top), px(s.width), px(s.height)); };
+const audio = new FakeMedia('audio');
+audio.duration = 3600;
+const video = new FakeMedia('video');
+const dialog = box(rect(315, 105, 970, 690));
+const rowA = box(rect(330, 500, 940, 40));
+const rowB = box(rect(330, 700, 940, 40));
+const button = () => ({ classList: { toggle() {} }, innerHTML: '' });
+const els = { 'playback-audio': audio, 'cleanup-video': video, 'cleanup-video-popup': popup,
+              'cleanup-video-idle': box(null, { label: box(null) }), 'cleanup-video-noseek': box(null, { hidden: true }),
+              'cleanup-video-time': box(null), 'cleanup-video-header': box(rect(0, 0, 0, 28)) };
+let saved = 0;
+const page = {
+  document: { getElementById: id => els[id] || null, querySelectorAll: () => [],
+              querySelector: q => (q === '#speaker-manager-overlay .speaker-manager-dialog' ? dialog : null) },
+  window: { innerWidth: 1600, innerHeight: 900, addEventListener() {} },
+  setTimeout: setTimeoutFake, clearTimeout: clearTimeoutFake,
+  requestAnimationFrame: rafFake, cancelAnimationFrame: cafFake,
+  performance: { now: () => now },
+  state: { sessionId: 's1' },
+  Audio: function () { const a = new FakeMedia('audio'); a.duration = 3600; return a; },
+  _videoAvailable: true, _videoOffset: 0,
+  _cleanupVideoLoadedFor: null, _cleanupVideoUserClosed: false, _cleanupVideoAudioBound: false,
+  _cvSeekPending: false, _cvSeekWatchdog: 0, _cvRAF: 0, _cvLastSeekAt: 0,
+  _cvFollowEl: null, _cvFollowed: new WeakSet(), _cvDock: null, _cvPendingDock: null,
+  _voiceSampleAudio: null, _voicePlayToken: 0, _voicePlayButton: null, _voicePlayRender: null, _voiceMetaHandler: null,
+  _cleanupStopPlayback() {}, _cleanupVideoEnsureDragWired() {}, _cleanupVideoSyncToggleBtn() {},
+  _cvResetZoom() {}, _cvClampPan() {}, _cvApplyZoom() {}, savePref() {},
+  _cleanupVideoSavePosition() { saved += 1; },
+};
+const scope = new Proxy(page, {
+  has: (t, k) => typeof k === 'string' && (k in t || !(k in globalThis)),
+  get: (t, k) => (typeof k === 'symbol' ? undefined : t[k]),
+  set: (t, k, v) => { t[k] = v; return true; },
+});
+with (scope) {
+  globalThis.__compileInPage = function (__code) { return eval('(' + __code + ')'); };
+}
+const compileInPage = globalThis.__compileInPage;
+delete globalThis.__compileInPage;
+page._VS = eval('(' + vsLiteral + ')');
+page._VOICE_CLIP_DEFAULTS = eval('(' + src.match(/\nconst _VOICE_CLIP_DEFAULTS = (\{[^\n]*\});/)[1] + ')');
+for (const name of [
+  '_vsNow', '_fmtTime',
+  '_cleanupVideoEl', '_cleanupVideoPopupEl', '_cvAudio', '_cvShown', '_cleanupVideoAvailable',
+  '_cleanupVideoEnsureLoaded', '_cvBindAudio', '_cvFollow', '_cvSetStatus', '_cleanupVideoUpdateTime',
+  'closeCleanupVideoPopup', '_cvVideoTime', '_cvClampTarget', '_cvSeekLanded', '_cvOnError',
+  '_cvHardSeek', '_cvSyncOnce', '_cvSyncLoop', '_cvStart', '_cvKick', '_cvStop',
+  'showIdentifyVideoPreview', 'closeIdentifyVideoPreview', '_cvOnVoicePlay', '_cvUndock', '_cvRedock',
+  '_cvDockBeside', '_cleanupVideoPlacedByHand',
+  'stopSpeakerVoice', '_voiceDefaultRender', '_voiceSetButton', '_voiceAudioEl', '_pickVoiceClips',
+  '_voicePlaySeq', 'playSpeakerVoice',
+]) {
+  page[name] = compileInPage(grab(name));
+}
+
+// What the Identify tab's play button does: the sample, then the preview.
+// Each press is a row's own button, as on the page.
+const playRow = (row, segments) => {
+  page.playSpeakerVoice({ sessionId: 's1', speakerKeys: ['k'], button: button(), segments });
+  page.showIdentifyVideoPreview(row);
+};
+const snap = () => {
+  const r = popup.getBoundingClientRect();
+  const v = page._voiceSampleAudio;
+  return {
+    shown: !popup.hidden, docked: popup.classList.contains('is-docked'), gliding: popup.classList.contains('is-gliding'),
+    left: Math.round(r.left), top: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height),
+    follows: page._cvAudio() === audio ? 'transcript' : (v && page._cvAudio() === v ? 'voice' : 'none'),
+    videoTime: +video.currentTime.toFixed(2), videoPaused: video.paused,
+    voiceTime: v ? +v.currentTime.toFixed(2) : null, transcriptTime: +audio.currentTime.toFixed(2),
+  };
+};
+
+(async () => {
+  const s = {};
+  // The recording is 16:10; the popup learns that when its metadata lands.
+  video.videoWidth = 1920; video.videoHeight = 1200;
+  playRow(rowA, [{ start: 300, end: 304 }, { start: 500, end: 503 }]);
+  s.beforeItPlays = snap();
+  await advance(1500);
+  s.rowA = snap();
+  playRow(rowB, [{ start: 900, end: 903 }]);
+  await advance(800);
+  s.rowB = snap();
+  // Placed by hand: it stays, and Cleanup's remembered place is left alone.
+  popup.style.left = '100px'; popup.style.top = '50px';
+  page._cleanupVideoPlacedByHand();
+  playRow(rowA, [{ start: 300, end: 304 }]);
+  await advance(800);
+  s.byHand = Object.assign(snap(), { saved });
+  // The transcript plays: the preview follows it instead.
+  page.stopSpeakerVoice();
+  audio.currentTime = 1200;
+  audio.play();
+  await advance(1500);
+  s.transcript = snap();
+  audio.pause();
+  page.closeIdentifyVideoPreview();
+  await advance(200);
+  s.closed = snap();
+  // A sample stopped before it starts, or one with nothing to play, opens nothing.
+  playRow(rowA, [{ start: 300, end: 304 }]);
+  page.stopSpeakerVoice();
+  await advance(800);
+  s.stoppedFirst = snap();
+  playRow(rowA, []);
+  page.playSpeakerVoice({ sessionId: 's1', speakerKeys: ['k'], button: button(),
+                         segments: [{ start: 40, end: 44 }] });   // a later sample from elsewhere
+  await advance(800);
+  s.emptyThenOther = snap();
+  page.stopSpeakerVoice();
+  // No room beside the dialog: over its right edge, clear of the row.
+  page.window.innerWidth = 1100;
+  dialog._r = rect(65, 105, 970, 690);
+  playRow(rowB, [{ start: 900, end: 903 }]);
+  await advance(800);
+  s.cramped = snap();
+  console.log(JSON.stringify(s));
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_the_identify_preview_docks_beside_the_row_and_follows_its_sample():
+    """The Identify tab's play button brings the recording up beside the row
+    it played, in the room right of the dialog at the recording's shape, and
+    keeps it in step with the voice sample (its own <audio>, which the popup
+    did not follow before). It opens only once that sample plays, moves to the
+    next row played, stays where it is put by hand, and follows the transcript
+    again when that plays."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "identify_preview.cjs"
+        path.write_text(_DOCK_HARNESS, encoding="utf-8")
+        out = subprocess.run([node, str(path), str(ROOT / "ui_web/static/app.js")],
+                             capture_output=True, encoding="utf-8", timeout=60)
+    assert out.returncode == 0, out.stderr
+    s = json.loads(out.stdout.strip().splitlines()[-1])
+
+    # Nothing until the sample plays.
+    assert not s["beforeItPlays"]["shown"], s["beforeItPlays"]
+    # Right of the dialog (right edge 1285, 14 px gap), as wide as the room to
+    # the window's 12 px margin, 16:10 under a 28 px header, centred on row A.
+    a = s["rowA"]
+    assert a["shown"] and a["docked"] and a["follows"] == "voice", a
+    assert (a["left"], a["width"], a["height"]) == (1299, 289, 209), a
+    assert abs(a["top"] + a["height"] / 2 - 520) <= 1, a
+    assert abs(a["videoTime"] - a["voiceTime"]) <= 0.3, a
+    # The next row played: it glides there, still in step.
+    b = s["rowB"]
+    assert b["gliding"] and abs(b["top"] + b["height"] / 2 - 720) <= 1, b
+    assert 900 <= b["voiceTime"] <= 903 and abs(b["videoTime"] - b["voiceTime"]) <= 0.3, b
+    # Moved by hand: stays put, and Cleanup's saved position is not written.
+    hand = s["byHand"]
+    assert (hand["left"], hand["top"]) == (100, 50) and hand["saved"] == 0, hand
+    assert hand["follows"] == "voice" and 300 <= hand["voiceTime"] <= 304, hand
+    # The transcript plays: the preview follows it.
+    t = s["transcript"]
+    assert t["follows"] == "transcript" and abs(t["videoTime"] - t["transcriptTime"]) <= 0.3, t
+    assert not s["closed"]["shown"] and not s["closed"]["docked"], s["closed"]
+    # Stopped before it played, or nothing to play: no preview, even when
+    # another sample plays later.
+    assert not s["stoppedFirst"]["shown"], s["stoppedFirst"]
+    assert not s["emptyThenOther"]["shown"], s["emptyThenOther"]
+    # No room either side (1100 px window): 420 px at the window's right edge,
+    # above row B (700 to 740) rather than over it.
+    c = s["cramped"]
+    assert c["shown"] and c["docked"] and (c["left"], c["width"]) == (668, 420), c
+    assert c["top"] + c["height"] < 700, c
+
+
+def test_the_identify_tab_wires_play_to_the_preview_and_the_toggle():
+    js = (ROOT / "ui_web/static/speakers_ai.js").read_text(encoding="utf-8")
+    play = js[js.index("  function play(btn) {"):]
+    play = play[:play.index("\n  }\n")]
+    # The sample first, then the preview for it; only with Video on and a
+    # recording, and only when the press starts a sample rather than stopping one.
+    assert play.index("window.playSpeakerVoice(") < play.index("window.showIdentifyVideoPreview(")
+    assert "starting && videoOn() && S.insights && S.insights.has_video" in play
+    # On by default; turning it off closes a preview, turning it on opens none.
+    assert "prefs().identify_video_preview !== false" in js
+    toggle = js[js.index("  function toggleVideo(btn) {"):]
+    toggle = toggle[:toggle.index("\n  }\n")]
+    assert "savePref('identify_video_preview', on)" in toggle
+    assert "if (!on && typeof window.closeIdentifyVideoPreview === 'function')" in toggle
+    assert "showIdentifyVideoPreview" not in toggle
+    # Look again sends its targets and depth; they used to be dropped.
+    identify = js[js.index("  async function identify(opts) {"):]
+    identify = identify[:identify.index("\n  }\n")]
+    assert "req.targets = o.targets" in identify and "req.depth = o.depth" in identify
+    assert "JSON.stringify(req)" in identify
+
+
+def test_the_name_field_opens_in_place_and_never_waits_on_the_library():
+    js = (ROOT / "ui_web/static/speakers_ai.js").read_text(encoding="utf-8")
+    on_click = js[js.index("  function onClick(e) {"):]
+    on_click = on_click[:on_click.index("\n  }\n")]
+    assert "case 'name': return setNaming(b.dataset.key);" in on_click
+    # The library is read with the tab, and the field is focused before any fetch.
+    load = js[js.index("  async function load(sid) {"):]
+    assert load.index("refreshLibrary()") < load.index("await fetch(")
+    mount = js[js.index("  function mountNameField("):]
+    mount = mount[:mount.index("\n  }\n")]
+    assert "await" not in mount and mount.index("nameCombo.focus()") < mount.index("refreshLibrary()")
+    # Save, Noise, Apply and Dismiss draw first and write after.
+    for fn, write in (("async function saveName(", "await persistSpeakerLabel("),
+                      ("async function markNoise(", "await _markSpeakerAsNoise("),
+                      ("async function decide(", "await fetch(")):
+        body = js[js.index(fn):]
+        body = body[:body.index("\n  }\n")]
+        assert body.index("render(true)") < body.index(write), fn
+    # The noise writes are awaited, so the read-back sees them.
+    noise = APP_JS[APP_JS.index("async function _markSpeakerAsNoise("):]
+    noise = noise[:noise.index("\n}")]
+    assert "await Promise.all(writes);" in noise
+
+
+def test_the_combobox_list_floats_on_the_body():
+    # Inside the field's own box the list was clipped by the Identify tab's
+    # scroll area: a field near the bottom showed one option.
+    open_list = COMBO_JS[COMBO_JS.index("function openList("):]
+    open_list = open_list[:open_list.index("\n    }\n")]
+    assert "document.body.appendChild(list)" in open_list and "place()" in open_list
+    close_list = COMBO_JS[COMBO_JS.index("function closeList("):]
+    close_list = close_list[:close_list.index("\n    }\n")]
+    assert "mount.appendChild(list)" in close_list
+    assert "list.remove()" in COMBO_JS[COMBO_JS.index("destroy()"):]
+    rule = CSS[CSS.index(".ui-combobox-list {"):]
+    rule = rule[:rule.index("}")]
+    assert "position: fixed" in rule and "top: calc(100% + 4px)" not in rule
 
 
 def test_a_successful_apply_closes_the_dialog_and_a_failed_one_does_not():

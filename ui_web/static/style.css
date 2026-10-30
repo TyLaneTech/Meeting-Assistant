@@ -6118,6 +6118,13 @@ img#shutdown-icon.brand-icon {
 }
 .cleanup-video-popup[hidden] { display: none; }
 .cleanup-video-popup.dragging { user-select: none; cursor: grabbing; }
+/* Docked by the Identify tab (_cvDockBeside): sized to the room beside the
+   dialog, which already keeps it inside the window, and gliding from one
+   speaker's row to the next. */
+.cleanup-video-popup.is-docked { max-width: none; max-height: none; }
+.cleanup-video-popup.is-docked.is-gliding {
+  transition: left .2s ease, top .2s ease, width .2s ease, height .2s ease;
+}
 
 .cleanup-video-header {
   display: flex;
@@ -11490,12 +11497,12 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   font-size: 11px;
 }
 .ui-combobox-toggle:hover { color: var(--fg); }
+/* Open, it floats on <body> at the field (ui-combobox.js place()), above the
+   dialogs and the recording preview, so no scrolling box can clip it. */
 .ui-combobox-list {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: calc(100% + 4px);
-  z-index: 40;
+  position: fixed;
+  z-index: 10080;
+  box-sizing: border-box;
   max-height: 244px;
   overflow-y: auto;
   padding: 4px;
@@ -11549,7 +11556,9 @@ span.ql-color.ql-picker.ql-color-picker.ql-expanded:hover {
   font-size: 12px;
   text-align: left;
 }
+.ui-combobox-list.is-up { animation-name: uiComboUp; }
 @keyframes uiComboIn { from { opacity: 0; transform: translateY(-4px); } }
+@keyframes uiComboUp { from { opacity: 0; transform: translateY(4px); } }
 
 /* ══════════════════════════════════════════════════════════════════════════
    The app shell

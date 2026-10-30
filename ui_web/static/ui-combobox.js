@@ -19,11 +19,17 @@
  *   onInput(text)         fires on every keystroke
  *
  * Returns { element, input, setItems, setValue, getValue, focus, close, destroy }.
+ *
+ * The open list floats on <body>, fixed to the field: inside the field's own
+ * box it was clipped by any scrolling ancestor, so a field near the bottom of
+ * the Speakers dialog showed one option of its list. It opens upward when
+ * there is more room above.
  */
 (function () {
   'use strict';
 
   let comboSequence = 0;
+  const LIST_MAX = 244;   // px, the tallest the list grows
 
   function uiCombobox(options) {
     const o = options || {};
@@ -139,22 +145,57 @@
       }
     }
 
+    // Below the field, or above it when that has more room, never taller
+    // than the room it has.
+    function place() {
+      if (!open) return;
+      if (!field.isConnected) { closeList(); return; }
+      const r = field.getBoundingClientRect();
+      const gap = 4;
+      const margin = 8;
+      const below = window.innerHeight - r.bottom - gap - margin;
+      const above = r.top - gap - margin;
+      const want = Math.min(LIST_MAX, list.scrollHeight || LIST_MAX);
+      const up = below < want && above > below;
+      list.style.maxHeight = `${Math.max(64, Math.min(LIST_MAX, up ? above : below))}px`;
+      list.style.left = `${Math.round(r.left)}px`;
+      list.style.width = `${Math.round(r.width)}px`;
+      list.style.top = up ? '' : `${Math.round(r.bottom + gap)}px`;
+      list.style.bottom = up ? `${Math.round(window.innerHeight - r.top + gap)}px` : '';
+      list.classList.toggle('is-up', up);
+    }
+
+    // A scroll anywhere but the list itself moves the field under it.
+    function onScroll(ev) { if (ev.target !== list) place(); }
+
     function openList(resetActive) {
       computeFiltered();
       if (resetActive) activeIndex = filtered.length ? 0 : -1;
       if (activeIndex >= filtered.length) activeIndex = filtered.length - 1;
-      open = true;
+      if (!open) {
+        open = true;
+        document.body.appendChild(list);
+        document.addEventListener('scroll', onScroll, true);
+        window.addEventListener('resize', place);
+      }
       list.hidden = false;
       input.setAttribute('aria-expanded', 'true');
       renderList();
+      place();
       syncActiveDescendant();
       scrollActiveIntoView();
     }
 
     function closeList() {
+      const wasOpen = open;
       open = false;
       activeIndex = -1;
       list.hidden = true;
+      if (wasOpen) {
+        document.removeEventListener('scroll', onScroll, true);
+        window.removeEventListener('resize', place);
+        mount.appendChild(list);
+      }
       input.setAttribute('aria-expanded', 'false');
       syncActiveDescendant();
     }
@@ -224,7 +265,7 @@
       getValue() { return input.value; },
       focus() { input.focus(); },
       close: closeList,
-      destroy() { closeList(); mount.replaceChildren(); mount.classList.remove('ui-combobox'); },
+      destroy() { closeList(); list.remove(); mount.replaceChildren(); mount.classList.remove('ui-combobox'); },
     };
   }
 

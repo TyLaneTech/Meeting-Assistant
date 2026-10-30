@@ -19,6 +19,21 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Improved the Identify tab and the app's speed (2026-10-30)
+
+### Speakers
+
+- **Play on the `Identify` tab** shows the screen recording beside the speaker, or plays audio only with `Video` turned off.
+- **Each voice** of a person has its own play button in their details.
+- **The name list** is no longer cut off at the bottom of the dialog.
+- **`Name…`, `Noise`, `Apply` and `Dismiss`** respond at once.
+- **`Look again`** looks closely at just that speaker instead of rereading the whole meeting.
+
+### General
+
+- **Anything that loads or saves** responds about a third of a second sooner on Windows.
+
+
 ## Added AI speaker detection from the screen recording (2026-10-09)
 
 ### Speakers

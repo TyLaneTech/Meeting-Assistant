@@ -9281,10 +9281,14 @@ let _cvSeekPending  = false; // between currentTime= and its 'seeked'
 let _cvSeekWatchdog = 0;     // watchdog timer id for a stuck pending seek
 let _cvRAF          = 0;     // requestAnimationFrame id for the sync loop
 let _cvLastSeekAt   = 0;     // perf clock of the last throttled seek
+// The audio the popup mirrors: playback-audio, or the Identify tab's voice
+// sample (playSpeakerVoice's own <audio>), whichever played last.
+let _cvFollowEl     = null;
+const _cvFollowed   = new WeakSet();
 
 function _cleanupVideoEl() { return document.getElementById('cleanup-video'); }
 function _cleanupVideoPopupEl() { return document.getElementById('cleanup-video-popup'); }
-function _cvAudio() { return document.getElementById('playback-audio'); }
+function _cvAudio() { return _cvFollowEl || document.getElementById('playback-audio'); }
 function _cvShown() { const p = _cleanupVideoPopupEl(); return !!p && !p.hidden; }
 
 function _cleanupVideoAvailable() {
@@ -9317,12 +9321,25 @@ function _cleanupVideoEnsureLoaded() {
 // popup, and the rAF loop runs while it plays. Bound once per page.
 function _cvBindAudio() {
   if (_cleanupVideoAudioBound) return;
-  const audio = _cvAudio();
+  const audio = document.getElementById('playback-audio');
   if (!audio) return;
   _cleanupVideoAudioBound = true;
-  for (const ev of ['play', 'pause', 'seeked', 'ended']) audio.addEventListener(ev, _cvKick);
+  _cvFollow(audio);
+}
+
+// Listen to one audio element, once: whichever plays is the one the popup
+// mirrors from then on, and only that one's pause, seek and end move it.
+function _cvFollow(audio) {
+  if (!audio || _cvFollowed.has(audio)) return;
+  _cvFollowed.add(audio);
+  audio.addEventListener('play', () => { _cvFollowEl = audio; _cvKick(); });
+  for (const ev of ['pause', 'seeked', 'ended']) {
+    audio.addEventListener(ev, () => { if (_cvAudio() === audio) _cvKick(); });
+  }
   // Safety net, as on the main viewer: restart the loop if a frame was lost.
-  audio.addEventListener('timeupdate', () => { if (!audio.paused && !_cvRAF) _cvStart(); });
+  audio.addEventListener('timeupdate', () => {
+    if (_cvAudio() === audio && !audio.paused && !_cvRAF) _cvStart();
+  });
 }
 
 // What the popup shows over the video: a loading or error message, the
@@ -9432,6 +9449,7 @@ function showCleanupVideoPopup() {
   const popup = _cleanupVideoPopupEl();
   if (!popup) return;
   if (!_cleanupVideoEnsureLoaded()) return;
+  _cvUndock();
   popup.hidden = false;  // unhide first so offsetWidth/Height read correctly
   _cleanupVideoApplySavedPosition();
   _cleanupVideoEnsureDragWired();
@@ -9447,6 +9465,7 @@ function closeCleanupVideoPopup() {
   popup.hidden = true;
   _cvStop();
   _cvResetZoom();
+  _cvUndock();
   _cleanupVideoUserClosed = true;
   if (typeof savePref === 'function') savePref('cleanup_video_open', false);
   _cleanupVideoSyncToggleBtn();
@@ -9457,6 +9476,133 @@ function toggleCleanupVideoPopup() {
   if (!popup) return;
   if (popup.hidden) showCleanupVideoPopup();
   else closeCleanupVideoPopup();
+}
+
+// ── The Identify tab's preview: docked beside the speaker being played ──────
+// The same popup and the same sync. A play button on the Identify tab asks for
+// it (showIdentifyVideoPreview) and it opens when that voice sample starts
+// playing, beside the row, in the room right of the dialog, sized to fill it.
+// It moves to each row played next until it is dragged or resized by hand;
+// then it stays put until it closes. It never saves Cleanup's position.
+let _cvPendingDock = null;   // {anchor, token}: the row whose sample is about to play
+let _cvDock = null;          // {anchor} while docked and not moved by hand
+
+// Called right after playSpeakerVoice() started the row's sample (the
+// recording starts loading now). The sample's token is kept, so a stop or
+// another sample before this one plays opens nothing.
+function showIdentifyVideoPreview(anchor) {
+  if (!anchor || !_cleanupVideoAvailable() || !_cleanupVideoEnsureLoaded()) return false;
+  const voice = _voiceAudioEl(state.sessionId);
+  _cvFollow(voice);
+  voice.addEventListener('play', _cvOnVoicePlay);
+  _cvPendingDock = { anchor, token: _voicePlayToken };
+  return true;
+}
+
+function closeIdentifyVideoPreview() {
+  _cvPendingDock = null;
+  if (_cvShown()) closeCleanupVideoPopup();
+}
+
+// The sample the row asked for has started: open beside it, or move there.
+function _cvOnVoicePlay() {
+  const pending = _cvPendingDock;
+  _cvPendingDock = null;
+  const popup = _cleanupVideoPopupEl();
+  if (!pending || pending.token !== _voicePlayToken || !popup) return;
+  const anchor = pending.anchor;
+  if (popup.hidden) {
+    popup.classList.add('is-docked');
+    _cvDock = { anchor };
+    popup.hidden = false;
+    _cvDockBeside(anchor, false);
+  } else if (popup.classList.contains('is-docked') && _cvDock) {
+    _cvDock.anchor = anchor;
+    _cvDockBeside(anchor, true);
+  }
+  // Otherwise it was placed by hand, or opened from Cleanup: it stays there.
+  const v = _cleanupVideoEl();
+  if (v && !(v.videoWidth > 0)) v.addEventListener('loadedmetadata', _cvRedock, { once: true });
+  _cleanupVideoEnsureDragWired();
+  _cleanupVideoUserClosed = false;
+  _cleanupVideoSyncToggleBtn();
+  _cvKick();
+}
+
+function _cvUndock() {
+  const popup = _cleanupVideoPopupEl();
+  if (popup) popup.classList.remove('is-docked', 'is-gliding');
+  _cvDock = null;
+}
+
+// Fit the docked popup again: the recording's shape became known, or the
+// window changed size (browser zoom included).
+function _cvRedock() {
+  if (_cvDock && _cvShown()) _cvDockBeside(_cvDock.anchor, false);
+}
+
+// Right of the dialog, as wide as the room there allows at the recording's
+// shape, centred on the row. Left of it when only the left has room. With no
+// room either side it overlaps the dialog's right edge at a usable size,
+// above or below the row so the row's own buttons stay clear.
+function _cvDockBeside(anchor, glide) {
+  const popup = _cleanupVideoPopupEl();
+  const dialog = document.querySelector('#speaker-manager-overlay .speaker-manager-dialog');
+  if (!popup || !dialog) return;
+  const v = _cleanupVideoEl();
+  const aspect = v && v.videoWidth > 0 && v.videoHeight > 0 ? v.videoWidth / v.videoHeight : 16 / 9;
+  const head = document.getElementById('cleanup-video-header')?.offsetHeight || 28;
+  const M = 12, GAP = 14, MIN_W = 280, LOOSE_W = 420;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const d = dialog.getBoundingClientRect();
+  const fit = room => {
+    const w = Math.max(240, Math.min(room, (vh - 2 * M - head) * aspect));
+    return [w, w / aspect + head];
+  };
+  const a = anchor.isConnected ? anchor.getBoundingClientRect() : null;
+  const mid = a ? a.top + a.height / 2 : popup.getBoundingClientRect().top + popup.offsetHeight / 2;
+  const right = vw - d.right - GAP - M;
+  const left = d.left - GAP - M;
+  let w, h, x, y;
+  if (right >= MIN_W || (left < MIN_W && right >= left && right >= 240)) {
+    [w, h] = fit(right);
+    x = d.right + GAP;
+    y = mid - h / 2;
+  } else if (left >= MIN_W) {
+    [w, h] = fit(left);
+    x = d.left - GAP - w;
+    y = mid - h / 2;
+  } else {
+    [w, h] = fit(Math.min(LOOSE_W, vw - 2 * M));
+    x = vw - M - w;
+    const top = a ? a.top : mid, bottom = a ? a.bottom : mid;
+    y = vh - bottom - GAP - M >= h ? bottom + GAP
+      : top - GAP - M >= h ? top - GAP - h
+      : mid - h / 2;
+  }
+  y = Math.max(M, Math.min(y, vh - M - h));
+  popup.classList.toggle('is-gliding', !!glide);
+  popup.style.width = `${Math.round(w)}px`;
+  popup.style.height = `${Math.round(h)}px`;
+  popup.style.left = `${Math.round(x)}px`;
+  popup.style.top = `${Math.round(y)}px`;
+  popup.style.right = 'auto';
+  _cvClampPan();
+  _cvApplyZoom();
+}
+
+window.addEventListener('resize', _cvRedock);
+
+// Moved or resized by hand: Cleanup's preview remembers where; the docked
+// one stops following the rows and stays there until it closes.
+function _cleanupVideoPlacedByHand() {
+  const popup = _cleanupVideoPopupEl();
+  if (popup && popup.classList.contains('is-docked')) {
+    popup.classList.remove('is-gliding');
+    _cvDock = null;
+  } else {
+    _cleanupVideoSavePosition();
+  }
 }
 
 function _cvVideoTime(audioTime) {
@@ -9631,6 +9777,7 @@ function _cleanupVideoEnsureDragWired() {
     if (e.button !== 0) return;
     const r = popup.getBoundingClientRect();
     dragStart = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+    popup.classList.remove('is-gliding');
     popup.classList.add('dragging');
     e.preventDefault();
   });
@@ -9641,6 +9788,7 @@ function _cleanupVideoEnsureDragWired() {
     if (e.button !== 0) return;
     const r = popup.getBoundingClientRect();
     resizeStart = { x: e.clientX, y: e.clientY, width: r.width, height: r.height };
+    popup.classList.remove('is-gliding');
     e.preventDefault();
     e.stopPropagation();
   });
@@ -9679,15 +9827,17 @@ function _cleanupVideoEnsureDragWired() {
       _cvApplyZoom();
     }
   });
-  document.addEventListener('mouseup', () => {
+  document.addEventListener('mouseup', (e) => {
     if (dragStart) {
+      // A press on the header that never moved is not a placement.
+      const moved = Math.abs(e.clientX - dragStart.x) + Math.abs(e.clientY - dragStart.y) > 3;
       dragStart = null;
       popup.classList.remove('dragging');
-      _cleanupVideoSavePosition();
+      if (moved) _cleanupVideoPlacedByHand();
     }
     if (resizeStart) {
       resizeStart = null;
-      _cleanupVideoSavePosition();
+      _cleanupVideoPlacedByHand();
     }
     if (panStart) {
       panStart = null;
@@ -11691,14 +11841,17 @@ function _pickVoiceClips(segments, opts) {
  * keep only segments whose source really is one of those keys. */
 async function _fetchVoiceSegments(sessionId, speakerKeys) {
   const wanted = new Set((speakerKeys || []).map(k => String(k).trim().toLowerCase()));
-  const segs = [];
-  for (const key of (speakerKeys || [])) {
+  // All the keys at once: one after another, a three-voice person waited for
+  // three round trips before a sound.
+  const pages = await Promise.all((speakerKeys || []).map(async key => {
     const url = `/api/agent/v1/meetings/${encodeURIComponent(sessionId)}/transcript` +
       `?speaker=${encodeURIComponent(key)}&format=json&limit=60`;
-    let data;
-    try { const r = await fetch(url); if (!r.ok) continue; data = await r.json(); }
-    catch (_) { continue; }
-    for (const s of (data.segments || [])) {
+    try { const r = await fetch(url); return r.ok ? await r.json() : null; }
+    catch (_) { return null; }
+  }));
+  const segs = [];
+  for (const data of pages) {
+    for (const s of ((data && data.segments) || [])) {
       const src = String(s.source || '').trim().toLowerCase();
       if (src && !wanted.has(src)) continue;   // matcher can leak on name-substring
       segs.push(s);
@@ -11787,6 +11940,8 @@ async function playSpeakerVoice(opts) {
 // Exposed on window for scripts loaded separately from this file.
 window.playSpeakerVoice = playSpeakerVoice;
 window.stopSpeakerVoice = stopSpeakerVoice;
+window.showIdentifyVideoPreview = showIdentifyVideoPreview;
+window.closeIdentifyVideoPreview = closeIdentifyVideoPreview;
 
 /* ── Shared modal header, status line and tab badges ────────────────────────
  * All three tabs describe the same set of speakers, so the header states that
@@ -12645,18 +12800,23 @@ function _applyNoiseStyle(seg, badge, segId) {
 }
 
 // Mark all DOM segments for a speaker_key as noise and persist overrides.
+// The transcript changes at once; the returned promise settles once every
+// line's override is written, so a caller that reads the speakers back (the
+// Identify tab) reads them after the change rather than before it.
 async function _markSpeakerAsNoise(speakerKey) {
   _manualNoiseKeys.add(speakerKey);
   const segs = [...document.querySelectorAll(`#transcript .transcript-segment[data-transcript-source="${speakerKey}"]`)];
+  const writes = [];
   for (const seg of segs) {
     const badge = seg.querySelector('.src-badge');
     const segId = seg.dataset.segId || badge?.dataset.segId;
     if (badge) _applyNoiseStyle(seg, badge, segId);
-    if (segId) persistSegmentOverride(segId, _NOISE_LABEL).catch(() => {});
+    if (segId) writes.push(persistSegmentOverride(segId, _NOISE_LABEL).catch(() => {}));
   }
   applyTranscriptFilter();
   _tnRefreshSpeakerPills();
   _tnRefreshReassignDropdowns();
+  await Promise.all(writes);
 }
 
 // Mark a single segment as noise and persist the override.
@@ -13523,7 +13683,7 @@ async function tnApplyReassign() {
   if (toName === _NOISE_LABEL) {
     // Collect unique speaker_keys from target segments and mark them as noise
     const keys = new Set(targets.map(s => s.dataset.transcriptSource).filter(Boolean));
-    for (const k of keys) await _markSpeakerAsNoise(k);
+    await Promise.all([...keys].map(k => _markSpeakerAsNoise(k)));
   } else {
     for (const seg of targets) {
       const badge = seg.querySelector('.src-speaker');
