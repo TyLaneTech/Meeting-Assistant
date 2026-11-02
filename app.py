@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, stream_with_context
 import flask.cli
+from werkzeug.serving import ThreadedWSGIServer
 
 # ── Suppress Flask / werkzeug console noise ────────────────────────────────────
 # Kill the startup banner ("Serving Flask app", "Running on ...", CTRL+C hint)
@@ -66,6 +67,7 @@ from core import storage_api as storage_api
 from core import changelog as changelog
 from core import dashboard_api as dashboard_api
 from core import heartbeat as heartbeat
+from core import frozen_instance as frozen_instance
 from core import icons as icons
 from core import icons_api as icons_api
 from core import updater as updater
@@ -2494,7 +2496,10 @@ def _stop_heartbeat() -> None:
         pass
 
 
-threading.Thread(target=_heartbeat_loop, daemon=True).start()
+# _heartbeat_loop is started by main() once this process holds the port, not
+# here at import: a launch still deciding whether to take over reads the other
+# instance's heartbeat (_settle_silent_port), and one that aborts must not
+# leave its own pid in the file for the watchdog.
 
 
 # ── "Me" speaker (microphone = app user) ──────────────────────────────────────
@@ -12947,15 +12952,23 @@ def _handshake_existing_instance(url: str) -> bool:
     """
     import urllib.request
     opener = _local_opener()
+    req = urllib.request.Request(
+        f"{url}/api/instance-handshake", data=b"{}",
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
     try:
-        req = urllib.request.Request(
-            f"{url}/api/instance-handshake", data=b"{}",
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        resp = opener.open(req, timeout=3)
-        data = json.loads(resp.read())
+        data = json.loads(opener.open(req, timeout=3).read())
     except Exception:
-        return True  # nothing listening — port is free
+        # No answer. Almost always nothing is listening, but a frozen instance
+        # accepts the connection and never replies, which fails the same way.
+        settled = _settle_silent_port(url)
+        if settled != "answering":
+            return settled == "free"
+        try:
+            data = json.loads(opener.open(req, timeout=3).read())
+        except Exception:
+            log.error("app", "Another instance answered once, then stopped answering. Aborting.")
+            return False
 
     # "busy" covers a reanalysis as well as a recording; "recording" alone is
     # what an instance older than that change reports.
@@ -12998,6 +13011,55 @@ def _handshake_existing_instance(url: str) -> bool:
     return False
 
 
+# How long a launch waits on a port that is held but silent before giving up:
+# long enough for a heartbeat that has only just stopped to count as frozen.
+_SILENT_PORT_PATIENCE_SEC = frozen_instance.FROZEN_AFTER_SEC + 15
+
+
+def _settle_silent_port(url: str) -> str:
+    """What holds our port, once the handshake got no answer.
+
+    "free": nothing does (a cold start, the usual case), or it was a frozen
+    instance of this app and has been ended. "answering": an instance answered
+    while we waited, so it was busy rather than frozen. "held": the port stays
+    taken by something this launch will not end. core/frozen_instance.py says
+    what counts as frozen; anything short of that is waited on, never ended.
+    """
+    port = int(url.rsplit(":", 1)[-1])
+    if frozen_instance.port_is_free(port):
+        return "free"
+    opener = _local_opener()
+    ended = False
+    give_up = time.monotonic() + _SILENT_PORT_PATIENCE_SEC
+    while True:
+        holder = None if ended else frozen_instance.frozen_holder(port)
+        if holder:
+            pid, age = holder
+            log.warn("app", f"The previous instance (pid {pid}) holds port {port} and stopped "
+                            f"responding {age:.0f} s ago; ending it.")
+            frozen_instance.end(pid)
+            heartbeat.clear()   # or the watchdog counts its dead pid as a crash and relaunches
+            ended = True
+        try:
+            opener.open(f"{url}/api/status", timeout=2)
+            return "answering"
+        except Exception:
+            pass
+        if frozen_instance.port_is_free(port):
+            if ended:
+                log.info("app", "Previous instance ended.")
+            return "free"
+        if time.monotonic() >= give_up:
+            break
+        time.sleep(1)
+    pids = ", ".join(str(p) for p in sorted(frozen_instance.listening_pids(port))) or "unknown"
+    log.error("app", f"Port {port} is held by a process that does not answer (pid {pids}). "
+                     "Aborting rather than starting beside it.")
+    print(f"\n  *** Port {port} is held by a process that does not answer (pid {pids}). ***")
+    print("  *** Quit it or end it in Task Manager, then start Meeting Assistant again. ***\n")
+    return "held"
+
+
 def _keepalive_loop() -> None:
     """Keep the main thread alive in a Python-level loop so signal handlers
     (Ctrl+C) can fire.  threading.Event.wait() with a timeout releases the GIL
@@ -13008,6 +13070,20 @@ def _keepalive_loop() -> None:
             pass
     except KeyboardInterrupt:
         _force_quit()
+
+
+class _LocalServer(ThreadedWSGIServer):
+    """The server app.run() built, without SO_REUSEADDR on Windows.
+
+    Windows lets a socket with SO_REUSEADDR bind an address that another socket
+    with the flag is still listening on. Werkzeug sets it, so on 2026-11-02 a
+    launch came up beside a frozen instance and connections went to either one.
+    Without it the bind fails, and so does any later SO_REUSEADDR bind beside
+    this server. POSIX keeps the flag: there it only gets a bind past TIME_WAIT,
+    never past a listener. Windows needs no help with TIME_WAIT (a plain bind
+    succeeded beside five, measured).
+    """
+    allow_reuse_address = sys.platform != "win32"
 
 
 def _serve_ipv6_loopback(port: int) -> None:
@@ -13077,11 +13153,14 @@ def main() -> None:
         from capture_audio.windows import prewarm_loopback_helper
         prewarm_loopback_helper()
 
-    # Start Flask in a daemon thread so the main thread is free for the tray
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, threaded=True),
-        daemon=True,
-    )
+    # Bind here, on the main thread, and serve from a daemon thread so the main
+    # thread is free for the tray. A port this process cannot have now ends it
+    # (Werkzeug's sys.exit(1)); inside app.run() on the thread it ended only the
+    # server, and the instance went on loading models with no way to reach it.
+    server = _LocalServer("127.0.0.1", port, app)
+    # The port is ours, so the watchdog's heartbeat is too (see _heartbeat_loop).
+    threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat").start()
+    flask_thread = threading.Thread(target=server.serve_forever, daemon=True, name="http")
     flask_thread.start()
     threading.Thread(target=_serve_ipv6_loopback, args=(port,), daemon=True,
                      name="http-ipv6").start()

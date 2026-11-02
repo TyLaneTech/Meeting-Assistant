@@ -118,7 +118,7 @@ def test_a_taken_ipv6_port_is_logged_not_fatal():
 
 def test_main_starts_it_beside_the_ipv4_server():
     main = _fn(APP_PY, "\ndef main(", '\nif __name__ == "__main__":')
-    v4 = main.index('app.run(host="127.0.0.1"')
+    v4 = main.index('_LocalServer("127.0.0.1"')
     v6 = main.index("target=_serve_ipv6_loopback")
     assert v4 < v6
     # Its own daemon thread: a failure there must not touch the app's start.
