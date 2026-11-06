@@ -18,6 +18,7 @@ Nothing else is ended. An instance whose heartbeat still advances is alive
 never wrote our heartbeat is not ours to end.
 """
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -30,6 +31,17 @@ from core import heartbeat
 FROZEN_AFTER_SEC = 30.0
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Where macOS keeps lsof and pkill. An app opened from Finder gets a minimal PATH
+# that can leave out /usr/sbin, and a failed lookup reads as "no listener".
+_SYSTEM_TOOL_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def _system_tool(name: str) -> str:
+    """Full path of a system tool, looked for in the system folders and then on
+    PATH. The bare name if it is in neither, which fails as a missing tool does."""
+    search = os.pathsep.join((*_SYSTEM_TOOL_DIRS, os.environ.get("PATH") or os.defpath))
+    return shutil.which(name, path=search) or name
 
 
 def port_is_free(port: int) -> bool:
@@ -69,7 +81,7 @@ def listening_pids(port: int) -> set[int]:
                     pids.add(int(parts[4]))
         else:
             out = subprocess.run(
-                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                [_system_tool("lsof"), "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
                 capture_output=True, text=True, timeout=10,
             ).stdout
             pids.update(int(p) for p in out.split() if p.isdigit())
@@ -115,8 +127,11 @@ def end(pid: int) -> None:
                 capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW,
             )
         else:
-            subprocess.run(["pkill", "-KILL", "-P", str(int(pid))],
-                           capture_output=True, timeout=10)
+            try:
+                subprocess.run([_system_tool("pkill"), "-KILL", "-P", str(int(pid))],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass  # no reason to spare the process itself
             os.kill(int(pid), signal.SIGKILL)
     except Exception:
         pass

@@ -16,11 +16,13 @@ against stand-ins.
 Run: .venv/Scripts/python.exe -m pytest tests/test_frozen_instance.py -q
 """
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.request
 from pathlib import Path
 
@@ -100,6 +102,80 @@ def test_listening_pids_finds_the_listener_and_only_the_listener():
     finally:
         a.close()
         c.close()
+
+
+# ── A Mac app opened from Finder ──────────────────────────────────────────────
+# Its minimal PATH can leave out /usr/sbin, where lsof lives. The failure was
+# silent: the except in listening_pids() swallowed FileNotFoundError, the pid set
+# came back empty, and a frozen instance was reported as "pid unknown" and never
+# replaced. These run on any OS: the platform and the tools are stood in for.
+
+def _system_dirs_only_which(name, path=None):
+    """shutil.which on a Mac where these tools exist only in the system folders."""
+    return f"/usr/sbin/{name}" if "/usr/sbin" in (path or "").split(os.pathsep) else None
+
+
+def _run_with_no_tool_on_path(calls, stdout=""):
+    """subprocess.run when PATH has none of these tools: a bare name is not found."""
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if not cmd[0].startswith("/"):
+            raise FileNotFoundError(cmd[0])
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+    return run
+
+
+@pytest.fixture
+def mac(monkeypatch):
+    monkeypatch.setattr(frozen_instance, "sys", types.SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(frozen_instance, "signal", types.SimpleNamespace(SIGKILL=9))
+    monkeypatch.setenv("PATH", "/opt/homebrew/bin")
+    return monkeypatch
+
+
+def test_listening_pids_finds_lsof_when_path_leaves_it_out(mac):
+    calls = []
+    mac.setattr(shutil, "which", _system_dirs_only_which)
+    mac.setattr(subprocess, "run", _run_with_no_tool_on_path(calls, stdout="123\n456\n"))
+    assert frozen_instance.listening_pids(6969) == {123, 456}
+    assert calls[0][0] == "/usr/sbin/lsof"
+
+
+def test_a_tool_that_is_nowhere_still_reads_as_unknown(mac):
+    mac.setattr(shutil, "which", lambda name, path=None: None)
+    mac.setattr(subprocess, "run", _run_with_no_tool_on_path([]))
+    assert frozen_instance.listening_pids(6969) == set()
+
+
+def test_the_system_folders_are_searched_with_the_real_lookup(monkeypatch, tmp_path):
+    tool = tmp_path / ("lsof.exe" if sys.platform == "win32" else "lsof")
+    tool.write_text("")
+    tool.chmod(0o755)
+    monkeypatch.setattr(frozen_instance, "_SYSTEM_TOOL_DIRS", (str(tmp_path),))
+    monkeypatch.setenv("PATH", str(tmp_path / "not-here"))
+    assert Path(frozen_instance._system_tool("lsof")) == tool
+
+
+@pytest.mark.parametrize("failure", [
+    None,
+    FileNotFoundError("pkill"),
+    subprocess.TimeoutExpired("pkill", 10),
+], ids=["pkill-works", "pkill-missing", "pkill-hangs"])
+def test_end_kills_the_process_whatever_pkill_does(mac, failure):
+    """Its children go first, but they are no reason to spare the process itself."""
+    order = []
+
+    def run(cmd, **kwargs):
+        order.append(("run", cmd[0], cmd[1:]))
+        if failure:
+            raise failure
+        return subprocess.CompletedProcess(cmd, 0)
+
+    mac.setattr(shutil, "which", _system_dirs_only_which)
+    mac.setattr(subprocess, "run", run)
+    mac.setattr(os, "kill", lambda pid, sig: order.append(("kill", pid, sig)))
+    frozen_instance.end(4242)
+    assert order == [("run", "/usr/sbin/pkill", ["-KILL", "-P", "4242"]), ("kill", 4242, 9)]
 
 
 # ── Which instance counts as frozen ───────────────────────────────────────────
