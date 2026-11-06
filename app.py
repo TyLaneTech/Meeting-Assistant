@@ -332,6 +332,7 @@ _state: dict = {
     "audio_capture": None,
     "test_capture": None,    # lightweight capture used only for visualizer testing
     "is_testing": False,
+    "test_start": None,      # {"at": monotonic} while an audio test start is in progress
     "model_ready": False,
     "model_info": "",
     "diarizer_ready": False,
@@ -458,17 +459,62 @@ def _speaker_summary_update_context(rename_changes: list[tuple[str, str]]) -> st
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
 
+def _end_sse_stream(q: queue.Queue) -> None:
+    """Tell a client's stream to close once it has sent what is queued.
+
+    A client dropped from _client_queues gets no more events, so its stream has
+    to end: left open, it sends heartbeats forever, EventSource never reports an
+    error, and the page sits on flat meters and a blank transcript while the
+    recording carries on. Ending it lets the page reconnect and replay.
+
+    The whole queue goes, not just enough for the marker. The page replays from
+    the last line it saw, so sending a later line after dropping an earlier one
+    would leave a hole in its transcript."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
+    q.put_nowait(None)
+
+
+def _queue_for_client(q: queue.Queue, msg: str) -> None:
+    """Queue a handshake event without blocking. A client that fills up before its
+    stream starts is closed by the next _push, and catches up when it reconnects."""
+    try:
+        q.put_nowait(msg)
+    except queue.Full:
+        pass
+
+
+def _sse_messages(q: queue.Queue):
+    """Yield a client's queued events, with a heartbeat when idle, until the end marker."""
+    while True:
+        try:
+            msg = q.get(timeout=25)
+        except queue.Empty:
+            yield ": heartbeat\n\n"
+            continue
+        if msg is None:
+            return
+        yield msg
+
+
 def _push(event: str, data: dict) -> None:
     msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    dead = []
     with _cq_lock:
-        dead = []
         for cid, q in _client_queues.items():
             try:
                 q.put_nowait(msg)
             except queue.Full:
-                dead.append(cid)
-        for cid in dead:
+                dead.append((cid, q))
+        for cid, q in dead:
             _client_queues.pop(cid, None)
+            _end_sse_stream(q)
+    if dead:
+        log.warn("sse", f"Closed {len(dead)} event stream(s) that fell behind; "
+                        "the page reconnects and catches up")
     # Keep tray icon in sync with status changes
     if event == "status":
         _refresh_tray()
@@ -2954,7 +3000,7 @@ def events():
     with _state_lock:
         active_sid = _state["session_id"] if _state["is_recording"] else None
     init = _status_payload()
-    q.put(f"event: status\ndata: {json.dumps(init)}\n\n")
+    _queue_for_client(q, f"event: status\ndata: {json.dumps(init)}\n\n")
 
     # A start command minted while no window was listening rides the handshake
     # into this freshly-loaded page. That is what lets an auto-detected meeting
@@ -2962,7 +3008,7 @@ def events():
     # cannot pass one to an --app-id PWA launch). Only this client gets it.
     pending_cmd = _start_coordinator.pending_command()
     if pending_cmd:
-        q.put(f"event: recording_command\ndata: {json.dumps(pending_cmd)}\n\n")
+        _queue_for_client(q, f"event: recording_command\ndata: {json.dumps(pending_cmd)}\n\n")
 
     # Replay active session so reconnecting clients catch up instantly
     if active_sid:
@@ -2979,17 +3025,13 @@ def events():
                     "summary":         sess.get("summary", "") or "",
                     "chapters":        sess.get("chapters", []),
                 }
-                q.put(f"event: replay\ndata: {json.dumps(replay_payload)}\n\n")
+                _queue_for_client(q, f"event: replay\ndata: {json.dumps(replay_payload)}\n\n")
         except Exception:
             pass  # non-fatal - client will simply have a partial transcript
 
     def generate():
         try:
-            while True:
-                try:
-                    yield q.get(timeout=25)
-                except queue.Empty:
-                    yield ": heartbeat\n\n"
+            yield from _sse_messages(q)
         except GeneratorExit:
             pass
         finally:
@@ -3233,41 +3275,80 @@ def start_audio_test():
             return jsonify({"error": "Cannot test while recording"}), 400
         if _state["is_testing"]:
             return jsonify({"error": "Already testing"}), 400
-
-    body = request.get_json(silent=True) or {}
-    loopback_device = body.get("loopback_device")
-    loopback_name   = body.get("loopback_device_name")
-    mic_device      = body.get("mic_device")
-    ffmpeg_mic_name = body.get("ffmpeg_mic_name")
-
-    # A dummy queue - the mixer writes into it but nothing reads it.
-    # We only care about the live loopback_level / mic_level attributes.
-    test_queue: queue.Queue = queue.Queue(maxsize=100)
-    capture = AudioCapture(test_queue)
-
-    # Apply audio processing settings so the test reflects real behavior
-    from capture_audio.params import resolve_audio_params
-    _params = resolve_audio_params()
-    capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
-    capture.noise_suppress_enabled = bool(int(_params.get("noise_suppress_enabled", 0)))
-    capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
-    capture.agc_mic_enabled = bool(int(_params.get("agc_mic_enabled", 0)))
-    capture.agc_target_rms = float(_params.get("agc_target_rms", 0.15))
-    capture.agc_max_gain = float(_params.get("agc_max_gain", 4.0))
-    capture.agc_gate_threshold = float(_params.get("agc_gate_threshold", 0.01))
+        if _state.get("is_starting"):
+            return jsonify({"error": "Cannot test while recording"}), 400
+        # capture.start() takes a moment and is_testing is only set after it, so
+        # a second request (a double click) would pass the checks above and open
+        # another capture. The one it replaced could then never be stopped. A
+        # reservation older than a minute is a wedged device open, not a start.
+        other = _state.get("test_start")
+        if other is not None and time.monotonic() - other["at"] < 60.0:
+            return jsonify({"error": "Already testing"}), 400
+        reservation = {"at": time.monotonic()}
+        _state["test_start"] = reservation
 
     try:
-        capture.start(loopback_index=loopback_device, mic_index=mic_device,
-                      ffmpeg_mic_name=ffmpeg_mic_name, loopback_name=loopback_name)
+        body = request.get_json(silent=True) or {}
+        loopback_device = body.get("loopback_device")
+        loopback_name   = body.get("loopback_device_name")
+        mic_device      = body.get("mic_device")
+        ffmpeg_mic_name = body.get("ffmpeg_mic_name")
+
+        # A dummy queue - the mixer writes into it but nothing reads it.
+        # We only care about the live loopback_level / mic_level attributes.
+        test_queue: queue.Queue = queue.Queue(maxsize=100)
+        capture = AudioCapture(test_queue)
+
+        # Apply audio processing settings so the test reflects real behavior
+        from capture_audio.params import resolve_audio_params
+        _params = resolve_audio_params()
+        capture.echo_cancel_enabled = bool(int(_params.get("echo_cancel_enabled", 0)))
+        capture.noise_suppress_enabled = bool(int(_params.get("noise_suppress_enabled", 0)))
+        capture.agc_loopback_enabled = bool(int(_params.get("agc_loopback_enabled", 0)))
+        capture.agc_mic_enabled = bool(int(_params.get("agc_mic_enabled", 0)))
+        capture.agc_target_rms = float(_params.get("agc_target_rms", 0.15))
+        capture.agc_max_gain = float(_params.get("agc_max_gain", 4.0))
+        capture.agc_gate_threshold = float(_params.get("agc_gate_threshold", 0.01))
+
+        try:
+            capture.start(loopback_index=loopback_device, mic_index=mic_device,
+                          ffmpeg_mic_name=ffmpeg_mic_name, loopback_name=loopback_name)
+        except Exception as e:
+            _stop_unused_capture(capture)
+            return jsonify({"error": str(e)}), 500
+
+        with _state_lock:
+            # A recording that began during the start above did not see this
+            # capture, so nothing else would ever stop it.
+            recording = _state["is_recording"] or _state.get("is_starting")
+            # A start that outlasted its reservation may have been replaced by a
+            # newer one, whose capture must not be overwritten.
+            overtaken = _state.get("test_start") is not reservation or _state["is_testing"]
+            if not recording and not overtaken:
+                _state["test_capture"] = capture
+                _state["is_testing"]   = True
+        if recording:
+            _stop_unused_capture(capture)
+            return jsonify({"error": "Cannot test while recording"}), 400
+        if overtaken:
+            _stop_unused_capture(capture)
+            return jsonify({"error": "Already testing"}), 400
+
+        _push("audio_test_status", {"testing": True})
+        return jsonify({"ok": True})
+    finally:
+        with _state_lock:
+            if _state.get("test_start") is reservation:
+                _state["test_start"] = None
+
+
+def _stop_unused_capture(capture) -> None:
+    """Close a capture whose start failed or was overtaken. Its streams may
+    already be open, and nothing else holds a reference that could stop them."""
+    try:
+        capture.stop(encode_per_source=False)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    with _state_lock:
-        _state["test_capture"] = capture
-        _state["is_testing"]   = True
-
-    _push("audio_test_status", {"testing": True})
-    return jsonify({"ok": True})
+        log.warn("audio", f"Could not stop an unused capture: {e}")
 
 
 @app.route("/api/audio/test/stop", methods=["POST"])
@@ -3348,6 +3429,7 @@ def start_recording():
     # recording. The pass itself re-checks is_starting before taking ownership.
     _post_meeting.cancel_for_recording()
 
+    opened_capture = None
     try:
         if test_cap:
             # Stop synchronously: the test capture's ffmpeg-dshow process is still
@@ -3520,10 +3602,11 @@ def start_recording():
             )
         except Exception as e:
             log.error("recording", f"Could not start capture: {e}")
-            capture.stop_wav()
+            _stop_unused_capture(capture)
             if not resume_session_id:
                 storage.end_session(session_id)
             return jsonify({"error": str(e)}), 500
+        opened_capture = capture  # stopped in the finally below until it goes live
 
         # Activate the "Me" mic stream only when the capture actually produced
         # per-source tracks (Windows + mic present). On platforms/paths without
@@ -3584,6 +3667,7 @@ def start_recording():
                 "recording_started_at_monotonic": now_mono,
                 "capture_silent": False,   # start healthy; the level loop flips this
             })
+        opened_capture = None  # the recording owns it now
         if defer_transcription:
             # Drain the bounded live queue while transcription is deferred so
             # unused PCM does not accumulate or count as a live overrun.
@@ -3675,8 +3759,18 @@ def start_recording():
         # Released however this returns: early error, exception, or a
         # started capture. A stuck reservation would lock out every later
         # start, which is worse than the race it prevents.
-        with _state_lock:
-            _state["is_starting"] = False
+        try:
+            # An error between opening the capture and the recording going live
+            # would otherwise leave it running with nothing able to stop it,
+            # feeding the shared _audio_queue that the next recording reads.
+            # Stopped before the release, so the next start can't open beside it.
+            if opened_capture is not None:
+                _stop_unused_capture(opened_capture)
+                if not resume_session_id:
+                    storage.end_session(session_id)
+        finally:
+            with _state_lock:
+                _state["is_starting"] = False
 
 
 def _settle_video_offset(session_id: str, capture, wav_at_start: float) -> None:

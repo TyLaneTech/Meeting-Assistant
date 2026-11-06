@@ -19,6 +19,15 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Fixed the live view freezing during a recording (2026-11-06)
+
+### Recording
+
+- **The meters and transcript** no longer stay frozen after the window falls behind; the window reconnects and catches up by itself.
+- **`No desktop audio for a minute`** no longer stays up because the window stopped updating while the call was still being recorded.
+- **`Test audio`** opens one capture when double-clicked, so it can no longer hold the microphone until the app quits.
+
+
 ## Improved the Identify tab and the app's speed (2026-10-30)
 
 ### Speakers

@@ -20454,7 +20454,20 @@ function saveDeviceSelection() {
   if (micSel) savePref('mic_device', micSel.value);
 }
 
+// A second click while the first request is out would start or stop a test that
+// is already on its way: state.isTesting only changes once the server reports it.
+let _audioTestBusy = false;
 async function toggleAudioTest() {
+  if (_audioTestBusy) return;
+  _audioTestBusy = true;
+  try {
+    await _toggleAudioTestNow();
+  } finally {
+    _audioTestBusy = false;
+  }
+}
+
+async function _toggleAudioTestNow() {
   if (state.isTesting) {
     try {
       await fetch('/api/audio/test/stop', { method: 'POST' });
@@ -20479,6 +20492,9 @@ async function toggleAudioTest() {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(body),
+      // A device open that never returns must not leave the button dead: the
+      // server gives up on that start after a minute.
+      signal:  AbortSignal.timeout(70000),
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));

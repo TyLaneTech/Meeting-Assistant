@@ -279,6 +279,7 @@ _state = {
     "audio_capture": AudioCapture | None,
     "test_capture": AudioCapture | None,
     "is_testing": bool,
+    "test_start": dict | None,     # {"at": monotonic} while an audio test start is in progress
     "model_ready": bool,
     "model_info": str,
     "diarizer_ready": bool,
@@ -324,6 +325,8 @@ es.addEventListener("event_name", e => {
     // handle it
 });
 ```
+
+**A client that falls behind has its stream ended, never left open:** `_push` drops a client whose 200-item queue is full and calls `_end_sse_stream()`, which clears the queue and queues the `None` end marker that makes `_sse_messages()` return. Left open, the stream sends heartbeats forever, `EventSource` never reports an error, and the page sits on flat meters and a blank transcript while the recording carries on. The whole queue goes because the page replays from the last line it saw: a later line sent after a dropped one would leave a hole. `GET /api/events` queues its handshake with `_queue_for_client()`, because a blocking put before the stream starts could hang the request.
 
 ### Event catalog
 
