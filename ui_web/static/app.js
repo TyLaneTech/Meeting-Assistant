@@ -20488,14 +20488,22 @@ async function _toggleAudioTestNow() {
     }
     Object.assign(body, parseMicSelection(micVal));
 
-    const resp = await fetch('/api/audio/test/start', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
-      // A device open that never returns must not leave the button dead: the
-      // server gives up on that start after a minute.
-      signal:  AbortSignal.timeout(70000),
-    });
+    let resp;
+    try {
+      resp = await fetch('/api/audio/test/start', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+        // A device open that never returns must not leave the button dead: the
+        // server gives up on that start after a minute.
+        signal:  AbortSignal.timeout(70000),
+      });
+    } catch (_) {
+      // Timed out or never reached the server. A start that still succeeds
+      // later reports itself over SSE.
+      uiToast({ message: 'The audio test did not start', kind: 'error' });
+      return;
+    }
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       uiToast({ message: err.error || 'Failed to start audio test', kind: 'error' });

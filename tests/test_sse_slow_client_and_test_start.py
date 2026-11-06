@@ -356,3 +356,11 @@ def test_the_test_button_ignores_a_click_while_its_request_is_out():
     # A start that never answers must not leave the button dead for good.
     start = APP_JS[APP_JS.index("fetch('/api/audio/test/start'"):][:500]
     assert "AbortSignal.timeout(" in start
+
+
+def test_a_start_that_times_out_says_so():
+    """The timeout rejects the fetch. Uncaught, a wedged device open looks like a
+    click that did nothing."""
+    src = APP_JS[APP_JS.index("fetch('/api/audio/test/start'"):]
+    handler = src[src.index("} catch"):src.index("if (!resp.ok)")]
+    assert "uiToast(" in handler and "return;" in handler
