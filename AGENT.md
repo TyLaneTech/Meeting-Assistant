@@ -113,7 +113,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/storage_api.py` | `/api/storage/*` blueprint: price a plan, start it, read the job, cancel it |
 | `core/attention.py` | The Needs attention queue: recordings whose speakers are still unnamed, against the calendar's expected count |
 | `core/reanalysis_guard.py` | Crash safety for the one operation that deletes a transcript before it has a replacement: writes `backups/{sid}/reanalysis-in-progress.json` before the clear, removes it on success, and `pending_session_ids()` is what the startup sweep rolls back. Separate from the trim/split snapshot on purpose |
-| `core/browser.py` | Opens the UI as an app window (Chrome/Edge `--app=` or the installed PWA) instead of a browser tab |
+| `core/browser.py` | Opens the UI as an app window (Chrome/Edge `--app=` or the installed PWA) instead of a browser tab; `open_hidden_page()` loads a page in a headless, muted Chrome/Edge for the tray's windowless start |
 | `core/app_window.py` | One app window. Every click that means "show me the app" (tray, toast, Start Menu) raises the window that is already open and sends it where the click was going over the `navigate` SSE; only when there is nothing to raise does it call `core/browser.py`. Unconfigured it opens a window as before, so `app_window.configure()` in app.py is what puts it in charge |
 | `core/window_focus.py` | Finds that window and raises it: on Windows a visible Chromium-class window, owned by a browser process, whose caption ENDS with `Meeting Assistant` (an ordinary browser window and an Electron editor both append their own name, so they are skipped); on macOS the same match through AppleScript. Best effort, never raises |
 | `core/calendar_feed.py` | Published-calendar (ICS) download, RRULE expansion, time zones, attendee parsing, URL masking |
@@ -121,6 +121,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/calendar_events_api.py` | `/api/calendar/events` blueprint behind the Calendar view; `event_key` / `find_instance` turn one opaque key back into its cached occurrence |
 | `core/mac_calendar.py` | macOS only: reads the Calendar app through EventKit for a `macos-calendar://` link and writes the events as ICS, so the published feed's parse, expand and match path runs unchanged (see Platform Notes) |
 | `core/meeting_links.py` | Finds a Teams/Zoom/Meet/Webex join link in a calendar event and hands it to the OS, preferring the desktop client's own URL scheme. The link is a credential and never reaches the browser |
+| `core/meeting_reminders.py` | Meeting reminders (opt-in): `due()` decides from the cached calendar which reminder shows now (pure, a fixed clock in tests), and `ReminderBook` keeps what was shown and which meetings were silenced in `<data>/meeting_reminders.json` |
 | `core/changelog.py` | Parses `CHANGELOG.md` into the entries the Changelog tab and What's new card show |
 | `core/updater.py` | Installs an update for `/api/update/apply`: stashes local edits, fast-forwards to the fetched `main`, pops them back on top; on a clash or any failure it restores the checkout exactly and says why |
 | `core/dashboard_api.py` | `/api/dashboard` blueprint: the Home dashboard's stats, charts and people queries; `/api/dashboard/storage` and `storage_report()`, the disk scan joined to the sessions table |
@@ -129,7 +130,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | `core/icons.py`, `core/icons_api.py` | Icon sets (Settings > Icons): per-state slots, tinting, PNG/ICO rendering, custom uploads, the tray and shortcut icons; `/api/icons/*` and the web manifest |
 | `core/obsidian_export.py` | Optional Markdown export of finished meetings into an Obsidian vault |
 | `core/speaker_journal.py` | The record of AI speaker changes (`speaker_changes`): before and after snapshots of the label rows and line overrides each touched, the voice samples and profiles it added, suggestions waiting to be accepted, and exact undo with a conflict check |
-| `core/recording_request.py` | Start-recording coordinator: offers the start to an already-open window over SSE, then the installed PWA, then a fresh `?autostart=1` window |
+| `core/recording_request.py` | Start-recording coordinator: offers the start to an already-open window over SSE, then (for the tray's windowless start) a hidden `?autostart=1` page, then the installed PWA, then a fresh `?autostart=1` window |
 | `core/shortcut.py` | Windows `.lnk` helpers shared by the launcher and the icon sync; only ever touches shortcuts that launch this checkout |
 
 ### `capture_audio/`: audio input
@@ -196,7 +197,7 @@ Code is organized into seven packages plus root-level entry points (`app.py`, `l
 | File | Responsibility |
 |---|---|
 | `ui_desktop/tray.py` | System tray icon (pystray + Pillow), dynamic menu, status indicators. Loads icons from `ui_web/static/images/`. |
-| `ui_desktop/notifications.py` | Every desktop notification the app sends (meeting detected, auto-started, quiet recording, capture alarm, start failed, test), each tagged so the app can replace or withdraw it. The app's own toast on Windows, `osascript` on macOS. |
+| `ui_desktop/notifications.py` | Every desktop notification the app sends (meeting detected, auto-started, quiet recording, capture alarm, start failed, meeting reminder, join failed, test), each tagged so the app can replace or withdraw it. The app's own toast on Windows, `osascript` on macOS. |
 | `ui_desktop/toast/` | The notification widget (Windows). `spec.py`: what a toast is (kinds, icons, buttons). `theme.py`: the palette, read from `style.css`'s theme blocks and the saved theme. `paint.py`: the card as an RGBA image (Pillow, Segoe UI, the bundled Font Awesome). `sounds.py`: the synthesised cues and `PlaySound`. `manager.py`: stacking, timing, hover, clicks, animation. `win32.py`: the layered windows and their thread. `python -m ui_desktop.toast` shows every kind. |
 
 ### `ui_web/`: Flask web UI assets
@@ -247,6 +248,7 @@ Daemon threads: Flask server (127.0.0.1, bound on the main thread by main()), an
                 Model/diarizer loading (on startup, on change)
                 Chat/summary generation
                 Recording cleanup
+                _meeting_reminder_loop() (opt-in reminders; looks every 10 s)
                 toast-ui: the notification windows and their message loop (ui_desktop/toast/win32.py)
 ```
 
@@ -650,6 +652,52 @@ launches it. `core/meeting_links.py` matches a host *and* a join path, because a
 Outlook invite is full of same-host links that are not the meeting (Meeting
 options, `aka.ms` help, Zoom's download and SIP lines).
 
+**Joining can record, the page's way:** the page's Join and a reminder's Join
+both go through `_join_calendar_event()` in app.py. Once the link opens, it
+silences the rest of that meeting's reminders, and with
+`calendar_join_autostart` on (`Settings > Calendar`, off by default) it calls
+`recording_request.request_start_async("join:<page|reminder>")`, so the open
+window takes the `recording_command` and starts through `startNewRecording()`,
+the same start Record makes. Never start a capture from the join path itself:
+that is the `?autostart` rule. A recording already running is left alone
+(`recording: "already"` in the answer, which the page's toast reports); it is
+not stopped to make room for the meeting being joined.
+
+**Meeting reminders:** opt-in (`meeting_reminders_enabled`, and only while the
+calendar is on). `_meeting_reminder_loop()` looks every 10 s, re-parsing the
+calendar cache only when its file changes, and `ReminderBook.take_due()` answers
+from `core/meeting_reminders.py`. `meeting_reminder_minutes` is any mix of
+`CHOICES` (minutes before the start, 0 is the start). Every reminder for one
+meeting shares the tag `meeting-reminder:<event key>`, so the next replaces the
+last. A moment missed by more than `LATE_GRACE` (asleep, not running) is
+settled without being shown, and when several are due together only the latest
+shows. `Silence this meeting` appears only while another reminder is still to
+come, and silencing is per occurrence (the event key), never the series.
+Shown and silenced marks live in `<data>/meeting_reminders.json`, not
+settings, so a restart repeats nothing and no preferences write can clobber
+them; they are dropped a day after the meeting ends. The log line carries the
+time, never the subject.
+
+**A stop from outside the page stays put:** the tray's `Stop Recording` and the
+`Still in the meeting?` notification's `Stop recording` only POST
+`/api/recording/stop` (with a `source` the stop log line names); neither raises
+or opens the app window. The notification's body is still how to open the
+meeting.
+
+**The tray's Start opens no window either:** it asks the coordinator with
+`show_window=False`. An open window still takes it at tier 1. With none
+answering, `_start_hidden()` loads the same `/session?autostart=1` page in a
+headless Chrome or Edge (`browser.open_hidden_page()`), so the page does the
+start exactly as it does on screen and the DirectShow rule holds. The hidden
+browser runs muted under a throwaway profile in `storage/hidden-browser/`
+(headless Chrome cannot share the user's profile; the page reads devices and
+settings from the server, so it needs nothing from one), and is closed
+`hidden_linger` seconds after the recording runs. It is closed *before* any
+visible tier opens, so it can never start a second recording beside one. No
+Chromium, a launch failure, or no answer falls through to tiers 2 and 3: a
+window appearing is better than a meeting going unrecorded. Other sources
+(meeting detect, joins, the Agent API) still open a window.
+
 **A calendar name is a chosen name:** with `calendar_title_from_event` on, a
 recording that starts inside a calendar meeting takes that meeting's subject and
 `title_user_set` is set, so the post-stop AI auto-title leaves it alone. Private
@@ -730,6 +778,7 @@ A published Outlook link has no login: anyone holding it reads every meeting. On
 storage/data/
 ├── meetings.db       # SQLite: sessions, segments, summaries, chat, speaker labels
 ├── settings.json     # User preferences (auto-created, human-readable JSON)
+├── meeting_reminders.json  # Which meeting reminders were shown or silenced (core/meeting_reminders.py)
 ├── audio/
 │   └── <session_id>.wav    # Recorded audio per session
 ├── video/

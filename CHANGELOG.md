@@ -19,6 +19,23 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Added meeting reminders and recording on join (2026-11-10)
+
+### Reminders
+
+- **Meeting reminders** in `Settings > Reminders` notify you before each meeting on your calendar, at any mix of times you pick.
+- **`Join`** on a reminder opens the meeting, and **`Silence this meeting`** turns off the rest of its reminders.
+
+### Calendar
+
+- **`Start recording when I join`** in `Settings > Calendar` starts a recording when you join a meeting from Home, the Calendar or a reminder.
+
+### Recording
+
+- **Starting or stopping a recording** from the tray icon no longer opens the app window, even when it is closed.
+- **Stopping a recording** from the `Still in the meeting?` notification leaves the app window where it is.
+
+
 ## Fixed the live view freezing during a recording (2026-11-06)
 
 ### Recording

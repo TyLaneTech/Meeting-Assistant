@@ -526,6 +526,35 @@
               <button class="btn-settings-action btn-settings-secondary" id="notify-test-btn" onclick="sendTestNotification()">Send a test notification</button>
             </div>
           </div>
+          <div class="settings-group-title">Meeting Reminders</div>
+          <div class="settings-group">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Remind Me Before Meetings</div>
+                <div class="settings-row-desc">A notification before each meeting on your calendar, with Join and a button that silences the rest of that meeting's reminders</div>
+                <div class="settings-row-desc meeting-reminders-note" id="meeting-reminders-calendar-note" hidden>Reminders come from your calendar, so turn it on in <a href="#" onclick="switchSettingsSection(document.querySelector('.settings-nav-item[data-target=section-calendar]')); return false;">Settings &gt; Calendar</a> too</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="meeting-reminders-enabled" onchange="saveMeetingReminderSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row reminder-times-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">When</div>
+                <div class="settings-row-desc">Minutes before the meeting starts. Pick one or more; each reminder replaces the one before it</div>
+              </div>
+              <div class="reminder-times" id="meeting-reminder-times" role="group" aria-label="When to remind me">
+                <button type="button" class="reminder-time" data-minutes="30" aria-pressed="false" onclick="toggleReminderTime(this)">30 min</button>
+                <button type="button" class="reminder-time" data-minutes="15" aria-pressed="false" onclick="toggleReminderTime(this)">15 min</button>
+                <button type="button" class="reminder-time" data-minutes="10" aria-pressed="false" onclick="toggleReminderTime(this)">10 min</button>
+                <button type="button" class="reminder-time" data-minutes="5" aria-pressed="false" onclick="toggleReminderTime(this)">5 min</button>
+                <button type="button" class="reminder-time" data-minutes="2" aria-pressed="false" onclick="toggleReminderTime(this)">2 min</button>
+                <button type="button" class="reminder-time" data-minutes="1" aria-pressed="false" onclick="toggleReminderTime(this)">1 min</button>
+                <button type="button" class="reminder-time" data-minutes="0" aria-pressed="false" onclick="toggleReminderTime(this)">At start</button>
+              </div>
+            </div>
+          </div>
           <div class="settings-group-title">Quiet Recording Reminder</div>
           <div class="settings-group">
             <div class="settings-row">
@@ -967,6 +996,19 @@
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="calendar-title-from-event" onchange="saveCalendarSettings()">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <div class="settings-row-label">Start recording when I join</div>
+                <div class="settings-row-desc">
+                  Joining a meeting from Home, the Calendar or a meeting reminder starts a
+                  recording too. A recording that is already running carries on.
+                </div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="calendar-join-autostart" onchange="saveCalendarSettings()">
                 <span class="toggle-slider"></span>
               </label>
             </div>

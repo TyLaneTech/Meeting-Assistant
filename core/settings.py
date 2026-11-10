@@ -127,6 +127,15 @@ DEFAULTS: dict = {
     # never finalizes, and no title / summary / Obsidian export is ever produced.
     # Only ever stops recordings that auto-start began, never a manual one.
     "meeting_detect_autostop": True,
+
+    # Meeting reminders (core/meeting_reminders.py). Opt-in: a notification
+    # before each meeting on the published calendar, so it also needs
+    # calendar_enabled. meeting_reminder_minutes is when, as minutes before the
+    # start (0 is at the start), any of meeting_reminders.CHOICES. Which
+    # reminders were shown and which meetings were silenced live in
+    # <data>/meeting_reminders.json, not here.
+    "meeting_reminders_enabled": False,
+    "meeting_reminder_minutes": [5, 0],
     # Chrome extension id of the installed Meeting Assistant PWA (the app the
     # taskbar pin launches, via app_launcher.vbs). When set, an auto-detected
     # meeting focuses THAT window instead of opening a second one: core/browser
@@ -273,6 +282,10 @@ DEFAULTS: dict = {
     # "Meeting <date> <time>". Off by default because it puts a subject line
     # from an external feed into the sidebar, exports and the vault.
     "calendar_title_from_event": False,
+    # Opt-in: joining a meeting from Home, the Calendar or a meeting reminder
+    # also starts a recording. The start goes through the start coordinator,
+    # so the page still performs it; a recording already running is left alone.
+    "calendar_join_autostart": False,
     "calendar_last_refresh": "",
     "calendar_last_error": "",
 

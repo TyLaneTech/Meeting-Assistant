@@ -187,8 +187,12 @@ def test_a_toast_click_lands_in_the_window_that_is_open():
     assert "browser.open_app_window(" not in notif
     quiet = notif[notif.index("def send_quiet_recording_toast("):
                   notif.index("def send_meeting_detected_toast(")]
-    # Both the toast body and its Stop button route back to the meeting.
-    assert quiet.count("app_window.show(") == 2
+    # The toast body routes back to the meeting. Its Stop button only stops:
+    # raising the window there put it over whatever the user had moved on to
+    # (tests/test_meeting_reminders.py drives it).
+    assert quiet.count("app_window.show(") == 1
+    stop = quiet[quiet.index("def _stop_recording("):]
+    assert "app_window.show(" not in stop
     started = notif[notif.index("def send_meeting_autostarted_toast("):]
     assert "app_window.show(" in started
 

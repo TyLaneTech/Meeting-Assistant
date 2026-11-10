@@ -449,11 +449,13 @@ class MeetingTray:
         if st.get("is_recording"):
             # Stop: POST on a daemon thread so the AppKit main run loop (which
             # invokes this callback on macOS) is never blocked on the socket.
+            # Stop only: the window stays where it is, closed or not, the same
+            # as when the meeting is stopped from its notification.
             def _do_stop() -> None:
                 try:
                     req = urllib.request.Request(
                         f"{self._url}/api/recording/stop",
-                        data=b"{}",
+                        data=b'{"source": "tray"}',
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
@@ -465,9 +467,10 @@ class MeetingTray:
             # Start: hand it to the start coordinator. The page still performs
             # the start (that is where device selection and the readiness gate
             # live), but the window the user already has open takes the command
-            # first, so the tray never spawns a second one.
-            # See core/recording_request.py.
-            recording_request.request_start_async("tray")
+            # first, so the tray never spawns a second one. With no window open
+            # the page runs hidden, so Start leaves the screen alone the same
+            # way Stop does. See core/recording_request.py.
+            recording_request.request_start_async("tray", show_window=False)
 
     def _test_toast(self, icon=None, item=None) -> None:
         """Send a notification to look at: visibility, theme and buttons.

@@ -11,6 +11,7 @@ Run: .venv/Scripts/python -m pytest tests/test_recording_request.py -q
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -553,6 +554,259 @@ def test_pwa_launch_is_skipped_without_the_installed_app_folder(monkeypatch, tmp
     monkeypatch.setattr(browser.subprocess, "Popen", lambda *a, **k: calls.append(a))
     assert browser._open_installed_pwa() is False
     assert calls == []
+
+
+# -- a start that asks for no window (the tray) ----------------------------------
+
+class FakePage:
+    """A hidden page: records whether it was closed and when."""
+
+    def __init__(self, clock=None) -> None:
+        self.closes = 0
+        self.clock = clock
+        self.closed_at = None
+
+    def close(self):
+        self.closes += 1
+        if self.clock:
+            self.closed_at = self.clock.t
+
+
+def _hidden_harness(clients=0, page="fresh", on_open=None):
+    """A harness whose open_hidden hands out one FakePage (or None)."""
+    opened = []
+    box = {}
+
+    def _open_hidden(url):
+        opened.append(url)
+        if page is None:
+            return None
+        box["page"] = FakePage(h.clock)
+        if on_open:
+            on_open(h)
+        return box["page"]
+
+    h = Harness(open_hidden=_open_hidden)
+    h.clients = clients
+    h.opened_hidden = opened
+    h.page = lambda: box.get("page")
+    return h
+
+
+def test_a_windowless_start_with_no_window_open_uses_a_hidden_page():
+    h = _hidden_harness(on_open=lambda h: h.coord.acknowledge(h.coord.pending_command()["nonce"],
+                                                               "hidden"))
+
+    result = h.coord.request_start("tray", show_window=False)
+
+    assert result["status"] == "started_by_client", result
+    assert result["acked"] is True
+    assert h.opened_hidden == [AUTOSTART_URL], "the hidden page is the ?autostart page"
+    assert h.windows == [], "no window may open"
+    assert h.page().closes == 0, "the page is still starting the recording"
+
+    # The watcher sees the recording, lets the page finish, then closes it.
+    h.recording_at = h.clock.t + 2.0
+    started_at = h.clock.t
+    h.spawned[0]()
+    assert h.page().closes == 1
+    assert h.page().closed_at >= started_at + 2.0 + h.coord.hidden_linger
+    assert h.windows == []
+    assert h.failures == []
+
+
+def test_a_hidden_page_that_starts_at_once_is_closed_after_its_linger():
+    def _open(h):
+        h.recording = True
+
+    h = _hidden_harness(on_open=_open)
+    result = h.coord.request_start("tray", show_window=False)
+
+    assert result["status"] == "started_by_client" and result["acked"] is False
+    assert h.page().closes == 0
+    assert len(h.spawned) == 1
+    before = h.clock.t
+    h.spawned[0]()
+    assert h.page().closes == 1
+    assert h.page().closed_at == before + h.coord.hidden_linger
+    assert h.windows == []
+
+
+def test_an_open_window_still_takes_a_windowless_start():
+    h = _hidden_harness(clients=1)
+    h.on_push = lambda d: h.coord.acknowledge(d["nonce"], "window")
+
+    result = h.coord.request_start("tray", show_window=False)
+
+    assert result["tier"] == 1
+    assert h.opened_hidden == [], "no hidden page when a window answered"
+    assert h.windows == []
+
+
+def test_a_normal_start_never_uses_a_hidden_page():
+    h = _hidden_harness()
+
+    def _window(url, prefer_pwa):
+        h.coord.acknowledge(h.coord.pending_command()["nonce"], "window")
+
+    h.on_window = _window
+    result = h.coord.request_start("toast:autostart")
+
+    assert result["tier"] == 2
+    assert h.opened_hidden == []
+    assert h.windows == [(SESSION_URL, True)]
+
+
+def test_no_hidden_browser_falls_back_to_the_app_window():
+    h = _hidden_harness(page=None)
+
+    def _window(url, prefer_pwa):
+        h.coord.acknowledge(h.coord.pending_command()["nonce"], "window")
+
+    h.on_window = _window
+    result = h.coord.request_start("tray", show_window=False)
+
+    assert h.opened_hidden == [AUTOSTART_URL]
+    assert h.windows == [(SESSION_URL, True)], "a meeting is never lost to a missing browser"
+    assert result["status"] == "started_by_client"
+    assert any("No hidden page available" in msg for _, msg in h.logs)
+
+
+def test_a_hidden_page_that_never_answers_is_closed_before_a_window_opens():
+    h = _hidden_harness()
+    seen = {}
+
+    def _window(url, prefer_pwa):
+        seen.setdefault("closed_first", h.page().closes == 1)
+        h.coord.acknowledge(h.coord.pending_command()["nonce"], "window")
+
+    h.on_window = _window
+    result = h.coord.request_start("tray", show_window=False)
+
+    assert seen["closed_first"] is True, "it could otherwise start a second recording"
+    assert h.windows == [(SESSION_URL, True)]
+    assert result["status"] == "started_by_client"
+    assert h.page().closes == 1
+
+
+def test_a_hidden_page_that_acks_but_never_starts_gives_way_to_the_autostart_window():
+    h = _hidden_harness(on_open=lambda h: h.coord.acknowledge(h.coord.pending_command()["nonce"],
+                                                               "hidden"))
+    seen = {}
+
+    def _window(url, prefer_pwa):
+        if url == AUTOSTART_URL:
+            seen["closed_first"] = h.page().closes == 1
+            h.recording = True
+
+    h.on_window = _window
+    h.coord.request_start("tray", show_window=False)
+    h.spawned[0]()
+
+    assert seen.get("closed_first") is True
+    assert h.windows == [(AUTOSTART_URL, False)]
+    assert h.page().closes == 1, "closed once, not again after the window started it"
+    assert h.failures == []
+
+
+def test_cancelling_a_windowless_start_closes_the_hidden_page():
+    h = _hidden_harness(on_open=lambda h: h.coord.cancel("user stopped it"))
+
+    result = h.coord.request_start("tray", show_window=False)
+
+    assert result["status"] == "cancelled"
+    assert h.page().closes == 1
+    assert h.windows == []
+
+
+def test_a_hidden_page_holds_the_request_in_flight_until_it_is_closed():
+    h = _hidden_harness(on_open=lambda h: h.coord.acknowledge(h.coord.pending_command()["nonce"],
+                                                               "hidden"))
+    h.coord.request_start("tray", show_window=False)
+    assert h.coord.request_start("agent_api")["status"] == "in_flight"
+    h.recording_at = h.clock.t
+    h.spawned[0]()
+    h.recording = False   # that meeting ended; a new request is a new request
+    assert h.coord.request_start("tray", show_window=False)["status"] != "in_flight"
+
+
+def test_the_hidden_page_is_a_headless_muted_browser_with_its_own_profile(monkeypatch, tmp_path):
+    from core import browser
+    calls = []
+
+    class _Proc:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(browser, "_chromium_path", lambda: r"C:\Chrome\chrome.exe")
+    monkeypatch.setattr(browser, "_HIDDEN_PROFILES", tmp_path / "hidden-browser")
+    monkeypatch.setattr(browser.subprocess, "Popen",
+                        lambda args, **kw: calls.append((args, kw)) or _Proc())
+
+    page = browser.open_hidden_page(AUTOSTART_URL)
+
+    assert isinstance(page, browser.HiddenPage)
+    args, kw = calls[0]
+    assert args[0] == r"C:\Chrome\chrome.exe"
+    assert "--headless=new" in args and "--mute-audio" in args
+    assert args[-1] == AUTOSTART_URL
+    profile = [a for a in args if a.startswith("--user-data-dir=")]
+    assert len(profile) == 1
+    assert profile[0].startswith(f"--user-data-dir={tmp_path / 'hidden-browser'}")
+    # Never the user's profile, and never an app window.
+    assert not any(a.startswith(("--profile-directory", "--app")) for a in args)
+    assert kw["stdout"] is browser.subprocess.DEVNULL
+    if sys.platform == "win32":
+        assert kw["creationflags"] == browser.subprocess.CREATE_NO_WINDOW
+
+
+def test_no_browser_means_no_hidden_page(monkeypatch):
+    from core import browser
+    monkeypatch.setattr(browser, "_chromium_path", lambda: None)
+    monkeypatch.setattr(browser.subprocess, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("launched")))
+    assert browser.open_hidden_page(AUTOSTART_URL) is None
+
+
+def test_closing_a_hidden_page_ends_its_browser_and_deletes_its_profile(tmp_path):
+    from core import browser
+
+    class _Proc:
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            return 0 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    profile = tmp_path / "abc"
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default" / "Preferences").write_text("{}")
+    proc = _Proc()
+    page = browser.HiddenPage(proc, profile)
+    page.close()
+    assert proc.killed
+    assert not profile.exists()
+    page.close()   # a second close is harmless
+
+
+def test_the_profile_sweep_leaves_a_page_that_is_still_running_alone(monkeypatch, tmp_path):
+    from core import browser
+    root = tmp_path / "hidden-browser"
+    old, fresh = root / "old", root / "fresh"
+    old.mkdir(parents=True)
+    fresh.mkdir()
+    stale = time.time() - 7200
+    os.utime(old, (stale, stale))
+    monkeypatch.setattr(browser, "_HIDDEN_PROFILES", root)
+    browser._sweep_hidden_profiles()
+    assert not old.exists()
+    assert fresh.exists()
 
 
 def test_a_request_during_the_watcher_is_coalesced():

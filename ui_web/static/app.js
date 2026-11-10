@@ -21166,6 +21166,7 @@ async function openSettings(section) {
     _updateSessionModelLabels();
     _renderQuietReminderSettings();
     _renderMeetingDetectSettings();
+    _renderMeetingReminderSettings();
     _renderNotifySettings();
     _renderWarpSettings();
     _renderMicIsMeSettings();
@@ -21265,6 +21266,67 @@ function saveMeetingDetectSettings() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates),
   }).catch(() => {});
+}
+
+/* ── Meeting reminders (Settings > Reminders) ─────────────────────────────── */
+// Minutes before the start, 0 being the start itself. The server keeps the
+// same list (core/meeting_reminders.py CHOICES) and drops anything else.
+const _REMINDER_CHOICES = [30, 15, 10, 5, 2, 1, 0];
+
+function _reminderMinutes() {
+  const raw = Array.isArray(_prefs.meeting_reminder_minutes) ? _prefs.meeting_reminder_minutes : [5, 0];
+  return raw.map(Number).filter(m => _REMINDER_CHOICES.includes(m));
+}
+
+function _renderMeetingReminderSettings() {
+  const toggle = document.getElementById('meeting-reminders-enabled');
+  if (!toggle) return;
+  const on = _prefs.meeting_reminders_enabled === true;
+  toggle.checked = on;
+  const picked = new Set(_reminderMinutes());
+  document.querySelectorAll('#meeting-reminder-times .reminder-time').forEach(btn => {
+    btn.setAttribute('aria-pressed', picked.has(Number(btn.dataset.minutes)) ? 'true' : 'false');
+    btn.disabled = !on;
+  });
+  // Reminders read the calendar, so with it off they would never show.
+  const note = document.getElementById('meeting-reminders-calendar-note');
+  if (note) note.hidden = !on || _prefs.calendar_enabled === true;
+}
+
+function _putPreferences(updates) {
+  Object.assign(_prefs, updates);
+  fetch('/api/preferences', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  }).catch(() => {});
+}
+
+function saveMeetingReminderSettings() {
+  _putPreferences({
+    meeting_reminders_enabled: document.getElementById('meeting-reminders-enabled')?.checked === true,
+  });
+  _renderMeetingReminderSettings();
+}
+
+/** A timing chip: add or drop that reminder. The last one stays, since none
+ *  at all is the same as reminders off and the switch above says that. */
+function toggleReminderTime(btn) {
+  if (!btn || btn.disabled) return;
+  const m = Number(btn.dataset.minutes);
+  const picked = new Set(_reminderMinutes());
+  if (picked.has(m)) {
+    if (picked.size === 1) {
+      uiToast({ message: 'Keep at least one reminder time, or turn reminders off.',
+                kind: 'info', id: 'reminder-times' });
+      return;
+    }
+    picked.delete(m);
+  } else {
+    picked.add(m);
+  }
+  _putPreferences({ meeting_reminder_minutes: _REMINDER_CHOICES.filter(x => picked.has(x)) });
+  _renderMeetingReminderSettings();
 }
 
 /* ── Desktop notifications (Settings > Reminders) ─────────────────────────── */
@@ -22568,16 +22630,24 @@ function saveObsidianSettings() {
 function calendarJoinButton(key, provider, label, cls) {
   if (!key || !provider) return '';
   const name = label || provider;
+  // With Settings > Calendar's "Start recording when I join" on, the button
+  // says so, since pressing it does more than open the meeting.
+  const records = _prefs.calendar_join_autostart === true;
+  const tip = records ? `Open this meeting in ${name} and start recording`
+                      : `Open this meeting in ${name}`;
   return `<button type="button" class="${cls}"`
     + ` data-join-key="${escapeHtml(key)}" data-join-label="${escapeHtml(name)}"`
-    + ` title="Open this meeting in ${escapeHtml(name)}"`
-    + ` aria-label="Join this meeting in ${escapeHtml(name)}"`
+    + ` title="${escapeHtml(tip)}"`
+    + ` aria-label="${escapeHtml(records ? `Join this meeting in ${name} and record it` : `Join this meeting in ${name}`)}"`
     + ` onclick="joinCalendarMeeting(this.dataset.joinKey, this.dataset.joinLabel, this)">Join</button>`;
 }
 
 /** Open one calendar meeting in its own app. The server tries the desktop
  *  client's URL scheme first and falls back to the browser, and says which
- *  one it used so the toast does not promise the wrong thing. */
+ *  one it used so the toast does not promise the wrong thing. With
+ *  calendar_join_autostart on, the server also asks this window (through the
+ *  start coordinator's recording_command) to start a recording, so the start
+ *  is the same one Record makes. */
 async function joinCalendarMeeting(key, label, btn) {
   if (!key || (btn && btn.disabled)) return;
   const what = label || 'the meeting';
@@ -22595,11 +22665,15 @@ async function joinCalendarMeeting(key, label, btn) {
       return;
     }
     const name = data.label || what;
+    const where = data.opened === 'browser' ? `${name} in your browser` : name;
+    const message = data.recording === 'starting'
+      ? `Opening ${where} and starting a recording…`
+      : data.recording === 'already'
+        ? `Opening ${where}. Already recording, so that recording carries on.`
+        : `Opening ${where}…`;
     uiToast({
-      message: data.opened === 'browser'
-        ? `Opening ${name} in your browser…`
-        : `Opening ${name}…`,
-      kind: 'success', id: 'calendar-join', duration: 2500,
+      message, kind: 'success', id: 'calendar-join',
+      duration: data.recording === 'already' ? 4000 : 2500,
     });
   } catch (_) {
     uiToast({ message: `Could not open ${what}.`, kind: 'error', id: 'calendar-join' });
@@ -22631,6 +22705,8 @@ async function loadCalendarStatus() {
   if (toggle) toggle.checked = !!st.enabled;
   const naming = document.getElementById('calendar-title-from-event');
   if (naming) naming.checked = !!st.title_from_event;
+  const joinRecords = document.getElementById('calendar-join-autostart');
+  if (joinRecords) joinRecords.checked = _prefs.calendar_join_autostart === true;
   const interval = document.getElementById('calendar-refresh-minutes');
   if (interval) interval.value = String(st.refresh_minutes || 60);
   const input = document.getElementById('calendar-ics-url');
@@ -22685,9 +22761,11 @@ function saveCalendarSettings() {
   const updates = {
     calendar_enabled: document.getElementById('calendar-enabled')?.checked === true,
     calendar_title_from_event: document.getElementById('calendar-title-from-event')?.checked === true,
+    calendar_join_autostart: document.getElementById('calendar-join-autostart')?.checked === true,
     calendar_refresh_minutes: parseInt(document.getElementById('calendar-refresh-minutes')?.value || '60', 10),
   };
   Object.assign(_prefs, updates);
+  _renderMeetingReminderSettings();   // its "turn the calendar on" note
   fetch('/api/preferences', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

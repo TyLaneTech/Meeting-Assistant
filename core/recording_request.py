@@ -24,6 +24,13 @@ a meeting can never be lost:
 Each tier runs in its own try, so a failure inside tier 1 or tier 2 falls
 through to tier 3 rather than skipping the proven path.
 
+A request made with ``show_window=False`` (the tray's Start) puts one more step
+between tiers 1 and 2: the same ``?autostart=1`` page, loaded in a hidden
+browser (core/browser.py ``open_hidden_page``). The page does the start exactly
+as it does in a window; nothing appears on screen; the hidden browser is closed
+once the recording is running. If it cannot be opened, or never answers, tiers
+2 and 3 follow as usual. A window showing up beats a meeting going unrecorded.
+
 An ack is not proof of a capture: the elected window can be closed, throw, or
 sit on a model that never loads. ``_confirm_started`` therefore watches the
 outcome, escalates to the tier-3 window once if the server has been ready for
@@ -57,6 +64,28 @@ def _default_spawn(fn: Callable[[], None]) -> None:
     threading.Thread(target=fn, daemon=True, name="record-confirm").start()
 
 
+class _HiddenPage:
+    """Closes the hidden page it wraps exactly once, whoever gets there first."""
+
+    def __init__(self, page) -> None:
+        self._page = page
+        self._lock = threading.Lock()
+
+    @property
+    def closed(self) -> bool:
+        return self._page is None
+
+    def close(self) -> None:
+        with self._lock:
+            page, self._page = self._page, None
+        if page is None:
+            return
+        try:
+            page.close()
+        except Exception:  # pragma: no cover - a page that will not close is not a lost start
+            pass
+
+
 class StartRequestCoordinator:
     """Owns the pending "start recording" command and the tier escalation.
 
@@ -69,6 +98,10 @@ class StartRequestCoordinator:
     ``client_count()`` is how many browser windows are listening, and
     ``is_ready()`` mirrors the recording_ready status field: both let the
     escalation tell "nobody is there" apart from "the model is still loading".
+    ``open_hidden(url)`` loads a page nobody can see and returns something with
+    ``close()``, or None; without it, ``show_window=False`` is ignored.
+    ``hidden_linger`` is how long a hidden page is kept once the recording
+    runs, so the page's own start request finishes before it goes.
     """
 
     def __init__(
@@ -84,6 +117,8 @@ class StartRequestCoordinator:
         client_count: Optional[Callable[[], int]] = None,
         is_ready: Optional[Callable[[], bool]] = None,
         on_failure: Optional[Callable[[str, str], None]] = None,
+        open_hidden: Optional[Callable[[str], object]] = None,
+        hidden_linger: float = 5.0,
         ack_wait_existing: float = 5.0,
         ack_wait_after_window: float = 20.0,
         ack_wait_after_autostart_window: float = 25.0,
@@ -105,6 +140,8 @@ class StartRequestCoordinator:
         self._client_count = client_count or (lambda: 1)
         self._is_ready = is_ready or (lambda: True)
         self._on_failure = on_failure or (lambda source, reason: None)
+        self._open_hidden = open_hidden
+        self.hidden_linger = float(hidden_linger)
 
         self.ack_wait_existing = float(ack_wait_existing)
         self.ack_wait_after_window = float(ack_wait_after_window)
@@ -124,12 +161,17 @@ class StartRequestCoordinator:
 
     # -- public API ----------------------------------------------------------
 
-    def request_start(self, source: str, reason: str = "") -> dict:
+    def request_start(self, source: str, reason: str = "", *,
+                      show_window: bool = True) -> dict:
         """Ask a client window to start recording, escalating until one does.
 
         Blocking (up to ~50 s worst case): run it on a worker thread. Returns a
         dict whose "status" is one of already_recording, in_flight,
         started_by_client, cancelled, failed.
+
+        ``show_window=False`` asks for the start without putting a window on
+        screen: when no open window takes it, a hidden page does (see the
+        module docstring). The visible tiers stay behind it.
         """
         if self._is_recording():
             return {"status": "already_recording", "source": source}
@@ -176,6 +218,11 @@ class StartRequestCoordinator:
             done = self._settle(outcome, tier=1, nonce=nonce, source=source)
             if done:
                 return done
+
+            if not show_window:
+                done = self._start_hidden(nonce, source)
+                if done:
+                    return done
 
             # Tier 2: open or focus the installed app window. The pending
             # command reaches it through the SSE handshake.
@@ -294,6 +341,50 @@ class StartRequestCoordinator:
         except Exception as e:  # pragma: no cover - a broken toast must not matter
             self._log("warn", "record", f"Failure notification failed: {e}")
 
+    def _start_hidden(self, nonce: str, source: str) -> Optional[dict]:
+        """The step for a start that asked for no window: a hidden page.
+
+        It is the ``?autostart=1`` page, so the start is the page's own, the
+        same as tier 3's. It also answers the pending command over the SSE
+        handshake like any window, which is how its ack reaches ``_wait``.
+        None means it could not be opened or never answered, and the visible
+        tiers take over; the page is closed first so it cannot start a second
+        recording beside them.
+        """
+        if self._open_hidden is None:
+            return None
+        page: Optional[_HiddenPage] = None
+        outcome = None
+        try:
+            base = self._base_url().rstrip("/")
+            opened = self._open_hidden(f"{base}/session?autostart=1")
+            if opened is None:
+                self._log("warn", "record",
+                          f"No hidden page available; opening the app window instead ({source})")
+                return None
+            page = _HiddenPage(opened)
+            self._log("info", "record",
+                      f"No app window took the start command; starting it in a hidden page "
+                      f"({source})")
+            outcome = self._wait(self.ack_wait_after_window)
+        except Exception as e:
+            self._log("error", "record", f"Hidden page failed: {e}")
+        done = self._settle(outcome, tier=2, nonce=nonce, source=source, page=page)
+        if not done and page is not None:
+            self._log("warn", "record",
+                      f"The hidden page did not take the start command; opening the app "
+                      f"window ({source})")
+            page.close()
+        return done
+
+    def _let_go(self, page: Optional[_HiddenPage]) -> None:
+        """Close a hidden page once its start request has had time to finish."""
+        if page is None or page.closed:
+            return
+        if self.hidden_linger > 0:
+            self._sleep(self.hidden_linger)
+        page.close()
+
     def _safe_is_ready(self) -> bool:
         try:
             return bool(self._is_ready())
@@ -335,16 +426,24 @@ class StartRequestCoordinator:
             self._nap(min(_POLL_SEC, remaining), False)
 
     def _settle(self, outcome: Optional[str], tier: int, nonce: str,
-                source: str) -> Optional[dict]:
-        """Turn a wait outcome into a return value, or None to keep escalating."""
+                source: str, page: Optional[_HiddenPage] = None) -> Optional[dict]:
+        """Turn a wait outcome into a return value, or None to keep escalating.
+
+        ``page`` is the hidden page that took the command, if one did. It is
+        closed here or by the watcher, never left running.
+        """
         if outcome is None:
             return None
         if outcome == "cancelled":
             self._clear()
+            if page is not None:
+                page.close()
             return {"status": "cancelled", "tier": tier, "source": source, "nonce": nonce}
         if outcome == "recording":
             self._log("info", "record", f"Recording started by a client at tier {tier} ({source})")
             self._clear()
+            if page is not None:
+                self._spawn(lambda: self._let_go(page))
             return {"status": "started_by_client", "tier": tier, "source": source,
                     "nonce": nonce, "acked": False}
         # Acked but not recording yet: the page acks first, then waits for the
@@ -357,18 +456,25 @@ class StartRequestCoordinator:
         # recording (or given up), so a second request arriving meanwhile is
         # coalesced instead of pushing a second command at the same window.
         self._clear(keep_in_flight=True)
-        self._spawn(lambda: self._confirm_started(tier, source))
+        self._spawn(lambda: self._confirm_started(tier, source, page))
         return {"status": "started_by_client", "tier": tier, "source": source,
                 "nonce": nonce, "acked": True}
 
-    def _confirm_started(self, tier: int, source: str) -> None:
+    def _confirm_started(self, tier: int, source: str,
+                         page: Optional[_HiddenPage] = None) -> None:
         try:
-            self._confirm_started_inner(tier, source)
+            self._confirm_started_inner(tier, source, page)
         finally:
-            with self._lock:
-                self._in_flight = False
+            # Still in flight while a hidden page lingers, so a second request
+            # cannot open another one beside it.
+            try:
+                self._let_go(page)
+            finally:
+                with self._lock:
+                    self._in_flight = False
 
-    def _confirm_started_inner(self, tier: int, source: str) -> None:
+    def _confirm_started_inner(self, tier: int, source: str,
+                               page: Optional[_HiddenPage] = None) -> None:
         """Make an ack stick, or escalate.
 
         An ack only means a window took the command. If that window is closed,
@@ -409,6 +515,10 @@ class StartRequestCoordinator:
                   f"A window acked the start command (tier {tier}, {source}) but never "
                   f"started after {self.ready_grace:g}s of readiness; falling back to the "
                   f"autostart window")
+        # A hidden page that took the command and never started goes first, so
+        # it cannot wake up and start a second recording beside the window.
+        if page is not None:
+            page.close()
         try:
             base = self._base_url().rstrip("/")
             self._open_window(f"{base}/session?autostart=1", False)
@@ -440,17 +550,18 @@ def get_default() -> Optional[StartRequestCoordinator]:
     return _default
 
 
-def request_start(source: str, reason: str = "") -> dict:
+def request_start(source: str, reason: str = "", *, show_window: bool = True) -> dict:
     """Blocking start request against the registered coordinator."""
     coordinator = _default
     if coordinator is None:
         _default_log("error", "record",
                      f"Start request from {source} dropped: no coordinator registered")
         return {"status": "unavailable", "source": source}
-    return coordinator.request_start(source, reason)
+    return coordinator.request_start(source, reason, show_window=show_window)
 
 
-def request_start_async(source: str, reason: str = "") -> None:
+def request_start_async(source: str, reason: str = "", *, show_window: bool = True) -> None:
     """Fire-and-forget start request. Safe to call from a UI callback thread."""
     threading.Thread(target=request_start, args=(source, reason),
+                     kwargs={"show_window": show_window},
                      daemon=True, name="record-request").start()

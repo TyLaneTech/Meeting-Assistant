@@ -503,6 +503,8 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "quiet_prompt_enabled": "Remind the user when a recording has captured near-silence for a while.",
     "meeting_detect_enabled": "Watch for Zoom/Teams meetings and offer to record (opt-in).",
     "meeting_detect_autostart": "Auto-start recording on meeting detection instead of prompting.",
+    "meeting_reminders_enabled": "Show a notification before each meeting on the calendar (opt-in; needs calendar_enabled).",
+    "meeting_reminder_minutes": "When meeting reminders show: minutes before the start, any of 30, 15, 10, 5, 2, 1 and 0 (0 is at the start).",
     "pwa_app_id": "Chrome app id of the installed Meeting Assistant PWA, so a start request focuses that window instead of opening a second one.",
     "warp_toggle_enabled": "Briefly disconnect Cloudflare WARP around network-heavy operations (rarely needed).",
     "open_window_on_launch": "Open the app window every time the app starts. Off means it starts in the tray and waits. A launch that still needs API keys opens the window regardless.",
@@ -515,6 +517,7 @@ SETTINGS_DESCRIPTIONS: dict[str, str] = {
     "calendar_refresh_minutes": "Minutes between background calendar refreshes (the feed itself can lag up to 24 hours).",
     "calendar_match_window_minutes": "How far a calendar event's start may sit from a recording's start and still match.",
     "calendar_title_from_event": "Name a new recording after the calendar meeting it starts in, instead of the date and time. The name then counts as user-set, so auto-titling leaves it alone; private appointments are skipped.",
+    "calendar_join_autostart": "Start a recording when the user joins a meeting from Home, the Calendar or a meeting reminder. A running recording is left alone.",
     "calendar_last_refresh": "Machine-managed: UTC timestamp of the last successful calendar refresh.",
     "calendar_last_error": "Machine-managed: message from the last failed calendar refresh.",
     "post_meeting_pending": "Machine-managed: ids of meetings still waiting for their after-meeting transcription, so a restart picks them up. Not writable through this API.",
@@ -630,6 +633,15 @@ def coerce_setting(key: str, value):
         if isinstance(value, dict):
             return True, value
         return False, "Expected an object."
+    if key == "meeting_reminder_minutes":
+        # The one list of numbers: minutes before a meeting, from a fixed set.
+        from core import meeting_reminders
+        if (isinstance(value, list)
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+                and all(v in meeting_reminders.CHOICES for v in value)):
+            return True, meeting_reminders.normalize_minutes(value)
+        return False, (f"Expected an array of minutes from {list(meeting_reminders.CHOICES)} "
+                       f"(0 is at the start).")
     if isinstance(default, list):
         # Turning a list setting into a string broke every reader that
         # iterates it (a string iterates as characters).

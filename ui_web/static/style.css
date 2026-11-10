@@ -4972,6 +4972,31 @@ body.video-fullscreen .playback-bar {
 .settings-row-label { font-size: 13px; font-weight: 600; color: var(--fg); }
 .settings-row-desc { font-size: 11px; color: var(--fg-muted); margin-top: 2px; line-height: 1.35; }
 
+/* Settings > Reminders > Meeting Reminders: the timing chips, any number of
+   them on at once, so they sit under the label on their own line. */
+.reminder-times-row { display: block; }
+.reminder-times-row .settings-row-info { margin-bottom: 10px; }
+.reminder-times { display: flex; flex-wrap: wrap; gap: 6px; }
+.reminder-time {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg-muted);
+  font: 500 12px var(--font-ui);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.reminder-time:hover:not(:disabled) { color: var(--fg); border-color: var(--accent); }
+.reminder-time[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface2));
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.reminder-time:disabled { opacity: 0.45; cursor: not-allowed; }
+.meeting-reminders-note { color: var(--yellow, var(--fg-muted)); }
+.meeting-reminders-note a { color: var(--accent); }
+
 .settings-key-row { padding: 13px 16px; display: flex; flex-direction: column; gap: 8px; }
 .settings-key-header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .settings-key-link {font-size: 11px;color: var(--accent);text-decoration: none !important;cursor: pointer;margin-left: auto;border: none;background-color: var(--surface2);padding: 4px 6px;border-radius: 3px;}

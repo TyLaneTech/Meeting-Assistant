@@ -76,6 +76,7 @@ from core import config as config
 from capture_video import media_edit as media_edit
 from ui_desktop import notifications as notifications
 from core import meeting_detect as meeting_detect
+from core import meeting_reminders as meeting_reminders
 from core import obsidian_export as obsidian
 from core import paths as paths
 from core import reanalysis_guard as reanalysis_guard
@@ -576,6 +577,9 @@ _start_coordinator = recording_request.StartRequestCoordinator(
     client_count=_connected_client_count,
     is_ready=_recording_ready_now,
     on_failure=_notify_start_failed,
+    # The tray's Start asks for no window: with none open, the page does the
+    # start in a hidden browser instead of a window popping up.
+    open_hidden=browser.open_hidden_page,
 )
 recording_request.set_default(_start_coordinator)
 
@@ -3887,6 +3891,9 @@ def _concat_video_parts(session_id: str) -> None:
 
 @app.route("/api/recording/stop", methods=["POST"])
 def stop_recording():
+    # Who pressed Stop (the tray, a notification), when they say. Only logged:
+    # a stop from outside the page never opens or raises the app window.
+    stop_source = str((request.get_json(silent=True) or {}).get("source") or "")[:40]
     with _state_lock:
         if not _state["is_recording"]:
             return jsonify({"error": "Not recording"}), 400
@@ -3944,6 +3951,8 @@ def stop_recording():
                 # while the backlog was being discarded.
                 tail = (f", {_drain_seconds / 60:.1f} min still transcribing"
                         if _drain_seconds >= _BACKLOG_WARN_SECONDS else "")
+                if stop_source:
+                    tail += f", from {stop_source}"
                 log.info("recording",
                          f"Stopped - session {sid} ({seg_count} segments{tail})")
             # media_ready: the WAV and the video are final, so this is the push
@@ -11298,6 +11307,59 @@ def calendar_test():
     return jsonify(calendar_sync.test_link(url))
 
 
+def _join_calendar_event(key, source: str) -> tuple[dict, int]:
+    """Open one calendar event's meeting link: the page's Join and a reminder's.
+
+    Returns ``(body, status)``. After the link opens, the meeting's remaining
+    reminders are silenced (the user is on their way in, so "starting now"
+    would only repeat it), and with ``calendar_join_autostart`` on a recording
+    is requested through the start coordinator, which offers it to the open
+    window, so the page still performs the start (the ?autostart rule). A
+    recording that is already running is left alone: ``recording`` in the
+    body is "starting", "already" or "".
+    """
+    instance = calendar_events_api.find_instance(key)
+    if instance is None:
+        return {"ok": False, "error": "That meeting is no longer in the calendar."}, 404
+    link = meeting_links.find_link(instance)
+    if not link:
+        return {"ok": False, "error": "This meeting has no join link."}, 404
+    result = meeting_links.open_link(link)
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "provider": link["provider"],
+            "label": link["label"],
+            "error": f"Could not open {link['label']} on this computer.",
+        }, 502
+    event_key = calendar_events_api.event_key(instance)
+    try:
+        _reminder_book.silence(event_key, calendar_feed.as_utc(instance.end))
+        notifications.dismiss(meeting_reminders.tag_for(event_key))
+    except Exception as e:
+        log.warn("reminders", f"Could not silence the joined meeting's reminders: {e}")
+    recording = ""
+    if settings.get("calendar_join_autostart", False):
+        with _state_lock:
+            already = bool(_state["is_recording"])
+        if already:
+            recording = "already"
+        else:
+            recording = "starting"
+            recording_request.request_start_async(
+                f"join:{source}", f"Joined a {link['label']} meeting")
+    log.info("calendar", f"Joined a {link['label']} meeting from the {source}"
+                         + (", recording requested" if recording == "starting" else "")
+                         + (", already recording" if recording == "already" else ""))
+    return {
+        "ok": True,
+        "provider": link["provider"],
+        "label": link["label"],
+        "opened": result.get("opened") or "",
+        "recording": recording,
+    }, 200
+
+
 @app.route("/api/calendar/join", methods=["POST"])
 def calendar_join():
     """Open one calendar event's meeting link. Body: {key}.
@@ -11308,26 +11370,83 @@ def calendar_join():
     page could forge reaches the launcher.
     """
     data = request.get_json(silent=True) or {}
-    instance = calendar_events_api.find_instance(data.get("key"))
-    if instance is None:
-        return jsonify({"ok": False, "error": "That meeting is no longer in the calendar."}), 404
-    link = meeting_links.find_link(instance)
-    if not link:
-        return jsonify({"ok": False, "error": "This meeting has no join link."}), 404
-    result = meeting_links.open_link(link)
-    if not result.get("ok"):
-        return jsonify({
-            "ok": False,
-            "provider": link["provider"],
-            "label": link["label"],
-            "error": f"Could not open {link['label']} on this computer.",
-        }), 502
-    return jsonify({
-        "ok": True,
-        "provider": link["provider"],
-        "label": link["label"],
-        "opened": result.get("opened") or "",
-    })
+    body, status = _join_calendar_event(data.get("key"), "page")
+    return jsonify(body), status
+
+
+# ── Meeting reminders ────────────────────────────────────────────────────────
+# Opt-in (meeting_reminders_enabled). core/meeting_reminders.py decides what is
+# due from the cached calendar; this loop only looks and shows. The book
+# remembers what was shown and what was silenced, so a restart repeats neither.
+
+_reminder_book = meeting_reminders.ReminderBook(
+    lambda: paths.data_dir() / "meeting_reminders.json")
+
+
+def _reminders_active(cfg: dict) -> bool:
+    """Reminders are on, and so is the calendar they are read from."""
+    return bool(
+        cfg.get("meeting_reminders_enabled", False)
+        and cfg.get("calendar_enabled", False)
+        and str(cfg.get("calendar_ics_url") or "").strip()
+    )
+
+
+def _show_meeting_reminder(reminder, now) -> None:
+    """Put one reminder on screen, wired to the join and silence paths."""
+    def _join(_arg: str) -> None:
+        body, _status = _join_calendar_event(reminder.key, "reminder")
+        if not body.get("ok"):
+            notifications.send_join_failed_toast(body.get("error") or "")
+
+    def _silence(_arg: str) -> None:
+        _reminder_book.silence(reminder.key, reminder.end)
+        log.info("reminders", "Silenced the rest of a meeting's reminders")
+
+    notifications.send_meeting_reminder_toast(
+        reminder, _server_url,
+        on_join=_join, on_silence=_silence,
+        records=bool(settings.get("calendar_join_autostart", False)),
+        now=now,
+    )
+    # The time, never the subject: a meeting's title is the user's business.
+    log.info("reminders", f"Reminder for a meeting at "
+                          f"{meeting_reminders.time_range(reminder.start, reminder.end)} "
+                          f"({'at the start' if reminder.minutes == 0 else f'{reminder.minutes} min before'})")
+
+
+def _meeting_reminder_loop() -> None:
+    """Show each meeting reminder as its moment comes. Never raises."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    cache_stamp = None
+    instances: list = []
+    while True:
+        time.sleep(meeting_reminders.POLL_SEC)
+        try:
+            cfg = settings.load()
+            if not _reminders_active(cfg):
+                continue
+            minutes = meeting_reminders.normalize_minutes(cfg.get("meeting_reminder_minutes"))
+            if not minutes:
+                continue
+            # The cache is rewritten by each calendar refresh; parse it again
+            # only then rather than every few seconds.
+            try:
+                stamp = calendar_feed.cache_path().stat().st_mtime_ns
+            except OSError:
+                continue
+            if stamp != cache_stamp:
+                instances = calendar_feed.cached_instances()
+                cache_stamp = stamp
+            now = _dt.now(_tz.utc)
+            for reminder in _reminder_book.take_due(instances, minutes, now):
+                _show_meeting_reminder(reminder, now)
+        except Exception as e:
+            log.warn("reminders", f"Reminder check failed: {e}")
+
+
+threading.Thread(target=_meeting_reminder_loop, daemon=True, name="meeting-reminders").start()
 
 
 @app.route("/api/sessions/<session_id>/calendar_match", methods=["GET"])

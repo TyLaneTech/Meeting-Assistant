@@ -11,6 +11,10 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
 
 from core import log
 from core import settings
@@ -18,6 +22,10 @@ from core import settings
 # Roughly a comfortable default; the window is resizable and remembers its size
 # per Chrome's app-window state.
 _WINDOW_SIZE = "1360,900"
+
+# Where hidden pages keep their throwaway browser profiles. Under storage/ (local
+# to this install and gitignored), never the data folder, which may be synced.
+_HIDDEN_PROFILES = Path(__file__).resolve().parent.parent / "storage" / "hidden-browser"
 
 
 def _chromium_path() -> str | None:
@@ -168,3 +176,84 @@ def open_app_window(url: str, prefer_pwa: bool = False) -> bool:
     except Exception as e:  # pragma: no cover
         log.warn("app", f"browser open failed: {e}")
     return False
+
+
+class HiddenPage:
+    """A page running in a browser nobody can see. ``close()`` ends it."""
+
+    def __init__(self, proc: subprocess.Popen, profile: Path) -> None:
+        self._proc = proc
+        self._profile = profile
+
+    def close(self) -> None:
+        """End the browser and delete its profile. Never raises.
+
+        Ending the browser process is enough: its renderer and helper processes
+        exit with it. The profile can stay locked for a moment after that, so
+        the delete gets a few tries, and whatever is left is swept on the next
+        open.
+        """
+        try:
+            if self._proc.poll() is None:
+                self._proc.kill()
+                self._proc.wait(timeout=5)
+        except Exception as e:  # pragma: no cover - environment dependent
+            log.warn("app", f"Could not close the hidden page ({e})")
+        for _ in range(5):
+            shutil.rmtree(self._profile, ignore_errors=True)
+            if not self._profile.exists():
+                return
+            time.sleep(0.5)
+
+
+def _sweep_hidden_profiles(older_than: float = 3600.0) -> None:
+    """Delete profiles that earlier hidden pages left behind (a crash, a lock).
+
+    Only old ones: a page lives for minutes at most, and deleting the files of
+    one that is still running would break it.
+    """
+    cutoff = time.time() - older_than
+    try:
+        for leftover in _HIDDEN_PROFILES.iterdir():
+            try:
+                if leftover.stat().st_mtime < cutoff:
+                    shutil.rmtree(leftover, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def open_hidden_page(url: str) -> Optional[HiddenPage]:
+    """Load ``url`` in an invisible Chrome or Edge. None when that is not possible.
+
+    This is how the tray starts a recording with no app window open: the page
+    still does the start, exactly as it does in a window, but nothing appears
+    on screen. A headless browser has to run under its own profile (Chrome
+    will not share the user's profile with one), so each page gets a fresh one
+    that ``close()`` deletes. The page reads its devices and settings from the
+    server, so the profile holds nothing it needs. Muted, so a page can never
+    make a sound nobody can find. Never raises.
+    """
+    exe = _chromium_path()
+    if not exe:
+        log.info("app", "No Chrome or Edge for a hidden page")
+        return None
+    try:
+        _HIDDEN_PROFILES.mkdir(parents=True, exist_ok=True)
+        _sweep_hidden_profiles()
+        profile = _HIDDEN_PROFILES / uuid.uuid4().hex[:12]
+        args = [
+            exe, "--headless=new", f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+            "--disable-sync", "--mute-audio", f"--window-size={_WINDOW_SIZE}", url,
+        ]
+        kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                        "stderr": subprocess.DEVNULL, "close_fds": True}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(args, **kwargs)
+        return HiddenPage(proc, profile)
+    except Exception as e:  # pragma: no cover - environment dependent
+        log.warn("app", f"Hidden page launch failed ({e})")
+        return None

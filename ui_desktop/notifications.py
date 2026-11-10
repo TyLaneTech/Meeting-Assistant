@@ -178,11 +178,12 @@ def sound_sets() -> list[dict]:
 # ── The notifications the app sends ───────────────────────────────────────────
 
 
-def _post_stop(stop_url: str) -> None:
+def _post_stop(stop_url: str, source: str) -> None:
     try:
+        import json
         import urllib.request
         req = urllib.request.Request(
-            stop_url, data=b"{}",
+            stop_url, data=json.dumps({"source": source}).encode("utf-8"),
             headers={"Content-Type": "application/json"}, method="POST",
         )
         urllib.request.urlopen(req, timeout=5).read()
@@ -202,8 +203,9 @@ def send_quiet_recording_toast(session_id: str, server_url: str) -> bool:
         app_window.show(session_url, reason="toast:quiet")
 
     def _stop_recording(_arg: str) -> None:
-        _post_stop(stop_url)
-        app_window.show(session_url, reason="toast:quiet-stop")
+        # Stop only. Raising the window here put it over whatever the user
+        # had moved on to; the body of the toast is how to open the meeting.
+        _post_stop(stop_url, "toast:quiet")
 
     return notify(
         "Still in the meeting?",
@@ -286,7 +288,7 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
                         reason="toast:autostarted")
 
     def _stop(_arg: str) -> None:
-        _post_stop(stop_url)
+        _post_stop(stop_url, "toast:autostarted")
 
     shown = notify(
         f"Recording {app_name} meeting",
@@ -303,6 +305,61 @@ def send_meeting_autostarted_toast(app_name: str, server_url: str) -> bool:
         log.warn("notify", f"Recording {app_name} meeting: start requested but the "
                            f"confirmation did not display")
     return True
+
+
+def send_meeting_reminder_toast(
+    reminder,
+    server_url: str,
+    *,
+    on_join: Optional[Callable[[str], None]] = None,
+    on_silence: Optional[Callable[[str], None]] = None,
+    records: bool = False,
+    now=None,
+) -> bool:
+    """A meeting on the calendar is about to start (core/meeting_reminders.py).
+
+    ``reminder`` is a ``meeting_reminders.Reminder``. Join shows only when the
+    meeting has a join link and the caller passes ``on_join``; it reads "Join
+    and record" when joining also starts a recording (``records``). Silence
+    shows only when another reminder for this meeting is still to come, since
+    on the last one there is nothing left to silence. Every reminder for one
+    meeting shares its tag, so the next replaces the last.
+
+    The toast stays until five minutes after the start (15 minutes at most,
+    so an early reminder does not sit there for half an hour), then goes.
+    """
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    base = server_url.rstrip("/")
+    calendar_url = f"{base}/calendar"
+
+    def _open_calendar(_arg: str) -> None:
+        app_window.show(calendar_url, reason="toast:reminder")
+
+    actions = []
+    if on_join is not None and reminder.provider:
+        actions.append({"label": "Join and record" if records else "Join", "arg": "join",
+                        "on_click": on_join, "style": "primary"})
+    if on_silence is not None and reminder.later:
+        actions.append({"label": "Silence this meeting", "arg": "silence",
+                        "on_click": on_silence, "style": "secondary"})
+    left = (reminder.start - now).total_seconds()
+    return notify(
+        reminder.title,
+        reminder.body(now),
+        kind="prompt", icon="calendar-days", tag=reminder.tag,
+        timeout=max(60.0, min(left + 300.0, 900.0)),
+        on_click=_open_calendar,
+        actions=actions,
+        mac_url=calendar_url,
+    )
+
+
+def send_join_failed_toast(error: str) -> bool:
+    """A Join pressed on a reminder could not open the meeting."""
+    return notify("Could not join the meeting", error or "The meeting link did not open.",
+                  kind="error", icon="calendar-days", tag="meeting-join-failed", timeout=15)
 
 
 def send_test_toast(server_url: Optional[str] = None) -> bool:
