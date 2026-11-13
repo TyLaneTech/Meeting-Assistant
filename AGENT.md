@@ -886,6 +886,20 @@ The audio pipeline is designed to avoid progressive slowdown during long session
 
 **Do not introduce `np.concatenate()` in hot loops.** If you need to accumulate numpy arrays, use a list of arrays and concatenate once at the end, or use a pre-allocated buffer with index tracking.
 
+### Transcript UI on long meetings
+
+A long meeting holds thousands of `.transcript-segment` elements, so anything that walks them per speaker, per comparison or per frame shows up as click lag. Measured 2026-11-13 on a 2,613-line meeting with 117 speaker keys (headless Chrome driving real clicks against a read-only proxy of the app, click to next paint, medians of three alternating runs): Filter 648 ms, Analytics 664 ms, the rename picker 584 ms and the first Ctrl+click 1,000 ms; afterwards 128, 168, 80 and 32 ms. `tests/test_transcript_toolbar_speed.py` holds these rules.
+
+- **Count speaker lines once.** `_speakerBadgeCounts()` returns a `Map` from one pass; `_getSortedSpeakerProfiles(counts)` and `_speakerSimScorers(..., counts)` take it. Never call `_speakerBadgeCount()` inside a sort comparator or a per-group loop: that was the 400 ms.
+- **Pills and analytics redraw at most once a frame.** `_tnRefreshSpeakerPills()` schedules; it draws the pills only while the filter panel is open (`openTranscriptFilter` draws them with `_tnRenderSpeakerPills()` before showing the panel) and refreshes analytics only while that panel is open.
+- **Burst events coalesce the recordings refetch.** `speaker_label`, `speaker_linked` and `fingerprint_auto_applied` call `AppData.invalidateSoon()`: a Cleanup apply sends one event per speaker, a multi-line reassignment one per line, and each used to refetch `/api/sessions` (about 400 KB, half a second of server time) and redraw the sidebar.
+- **Slide panels never animate their height.** The filter, analytics and suggestion panels toggle `display` (`.collapsed`). The filter and suggestion panels fade on opacity and transform; analytics shows at once and its charts animate in, because fading the whole panel made the browser rasterize all of it before the first frame. A `max-height` transition resized the transcript every frame, and each resize relaid out every line.
+- **`#transcript` keeps `scrollbar-gutter: stable`.** Without it every layout of the column ran the transcript's layout again after re-deciding the scrollbar ("Scrollbar changed" in a trace), two or three full passes instead of one.
+- **A filter change only hides and shows.** `applyTranscriptFilter` writes `display` only where it changes, re-places chapter headings only when the chapters or the lines changed (`_refreshTranscriptChapterHeadings`), and a line shown again gets `.is-reshown` so it does not replay its entrance fade.
+- **Selection paints the difference.** `_updateTranscriptSelectionUI` touches only lines whose selected state changed (`_transcriptSelPainted`).
+- **The pickers draw in their first frame.** The Voice Library list is kept between opens (`_pickerLibrary`, refreshed in the background, redrawn only if it changed) and the similarity order is applied at once when the index for the meeting is loaded.
+- **Analytics animates on transforms.** Bars have their final width and grow on `transform: scaleX`; each timeline track grows as one element (no timer per segment) and rests at `scaleX(1)`, because going between no transform and a transform asks for a layout.
+
 ---
 
 ## Release Notes and Commit Messages

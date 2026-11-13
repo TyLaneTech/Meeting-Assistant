@@ -19,6 +19,17 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Improved the transcript's speed on long meetings (2026-11-13)
+
+- **The `Filter transcript` and `Session analytics` buttons** respond at once, even on long meetings with many speakers.
+- **The speaker picker** opens right away from a transcript badge, `Reassign to…` on Ctrl+click and Shift+click included.
+- **Selected lines** highlight as soon as you click them.
+- **Clearing a filter or a search** brings every line back without a pause.
+- **The filter and suggestion panels** fade in and out, and the analytics panel opens without sliding.
+- **Applying Cleanup or renaming speakers** no longer bogs the app down while the recordings list refreshes.
+- **The copy button** goes back to its own icon after copying a transcript.
+
+
 ## Added meeting reminders and recording on join (2026-11-10)
 
 ### Reminders

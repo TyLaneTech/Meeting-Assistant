@@ -405,6 +405,26 @@ const AppData = {
     return Promise.all(jobs);
   },
 
+  /** invalidate() for events that arrive in bursts. A Cleanup apply sends a
+   *  speaker_label event per speaker and a multi-line reassignment can send a
+   *  speaker_linked event per line; each used to refetch the whole recordings
+   *  list (about 400 KB, half a second of server time) and redraw the sidebar.
+   *  Names are merged and loaded once the burst has been quiet for 300 ms
+   *  (at most 1.5 s after its first event). */
+  invalidateSoon(names, reason) {
+    const p = this._soon || (this._soon = { names: new Set(), reasons: new Set(), timer: 0, first: 0 });
+    (Array.isArray(names) ? names : [names]).forEach(n => p.names.add(n));
+    p.reasons.add(reason);
+    const now = Date.now();
+    if (!p.timer) p.first = now;
+    clearTimeout(p.timer);
+    p.timer = setTimeout(() => {
+      const list = [...p.names], why = [...p.reasons].join(',');
+      p.names.clear(); p.reasons.clear(); p.timer = 0;
+      this.invalidate(list, why);
+    }, Math.max(0, Math.min(300, p.first + 1500 - now)));
+  },
+
   /** In-place edit for an event that carries enough data to patch (a retitle),
    *  so the list does not have to be refetched to look right. */
   patch(name, fn, key) {
@@ -5680,7 +5700,7 @@ function connectSSE(afterSegId = 0) {
         _renderSidebar();
       }
     }
-    AppData.invalidate(['sessions', 'attention', 'analytics'], 'speaker_label');
+    AppData.invalidateSoon(['sessions', 'attention', 'analytics'], 'speaker_label');
   });
 
   // The Agent API renamed or moved folders or meetings, or relabelled speakers
@@ -5759,7 +5779,7 @@ function connectSSE(afterSegId = 0) {
       _fpRemoveFromQueue(d.speaker_key);
     }
     _fpLoaded = false;  // the voice library changed; the Speakers view must refetch on its next visit
-    AppData.invalidate(['sessions', 'attention', 'analytics'], 'fingerprint_auto_applied');
+    AppData.invalidateSoon(['sessions', 'attention', 'analytics'], 'fingerprint_auto_applied');
   });
 
   src.addEventListener('speaker_linked', e => {
@@ -5767,12 +5787,17 @@ function connectSSE(afterSegId = 0) {
     _fpLoaded = false;  // linking can seed a new profile; the Speakers view must refetch
     if (d.session_id === state.sessionId) {
       _sessionLinks[d.speaker_key] = { global_id: d.global_id, name: d.name };
-      _updateLinkedBadges();
       // Clean up notification queue - this speaker is now identified
       _fpRemoveFromQueue(d.speaker_key);
-      _fpUpdateInlineIcons();
+      // One repaint of every badge per frame: training a reassignment sends
+      // this event once per line moved.
+      if (!_linkedBadgesRaf) _linkedBadgesRaf = requestAnimationFrame(() => {
+        _linkedBadgesRaf = 0;
+        _updateLinkedBadges();
+        _fpUpdateInlineIcons();
+      });
     }
-    AppData.invalidate(['sessions', 'attention', 'analytics'], 'speaker_linked');
+    AppData.invalidateSoon(['sessions', 'attention', 'analytics'], 'speaker_linked');
   });
 
   src.addEventListener('transcript_reset', e => {
@@ -6765,6 +6790,7 @@ function _clearSegmentRegistry() {
   _segmentRegistry  = [];
   _segmentTimes     = [];
   _visibleRangesCache = null;
+  _transcriptSelPainted = new Set();
   // Reset collapse state
   _collapseActive = false;
   const colBtn = document.getElementById('transcript-collapse-toggle');
@@ -6793,6 +6819,7 @@ var _sseSource       = null;  // var so home.js can access it
 
 // Transcript segment multi-select (Ctrl/Shift+click on badges)
 let _transcriptSelectedSegs = new Set(); // Set of .transcript-segment DOM elements
+let _transcriptSelPainted = new Set();   // the lines currently drawn as selected
 let _transcriptSelectionAnchor = null;
 
 // Speakers added before a session exists; flushed to the API on session start
@@ -6830,6 +6857,7 @@ function _speakerDisplayName(speakerKey) {
   return _speakerProfiles[speakerKey]?.name || _speakerLabels[speakerKey] || speakerKey;
 }
 
+let _linkedBadgesRaf = 0;
 /** Scan all speaker badges and add/remove the 'speaker-linked' class. */
 function _updateLinkedBadges() {
   document.querySelectorAll('.src-badge.src-speaker').forEach(badge => {
@@ -7175,13 +7203,22 @@ function _ensureSpeakerProfile(speakerKey, data = {}) {
   });
 }
 
-function _speakerBadgeCount(speakerKey) {
-  let count = 0;
+// Lines per speaker key, counted in one pass over the transcript. Anything
+// that needs more than one count takes this map once: counting inside a sort
+// comparator walked every line on every comparison, which took 400 ms on a
+// 2,600-line meeting with 117 keys and made the filter, the analytics panel
+// and every speaker picker wait for it (2026-11-13).
+function _speakerBadgeCounts() {
+  const counts = new Map();
   for (const seg of _segmentRegistry) {
-    const badge = seg.querySelector('.src-badge.src-speaker');
-    if (badge && badge.dataset.speakerKey === speakerKey) count++;
+    const key = seg.querySelector('.src-badge.src-speaker')?.dataset.speakerKey;
+    if (key) counts.set(key, (counts.get(key) || 0) + 1);
   }
-  return count;
+  return counts;
+}
+
+function _speakerBadgeCount(speakerKey) {
+  return _speakerBadgeCounts().get(speakerKey) || 0;
 }
 
 function speakerColor(speakerKey) {
@@ -7205,27 +7242,25 @@ function speakerColor(speakerKey) {
   return _speakerColors[speakerKey];
 }
 
-function _getSortedSpeakerProfiles() {
-  const keys = new Set([...Object.keys(_speakerProfiles), ...Object.keys(_speakerLabels)]);
-  for (const seg of _segmentRegistry) {
-    const badge = seg.querySelector('.src-badge.src-speaker');
-    if (badge) keys.add(badge.dataset.speakerKey);
-  }
-
+// Pass the counts when the caller already has them (see _speakerBadgeCounts).
+function _getSortedSpeakerProfiles(counts = _speakerBadgeCounts()) {
+  const keys = new Set([...Object.keys(_speakerProfiles), ...Object.keys(_speakerLabels), ...counts.keys()]);
+  const lines = key => counts.get(key) || 0;
   return [...keys]
     .map(key => _ensureSpeakerProfile(key))
+    .filter(Boolean)
     .sort((a, b) => {
-      const countDiff = _speakerBadgeCount(b.speaker_key) - _speakerBadgeCount(a.speaker_key);
+      const countDiff = lines(b.speaker_key) - lines(a.speaker_key);
       if (countDiff !== 0) return countDiff;
       if (a.custom !== b.custom) return a.custom ? 1 : -1;
       return (a.name || a.speaker_key).localeCompare(b.name || b.speaker_key);
     });
 }
 
-function _speakerOptionNames(currentName = '', excludeKey = '') {
+function _speakerOptionNames(currentName = '', excludeKey = '', counts = undefined) {
   const seen = new Set();
   const names = [];
-  _getSortedSpeakerProfiles().forEach(profile => {
+  _getSortedSpeakerProfiles(counts).forEach(profile => {
     const name = (profile.name || '').trim();
     if (!name || name === currentName || profile.speaker_key === excludeKey) return;
     if (!_isCustomSpeakerKey(profile.speaker_key) && (name === profile.speaker_key || _isDefaultName(name))) {
@@ -11283,10 +11318,16 @@ function _toggleTranscriptSegSelection(segEl, { range = false } = {}) {
   if (_transcriptSelectedSegs.size > 0) _openBulkSpeakerPicker(segEl);
 }
 
+// Only the lines whose state changed are touched (this used to visit every
+// line in the meeting on each Ctrl/Shift+click).
 function _updateTranscriptSelectionUI() {
-  _segmentRegistry.forEach(seg => {
-    seg.classList.toggle('transcript-seg-selected', _transcriptSelectedSegs.has(seg));
-  });
+  for (const seg of _transcriptSelPainted) {
+    if (!_transcriptSelectedSegs.has(seg)) seg.classList.remove('transcript-seg-selected');
+  }
+  for (const seg of _transcriptSelectedSegs) {
+    if (!_transcriptSelPainted.has(seg)) seg.classList.add('transcript-seg-selected');
+  }
+  _transcriptSelPainted = new Set(_transcriptSelectedSegs);
   if (_transcriptSelectedSegs.size > 0) {
     _bulkPickerUpdateCount(_transcriptSelectedSegs.size);
   } else {
@@ -11588,6 +11629,21 @@ function _bulkReassignSelectedTo(name) {
     persistSpeakerLabel(targetKey, name).catch(() => {});
   }
 
+  // Noise lines left per key, counted once (it was a query over the whole
+  // transcript for every selected noise line).
+  let noiseLeft = null;
+  const noiseLinesOf = source => {
+    if (!noiseLeft) {
+      noiseLeft = new Map();
+      for (const seg of _segmentRegistry) {
+        if (!seg.querySelector('.src-noise')) continue;
+        const k = seg.dataset.transcriptSource;
+        noiseLeft.set(k, (noiseLeft.get(k) || 0) + 1);
+      }
+    }
+    return noiseLeft.get(source) || 0;
+  };
+
   for (const segEl of _transcriptSelectedSegs) {
     const source = segEl.dataset.transcriptSource;
     if (!source || source in SOURCE_META) continue;
@@ -11614,10 +11670,9 @@ function _bulkReassignSelectedTo(name) {
     // If this was a noise segment, restore normal styling
     if (segEl.classList.contains('noise-segment')) {
       if (_manualNoiseKeys.has(source)) {
-        const remaining = document.querySelectorAll(
-          `#transcript .transcript-segment[data-transcript-source="${source}"] .src-noise`
-        ).length;
+        const remaining = noiseLinesOf(source);
         if (remaining <= 1) _manualNoiseKeys.delete(source);
+        noiseLeft.set(source, remaining - 1);
       }
       segEl.classList.remove('noise-segment');
     }
@@ -12388,10 +12443,11 @@ function _cosineSim(a, b) {
 // meetingScore(displayName) ranks a meeting speaker (taking the best match over
 // the speaker_keys that share that display name); libScore(gid, name) ranks a
 // Voice Library profile. Both return a cosine in [-1,1] or null.
-function _speakerSimScorers(srcKey, idx) {
+function _speakerSimScorers(srcKey, idx, counts = undefined) {
   const src = (idx && srcKey) ? (idx.keyCentroid.get(srcKey) || null) : null;
+  if (!src) return { available: false, meetingScore: () => null, libScore: () => null };
   const nameKeys = new Map();   // lower(name) → [speaker_key,…]
-  _groupProfilesByName(_getSortedSpeakerProfiles()).forEach(g => {
+  _groupProfilesByName(_getSortedSpeakerProfiles(counts)).forEach(g => {
     nameKeys.set((g.name || '').toLowerCase(), g.speakerKeys);
   });
   const libByGid = new Map();
@@ -12472,6 +12528,23 @@ function _positionPicker(picker, anchorRect, placement = 'below') {
   picker.style.left = Math.max(margin, left) + 'px';
 }
 
+// The Voice Library list the speaker pickers offer, kept between opens so a
+// picker draws it in its first frame instead of popping it in (and re-sorting
+// under the pointer) once a fetch lands. Every open still refreshes it in the
+// background; a picker redraws that section only if the list changed.
+let _pickerLibrary = null;        // last /api/fingerprint/speakers answer
+let _pickerLibraryFetch = null;   // the refresh in flight, shared by every picker
+function _refreshPickerLibrary() {
+  if (!_pickerLibraryFetch) {
+    _pickerLibraryFetch = fetch('/api/fingerprint/speakers')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+      .then(list => { _pickerLibrary = Array.isArray(list) ? list : []; return _pickerLibrary; })
+      .catch(() => _pickerLibrary)
+      .finally(() => { _pickerLibraryFetch = null; });
+  }
+  return _pickerLibraryFetch;
+}
+
 /* Populate a picker's options container with two voice-similarity-ranked
  * groups: current meeting speakers (top) and saved Voice Library profiles
  * (below). Shared by the rename picker (editSpeakerLabel) and the bulk-reassign
@@ -12480,10 +12553,20 @@ function _positionPicker(picker, anchorRect, placement = 'below') {
  */
 function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey = '', srcKey = '', baseColor = '#58a6ff', onPick }) {
   const meetingEntries = [];   // { name, el }
-  const vlEntries = [];        // { name, gid, el }
+  let vlEntries = [];          // { name, gid, el }
+  let query = '';
 
   // ── Meeting speakers ──
-  const existingNames = _speakerOptionNames(currentName, excludeKey);
+  // One sort and one name lookup for the whole list (the lookup used to scan
+  // every speaker once per option).
+  const counts = _speakerBadgeCounts();
+  const existingNames = _speakerOptionNames(currentName, excludeKey, counts);
+  const keyByName = new Map();
+  Object.keys(_speakerProfiles).forEach(key => {
+    if (key === excludeKey) return;
+    const name = _speakerDisplayName(key);
+    if (!keyByName.has(name)) keyByName.set(name, key);
+  });
   const meetingNameSet = new Set(existingNames.map(n => n.toLowerCase()));
   const meetingHeader = document.createElement('div');
   meetingHeader.className = 'speaker-picker-section';
@@ -12491,7 +12574,7 @@ function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey 
   meetingHeader.style.display = existingNames.length ? '' : 'none';
   optionsWrap.appendChild(meetingHeader);
   existingNames.forEach(name => {
-    const optKey = _speakerNameKey(name, excludeKey);
+    const optKey = keyByName.get(name) || '';
     const optColor = (optKey && (_speakerColors[optKey] || speakerColor(optKey))) || baseColor;
     const opt = document.createElement('button');
     opt.className = 'speaker-picker-opt';
@@ -12511,36 +12594,52 @@ function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey 
   vlHeader.style.display = 'none';
   optionsWrap.appendChild(vlHeader);
 
-  function filterOpts(query) {
+  function filterOpts(q) {
+    query = q || '';
     let meetingVisible = 0, vlVisible = 0;
-    optionsWrap.querySelectorAll('.speaker-picker-opt').forEach(opt => {
-      const name = opt.dataset.optName || '';
-      const show = !query || name.includes(query);
-      opt.style.display = show ? '' : 'none';
-      if (show) { opt.classList.contains('speaker-picker-vl-opt') ? vlVisible++ : meetingVisible++; }
+    meetingEntries.forEach(e => {
+      const show = !query || e.el.dataset.optName.includes(query);
+      e.el.style.display = show ? '' : 'none';
+      if (show) meetingVisible++;
+    });
+    vlEntries.forEach(e => {
+      const show = !query || e.el.dataset.optName.includes(query);
+      e.el.style.display = show ? '' : 'none';
+      if (show) vlVisible++;
     });
     meetingHeader.style.display = meetingVisible > 0 ? '' : 'none';
     vlHeader.style.display = vlVisible > 0 ? '' : 'none';
   }
 
-  // Re-order both groups by voice similarity once the centroid index resolves,
-  // tagging each option with a small similarity badge. Idempotent; safe to
-  // call again when the VL list finishes loading.
+  // Re-order both groups by voice similarity once the centroid index is in,
+  // tagging each option with a small similarity badge. Idempotent; runs again
+  // when the Voice Library section is redrawn. The scorers are built once per
+  // index (building them sorts the meeting's speakers).
+  let simIdx = null, scorers = null;
   function applySimSort(idx) {
-    const scorers = _speakerSimScorers(srcKey, idx);
+    if (!idx) return;
+    if (idx !== simIdx) { simIdx = idx; scorers = _speakerSimScorers(srcKey, idx, counts); }
     if (!scorers.available) return;
     const th = idx.thresholds;
     meetingEntries.forEach(e => { e.score = scorers.meetingScore(e.name); _setOptSim(e.el, e.score, th); });
     vlEntries.forEach(e => { e.score = scorers.libScore(e.gid, e.name); _setOptSim(e.el, e.score, th); });
     meetingEntries.sort(_simComparator(e => e.score, e => e.name));
     vlEntries.sort(_simComparator(e => e.score, e => e.name));
-    meetingEntries.forEach(e => optionsWrap.insertBefore(e.el, vlHeader));  // keep between the two headers
-    vlEntries.forEach(e => optionsWrap.appendChild(e.el));                  // after the VL header
+    const meetingFrag = document.createDocumentFragment();
+    meetingEntries.forEach(e => meetingFrag.appendChild(e.el));
+    optionsWrap.insertBefore(meetingFrag, vlHeader);                 // keep between the two headers
+    const vlFrag = document.createDocumentFragment();
+    vlEntries.forEach(e => vlFrag.appendChild(e.el));
+    optionsWrap.appendChild(vlFrag);                                  // after the VL header
   }
 
-  fetch('/api/fingerprint/speakers').then(r => r.json()).then(speakers => {
-    if (!speakers || !speakers.length) return;
-    speakers.forEach(sp => {
+  let shownLibrary = null;
+  function renderLibrary(speakers) {
+    shownLibrary = speakers;
+    vlEntries.forEach(e => e.el.remove());
+    vlEntries = [];
+    const frag = document.createDocumentFragment();
+    (speakers || []).forEach(sp => {
       const name = (sp.name || '').trim();
       if (!name || meetingNameSet.has(name.toLowerCase())) return;
       if (currentName && name.toLowerCase() === currentName.toLowerCase()) return;
@@ -12555,17 +12654,29 @@ function _buildPickerSpeakerOptions(optionsWrap, { currentName = '', excludeKey 
       opt.style.borderColor = vlColor + '60';
       opt.style.color = vlColor;
       opt.addEventListener('mousedown', e => { e.preventDefault(); onPick(name); });
-      optionsWrap.appendChild(opt);
+      frag.appendChild(opt);
       vlEntries.push({ name, gid: sp.id, el: opt });
     });
-    if (vlEntries.length) {
-      vlHeader.style.display = '';
-      if (_simIndex && _simIndex.sessionId === state.sessionId) applySimSort(_simIndex);
-    }
-  }).catch(() => {});
+    optionsWrap.appendChild(frag);
+    if (simIdx) applySimSort(simIdx);
+    filterOpts(query);
+  }
+
+  // Draw what is already known in this frame: the remembered library and,
+  // when it is loaded for this meeting, the similarity order.
+  if (_pickerLibrary) renderLibrary(_pickerLibrary);
+  else vlHeader.style.display = 'none';
+  if (_simIndex && _simIndex.sessionId === state.sessionId) applySimSort(_simIndex);
+
+  const libSig = list => (list || []).map(sp => `${sp.id}\u0001${sp.name}\u0001${sp.color}`).join('\u0002');
+  _refreshPickerLibrary().then(list => {
+    if (!list || !optionsWrap.isConnected) return;
+    if (shownLibrary && libSig(list) === libSig(shownLibrary)) return;
+    renderLibrary(list);
+  });
 
   // Kick off (or reuse) the centroid index; re-sort when it's ready.
-  _ensureSimIndex().then(idx => { if (idx) applySimSort(idx); });
+  if (!simIdx) _ensureSimIndex().then(idx => { if (idx && optionsWrap.isConnected) applySimSort(idx); });
 
   return { filterOpts };
 }
@@ -12613,23 +12724,21 @@ function editSpeakerLabel(badge, speakerKey) {
   });
 
   // Highlight all matching badges when in global mode
-  const _highlighted = [];
+  const _highlighted = [];   // [badge, seg]
   if (editMode === 'global') {
-    document.querySelectorAll(`[data-speaker-key="${speakerKey}"]`).forEach(el => {
-      if (el !== badge && el.tagName === 'SPAN' && !el.dataset.override) {
-        el.classList.add('label-highlight');
-        const seg = el.closest('.transcript-segment');
-        if (seg) seg.classList.add('label-highlight-seg');
-        _highlighted.push(el);
-      }
-    });
+    for (const seg of _segmentRegistry) {
+      const el = seg.querySelector('.src-badge.src-speaker');
+      if (!el || el === badge || el.dataset.speakerKey !== speakerKey || el.dataset.override) continue;
+      el.classList.add('label-highlight');
+      seg.classList.add('label-highlight-seg');
+      _highlighted.push([el, seg]);
+    }
   }
 
   function _clearHighlights() {
-    _highlighted.forEach(el => {
+    _highlighted.forEach(([el, seg]) => {
       el.classList.remove('label-highlight');
-      const seg = el.closest('.transcript-segment');
-      if (seg) seg.classList.remove('label-highlight-seg');
+      seg.classList.remove('label-highlight-seg');
     });
   }
 
@@ -12705,6 +12814,7 @@ function editSpeakerLabel(badge, speakerKey) {
   input.select();
 
   // Live filter + merge hint on input
+  let mergeData = null;
   input.addEventListener('input', () => {
     const typed = input.value.trim().toLowerCase();
     // Filter option buttons
@@ -12719,14 +12829,18 @@ function editSpeakerLabel(badge, speakerKey) {
         hint.style.color = '';
         return;
       }
-      const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
-      const match = groups.find(g =>
+      // Taken once per picker, on the first keystroke that needs them.
+      if (!mergeData) {
+        const counts = _speakerBadgeCounts();
+        mergeData = { counts, groups: _groupProfilesByName(_getSortedSpeakerProfiles(counts)) };
+      }
+      const match = mergeData.groups.find(g =>
         g.speakerKeys[0] !== speakerKey &&
         !g.speakerKeys.includes(speakerKey) &&
         g.name.toLowerCase() === typed
       );
       if (match) {
-        const mergeCount = match.speakerKeys.reduce((s, k) => s + _speakerBadgeCount(k), 0);
+        const mergeCount = match.speakerKeys.reduce((s, k) => s + (mergeData.counts.get(k) || 0), 0);
         hint.textContent = `Will merge with "${match.name}" (${mergeCount} seg${mergeCount === 1 ? '' : 's'})`;
         hint.style.color = 'var(--accent)';
       } else {
@@ -13067,11 +13181,13 @@ function copyTranscript() {
     if (btn) {
       const icon = btn.querySelector('i');
       if (icon) {
+        // Put back the button's own icon, whatever the markup says it is.
+        if (!btn._copyIcon) btn._copyIcon = icon.className;
         icon.className = 'fa-solid fa-check';
         icon.style.color = '#00b464';
         clearTimeout(btn._copyTimer);
         btn._copyTimer = setTimeout(() => {
-          icon.className = 'fa-solid fa-clipboard';
+          icon.className = btn._copyIcon;
           icon.style.color = '';
         }, 2000);
       }
@@ -13089,24 +13205,35 @@ function _transcriptFilterActive() {
 }
 
 function _applyFilterToSeg(seg) {
+  const display = _segFilterDisplay(seg);
+  // Only a line whose visibility changes is written to (a filter pass visits
+  // every line in the meeting).
+  if (seg.style.display === display) return;
+  // A line coming back does not replay its entrance fade: clearing a filter
+  // brought thousands back at once, each restarting the animation.
+  if (display === '') seg.classList.add('is-reshown');
+  seg.style.display = display;
+}
+
+function _segFilterDisplay(seg) {
   const source  = seg.dataset.transcriptSource || '';
   // Always hide noise unless toggled visible (or in original-key mode where noise shows as regular pills)
-  if ((source === _NOISE_LABEL || _manualNoiseKeys.has(source)) && !_showNoise && !_showOriginalKeys) { seg.style.display = 'none'; return; }
-  if (!_transcriptFilterActive()) { seg.style.display = ''; return; }
+  if ((source === _NOISE_LABEL || _manualNoiseKeys.has(source)) && !_showNoise && !_showOriginalKeys) return 'none';
+  if (!_transcriptFilterActive()) return '';
   const speakers = _transcriptFilter.speakers;
   // In original-key mode, noise segments are treated as regular speakers for filtering.
   // In normal mode, noise has its own toggle so we exempt it from the speaker filter.
   const isNoise = source === _NOISE_LABEL || _manualNoiseKeys.has(source);
   const exemptNoise = isNoise && !_showOriginalKeys;
   if (speakers.size > 0 && !(source in SOURCE_META) && !speakers.has(source) && !exemptNoise) {
-    seg.style.display = 'none'; return;
+    return 'none';
   }
   // Time range filter
   if (_transcriptFilter.timeMin > 0 || _transcriptFilter.timeMax < Infinity) {
     const segStart = parseFloat(seg.dataset.start || 0);
     const segEnd   = parseFloat(seg.dataset.end || Infinity);
     if (segEnd < _transcriptFilter.timeMin || segStart > _transcriptFilter.timeMax) {
-      seg.style.display = 'none'; return;
+      return 'none';
     }
   }
   // Search filter: match against visible text (skip badge text for accuracy)
@@ -13119,10 +13246,10 @@ function _applyFilterToSeg(seg) {
       else if (!n.classList?.contains('src-badge')) textNodes.push(n.textContent);
     });
     if (!textNodes.join('').toLowerCase().includes(search)) {
-      seg.style.display = 'none'; return;
+      return 'none';
     }
   }
-  seg.style.display = '';
+  return '';
 }
 
 function applyTranscriptFilter() {
@@ -13130,7 +13257,7 @@ function applyTranscriptFilter() {
   _visibleRangesCache = null;  // filter changed - invalidate cached ranges
   _tnHighlightMatches();
   _refreshMinimap(true);
-  renderTranscriptChapterHeadings();  // re-place headings + hide empty sections
+  _refreshTranscriptChapterHeadings();  // place headings if the lines changed, hide empty sections
 }
 
 // The time-range slider fires dozens-to-hundreds of 'input' events per drag, and
@@ -13166,17 +13293,18 @@ function openTranscriptFilter() {
     _syncPanelBottomRadius();
     return;
   }
-  filter_btn?.classList.add('open');
-  panel.classList.remove('collapsed');
-  _syncPanelBottomRadius();
-  _tnRefreshSpeakerPills();
+  // Draw the contents first, so the panel's first frame already holds them.
+  _tnRenderSpeakerPills();
   _tnRefreshReassignDropdowns();
   _tnRefreshTimeRange();
   _tnRefreshStats();
+  filter_btn?.classList.add('open');
+  panel.classList.remove('collapsed');
+  _syncPanelBottomRadius();
   const searchInput = document.getElementById('tn-search-input');
   if (searchInput) {
     searchInput.value = _transcriptFilter.search;
-    searchInput.focus();
+    searchInput.focus({ preventScroll: true });
   }
 }
 
@@ -13415,12 +13543,30 @@ function _setBadgeLabel(badge, speakerKey) {
   }
 }
 
+// The pills and the analytics panel redraw at most once a frame, and the pills
+// only while the filter panel is open (opening it draws them). A Cleanup apply
+// sends a speaker_label event per speaker, and each one used to rebuild both
+// on the spot, panel open or not.
+let _tnPillsRaf = 0;
 function _tnRefreshSpeakerPills() {
+  if (_tnPillsRaf) return;
+  _tnPillsRaf = requestAnimationFrame(() => {
+    _tnPillsRaf = 0;
+    if (!document.getElementById('transcript-navigator')?.classList.contains('collapsed')) {
+      _tnRenderSpeakerPills();
+    }
+    _refreshAnalytics();
+  });
+}
+
+function _tnRenderSpeakerPills() {
   const container = document.getElementById('tn-speaker-pills');
   if (!container) return;
-  container.innerHTML = '';
+  const frag = document.createDocumentFragment();
 
-  const profiles = _getSortedSpeakerProfiles();
+  const counts = _speakerBadgeCounts();
+  const lines = key => counts.get(key) || 0;
+  const profiles = _getSortedSpeakerProfiles(counts);
   // In original-key mode, each speaker key is its own group (no name-based merging)
   const groups = _showOriginalKeys
     ? profiles.map(p => ({
@@ -13457,7 +13603,7 @@ function _tnRefreshSpeakerPills() {
 
   speakerGroups.forEach(g => {
     const color = g.color || speakerColor(g.speakerKeys[0]);
-    const count = g.speakerKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
+    const count = g.speakerKeys.reduce((sum, k) => sum + lines(k), 0);
     const isOn = _transcriptFilter.speakers.size === 0
       || g.speakerKeys.some(k => _transcriptFilter.speakers.has(k));
 
@@ -13486,11 +13632,11 @@ function _tnRefreshSpeakerPills() {
       _tnJumpToNextSpeaker(g.speakerKeys, 1);
     });
 
-    container.appendChild(pill);
+    frag.appendChild(pill);
   });
 
   // Single merged noise pill - every noise-flagged key combined
-  const totalNoiseCount = noiseKeys.reduce((sum, k) => sum + _speakerBadgeCount(k), 0);
+  const totalNoiseCount = noiseKeys.reduce((sum, k) => sum + lines(k), 0);
   if (totalNoiseCount > 0) {
     const pill = document.createElement('button');
     const active = _showNoise || _noiseSolo;
@@ -13526,13 +13672,12 @@ function _tnRefreshSpeakerPills() {
       e.preventDefault();
       _tnJumpToNextSpeaker(noiseKeys, 1);
     });
-    container.appendChild(pill);
+    frag.appendChild(pill);
   }
 
-  // Keep the analytics panel in lock-step with the chips: it reads the same
-  // speaker data, so any change that refreshes the pills must refresh it too.
-  // (_refreshAnalytics is a no-op while the panel is collapsed.)
-  _refreshAnalytics();
+  container.replaceChildren(frag);
+  // The analytics panel reads the same speaker data; _tnRefreshSpeakerPills
+  // keeps it in lock-step with the chips.
 }
 
 function _tnToggleSpeakerPill(keys, allKeys) {
@@ -13704,15 +13849,14 @@ async function tnApplyReassign() {
 
 let _tnRangeMaxPinned = true; // true = max handle tracks the live end of the timeline
 
+// Read from the in-memory index (_segmentTimes holds every timed line), not
+// the DOM: this runs on every filter open and on every live line.
 function _tnGetTimelineBounds() {
-  const allSegs = document.querySelectorAll('#transcript .transcript-segment[data-start]');
   let minT = Infinity, maxT = 0;
-  allSegs.forEach(seg => {
-    const s = parseFloat(seg.dataset.start || 0);
-    const e = parseFloat(seg.dataset.end || 0);
-    if (s < minT) minT = s;
-    if (e > maxT) maxT = e;
-  });
+  for (const t of _segmentTimes) {
+    if (t.start < minT) minT = t.start;
+    if (t.end > maxT) maxT = t.end;
+  }
   if (minT === Infinity) { minT = 0; maxT = 0; }
   return { minT, maxT };
 }
@@ -13739,11 +13883,13 @@ function _tnRefreshTimeRange() {
   _tnUpdateRangeFill();
   _tnUpdateTimeLabels();
 
-  // Remove old listeners by replacing elements
-  const newMin = rangeMin.cloneNode(true);
-  const newMax = rangeMax.cloneNode(true);
-  rangeMin.replaceWith(newMin);
-  rangeMax.replaceWith(newMax);
+  // The handles' listeners are bound once (they used to be cloned and rebound
+  // on every open). They read the handles from the closure, so they are the
+  // same two elements for the life of the page.
+  if (rangeMin._tnBound) return;
+  rangeMin._tnBound = true;
+  const newMin = rangeMin;
+  const newMax = rangeMax;
 
   newMin.addEventListener('input', () => {
     if (parseFloat(newMin.value) > parseFloat(newMax.value)) newMin.value = newMax.value;
@@ -13825,19 +13971,23 @@ function toggleAnalyticsPanel() {
   const panel = document.getElementById('analytics-panel');
   if (!panel) return;
   const btn = document.getElementById('analytics-btn');
-  const isOpen = !panel.classList.contains('collapsed');
-  panel.classList.toggle('collapsed');
-  if (btn) btn.classList.toggle('active', !isOpen);
-  if (!isOpen) _refreshAnalytics();
+  const opening = panel.classList.contains('collapsed');
+  // Draw before showing, so the panel's first frame already holds the charts.
+  if (opening) _renderAnalytics(panel);
+  panel.classList.toggle('collapsed', !opening);
+  if (btn) btn.classList.toggle('active', opening);
   _syncPanelBottomRadius();
 }
 
 function _refreshAnalytics() {
   const panel = document.getElementById('analytics-panel');
   if (!panel || panel.classList.contains('collapsed')) return;
+  _renderAnalytics(panel);
+}
 
-  const groups = _groupProfilesByName(_getSortedSpeakerProfiles());
-  const allSegs = _segmentRegistry;
+function _renderAnalytics(panel) {
+  const counts = _speakerBadgeCounts();
+  const groups = _groupProfilesByName(_getSortedSpeakerProfiles(counts));
 
   // Gather per-speaker data
   const speakerData = [];
@@ -13849,30 +13999,47 @@ function _refreshAnalytics() {
   // Aggregate noise data separately
   let noiseData = { name: 'Noise', color: _NOISE_COLOR, segCount: 0, speakTime: 0, words: 0, segments: [] };
 
+  // One pass over the transcript tallies every key; groups then add up their
+  // keys. (It used to walk the whole transcript once per speaker group.)
+  const perKey = new Map();
+  for (const seg of _segmentRegistry) {
+    const key = seg.dataset.transcriptSource;
+    let t = perKey.get(key);
+    if (!t) { t = { segCount: 0, speakTime: 0, words: 0, segments: [] }; perKey.set(key, t); }
+    t.segCount++;
+    const s = parseFloat(seg.dataset.start || 0);
+    const e = parseFloat(seg.dataset.end || 0);
+    if (e > s) {
+      t.speakTime += e - s;
+      t.segments.push({ start: s, end: e });
+    }
+    // Count words from text content (skip badge)
+    const badge = seg.querySelector('.src-badge');
+    let text = '';
+    for (let n = badge ? badge.nextSibling : seg.firstChild; n; n = n.nextSibling)
+      text += n.textContent || '';
+    const trimmed = text.trim();
+    if (trimmed) t.words += trimmed.split(/\s+/).length;
+  }
+
   // Tally segments/time/words for a set of speaker keys, extending the session
   // span as a side effect.
   const tallyKeys = (keys) => {
-    const keysSet = new Set(keys);
     let segCount = 0, speakTime = 0, words = 0;
     const segments = [];
-    allSegs.forEach(seg => {
-      if (!keysSet.has(seg.dataset.transcriptSource)) return;
-      segCount++;
-      const s = parseFloat(seg.dataset.start || 0);
-      const e = parseFloat(seg.dataset.end || 0);
-      if (e > s) {
-        speakTime += e - s;
-        segments.push({ start: s, end: e });
-        if (s < sessionStart) sessionStart = s;
-        if (e > sessionEnd) sessionEnd = e;
+    for (const key of keys) {
+      const t = perKey.get(key);
+      if (!t) continue;
+      segCount += t.segCount;
+      speakTime += t.speakTime;
+      words += t.words;
+      for (const sg of t.segments) {
+        segments.push(sg);
+        if (sg.start < sessionStart) sessionStart = sg.start;
+        if (sg.end > sessionEnd) sessionEnd = sg.end;
       }
-      // Count words from text content (skip badge)
-      const badge = seg.querySelector('.src-badge');
-      let text = '';
-      for (let n = badge ? badge.nextSibling : seg.firstChild; n; n = n.nextSibling)
-        text += n.textContent || '';
-      words += text.trim().split(/\s+/).filter(w => w).length;
-    });
+    }
+    if (keys.length > 1) segments.sort((a, b) => a.start - b.start);
     return { segCount, speakTime, words, segments };
   };
 
@@ -13942,7 +14109,7 @@ function _refreshAnalytics() {
     row.className = 'analytics-bar-row';
     row.innerHTML = `
       <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${d.color}"></span>${escapeHtml(d.name)}</span>
-      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${d.color}"></span></span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:${pct}%;background:${d.color}"></span></span>
       <span class="analytics-bar-value">${fmtDuration(d.speakTime)} (${sharePct}%)</span>
     `;
     timeBars.appendChild(row);
@@ -13953,7 +14120,7 @@ function _refreshAnalytics() {
     row.className = 'analytics-bar-row analytics-bar-noise';
     row.innerHTML = `
       <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${_NOISE_COLOR}"></span>Noise</span>
-      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${_NOISE_COLOR}"></span></span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:${pct}%;background:${_NOISE_COLOR}"></span></span>
       <span class="analytics-bar-value">${fmtDuration(noiseData.speakTime)}</span>
     `;
     timeBars.appendChild(row);
@@ -13969,7 +14136,7 @@ function _refreshAnalytics() {
     row.className = 'analytics-bar-row';
     row.innerHTML = `
       <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${d.color}"></span>${escapeHtml(d.name)}</span>
-      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${d.color}"></span></span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:${pct}%;background:${d.color}"></span></span>
       <span class="analytics-bar-value">${d.segCount} seg${d.segCount !== 1 ? 's' : ''}</span>
     `;
     segBars.appendChild(row);
@@ -13980,7 +14147,7 @@ function _refreshAnalytics() {
     row.className = 'analytics-bar-row analytics-bar-noise';
     row.innerHTML = `
       <span class="analytics-bar-label"><span class="analytics-bar-dot" style="background:${_NOISE_COLOR}"></span>Noise</span>
-      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:0%;background:${_NOISE_COLOR}"></span></span>
+      <span class="analytics-bar-track"><span class="analytics-bar-fill" data-pct="${pct}" style="width:${pct}%;background:${_NOISE_COLOR}"></span></span>
       <span class="analytics-bar-value">${noiseData.segCount} seg${noiseData.segCount !== 1 ? 's' : ''}</span>
     `;
     segBars.appendChild(row);
@@ -14026,19 +14193,17 @@ function _refreshAnalytics() {
       tlEl.appendChild(row);
     }
 
-    // Animate timeline rows in with stagger
+    // Animate timeline rows in with a stagger as they scroll into view. Each
+    // row's segments wipe in left to right as one clip on its track (CSS);
+    // every segment used to run a timer and a transition of its own, a
+    // thousand of them for a talkative speaker, spread over eight seconds.
     if (_analyticsTlObserver) _analyticsTlObserver.disconnect();
     _analyticsTlObserver = new IntersectionObserver((entries) => {
+      let nth = 0;
       entries.forEach(entry => {
         if (entry.isIntersecting) {
           const row = entry.target;
-          const delay = parseInt(row.dataset.rowIdx) * 50;
-          setTimeout(() => {
-            row.classList.add('visible');
-            row.querySelectorAll('.analytics-tl-seg').forEach((seg, i) => {
-              setTimeout(() => seg.classList.add('visible'), i * 8);
-            });
-          }, delay);
+          setTimeout(() => row.classList.add('visible'), Math.min(nth++ * 50, 400));
           _analyticsTlObserver.unobserve(row);
         }
       });
@@ -14057,13 +14222,15 @@ function _refreshAnalytics() {
     return;
   }
 
-  // Animate bars as they scroll into view
+  // Animate bars as they scroll into view. Each bar has its final width from
+  // the start and wipes in on a clip (CSS); growing the width meant a layout
+  // of the page on every frame of the animation.
   if (_analyticsBarObserver) _analyticsBarObserver.disconnect();
   _analyticsBarObserver = new IntersectionObserver((entries) => {
     entries.forEach(entry => {
       if (entry.isIntersecting) {
         const bar = entry.target.querySelector('.analytics-bar-fill');
-        if (bar) bar.style.width = bar.dataset.pct + '%';
+        if (bar) bar.classList.add('is-in');
         _analyticsBarObserver.unobserve(entry.target);
       }
     });
@@ -14123,8 +14290,13 @@ function tnClearAll() {
 
 async function clearTranscript() {
   if (!await uiConfirm({ title: 'Clear transcript?', message: 'The transcript will need to be reanalyzed for speaker labeling.', confirmLabel: 'Clear', danger: true })) return;
+  clearTranscriptSelection();
   document.getElementById('transcript').innerHTML =
     '<p class="empty-hint">Transcript cleared.</p>';
+  // The in-memory index goes with the lines: the filter pills, analytics and
+  // the playback highlight kept counting and walking the cleared ones.
+  _clearSegmentRegistry();
+  _tnRefreshSpeakerPills();
 }
 
 /* ── Summary ─────────────────────────────────────────────────────────────── */
@@ -17805,9 +17977,27 @@ function _makeChapterHeading(ch) {
  * or after each chapter's timestamp. Idempotent: clears and re-places on every
  * call, so it's safe to run after (re)render, chapter change, or filter change.
  */
+// What the headings were last placed against. While the chapters and the lines
+// are the same ones, a filter change only shows or hides headings: removing and
+// re-inserting every heading on each pill click or search keystroke also made
+// the whole transcript lay out again.
+let _chapterHeadingsPlaced = null;   // { chapters, registry, count, first }
+
+function _refreshTranscriptChapterHeadings() {
+  const p = _chapterHeadingsPlaced;
+  const container = document.getElementById('transcript');
+  if (p && container && p.chapters === _chapters && p.registry === _segmentRegistry
+      && p.count === _segmentRegistry.length && (!p.first || p.first.isConnected)) {
+    _syncChapterHeadingVisibility(container);
+    return;
+  }
+  renderTranscriptChapterHeadings();
+}
+
 function renderTranscriptChapterHeadings() {
   const container = document.getElementById('transcript');
   if (!container) return;
+  _chapterHeadingsPlaced = null;
   container.querySelectorAll('.transcript-chapter-heading').forEach(el => el.remove());
   if (!_chapters.length) return;
   const segs = container.querySelectorAll('.transcript-segment[data-start]');
@@ -17827,9 +18017,16 @@ function renderTranscriptChapterHeadings() {
     container.appendChild(_makeChapterHeading(_chapters[ci]));
     ci++;
   }
+  _chapterHeadingsPlaced = {
+    chapters: _chapters, registry: _segmentRegistry, count: _segmentRegistry.length,
+    first: container.querySelector('.transcript-chapter-heading'),
+  };
+  _syncChapterHeadingVisibility(container);
+}
 
-  // Under an active filter, hide any heading whose section has no visible
-  // segment (segments are hidden with style.display='none').
+// Under an active filter, hide any heading whose section has no visible
+// segment (segments are hidden with style.display='none').
+function _syncChapterHeadingVisibility(container) {
   container.querySelectorAll('.transcript-chapter-heading').forEach(h => {
     let node = h.nextElementSibling, visible = false;
     while (node && !node.classList.contains('transcript-chapter-heading')) {
@@ -17838,7 +18035,8 @@ function renderTranscriptChapterHeadings() {
       }
       node = node.nextElementSibling;
     }
-    h.style.display = visible ? '' : 'none';
+    const display = visible ? '' : 'none';
+    if (h.style.display !== display) h.style.display = display;
   });
 }
 

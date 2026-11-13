@@ -2427,6 +2427,12 @@ body.video-fullscreen .playback-bar {
 
 /* ── Transcript ────────────────────────────────────────────────────────────── */
 .transcript-body {font-size: 14px;margin-top: 5px;line-height: 1.7;margin-right: 4px;padding-right: 4px;padding-top: 1px;}
+/* The scrollbar's room is always reserved. With it optional, every layout of
+   the column ran the transcript's layout again after the scrollbar was
+   re-decided ("Scrollbar changed"), and each of those passes visits every
+   line: opening a panel or showing filtered lines again cost two or three
+   full transcript layouts instead of one (2026-11-13). */
+#transcript { scrollbar-gutter: stable; }
 
 .transcript-segment {
   content-visibility: auto;
@@ -2451,6 +2457,9 @@ body.video-fullscreen .playback-bar {
   animation: fadeIn .3s ease;
   line-height: 1.6;
 }
+/* Shown again by a filter: no second entrance fade (thousands of lines come
+   back at once). Before .search-flash, which must still play. */
+.transcript-segment.is-reshown { animation: none; }
 .transcript-segment[data-start] { cursor: pointer; }
 .transcript-segment[data-start]:hover { filter: brightness(1.15); }
 .transcript-segment.playing {
@@ -2510,6 +2519,9 @@ body.video-fullscreen .playback-bar {
   /* user-select: none; */
   background: rgb(255 255 255 / 7%);
   border-color: #ffffffb5 !important;
+  /* A Ctrl/Shift+click shows at once; the line's own 0.75s fade made the
+     selection look like it lagged the click. */
+  transition-duration: 0.08s;
 }
 .transcript-segment.transcript-seg-selected .src-speaker {
   outline: 1px solid currentColor;
@@ -5427,14 +5439,8 @@ img#shutdown-icon.brand-icon {
   background: var(--slide-out-bg);
   border-bottom: 1px solid var(--accent-dim2);
   overflow: hidden;
-  transition: max-height 0.25s ease, padding 0.25s ease;
   max-height: 300px;
   padding: 8px 12px;
-}
-.fp-notif-panel.collapsed {
-  max-height: 0;
-  padding: 0 12px;
-  border-bottom: none;
 }
 .fp-notif-header {
   display: flex;
@@ -6825,20 +6831,44 @@ img#shutdown-icon.brand-icon {
   border-bottom: 1px solid var(--accent-dim2);
   flex-shrink: 0;
   overflow: hidden;
-  transition: max-height 0.3s ease, padding 0.3s ease, opacity 0.2s ease;
   max-height: 600px;
   display: flex;
   gap: 0px;
   padding: 2px 0;
   padding-block: 5px;
-  opacity: 1;
   flex-direction: column;
 }
-.transcript-navigator.collapsed {
-  max-height: 0;
-  padding: 0;
-  border-bottom: none;
+
+/* The slide-out panels under the transcript header no longer animate
+   max-height. That resized the transcript on every frame, and every resize
+   relaid out every line (about 20 ms a frame on a 2,600-line meeting), so the
+   slide stuttered; a close also spent its first half shrinking a 600px cap the
+   content never reached, so the panel sat still after the click. The
+   transcript now moves once: when a panel opens, and when it has closed.
+   The filter and suggestion panels fade in and out (display switches after
+   the fade). The analytics panel shows at once and its charts animate in on
+   their own: fading the whole panel made the browser paint all of it as one
+   layer before the first frame, which cost more than the click itself. */
+.transcript-navigator,
+.fp-notif-panel {
+  transition-property: opacity, transform, display;
+  transition-duration: 0.16s;
+  transition-timing-function: ease;
+  transition-behavior: allow-discrete;
+}
+.transcript-navigator.collapsed,
+.fp-notif-panel.collapsed {
+  display: none;
   opacity: 0;
+  transform: translateY(-4px);
+}
+.analytics-panel.collapsed { display: none; }
+@starting-style {
+  .transcript-navigator:not(.collapsed),
+  .fp-notif-panel:not(.collapsed) {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
 }
 
 .tn-row {
@@ -7085,15 +7115,6 @@ img#shutdown-icon.brand-icon {
   border-bottom: 1px solid var(--accent-dim2);
   overflow-y: auto;
   max-height: 400px;
-  transition: max-height 0.3s ease, opacity 0.25s ease, padding 0.3s ease;
-  opacity: 1;
-}
-.analytics-panel.collapsed {
-  max-height: 0;
-  opacity: 0;
-  padding: 0 16px;
-  overflow: hidden;
-  border-bottom: none;
 }
 .analytics-panel::-webkit-scrollbar { width: 4px; }
 .analytics-panel::-webkit-scrollbar-track { background: transparent; }
@@ -7211,15 +7232,22 @@ img#shutdown-icon.brand-icon {
   overflow: hidden;
   position: relative;
 }
+/* The bar has its final width from the start and grows in on a transform,
+   which the compositor runs. Animating width laid out the page on every
+   frame of the animation. */
 .analytics-bar-fill {
   display: block;
   height: 100%;
   border-radius: 6px;
-  transition: width 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
   min-width: 0;
   position: relative;
-  width: 0%;
 }
+/* scaleX(1), not none: going between no transform and a transform is a
+   layout change; between two transforms it is not. */
+.analytics-bar-fill.is-in { transform: scaleX(1); }
 .analytics-bar-fill::after {
   content: '';
   position: absolute;
@@ -7274,23 +7302,32 @@ img#shutdown-icon.brand-icon {
   border-radius: 3px;
   position: relative;
   overflow: hidden;
+  /* Always a transform (identity at rest), so the grow-in animation goes
+     between two transforms and never asks for a layout. */
+  transform: scaleX(1);
+  transform-origin: left center;
 }
 .analytics-tl-seg {
   position: absolute;
   height: 100%;
   border-radius: 2px;
-  opacity: 0;
-  min-width: 2px;
-  transform: scaleX(0);
-  transform-origin: left center;
-  transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
-              opacity 0.2s ease;
-}
-.analytics-tl-seg.visible {
   opacity: 0.8;
-  transform: scaleX(1);
+  min-width: 2px;
+  transition: opacity 0.2s ease;
 }
-.analytics-tl-seg.visible:hover { opacity: 1; }
+.analytics-tl-seg:hover { opacity: 1; }
+/* A row's segments grow in from the left as one transform on the track,
+   started by the row's .visible. Each segment used to run a timer and a
+   transition of its own (1,000 timers over 8 seconds for a talkative
+   speaker). The track rests at scaleX(1) (below): starting and ending the
+   animation from no transform laid the track out again each time, and it
+   holds every segment of the speaker. */
+.analytics-tl-row.visible .analytics-tl-track {
+  animation: analytics-tl-grow 0.5s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+@keyframes analytics-tl-grow {
+  from { transform: scaleX(0); }
+}
 
 /* Donut wrapper (for the KPI area) */
 .analytics-donut-wrap {
