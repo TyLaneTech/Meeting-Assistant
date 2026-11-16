@@ -12,7 +12,7 @@
    Load-bearing ids: #record-btn #topbar-session-title #home-search-input
    #home-search-clear #home-search-results #home-search-ai #pane-toggle-*
    #refresh-btn #capture-meters #capture-meter-desktop #capture-meter-mic
-   #capture-warning #transcript-lag #transcript-lag-text #}
+   #capture-warning #transcript-lag #transcript-lag-text #live-return-btn #}
 <header class="app-header" id="app-header">
 
   <div class="app-header-title">
@@ -39,6 +39,16 @@
     </div>
   </div>
   <span class="capture-warning hidden" id="capture-warning" role="status"></span>
+
+  {# Back to the meeting that is recording, shown while a recording runs and
+     something else is on screen (another meeting, Home, Calendar). The
+     recording carries on either way; app.js shows and hides it
+     (_syncLiveReturnPill) and the click goes through showLiveMeeting(). #}
+  <button type="button" class="live-return-pill" id="live-return-btn" hidden
+          onclick="showLiveMeeting()" title="Go back to the meeting that is recording">
+    <span class="live-return-dot" aria-hidden="true"></span>
+    <span>Back to live</span>
+  </button>
 
   {# How far behind live transcription is (the transcription_backlog event). A
      pill in the row, never a bar over the page: the fixed bar it replaced sat

@@ -373,6 +373,22 @@ _state: dict = {
     "is_starting": False,
 }
 _state_lock = threading.Lock()
+# Custom summary instructions (the box above the summary), per meeting. A page
+# posts the instructions of the meeting it shows, and every summary, chat and
+# chapters call reads its own meeting's, so opening another meeting while one
+# records (in this window or another) never changes what the live summary is
+# told. A post with no meeting (a blank workspace, an older page) sets
+# _state["custom_prompt"], the default a meeting without its own entry uses,
+# which is how a new recording picks up what was typed before it started.
+# Guarded by _state_lock.
+_custom_prompts: dict[str, str] = {}
+
+
+def _custom_prompt_for(session_id: "str | None") -> str:
+    """The summary instructions for one meeting. Call with _state_lock held."""
+    if session_id and session_id in _custom_prompts:
+        return _custom_prompts[session_id]
+    return _state["custom_prompt"]
 _summary_lock = threading.Lock()  # serializes summary runs; prevents auto/manual overlap
 # Heavy summary regen/export of OTHER sessions requested while a recording is
 # active is deferred here and drained when the recording stops. Running a bulk
@@ -1251,7 +1267,7 @@ def _on_segment(
             new_transcript = _build_transcript(
                 _state["segments"], _state["speaker_labels"]
             )
-            custom_prompt = _state["custom_prompt"]
+            custom_prompt = _custom_prompt_for(_state["session_id"])
             meta = _build_session_meta(
                 _state["segments"],
                 _state["speaker_labels"],
@@ -1280,7 +1296,7 @@ def _on_segment(
                 _state["segments"],
                 _state["speaker_labels"],
                 is_live=True,
-                custom_prompt=_state["custom_prompt"],
+                custom_prompt=_custom_prompt_for(_state["session_id"]),
                 current_summary=_state["summary"],
             )
 
@@ -1704,9 +1720,8 @@ def _speaker_summary_args(session_id: str, update_context: str) -> "tuple | None
 
     saved = _saved_speakers_if_active(session_id)
     with _state_lock:
-        # custom_prompt mirrors whichever session the user is viewing in the
-        # textarea — always honor it regardless of active recording session.
-        custom_prompt = _state["custom_prompt"]
+        # This meeting's own instructions (see _custom_prompts).
+        custom_prompt = _custom_prompt_for(session_id)
         if _state["session_id"] == session_id:
             existing_summary = _state["summary"]
             if not existing_summary:
@@ -4078,13 +4093,12 @@ def summarize():
     session_id = data.get("session_id")
 
     # Get full transcript for this session.
-    # custom_prompt is taken from _state regardless of whether this session
-    # is the active recording — the summary textarea always POSTs its value
-    # via /api/custom-prompt for whichever session the user is viewing.
+    # The meeting's own instructions, which the page posts to
+    # /api/custom-prompt for the meeting it shows (see _custom_prompts).
     saved = _saved_speakers_if_active(session_id)
     with _state_lock:
         active_sid = _state["session_id"]
-        custom_prompt = _state["custom_prompt"]
+        custom_prompt = _custom_prompt_for(session_id)
         if session_id == active_sid:
             segments, labels = _live_lines(saved)
             transcript = _build_transcript(segments, labels)
@@ -4147,13 +4161,20 @@ def summarize():
 
 @app.route("/api/custom-prompt", methods=["GET", "POST"])
 def custom_prompt_endpoint():
-    """Get or set the custom summary prompt for the current session."""
+    """Get or set the custom summary instructions of one meeting (session_id),
+    or, without one, the default a meeting without its own uses."""
     if request.method == "GET":
+        sid = request.args.get("session_id") or None
         with _state_lock:
-            return jsonify({"custom_prompt": _state["custom_prompt"]})
+            return jsonify({"custom_prompt": _custom_prompt_for(sid)})
     data = request.get_json(silent=True) or {}
+    text = data.get("custom_prompt", "") or ""
+    sid = data.get("session_id") or None
     with _state_lock:
-        _state["custom_prompt"] = data.get("custom_prompt", "")
+        if sid:
+            _custom_prompts[sid] = text
+        else:
+            _state["custom_prompt"] = text
     return jsonify({"ok": True})
 
 
@@ -7166,7 +7187,7 @@ def chat():
             meta = _build_session_meta(
                 segments, labels,
                 is_live=_state["is_recording"],
-                custom_prompt=_state["custom_prompt"],
+                custom_prompt=_custom_prompt_for(session_id),
                 current_summary=_state["summary"],
             )
         else:
@@ -7210,7 +7231,11 @@ def chat():
     _chat_cancel[request_id] = cancel_event
 
     def run_chat():
-        _push("chat_start", {"request_id": request_id, "question": question})
+        # Every chat event names its meeting: the page shows one meeting at a
+        # time (a past one while another records, or another window's), and a
+        # reply streaming for one must never land in the chat of another.
+        _push("chat_start", {"request_id": request_id, "question": question,
+                             "session_id": session_id})
         response_chunks: list[str] = []
         tool_calls_log: list[dict] = []
 
@@ -7218,7 +7243,8 @@ def chat():
             if cancel_event.is_set():
                 return
             response_chunks.append(t)
-            _push("chat_chunk", {"request_id": request_id, "text": t})
+            _push("chat_chunk", {"request_id": request_id, "text": t,
+                                 "session_id": session_id})
 
         def on_tool_event(event_type: str, payload: dict) -> None:
             if cancel_event.is_set():
@@ -7256,6 +7282,7 @@ def chat():
                 "request_id": request_id,
                 "type": event_type,
                 **payload,
+                "session_id": session_id,
             })
 
         def on_done() -> None:
@@ -7267,7 +7294,7 @@ def chat():
                 with _state_lock:
                     if session_id == _state["session_id"]:
                         _state["chat_history"].append({"role": "assistant", "content": full})
-            _push("chat_done", {"request_id": request_id})
+            _push("chat_done", {"request_id": request_id, "session_id": session_id})
 
         # Build frame extractor - works for both live and completed recordings.
         # Returns (jpeg_bytes, url) so ai_assistant can show the image to the
@@ -7454,7 +7481,7 @@ def api_generate_chapters():
             meta = _build_session_meta(
                 segments, labels,
                 is_live=_state["is_recording"],
-                custom_prompt=_state["custom_prompt"],
+                custom_prompt=_custom_prompt_for(session_id),
                 current_summary=_state["summary"],
             )
         else:

@@ -756,6 +756,7 @@ const page = {
   _voiceSampleAudio: null, _voicePlayToken: 0, _voicePlayButton: null,
   _voicePlayRender: null, _voiceMetaHandler: null,
   _cleanupStopPlayback() {},
+  _guardSoundWhileRecording() {},   // tested in test_browse_during_recording.py
 };
 const scope = new Proxy(page, {
   has: (t, k) => typeof k === 'string' && (k in t || !(k in globalThis)),
@@ -857,6 +858,7 @@ const page = {
   _cvSeekPending: false, _cvSeekWatchdog: 0, _cvRAF: 0, _cvLastSeekAt: 0,
   _cvFollowEl: null, _cvFollowed: new WeakSet(), _cvDock: null, _cvPendingDock: null,
   _voiceSampleAudio: null, _voicePlayToken: 0, _voicePlayButton: null, _voicePlayRender: null, _voiceMetaHandler: null,
+  _guardSoundWhileRecording() {},   // tested in test_browse_during_recording.py
   _cleanupStopPlayback() {}, _cleanupVideoEnsureDragWired() {}, _cleanupVideoSyncToggleBtn() {},
   _cvResetZoom() {}, _cvClampPan() {}, _cvApplyZoom() {}, savePref() {},
   _cleanupVideoSavePosition() { saved += 1; },

@@ -19,11 +19,18 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
-## Fixed a false call audio alert and a lost transcript (2026-11-16)
+## Added browsing while a meeting records (2026-11-16)
 
 ### Recording
+- **Opening another meeting** no longer stops the recording; it carries on in the background while you read or edit.
+- **The `Back to live` button** in the header returns you to the meeting that is recording, from any page.
+- **Playing sound during a recording** asks first, because the recording picks up anything your computer plays.
+- **The `No desktop audio for a minute` notice** goes away when the recording stops.
 - **The `Call audio not captured` alert** no longer pops up while you present and everyone else on the call is quiet.
 - **Joining a quiet call early** no longer shows `Call audio not captured` before anyone has spoken.
+
+### Meetings
+- **`Open in new window`** in a meeting's right-click menu opens it in a window of its own, beside the app.
 
 ### Transcripts
 - **Restarting or updating the app** while a meeting is being transcribed no longer loses its transcript; it resumes on the next start.

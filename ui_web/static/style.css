@@ -12631,6 +12631,38 @@ body[data-view="session"] #view-title { display: none; }
 }
 .transcript-lag-close:hover { background: color-mix(in srgb, var(--yellow) 24%, transparent); }
 
+/* Back to the live meeting, while something else is on screen. The capture
+   warning's pill shape in the recording red, with the record dot's pulse. */
+.live-return-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 3px 9px 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--red) 40%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--red) 14%, var(--surface));
+  color: var(--red);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.live-return-pill[hidden] { display: none; }
+.live-return-pill:hover { background: color-mix(in srgb, var(--red) 24%, var(--surface)); }
+.live-return-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  animation: live-return-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-return-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+
 /* ── The header while recording ──────────────────────────────────────────────
    The strip's red is now the header's own. Every element that carried a
    surface fill is re-mixed against the same red so the row reads as one

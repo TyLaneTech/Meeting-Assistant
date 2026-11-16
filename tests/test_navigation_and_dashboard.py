@@ -949,12 +949,17 @@ def test_query_actions_are_consumed_once():
 
 def test_the_recording_state_machine_is_implemented():
     js = _read(STATIC / "app.js")
-    # Opening another recording while live asks once, and names the recording.
-    load = js[js.index("async function loadSession(sessionId)"):]
+    # Opening another meeting while live never stops the recording (it carries
+    # on in the background; test_browse_during_recording.py runs it), and the
+    # live meeting itself opens as the live view.
+    load = js[js.index("async function loadSession(sessionId, opts)"):]
     load = load[:load.index("const gen = ++_loadGeneration;")]
-    assert "Stop the current recording and open ${label}?" in load
-    # Opening the live session returns to its workspace instead of reloading it.
-    assert "if (sessionId === state.sessionId) {" in load
+    assert "/api/recording/stop" not in load
+    assert "Stop the current recording" not in js
+    assert "return showLiveMeeting(sessionId);" in load
+    # Opening the session already on screen returns to its workspace instead
+    # of reloading it.
+    assert "if (sessionId === state.sessionId && (o.live ? !state.isViewingPast : true)) {" in load
     # Stop from any view leaves the view alone and offers a way in.
     saved = js[js.index("function _announceRecordingSaved(sessionId)"):]
     saved = saved[:saved.index("// Auto-open the Cleanup tab")]

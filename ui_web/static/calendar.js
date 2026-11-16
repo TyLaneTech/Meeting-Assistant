@@ -241,7 +241,8 @@ function _calLoad() {
   const enabled = !!(status && (status.enabled != null ? status.enabled : status.calendar_enabled));
   const payload = range ? AppData.get('calendarEvents', range) : null;
   const events = (payload && payload.events) || [];
-  const liveId = (typeof state !== 'undefined' && state && state.isRecording) ? state.sessionId : null;
+  // The recording's meeting, whichever meeting the workspace shows.
+  const liveId = (typeof state !== 'undefined' && state && state.isRecording) ? (state.liveSessionId || null) : null;
 
   _calState.range = range;
   _calState.enabled = enabled;

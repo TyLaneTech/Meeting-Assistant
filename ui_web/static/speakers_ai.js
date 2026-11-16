@@ -1546,8 +1546,11 @@
   function onSpeakersUpdated(d) {
     if (!d || d.session_id !== curSid()) return;
     // The lines that moved repaint where they are; nothing reloads the
-    // meeting, which would close this dialog. Never during a recording.
-    if (!recording() && typeof window.onSpeakersChangedElsewhere === 'function') {
+    // meeting, which would close this dialog. Never over the live meeting
+    // while it records; a past meeting open meanwhile repaints as usual.
+    const overLive = recording() && typeof state !== 'undefined' && state
+      && d.session_id === state.liveSessionId;
+    if (!overLive && typeof window.onSpeakersChangedElsewhere === 'function') {
       window.onSpeakersChangedElsewhere(d.session_id, d.segments || []);
     }
     if (enabled() && _managerOpen() && S.pane === 'ai') loadSoon(d.session_id);

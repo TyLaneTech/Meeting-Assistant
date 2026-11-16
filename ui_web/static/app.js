@@ -631,6 +631,7 @@ const Views = {
     _syncNavCurrent(name);
     _syncAskRailForView(name);
     _syncHeaderForView(name);
+    _syncLiveReturnPill();
 
     const el = document.getElementById('view-' + name);
     if (el) {
@@ -707,6 +708,10 @@ const Views = {
       if (el) el.textContent = title;
       document.title = `${fallback} · Meeting Assistant`;
     }
+    // A window opened with "Open in new window" must not end its title in
+    // "Meeting Assistant", or the tray and toasts would raise it as the app
+    // window (core/window_focus.py; see _viewerWindow).
+    if (typeof _viewerWindow !== 'undefined' && _viewerWindow) document.title += ' (new window)';
     const sub = document.getElementById('view-subtitle');
     if (sub) {
       sub.textContent = custom.subtitle || '';
@@ -777,6 +782,7 @@ function _applyRouteQuery(view, params, opts) {
   const o = opts || {};
 
   if (params.has('workspace')) _consumeParams('workspace');
+  if (params.has('window')) _consumeParams('window');   // read at load (_viewerWindow)
 
   // ?attention=needs still filters the recordings list (the criterion lives in
   // the filter popover); the queue itself is the /attention route.
@@ -830,13 +836,13 @@ function _applyRouteQuery(view, params, opts) {
 
   const id = params.get('id');
   if (id) {
-    // Reconcile against /api/status before binding the workspace: if this is
-    // the live session, SSE status and replay own it and loadSession must not
-    // re-render underneath them.
+    // Reconcile against /api/status before binding the workspace: the live
+    // meeting is shown through showLiveMeeting(), which keeps appending what is
+    // said, never as a past meeting that would stop updating.
     fetch('/api/status').then(r => r.json()).then(st => {
       if (st.recording && st.session_id === id) {
-        state.sessionId = id;
-        state.isViewingPast = false;
+        state.liveSessionId = id;
+        if (!(state.sessionId === id && !state.isViewingPast)) showLiveMeeting();
         if (_quietPromptLanding === id) {
           setTimeout(() => showQuietStopConfirm(id), 250);
           _quietPromptLanding = null;
@@ -1014,9 +1020,14 @@ function _syncCaptureMeters() {
   if (!live) {
     meters.removeAttribute('title');
     if (_captureWarnTimer) { clearInterval(_captureWarnTimer); _captureWarnTimer = null; }
+    // The warning belongs to the recording: it goes with the meters. The timer
+    // that would have hidden it is gone, so left alone "No desktop audio for a
+    // minute" stayed up after the stop, whatever played next.
+    _syncCaptureWarning();
     return;
   }
-  const entry = _sidebarAllSessions.find(s => s.id === state.sessionId);
+  // The recording's meeting, which need not be the one on screen.
+  const entry = _sidebarAllSessions.find(s => s.id === (state.liveSessionId || state.sessionId));
   meters.title = `Recording ${(entry && entry.title) || 'New recording'}`;
   if (!_captureWarnTimer) {
     _captureLastDesktopAudio = Date.now();
@@ -1714,7 +1725,12 @@ function jumpToTimestamp(seconds) {
 
 /* ── App state ───────────────────────────────────────────────────────────── */
 const state = {
+  // The meeting on screen in the workspace. While a recording runs this can be
+  // any meeting: the recording carries on in the background, and liveSessionId
+  // says which meeting it is. isViewingPast is true whenever the meeting on
+  // screen is not the live one (see _showingLiveMeeting).
   sessionId:      null,
+  liveSessionId:  null,
   isRecording:    false,
   // Record was pressed and the start request is out, but the server has not
   // reported a recording yet. The button says "Starting…" for this stretch
@@ -1752,6 +1768,153 @@ const state = {
 
 // Per-session summary stream tracking: { [sessionId]: { buffer, streaming, mode } }
 const _summaryStreams = {};
+
+/* ── Browsing while a meeting records ────────────────────────────────────────
+ * A recording does not need its meeting on screen. It carries on in the
+ * background while the workspace shows any other meeting (or Home, Calendar,
+ * Speakers), and the header's "Back to live" pill returns to it from anywhere.
+ * state.liveSessionId is the recording's meeting, state.sessionId the one on
+ * screen. Live lines append only while the workspace shows the live meeting,
+ * and a status push binds the workspace to the recording only when it already
+ * shows it, was empty, or this window just started it (onStatus). */
+
+/** The workspace shows the meeting that is recording now. */
+function _showingLiveMeeting() {
+  return !!state.isRecording && !!state.sessionId
+    && state.sessionId === state.liveSessionId && !state.isViewingPast;
+}
+
+/** The parts of the last recording status push that belong to the live view
+ *  (the "(You)" link, the screen preview toggle), so returning to the live
+ *  meeting can put them back. */
+let _liveExtras = { meSpeaker: null, screenRecording: false };
+
+/** Live transcript events held while the workspace loads the live meeting
+ *  (showLiveMeeting): { sid, events: [[type, data], ...] }. The load reads the
+ *  meeting from the database, and whatever is said from the moment it starts
+ *  lands here and is replayed once the transcript has rendered, so a line is
+ *  never lost between the read and the first live event, nor shown twice.
+ *  null when no load is in progress. */
+let _liveCatchup = null;
+
+/** Show the header's "Back to live" pill whenever a recording runs and the
+ *  user is not looking at its meeting. */
+function _syncLiveReturnPill() {
+  const btn = document.getElementById('live-return-btn');
+  if (!btn) return;
+  const away = !!state.isRecording && !!state.liveSessionId
+    && !(Views.current === 'session' && _showingLiveMeeting());
+  btn.hidden = !away;
+}
+
+/* Sound played while a meeting records is picked up by the desktop capture
+ * and transcribed into the live meeting as if someone on the call had said
+ * it. The first sound of a recording (playback, a Cleanup preview, a voice
+ * sample) asks first; a yes holds until that recording ends. */
+let _soundAllowedFor = null;   // the liveSessionId the user said yes for
+let _soundAsk = null;          // the open question, so two plays ask once
+
+function _guardSoundWhileRecording(audio) {
+  if (!audio || audio.dataset.recordingGuard) return;
+  audio.dataset.recordingGuard = '1';
+  audio.addEventListener('play', () => {
+    if (!state.isRecording || _soundAllowedFor === state.liveSessionId) return;
+    // Only the plain playback bar is picked up again after a yes: a Cleanup
+    // preview or a voice sample runs its own queue, which the pause ended.
+    const resume = audio.id === 'playback-audio' && !audio.dataset.cleanupActive;
+    audio.pause();
+    // The playback bar set its button to "pause" when it asked to play.
+    if (audio.id === 'playback-audio') _setPlayBtn(false);
+    if (_soundAsk) return;
+    _soundAsk = uiConfirm({
+      title: 'Play sound while recording?',
+      message: 'A meeting is recording. Anything you play now is picked up by '
+             + 'the recording and ends up in its transcript.',
+      confirmLabel: 'Play anyway',
+    }).then(ok => {
+      _soundAsk = null;
+      if (!ok || !state.isRecording) return;
+      _soundAllowedFor = state.liveSessionId;
+      if (resume) { audio.play().catch(() => {}); _setPlayBtn(true); }
+    });
+  });
+}
+
+/* ── Windows opened with "Open in new window" ────────────────────────────────
+ * Such a window (a viewer) browses like any other, but while an app window is
+ * open it leaves the app's jobs to that window: its title does not end in
+ * "Meeting Assistant", so the tray, the Start Menu and toasts raise the app
+ * window instead (core/window_focus.py), and it ignores the desktop's navigate
+ * pushes and start commands. App windows answer a viewer's "who is there" on
+ * a BroadcastChannel; after two unanswered asks the viewer becomes an ordinary
+ * app window, so closing the main window never leaves the app without one. */
+const _VIEWER_KEY = 'ma-viewer-window';
+let _viewerWindow = (() => {
+  try {
+    if (new URLSearchParams(location.search).get('window') === 'viewer') {
+      sessionStorage.setItem(_VIEWER_KEY, '1');
+    }
+    return sessionStorage.getItem(_VIEWER_KEY) === '1';
+  } catch (_) { return false; }
+})();
+const _windowChannel = (() => {
+  try { return new BroadcastChannel('ma-windows'); } catch (_) { return null; }
+})();
+let _appWindowHeardAt = 0;
+let _appWindowAskedAt = 0;
+let _appWindowMisses = 0;
+
+function _announceAppWindow() {
+  if (!_viewerWindow && _windowChannel) _windowChannel.postMessage({ kind: 'app-window' });
+}
+
+function _becomeAppWindow() {
+  if (!_viewerWindow) return;
+  _viewerWindow = false;
+  try { sessionStorage.removeItem(_VIEWER_KEY); } catch (_) {}
+  if (Views.current) Views.applyTitle(Views.current);
+  _announceAppWindow();
+}
+
+/** One round of the viewer's check: count the last ask as missed when no app
+ *  window answered it, then ask again. */
+function _checkForAppWindow() {
+  if (!_viewerWindow || !_windowChannel) return;
+  if (_appWindowAskedAt && _appWindowHeardAt < _appWindowAskedAt) _appWindowMisses += 1;
+  else _appWindowMisses = 0;
+  if (_appWindowMisses >= 2) { _becomeAppWindow(); return; }
+  _appWindowAskedAt = Date.now();
+  _windowChannel.postMessage({ kind: 'who-is-there' });
+}
+
+if (_windowChannel) {
+  _windowChannel.onmessage = ev => {
+    const d = (ev && ev.data) || {};
+    if (d.kind === 'app-window') _appWindowHeardAt = Date.now();
+    else if (d.kind === 'who-is-there') _announceAppWindow();
+    else if (d.kind === 'app-window-gone' && _viewerWindow) _checkForAppWindow();
+  };
+  setInterval(_checkForAppWindow, 3000);
+  _checkForAppWindow();
+  window.addEventListener('pagehide', () => {
+    if (!_viewerWindow) _windowChannel.postMessage({ kind: 'app-window-gone' });
+  });
+}
+
+/** Open a meeting in a window of its own, beside this one. */
+function openMeetingInNewWindow(sessionId) {
+  if (!sessionId) return;
+  const url = '/session?id=' + encodeURIComponent(sessionId) + '&window=viewer';
+  const w = Math.min(1280, Math.round((screen.availWidth || 1280) * 0.8));
+  const h = Math.min(900, Math.round((screen.availHeight || 900) * 0.85));
+  const win = window.open(url, 'ma-meeting-' + sessionId, `popup,width=${w},height=${h}`);
+  if (win) { try { win.focus(); } catch (_) {} return; }
+  uiToast({
+    message: 'The browser blocked the new window.',
+    kind: 'warn',
+    action: { label: 'Open here', onClick: () => loadSession(sessionId) },
+  });
+}
 
 // Apply sidebar layout from cache synchronously - eliminates flash before async prefs load
 {
@@ -2621,7 +2784,7 @@ function _sessionMatchesFilter(s, f, knownFolderIds) {
   if (f.hasTranscript === 'yes' && !hasT) return false;
   if (f.hasTranscript === 'no'  &&  hasT) return false;
 
-  const isLive = s.id === state.sessionId && state.isRecording;
+  const isLive = state.isRecording && s.id === state.liveSessionId;
   const isDone = !!s.ended_at && !isLive;
   if (f.status === 'done'   && !isDone) return false;
   if (f.status === 'inprog' && !isLive) return false;
@@ -3743,7 +3906,8 @@ function _renderFolderSubtree(parentId, depth, container, childMap, sessionsByFo
 
 function _makeSessionEl(s) {
   const isActive   = s.id === state.sessionId;
-  const isLive     = isActive && state.isRecording;
+  // The recording's own row, whichever meeting is on screen.
+  const isLive     = state.isRecording && s.id === state.liveSessionId;
   const isSelected = _sidebarSelected.has(s.id);
 
   const el = document.createElement('div');
@@ -3901,6 +4065,14 @@ function _openSessionMenu(e, s, pos) {
   const menu = document.createElement('div');
   menu.className = 'session-menu';
   menu.id = 'session-menu-popup';
+
+  // Beside this window, so a meeting can be read next to another one (the
+  // live recording included) without leaving it.
+  const newWin = document.createElement('div');
+  newWin.className = 'session-menu-item';
+  newWin.innerHTML = '<i class="fa-solid fa-up-right-from-square"></i>  Open in new window';
+  newWin.addEventListener('click', ev => { ev.stopPropagation(); _closeSessionMenu(); openMeetingInNewWindow(s.id); });
+  menu.appendChild(newWin);
 
   if (s.has_audio) {
     const rea = document.createElement('div');
@@ -4429,8 +4601,10 @@ async function bulkDelete() {
     body: JSON.stringify({ action: 'delete', session_ids: ids }),
   });
   _sidebarSelected.clear();
-  if (ids.includes(state.sessionId) && !state.isRecording) {
-    newSession();
+  if (ids.includes(state.sessionId) && !_showingLiveMeeting()) {
+    // The meeting on screen is gone: back to the live one while it records.
+    if (state.isRecording && state.liveSessionId) showLiveMeeting();
+    else newSession();
     return;
   }
   refreshSidebar();
@@ -4600,7 +4774,7 @@ function formatSessionMeta(s) {
   // recording. Stale ended_at=NULL rows from app crashes / aborted splits
   // would otherwise mislead the sidebar - fall through and compute the
   // duration from last_segment_time instead.
-  const isActiveRecording = state.sessionId === s.id && state.isRecording;
+  const isActiveRecording = state.isRecording && state.liveSessionId === s.id;
   if (!s.ended_at && isActiveRecording) {
     return `${time} <span class="session-meta-sep">|</span> In progress`;
   }
@@ -4622,8 +4796,10 @@ function formatSessionMeta(s) {
 async function deleteSession(e, sessionId) {
   e.stopPropagation();
   await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
-  if (sessionId === state.sessionId && !state.isRecording) {
-    newSession();
+  if (sessionId === state.sessionId && !_showingLiveMeeting()) {
+    // The meeting on screen is gone: back to the live one while it records.
+    if (state.isRecording && state.liveSessionId) showLiveMeeting();
+    else newSession();
     return;
   }
   refreshSidebar();
@@ -5297,6 +5473,9 @@ function connectSSE(afterSegId = 0) {
   // destination behaves exactly as it does when it arrives in the URL.
   // See core/app_window.py.
   src.addEventListener('navigate', e => {
+    // Meant for the app window the desktop raised, never a window opened with
+    // "Open in new window" while that one is open (see _viewerWindow).
+    if (_viewerWindow) return;
     let d;
     try { d = JSON.parse(e.data); } catch (_) { return; }
     if (d && d.url) navigateTo(d.url);
@@ -5324,6 +5503,9 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('transcript', e => {
     const d = JSON.parse(e.data);
+    // The live meeting is loading (showLiveMeeting): hold its lines until the
+    // transcript has rendered, then replay them (_flushLiveCatchup).
+    if (_liveCatchup && d.session_id === _liveCatchup.sid) { _liveCatchup.events.push(['transcript', d]); return; }
     if (d.session_id && d.session_id !== state.sessionId) return;
     if (d.seg_id) _lastLiveSegId = Math.max(_lastLiveSegId, d.seg_id);
     if (!state.isViewingPast || state.isReanalyzing || state.isDrainingBacklog) {
@@ -5337,6 +5519,7 @@ function connectSSE(afterSegId = 0) {
 
   src.addEventListener('transcript_update', e => {
     const d = JSON.parse(e.data);
+    if (_liveCatchup && d.session_id === _liveCatchup.sid) { _liveCatchup.events.push(['transcript_update', d]); return; }
     if (d.session_id && d.session_id !== state.sessionId) return;
     if ((!state.isViewingPast || state.isReanalyzing || state.isDrainingBacklog) && d.seg_id) {
       const seg = document.querySelector(`.transcript-segment[data-seg-id="${d.seg_id}"]`);
@@ -5530,7 +5713,18 @@ function connectSSE(afterSegId = 0) {
     linkifyTimestamps(el);
   });
 
-  src.addEventListener('chat_start', () => {
+  // Chat events name their meeting. A reply streaming for one meeting (the
+  // live one, while the user reads another, or another window's) never lands
+  // in the chat on screen; it is saved, and shows when its meeting is opened.
+  const _chatForOtherMeeting = e => {
+    try {
+      const d = JSON.parse(e.data || '{}');
+      return !!(d && d.session_id && d.session_id !== state.sessionId);
+    } catch (_) { return false; }
+  };
+
+  src.addEventListener('chat_start', e => {
+    if (_chatForOtherMeeting(e)) return;
     state.chatBuffer  = '';
     state.chatToolCalls = [];
     state.chatCursor  = createAssistantBubble();
@@ -5541,6 +5735,7 @@ function connectSSE(afterSegId = 0) {
   });
 
   src.addEventListener('chat_tool_event', e => {
+    if (_chatForOtherMeeting(e)) return;
     const d = JSON.parse(e.data);
     if (!state.chatCursor) return;
     const wrap = state.chatCursor.closest('.chat-msg');
@@ -5572,6 +5767,7 @@ function connectSSE(afterSegId = 0) {
   });
 
   src.addEventListener('chat_chunk', e => {
+    if (_chatForOtherMeeting(e)) return;
     state.chatBuffer += JSON.parse(e.data).text;
     if (state.chatCursor) {
       const wrap = state.chatCursor.closest('.chat-msg');
@@ -5601,7 +5797,8 @@ function connectSSE(afterSegId = 0) {
     }
   });
 
-  src.addEventListener('chat_done', () => {
+  src.addEventListener('chat_done', e => {
+    if (_chatForOtherMeeting(e)) return;
     if (state.chatCursor) {
       // Flush any pending coalesced render so the final tokens are never dropped.
       if (_pendingChatRaf) {
@@ -5950,6 +6147,10 @@ function _bindRecordingCommand(src) {
     let d;
     try { d = JSON.parse(e.data); } catch (_) { return; }
     if (!d || d.action !== 'start' || !d.nonce) return;
+    // A window opened with "Open in new window" leaves starts to the app
+    // window. No ack, so with no app window left to take it the server opens
+    // one; and a viewer becomes the app window itself once it is the last one.
+    if (_viewerWindow) return;
     if (d.nonce === _lastRecordingCommandNonce) return;
     _lastRecordingCommandNonce = d.nonce;
     if (state.isRecording) return;
@@ -6297,6 +6498,8 @@ function onStatus(d) {
 
   if (d.recording !== undefined) {
     const _wasRecording = state.isRecording;
+    // Read before the line below clears it: a start this window asked for.
+    const startedHere = !!state.isStartingRecording;
     state.isRecording = d.recording;
     // A recording is live, whoever started it, so "Starting…" is over. Pushes
     // saying recording: false leave it alone: every push says that until the
@@ -6313,33 +6516,51 @@ function onStatus(d) {
           localStorage.removeItem('summary-prompt:new');
         }
       }
-      // Bind the Notes editor to the new session.  For a brand-new recording
-      // there are no saved notes yet; for a resumed session we fetch them so
-      // the user can keep adding to what they had before.
-      if (_notesSessionBound !== d.session_id) {
-        if (d.resumed) {
-          fetch(`/api/sessions/${d.session_id}/notes`)
-            .then(r => r.ok ? r.json() : null)
-            .then(p => _notesApplyForSession(d.session_id, p && p.delta ? p : null))
-            .catch(() => _notesApplyForSession(d.session_id, null));
-        } else {
-          _notesApplyForSession(d.session_id, null);
+      state.liveSessionId = d.session_id;
+      _liveExtras = { meSpeaker: d.me_speaker || null, screenRecording: !!d.screen_recording };
+      // Status arrives all through a recording (every reconnect, a window
+      // refocused, a settings change), so it binds the workspace to the
+      // recording only when the workspace already shows it, is empty, or this
+      // window just started it. A meeting the user opened stays on screen; the
+      // recording carries on in the background (see _showingLiveMeeting).
+      const follow = state.sessionId === d.session_id || !state.sessionId || startedHere;
+      if (follow) {
+        // Bind the Notes editor to the new session.  For a brand-new recording
+        // there are no saved notes yet; for a resumed session we fetch them so
+        // the user can keep adding to what they had before.
+        if (_notesSessionBound !== d.session_id) {
+          if (d.resumed) {
+            fetch(`/api/sessions/${d.session_id}/notes`)
+              .then(r => r.ok ? r.json() : null)
+              .then(p => _notesApplyForSession(d.session_id, p && p.delta ? p : null))
+              .catch(() => _notesApplyForSession(d.session_id, null));
+          } else {
+            _notesApplyForSession(d.session_id, null);
+          }
+        }
+        // Only the workspace shows a session, so the URL is rewritten only when
+        // the workspace is the active view. Recording from Home stays on Home.
+        if (Views.current === 'session') {
+          history.replaceState({ view: 'session', url: '/session?id=' + d.session_id },
+                               '', '/session?id=' + d.session_id);
+        }
+        state.sessionId     = d.session_id;
+        state.isViewingPast = false;
+        _loadChatContextFoldersForSession(d.session_id);
+        _loadPaneVisible(d.session_id);
+        refreshSessionChatPromptBadge();
+        destroyPlayback();
+        if (d.screen_recording) _showScreenPreviewToggle(true);
+        // During a live recording the reserved "me" key is THIS instance's own
+        // mic audio, so link it locally for the "(You)" badge. (When viewing a
+        // past/imported session, links come from the server instead, so foreign
+        // mic segments stay unbadged.)
+        if (d.me_speaker) {
+          _sessionLinks['me'] = { global_id: d.me_speaker.global_id, name: d.me_speaker.name };
         }
       }
-      // Only the workspace shows a session, so the URL is rewritten only when
-      // the workspace is the active view. Recording from Home stays on Home.
-      if (Views.current === 'session') {
-        history.replaceState({ view: 'session', url: '/session?id=' + d.session_id },
-                             '', '/session?id=' + d.session_id);
-      }
-      state.sessionId     = d.session_id;
-      state.isViewingPast = false;
-      _loadChatContextFoldersForSession(d.session_id);
       dot.className       = 'status-dot recording';
       text.textContent    = d.transcribe_after ? 'Recording (transcript after the meeting)' : 'Recording';
-      _loadPaneVisible(d.session_id);
-      refreshSessionChatPromptBadge();
-      destroyPlayback();
       if (!_durationInterval) {
         startDurationCounter(d.elapsed_sec);
         // Push stored gain values now - AudioCapture is guaranteed to exist
@@ -6348,14 +6569,7 @@ function onStatus(d) {
         _syncDurationCounter(d.elapsed_sec);
       }
       _updateBrandIcons(true);
-      if (d.screen_recording) { _updateScreenRecordingStatus(true); _showScreenPreviewToggle(true); }
-      // During a live recording the reserved "me" key is THIS instance's own
-      // mic audio, so link it locally for the "(You)" badge. (When viewing a
-      // past/imported session, links come from the server instead, so foreign
-      // mic segments stay unbadged.)
-      if (d.me_speaker) {
-        _sessionLinks['me'] = { global_id: d.me_speaker.global_id, name: d.me_speaker.name };
-      }
+      if (d.screen_recording) _updateScreenRecordingStatus(true);
       AppData.invalidate(['sessions'], 'recording_start');
       _syncCaptureMeters();
       if (_quietPromptLanding === d.session_id) {
@@ -6363,6 +6577,11 @@ function onStatus(d) {
         _quietPromptLanding = null;
       }
     } else if (!d.recording) {
+      // The meeting that just ended, which need not be the one on screen: the
+      // user may be reading another meeting while it records.
+      const endedId = _wasRecording ? (state.liveSessionId || d.session_id || null) : null;
+      state.liveSessionId = null;
+      _soundAllowedFor = null;
       // Smoothly fade the audio visualizers out rather than freezing on the last
       // frame: no more audio_level events will arrive to drive them down, so zero
       // the targets and re-kick the loops, which decay the bars/meters to zero and
@@ -6386,7 +6605,7 @@ function onStatus(d) {
       // A stop finalises in place, from whichever view the user is on.
       AppData.invalidate(['sessions', 'analytics', 'attention'], 'recording_stop');
       AppData.invalidate(['storage'], 'recording_stop');
-      if (_wasRecording && state.sessionId) _announceRecordingSaved(state.sessionId);
+      if (endedId) _announceRecordingSaved(endedId);
       // Load playback for a meeting that has just stopped on this page: on the
       // server's push that says its audio and video are final (media_ready), or
       // on any push that names it while playback is not set up yet, which
@@ -6410,10 +6629,13 @@ function onStatus(d) {
       // speakers remain (was manual-only before 2026-09-01). Claude-fed
       // candidates, if present, populate the hints; otherwise it shows the
       // dropdowns for manual assignment.
-      if (_wasRecording && state.sessionId) _maybeAutoOpenResolution(state.sessionId);
+      // Only over the meeting that ended: never over another meeting the user
+      // was reading while it recorded.
+      if (endedId && endedId === state.sessionId) _maybeAutoOpenResolution(endedId);
       if (_wasRecording) _clearCaptureAlert();  // recording ended; drop any capture warning
     }
   }
+  _syncLiveReturnPill();
 
   if (!state.isRecording && dot && text) {
     const row = dot.parentElement;
@@ -6495,7 +6717,7 @@ function updateTopbarSessionTitle() {
     const secs = _sessionDurationSec ? _sessionDurationSec(entry) : 0;
     if (secs > 0) parts.push(fmtDuration(secs));
   }
-  if (state.isRecording) parts.push('Recording');
+  if (_showingLiveMeeting()) parts.push('Recording');
   Views.setTitle('session', title, parts.join(' · '));
 }
 
@@ -11857,6 +12079,7 @@ function _voiceAudioEl(sessionId) {
   if (!_voiceSampleAudio) {
     _voiceSampleAudio = new Audio();
     _voiceSampleAudio.preload = 'auto';
+    _guardSoundWhileRecording(_voiceSampleAudio);
     // ONE permanent error handler. A per-play {once:true} listener only detaches
     // when it actually fires, so on a healthy file they piled up one per click.
     _voiceSampleAudio.addEventListener('error', () => stopSpeakerVoice());
@@ -14462,7 +14685,7 @@ function saveSummaryPrompt() {
     await fetch('/api/custom-prompt', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ custom_prompt: text }),
+      body: JSON.stringify({ custom_prompt: text, session_id: state.sessionId || null }),
     });
     // Show transient saved indicator
     const st = document.getElementById('summary-instr-status');
@@ -14529,18 +14752,20 @@ async function loadSummaryPrompt() {
       localStorage.setItem(key, def);
     } else {
       try {
-        const r = await fetch('/api/custom-prompt');
+        const q = state.sessionId ? '?session_id=' + encodeURIComponent(state.sessionId) : '';
+        const r = await fetch('/api/custom-prompt' + q);
         const data = await r.json();
         initialText = data.custom_prompt || '';
       } catch (_) {}
     }
   }
   _applyPromptText(initialText);
-  // Always sync to backend so active session picks it up
+  // Always sync to backend so the meeting on screen picks it up (per meeting:
+  // see app.py _custom_prompts)
   fetch('/api/custom-prompt', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ custom_prompt: initialText }),
+    body: JSON.stringify({ custom_prompt: initialText, session_id: state.sessionId || null }),
   }).catch(() => {});
   // Also load the per-session summary system prompt state
   loadSessionSummarySystemPrompt();
@@ -14548,6 +14773,7 @@ async function loadSummaryPrompt() {
 
 /* ── Playback ────────────────────────────────────────────────────────────── */
 const _playbackAudio = document.getElementById('playback-audio');
+_guardSoundWhileRecording(_playbackAudio);
 let _playbackActive = false;
 
 // Playback output level (0..1), persisted to localStorage. Recordings are
@@ -18896,12 +19122,51 @@ document.getElementById('chat-input')?.addEventListener('paste', e => {
 });
 
 /* ── Past sessions ───────────────────────────────────────────────────────── */
-async function loadSession(sessionId) {
+/** Go back to the meeting that is recording now, from any view or meeting.
+ *  It loads like any meeting (transcript, summary, chat, notes, speakers from
+ *  the database), then keeps appending what is said. Lines said while it
+ *  loads are held in _liveCatchup and replayed once the transcript is on
+ *  screen. `id` is for callers that know the live meeting before the first
+ *  status push has arrived (a page loaded on its URL). */
+async function showLiveMeeting(id) {
+  const liveId = id || state.liveSessionId;
+  if (!liveId) return;
+  if (state.sessionId === liveId && !state.isViewingPast) {
+    Views.show('session', { url: '/session?id=' + liveId });
+    _syncLiveReturnPill();
+    return;
+  }
+  return loadSession(liveId, { live: true });
+}
+
+/** Replay the live lines held while the live meeting loaded. A line the load
+ *  already showed (its id is at or below the newest one rendered) is skipped. */
+function _flushLiveCatchup(sid) {
+  const held = _liveCatchup;
+  if (!held || held.sid !== sid) return;
+  _liveCatchup = null;
+  if (!_sseSource || state.sessionId !== sid || state.isViewingPast) return;
+  for (const [type, d] of held.events) {
+    if (type === 'transcript' && d.seg_id && d.seg_id <= _lastLiveSegId) continue;
+    try {
+      _sseSource.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(d) }));
+    } catch (_) {}
+  }
+}
+
+async function loadSession(sessionId, opts) {
+  const o = opts || {};
   // Opening the session already loaded (the live one included) just brings the
   // workspace forward: it is never re-rendered underneath a live recording.
-  if (sessionId === state.sessionId) {
+  if (sessionId === state.sessionId && (o.live ? !state.isViewingPast : true)) {
     Views.show('session', { url: '/session?id=' + sessionId });
+    _syncLiveReturnPill();
     return;
+  }
+  // The meeting that is recording opens as the live view, never as a past
+  // meeting that would stop updating.
+  if (!o.live && state.isRecording && sessionId === state.liveSessionId) {
+    return showLiveMeeting(sessionId);
   }
 
   if (_cleanupState && _cleanupState.dirty) {
@@ -18909,23 +19174,20 @@ async function loadSession(sessionId) {
     _cleanupState.dirty = false;
   }
 
-  if (state.isRecording) {
-    const entry = _sidebarAllSessions.find(s => s.id === sessionId);
-    const label = (entry && entry.title) || 'this recording';
-    const go = await uiConfirm({
-      title: 'Stop the current recording?',
-      message: `Stop the current recording and open ${label}?`,
-      confirmLabel: 'Stop and open',
-      danger: true,
-    });
-    if (!go) return;
-    await fetch('/api/recording/stop', { method: 'POST' });
-  }
+  // Notes typed in the meeting being left (often the live one) are saved now
+  // rather than dropped with the pending autosave. It reads the editor and
+  // the meeting before its first await, so the switch below cannot redirect it.
+  if (_notesDirty || _notesSaveTimer) _notesFlushSave();
 
+  // Opening a meeting never stops a recording: it carries on in the
+  // background, and the header's "Back to live" pill returns to it.
   const gen = ++_loadGeneration;  // cancel any in-flight chunked render
+  // A newer load of any meeting ends the hold of an older live load.
+  _liveCatchup = o.live ? { sid: sessionId, events: [] } : null;
 
-  const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json());
+  const data = await fetch(`/api/sessions/${sessionId}`).then(r => r.json()).catch(() => ({ error: 'unreachable' }));
   if (data.error) {
+    if (_liveCatchup && _liveCatchup.sid === sessionId) _liveCatchup = null;
     // Session not found - clean up URL and show a brief status message
     history.replaceState(null, '', location.pathname);
     flashStatus('Session not found');
@@ -18937,7 +19199,17 @@ async function loadSession(sessionId) {
   _setPlaybackEditTrimmed(!!data.has_trim_backup);
   _setSessionSplitBackup(!!data.has_split_backup, data.split_group_id || null);
   state.sessionId     = sessionId;
-  state.isViewingPast = true;
+  state.isViewingPast = !o.live;
+  if (o.live) {
+    state.liveSessionId = sessionId;
+    // The newest line on screen once the render is done: the live lines held
+    // meanwhile replay after it, and the SSE replay on a reconnect too.
+    for (const s of (data.segments || [])) if (s.id) _lastLiveSegId = Math.max(_lastLiveSegId, s.id);
+  } else if (state.isRecording) {
+    // The live screen preview belongs to the live view only.
+    _stopScreenPreview();
+  }
+  _syncLiveReturnPill();
   _loadChatContextFoldersForSession(sessionId);
   Views.show('session', { url: '/session?id=' + sessionId });
   updateRecordBtn();
@@ -18961,8 +19233,16 @@ async function loadSession(sessionId) {
   _sessionLinks = {};
   fetch(`/api/fingerprint/sessions/${sessionId}/links`)
     .then(r => r.json())
-    .then(links => { _sessionLinks = links || {}; _updateLinkedBadges(); })
+    .then(links => {
+      _sessionLinks = links || {};
+      // The live meeting's "me" key is this instance's own mic (see onStatus).
+      if (o.live && _liveExtras.meSpeaker && state.sessionId === sessionId) {
+        _sessionLinks['me'] = { global_id: _liveExtras.meSpeaker.global_id, name: _liveExtras.meSpeaker.name };
+      }
+      _updateLinkedBadges();
+    })
     .catch(() => {});
+  if (o.live && _liveExtras.screenRecording) _showScreenPreviewToggle(true);
 
   // Load pending speaker suggestions
   _fpLoadSuggestions();
@@ -18982,6 +19262,8 @@ async function loadSession(sessionId) {
   // The pending search highlight needs the transcript DOM, so it runs once the
   // transcript is actually rendered (covers both the async and sync branches).
   const _afterTranscriptRender = () => {
+    // The live meeting: what was said while it loaded goes on after it.
+    if (o.live) _flushLiveCatchup(sessionId);
     if (_pendingSearchHighlight) {
       const hl = _pendingSearchHighlight;
       _pendingSearchHighlight = null;
@@ -19018,19 +19300,22 @@ async function loadSession(sessionId) {
   // network round-trip in front of the Summary/Chat render).
   const storedPrompt = localStorage.getItem('summary-prompt:' + sessionId) || '';
   _applyPromptText(storedPrompt);
+  // Per meeting on the server, so opening this one never changes what the
+  // live meeting's summary is told (app.py _custom_prompts).
   fetch('/api/custom-prompt', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ custom_prompt: storedPrompt }),
+    body: JSON.stringify({ custom_prompt: storedPrompt, session_id: sessionId }),
   }).catch(() => {});
 
   // Load this session's chapters (playback-bar ticks render once the audio
   // metadata loads; the modal list + minimap markers update immediately).
   setSessionChapters(data.chapters || []);
 
-  // Show playback bar if audio is available
-  if (data.has_audio) initPlayback(sessionId);
-  if (data.has_video) initVideo(sessionId, data.video_offset);
+  // Show playback bar if audio is available. Not for the live meeting: its
+  // audio is still being written, and it gets playback when it stops.
+  if (data.has_audio && !o.live) initPlayback(sessionId);
+  if (data.has_video && !o.live) initVideo(sessionId, data.video_offset);
   // Keep the cleanup video toggle in sync with the freshly-loaded session's
   // video availability (e.g. switching to a no-video session with the speaker
   // manager left open).
