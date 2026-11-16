@@ -519,6 +519,55 @@ def follow_decision(*, held: str | None, held_had_signal: bool, silent_for: floa
     return "switch", f"'{target}' is playing"
 
 
+# A render endpoint whose meter peaks at or above this is playing audio. The
+# meter reads 0.0 for dead silence and 0.0001 to 0.0006 on a call where nobody
+# else is talking (measured 2026-11-12); quiet speech is above 0.03.
+PLAYING_PEAK = 0.01
+
+# How old the render probe behind a silence alarm may be. While the desktop
+# side is silent, Follow call audio already probes at least every 30 s, so with
+# it on the alarm reuses those probes and adds none of its own.
+SILENCE_PROBE_MAX_AGE = 45.0
+
+
+def silence_alarm_verdict(*, heard: list[str] | None, probed_at: float,
+                          silent_since: float, peaks_at: float,
+                          max_age: float = SILENCE_PROBE_MAX_AGE) -> tuple[str, str]:
+    """Whether a silent desktop capture means call audio is being lost.
+
+    Silence cannot say on its own. Everyone else muted while this end presents
+    reads exactly like a call playing to a device nobody captures, and the
+    "call audio not captured" alarm came up mid-presentation, on a shared
+    screen, because of it (2026-11-12). The render probe can say: it reads
+    each output's own meter, outside our capture. No output playing means the
+    call side is quiet and nothing is being missed. An output playing while
+    our capture hears nothing is the real fault (the 2026-09-01 dead loopback,
+    or a call rendering to another device).
+
+    *heard* is the outputs the last probe found playing (None when it failed),
+    *probed_at* when it finished, *silent_since* when our capture last had
+    signal, *peaks_at* when the watchdog last read its peaks. Only a probe that
+    finished inside this silence and before that peak read counts, so anything
+    the probe heard has also had its chance to reach our capture.
+
+    ``("wait", why)``: a probe finished after the last peak read; decide on
+    the next tick. ``("probe", why)``: no probe inside this silence, or it is
+    older than *max_age*; take one. ``("alarm", why)``: it heard an output
+    playing, or it failed (with no evidence either way, the alarm stands).
+    ``("quiet", why)``: nothing plays. Pure: no I/O, so it is unit-testable.
+    """
+    if probed_at > peaks_at:
+        return "wait", "a render probe just finished; the capture has not caught up yet"
+    if probed_at <= silent_since or peaks_at - probed_at > max_age:
+        return "probe", "no recent render probe inside this silence"
+    if heard is None:
+        return "alarm", "the render probe failed, so the silence is all there is to go on"
+    if heard:
+        names = ", ".join(f"'{n}'" for n in heard)
+        return "alarm", f"{names} playing while the recording hears nothing"
+    return "quiet", "no output is playing anything, so the call side is just quiet"
+
+
 class AudioCapture:
     CHUNK_SIZE = 512
     FORMAT = pyaudio.paInt16
@@ -621,6 +670,11 @@ class AudioCapture:
         # probe (or None). Used to keep the loopback "sticky" on the call device
         # through a far-end pause, rather than chasing an unrelated sound.
         self._last_probe_comms: str | None = None
+        # What the most recent render probe heard: the outputs audibly playing
+        # (None when the probe failed), and when it finished. The silence alarm
+        # consults it so a quiet call is not reported as lost audio.
+        self._probe_heard: list[str] | None = None
+        self._probe_done_at: float = 0.0
         # The desktop device the user selected, by the name it carries now, set
         # by _resolve_loopback() at start. While the capture is on another output
         # because that device was unavailable (missing at start, or it went away
@@ -1877,8 +1931,12 @@ class AudioCapture:
         Probing runs in a subprocess (~duration plus interpreter start); only
         call it from the watchdog thread, never on the recording-start path.
         """
-        PLAYING = 0.01   # meter peak: 0.0 dead silence; quiet speech > 0.03
         probe = probe_render_endpoints(duration)
+        # Recorded before anything below can fail: a probe that returns
+        # nothing usable leaves heard=None, which the silence alarm reads as
+        # "no evidence" rather than "quiet".
+        self._probe_done_at = time.monotonic()
+        self._probe_heard = None
         if not probe:
             return None
         eps = probe.get("endpoints") or []
@@ -1894,7 +1952,8 @@ class AudioCapture:
         # to) so the watchdog can stay sticky on it through a far-end pause.
         self._last_probe_comms = next(
             (e["name"] for e in eps if e.get("is_default_communications")), None)
-        playing = [e for e in eps if e.get("peak", 0.0) >= PLAYING]
+        playing = [e for e in eps if e.get("peak", 0.0) >= PLAYING_PEAK]
+        self._probe_heard = [e["name"] for e in playing]
         pool = playing if playing else ([] if require_playing else eps)
         if not pool:
             return None
@@ -1971,7 +2030,9 @@ class AudioCapture:
         # desktop side is silent for the whole meeting. A pause is not that.
         # Ninety seconds of true digital silence while someone is talking on
         # this end is the shape of the real thing, and it is not the shape of a
-        # conversation.
+        # conversation. It is also the shape of presenting to a muted room, so
+        # neither alarm fires until a render probe hears audio playing that the
+        # capture does not (silence_alarm_verdict).
         DROP_AFTER = 90.0          # alarm if a live loopback dropped
         MIC_ACTIVE_NEEDED = 45.0   # of which this much had the mic talking
         ALARM_COOLDOWN = 300.0
@@ -1980,6 +2041,12 @@ class AudioCapture:
         RETURN_CONFIRM = 2         # consecutive probes that must see it playing to go back
         started = time.monotonic()
         last_signal_ts = started
+        # When this tick read its peaks: a probe counts toward an alarm only if
+        # it finished before then (see silence_alarm_verdict).
+        peaks_at = started
+        # The silent stretch (by its last_signal_ts) already logged as quiet, so
+        # a long presentation logs it once, not every tick.
+        quiet_noted_for: float | None = None
         # Mic-active seconds accrued since the loopback last produced anything.
         # Without it a recording nobody is talking on (or an idle desk between
         # meetings) reads exactly like a one-sided call.
@@ -2097,6 +2164,31 @@ class AudioCapture:
                 return_streak = 0
             return switched
 
+        def _audio_is_being_missed(kind: str) -> bool:
+            """The render probe's word on a silence that is about to alarm. With
+            no recent probe inside this silence it takes one and says no; the
+            next tick decides, once our own capture has had the same moment to
+            hear whatever the probe heard. Never raises."""
+            nonlocal quiet_noted_for
+            verdict, why = silence_alarm_verdict(
+                heard=self._probe_heard, probed_at=self._probe_done_at,
+                silent_since=last_signal_ts, peaks_at=peaks_at)
+            if verdict == "wait":
+                return False
+            if verdict == "probe":
+                try:
+                    self._probe_live_output(require_playing=True)
+                except Exception as e:
+                    log.warn("audio", f"loopback probe failed: {e}")
+                return False
+            if verdict == "quiet":
+                if quiet_noted_for != last_signal_ts:
+                    quiet_noted_for = last_signal_ts
+                    log.info("audio", f"Loopback silent, no {kind} alarm: {why}")
+                return False
+            log.info("audio", f"Loopback silent and audio is playing: {why}")
+            return True
+
         while self.is_running:
             # Proactive first check: a call already audible at record-start (e.g.
             # auto-record joined a call in progress) is followed within a couple
@@ -2182,6 +2274,7 @@ class AudioCapture:
                         next_mic_check = time.monotonic() + mic_check_every
 
             lb_peak, mic_peak = self.take_peaks()
+            peaks_at = time.monotonic()
             if lb_peak > SILENT_FLOOR:
                 last_signal_ts = now
                 mic_active_for = 0.0
@@ -2231,7 +2324,8 @@ class AudioCapture:
                     continue
 
             if not self.loopback_had_signal:
-                if not fired_start and now - grace_base > GRACE:
+                if (not fired_start and now - grace_base > GRACE
+                        and _audio_is_being_missed("never")):
                     fired_start = True
                     alarm_showing = True
                     last_alarm_ts = now
@@ -2239,7 +2333,8 @@ class AudioCapture:
             elif (self._has_mic
                     and silent_for > DROP_AFTER
                     and mic_active_for >= MIC_ACTIVE_NEEDED
-                    and now - last_alarm_ts > ALARM_COOLDOWN):
+                    and now - last_alarm_ts > ALARM_COOLDOWN
+                    and _audio_is_being_missed("dropped")):
                 alarm_showing = True
                 last_alarm_ts = now
                 self._emit_loopback_silent("dropped")

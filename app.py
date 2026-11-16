@@ -283,6 +283,10 @@ fingerprint_db._db_path   = storage.DB_PATH
 fingerprint_db._ready     = False
 fingerprint_db._inference = None
 fingerprint_db._me_id     = None   # set via _sync_me_id() once __init__ runs
+# Set when _load_fingerprint_db() has finished, loaded or not. A pass that
+# starts before then (one resumed at startup) waits on it; see _run_reanalysis.
+_fingerprint_loaded = threading.Event()
+FINGERPRINT_WAIT_SEC = 180.0
 
 # ── Global singletons ─────────────────────────────────────────────────────────
 
@@ -1876,21 +1880,24 @@ def _load_diarizer() -> None:
 
 def _load_fingerprint_db() -> None:
     """Load the speaker embedding model. Called after all module globals are set."""
-    fingerprint_db.__init__(storage.DB_PATH, os.getenv("HUGGING_FACE_KEY", ""))
-    # Register the "Me" speaker guard so its profile stays embedding-free even
-    # before the first recording (e.g. an import that arrives at startup).
-    _sync_me_id()
-    # Profiles that share a name are one person shown twice: fold any that
-    # an older version left behind (two threads could each make one).
     try:
-        _merge_same_name_profiles()
-    except Exception as e:  # noqa: BLE001 - a library that loads is worth more
-        log.warn("fingerprint", f"Duplicate profile check failed: {e}")
-    # Wire callback if diarizer already finished loading before we did
-    with _state_lock:
-        diarizer_ready = _state.get("diarizer_ready", False)
-    if fingerprint_db.ready and diarizer_ready:
-        _transcriber.fingerprint_callback = _on_fingerprint_audio
+        fingerprint_db.__init__(storage.DB_PATH, os.getenv("HUGGING_FACE_KEY", ""))
+        # Register the "Me" speaker guard so its profile stays embedding-free even
+        # before the first recording (e.g. an import that arrives at startup).
+        _sync_me_id()
+        # Profiles that share a name are one person shown twice: fold any that
+        # an older version left behind (two threads could each make one).
+        try:
+            _merge_same_name_profiles()
+        except Exception as e:  # noqa: BLE001 - a library that loads is worth more
+            log.warn("fingerprint", f"Duplicate profile check failed: {e}")
+        # Wire callback if diarizer already finished loading before we did
+        with _state_lock:
+            diarizer_ready = _state.get("diarizer_ready", False)
+        if fingerprint_db.ready and diarizer_ready:
+            _transcriber.fingerprint_callback = _on_fingerprint_audio
+    finally:
+        _fingerprint_loaded.set()
 
 
 def _load_text_embeddings() -> None:
@@ -9532,6 +9539,18 @@ def _run_reanalysis(session_id: str, wav_path: str, custom_prompt: str,
         guarded = reanalysis_guard.begin(
             session_id, storage.snapshot_session_transcript(session_id))
 
+        # A pass resumed at startup begins seconds after launch, before the
+        # voice library has loaded. Both the clean-up below and the speaker
+        # naming in the worker (on_fingerprint) are skipped while it is not
+        # ready, so wait for it (2026-11-12: a resumed pass named nobody and
+        # kept the old voice samples, so the speaker suggestions were wrong).
+        if not _fingerprint_loaded.is_set():
+            log.info("reanalysis", "Waiting for the voice library to load before "
+                                   f"transcribing {session_id[:8]}")
+            if not _fingerprint_loaded.wait(FINGERPRINT_WAIT_SEC):
+                log.warn("reanalysis", "The voice library is still loading; "
+                                       "continuing without speaker names")
+
         # Remove old session embeddings from Speaker Library and recompute centroids
         if fingerprint_db.ready:
             affected_ids = fingerprint_db.remove_session_embeddings(session_id)
@@ -9956,6 +9975,19 @@ class _PostMeetingTranscription:
         if running:
             log.info("reanalysis", f"A recording is starting; pausing the post-meeting "
                                    f"transcription of {running[:8]}")
+            self._cancel.set()
+
+    def stop_for_exit(self) -> None:
+        """The app is exiting (Quit, Restart, Update). A running pass ends as a
+        cancel, so _run puts its meeting back at the front of the persisted
+        queue and the next run resumes it. Without this the worker the exit
+        kills read as a failed pass, and the meeting left the queue with no
+        transcript (2026-11-12: a restart moments after a meeting ended)."""
+        with self._lock:
+            running = self.running_session
+        if running:
+            log.info("reanalysis", f"Exiting; keeping the post-meeting transcription of "
+                                   f"{running[:8]} queued for the next start")
             self._cancel.set()
 
     def pending(self) -> list[str]:
@@ -12042,6 +12074,11 @@ def _end_batch_workers() -> None:
     """Kill every reanalysis worker process (ml.batch_worker) and its children.
     Every exit path calls this before os._exit, which ends the app's threads
     but not a child process. Never raises."""
+    # First, so the post-meeting pass this kill ends stays queued.
+    try:
+        _post_meeting.stop_for_exit()
+    except Exception as e:
+        log.warn("reanalysis", f"Could not keep the post-meeting transcription queued: {e}")
     try:
         from ml import batch_worker
         n = batch_worker.kill_all()

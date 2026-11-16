@@ -19,6 +19,16 @@ How to write one:
 - No filler, no marketing words, and no restating the title in the first bullet.
 
 
+## Fixed a false call audio alert and a lost transcript (2026-11-16)
+
+### Recording
+- **The `Call audio not captured` alert** no longer pops up while you present and everyone else on the call is quiet.
+- **Joining a quiet call early** no longer shows `Call audio not captured` before anyone has spoken.
+
+### Transcripts
+- **Restarting or updating the app** while a meeting is being transcribed no longer loses its transcript; it resumes on the next start.
+- **A transcript that resumes when the app starts** names speakers from your voice library, like any other.
+
 ## Improved the transcript's speed on long meetings (2026-11-13)
 
 - **The `Filter transcript` and `Session analytics` buttons** respond at once, even on long meetings with many speakers.
@@ -28,7 +38,6 @@ How to write one:
 - **The filter and suggestion panels** fade in and out, and the analytics panel opens without sliding.
 - **Applying Cleanup or renaming speakers** no longer bogs the app down while the recordings list refreshes.
 - **The copy button** goes back to its own icon after copying a transcript.
-
 
 ## Added meeting reminders and recording on join (2026-11-10)
 

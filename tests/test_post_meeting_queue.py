@@ -178,3 +178,70 @@ def test_app_wiring():
         assert b.index("_post_meeting.forget(") < b.index("storage.delete_"), route
     rean = body("_run_reanalysis")
     assert "_post_meeting.discard(session_id)" in rean
+
+
+def _killable_pass(started, killed):
+    """A pass that runs until the exit kills its worker process, which is not
+    a cancel: the worker dies and the pass comes back unfinished."""
+    def _pass(sid, wav, prompt, num, maxs, cancel_event=None, post_meeting=False,
+              devices=None):
+        started.set()
+        killed.wait(10)
+        return False
+    return _pass
+
+
+def test_a_restart_during_a_pass_keeps_the_meeting_queued():
+    """2026-11-12: Restart pressed seconds after a meeting ended. The exit killed
+    the worker, the pass read as failed and the meeting left the queue, so it
+    never got a transcript."""
+    settings = _Settings()
+    started, killed = threading.Event(), threading.Event()
+    q = _queue_class(settings, _killable_pass(started, killed))()
+    q._follow_up = lambda sid: None
+    q.enqueue(SID)
+    sid = q._next_ready()
+    runner = threading.Thread(target=q._run, args=(sid,), daemon=True)
+    runner.start()
+    assert started.wait(5)
+    q.stop_for_exit()        # what _end_batch_workers does first
+    killed.set()             # then batch_worker.kill_all()
+    runner.join(5)
+    assert not runner.is_alive()
+    assert settings.data["post_meeting_pending"] == [SID]
+    after_restart = _queue_class(settings, _done)()
+    after_restart.restore()
+    assert after_restart._next_ready() == SID, "the next run transcribes it"
+
+
+def test_an_exit_with_nothing_running_changes_nothing():
+    settings = _Settings()
+    q = _queue_class(settings, _done)()
+    q.enqueue(SID)
+    q.stop_for_exit()
+    assert not q._cancel.is_set()
+    assert settings.data["post_meeting_pending"] == [SID]
+
+
+def test_every_exit_keeps_the_pass_queued_before_killing_it():
+    end = re.search(r"^def _end_batch_workers\(.*?\n(.*?)(?=^def |\Z)", APP_PY, re.M | re.S).group(1)
+    assert end.index("_post_meeting.stop_for_exit()") < end.index("batch_worker.kill_all()")
+    # Quit, Restart and Update all end the workers through it.
+    assert APP_PY.count("_end_batch_workers()") >= 3
+
+
+def test_a_pass_waits_for_the_voice_library_before_using_it():
+    """2026-11-12: a pass resumed at startup began 3 s after launch, before the
+    voice library loaded. It skipped clearing the meeting's old voice samples
+    and passed no fingerprint callback, so nobody was named and the speaker
+    suggestions came from the previous run's audio."""
+    def body(name):
+        return re.search(rf"^def {name}\(.*?\n(.*?)(?=^def |\Z)", APP_PY, re.M | re.S).group(1)
+
+    rean = body("_run_reanalysis")
+    wait = rean.index("_fingerprint_loaded.wait(FINGERPRINT_WAIT_SEC)")
+    assert wait < rean.index("if fingerprint_db.ready:")
+    assert wait < rean.index("if fingerprint_db.ready else None")
+    loader = body("_load_fingerprint_db")
+    assert loader.index("finally:") < loader.index("_fingerprint_loaded.set()"), \
+        "set even when loading fails, so a pass never waits out the timeout for nothing"

@@ -245,3 +245,187 @@ def test_a_stalled_file_warning_ends_only_when_the_file_grows():
     meters = js[js.index("function updateLevelMeters("):]
     meters = meters[:meters.index("function startVizLoop(")]
     assert "if (_captureAlertKind !== 'stalled') _clearCaptureAlert();" in meters
+
+
+# ── Presenting to a muted room is not lost audio (2026-11-12) ────────────────
+#
+# The "call audio not captured" alarm came up on a shared screen mid-
+# presentation: the user talked, nobody else did, and 90 s of a silent desktop
+# side plus a busy mic is exactly what the alarm was told to look for. The
+# render probe it already ran (Follow call audio) had read every output as
+# silent, which means nothing was playing and nothing was being missed. Both
+# alarms now need that probe to hear audio the capture does not.
+
+# The render probe at 2:40 PM on 2026-11-12, the moment the alarm fired.
+QUIET_CALL = [
+    {"name": "Headphones (Realtek(R) Audio)", "peak": 0.00015,
+     "is_default": True, "is_default_communications": True},
+    {"name": "Speakers (Realtek(R) Audio)", "peak": 0.0},
+]
+# The fault the alarm exists for: the call is audibly playing, the capture of
+# that same device hears nothing (the 2026-09-01 dead loopback).
+CALL_PLAYING = [
+    {"name": "Headphones (Realtek(R) Audio)", "peak": 0.21,
+     "is_default": True, "is_default_communications": True},
+    {"name": "Speakers (Realtek(R) Audio)", "peak": 0.0},
+]
+# A call rendering to a device nobody is capturing.
+CALL_ON_OTHER_DEVICE = [
+    {"name": "Headphones (Realtek(R) Audio)", "peak": 0.0002,
+     "is_default": True, "is_default_communications": True},
+    {"name": "Speakers (Realtek(R) Audio)", "peak": 0.18},
+]
+
+
+def _windows():
+    if sys.platform != "win32":
+        pytest.skip("WASAPI loopback is Windows-only")
+    return pytest.importorskip("capture_audio.windows")
+
+
+def test_the_verdict_counts_only_a_probe_inside_the_silence():
+    v = _windows().silence_alarm_verdict
+    # Taken before the capture last had signal: says nothing about now.
+    assert v(heard=[], probed_at=50.0, silent_since=60.0, peaks_at=200.0)[0] == "probe"
+    # Finished after the last peak read: whatever it heard has not had its
+    # chance to reach our capture yet.
+    assert v(heard=["Headphones"], probed_at=201.0, silent_since=60.0,
+             peaks_at=200.0)[0] == "wait"
+    # Inside the silence but too old to speak for this moment.
+    assert v(heard=[], probed_at=100.0, silent_since=60.0, peaks_at=200.0)[0] == "probe"
+
+
+def test_nothing_playing_anywhere_is_a_quiet_call():
+    v = _windows().silence_alarm_verdict
+    assert v(heard=[], probed_at=190.0, silent_since=60.0, peaks_at=200.0)[0] == "quiet"
+
+
+def test_audio_playing_that_the_capture_misses_still_alarms():
+    v = _windows().silence_alarm_verdict
+    assert v(heard=["Headphones (Realtek(R) Audio)"], probed_at=190.0,
+             silent_since=60.0, peaks_at=200.0)[0] == "alarm"
+    # A failed probe is no evidence either way, so the alarm stands.
+    assert v(heard=None, probed_at=190.0, silent_since=60.0, peaks_at=200.0)[0] == "alarm"
+
+
+def test_the_probe_records_what_it_heard(monkeypatch):
+    w = _windows()
+    cap = w.AudioCapture.__new__(w.AudioCapture)
+    cap._last_probe_comms = None
+    monkeypatch.setattr(w, "probe_render_endpoints", lambda d: {"ok": True, "endpoints": QUIET_CALL})
+    assert cap._probe_live_output(require_playing=True) is None
+    assert cap._probe_heard == []
+    monkeypatch.setattr(w, "probe_render_endpoints", lambda d: {"ok": True, "endpoints": CALL_PLAYING})
+    cap._probe_live_output(require_playing=True)
+    assert cap._probe_heard == ["Headphones (Realtek(R) Audio)"]
+    monkeypatch.setattr(w, "probe_render_endpoints", lambda d: None)
+    cap._probe_live_output(require_playing=True)
+    assert cap._probe_heard is None
+
+
+class _FakeClock:
+    """Stands in for the time module inside capture_audio.windows: sleep moves
+    the clock instead of waiting, and stops the watchdog at the end."""
+
+    def __init__(self, cap, seconds: float):
+        self.t = 1000.0
+        self._cap = cap
+        self._stop_at = self.t + seconds
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+        if self.t >= self._stop_at:
+            self._cap.is_running = False
+
+    def __getattr__(self, name):
+        import time
+        return getattr(time, name)
+
+
+def _run_watchdog(monkeypatch, *, endpoints, follow: bool, had_signal: bool = True,
+                  seconds: float = 600.0):
+    """The real watchdog loop for *seconds* of fake time: the user talking the
+    whole while (mic peak 0.08, the OBSBOT's level while presenting) and the
+    desktop side digitally silent. Returns the alarms fired and the fake times
+    at which render probes ran."""
+    w = _windows()
+    cap = w.AudioCapture.__new__(w.AudioCapture)
+    clock = _FakeClock(cap, seconds)
+    cap.is_running = True
+    cap._loopback_stream = None
+    cap._loopback_device_name = "Headphones (Realtek(R) Audio) [Loopback]"
+    cap._selected_loopback_name = None
+    cap._selected_mic_name = None
+    cap._last_probe_comms = None
+    cap._probe_heard = None
+    cap._probe_done_at = 0.0
+    cap.loopback_had_signal = had_signal
+    cap._has_mic = True
+    cap.restart_loopback = lambda **kw: False
+    cap._match_loopback_by_name = lambda name, strict=False: None
+    cap.take_peaks = lambda: (0.0, 0.08)
+    fired: list[str] = []
+    cap.on_loopback_silent = lambda dev, kind: fired.append(kind)
+    cap.on_loopback_recovered = None
+    probes: list[float] = []
+
+    def probe(duration=1.2):
+        probes.append(clock.t)
+        return {"ok": True, "endpoints": endpoints}
+
+    monkeypatch.setattr(w, "probe_render_endpoints", probe)
+    monkeypatch.setattr(w, "_follow_output_enabled", lambda: follow)
+    monkeypatch.setattr(w, "time", clock)
+    cap._loopback_silence_watchdog()
+    return fired, probes
+
+
+@pytest.mark.parametrize("follow", [True, False])
+def test_presenting_to_a_muted_room_never_alarms(monkeypatch, follow):
+    """Ten minutes of the user talking to a call where nobody else speaks."""
+    fired, probes = _run_watchdog(monkeypatch, endpoints=QUIET_CALL, follow=follow)
+    assert fired == []
+    assert probes, "the alarm decision must rest on a probe, not on silence"
+    # Never two probes in the same tick.
+    assert len(set(probes)) == len(probes)
+    if not follow:
+        # Its own probes, at most one per SILENCE_PROBE_MAX_AGE once the
+        # 90 s silence qualifies.
+        assert len(probes) <= (600 - 90) / _windows().SILENCE_PROBE_MAX_AGE + 2
+
+
+@pytest.mark.parametrize("follow", [True, False])
+def test_a_call_playing_into_a_dead_capture_still_alarms(monkeypatch, follow):
+    fired, _ = _run_watchdog(monkeypatch, endpoints=CALL_PLAYING, follow=follow)
+    assert fired and set(fired) == {"dropped"}
+    # Still at most once per ALARM_COOLDOWN (300 s) over ten minutes.
+    assert len(fired) <= 2
+
+
+def test_a_call_on_another_device_still_alarms_without_follow(monkeypatch):
+    fired, _ = _run_watchdog(monkeypatch, endpoints=CALL_ON_OTHER_DEVICE, follow=False)
+    assert fired and set(fired) == {"dropped"}
+
+
+def test_a_quiet_start_does_not_say_audio_is_not_captured(monkeypatch):
+    """Joining early to a room where nobody has spoken yet."""
+    fired, _ = _run_watchdog(monkeypatch, endpoints=QUIET_CALL, follow=False,
+                             had_signal=False)
+    assert fired == []
+
+
+def test_a_call_nobody_captures_from_the_start_still_alarms(monkeypatch):
+    fired, _ = _run_watchdog(monkeypatch, endpoints=CALL_ON_OTHER_DEVICE, follow=False,
+                             had_signal=False)
+    assert fired == ["never"]
+
+
+def test_both_alarms_go_through_the_probe():
+    body = _watchdog()
+    polling = body[body.index("while self.is_running:"):]
+    assert polling.count('_audio_is_being_missed("never")') == 1
+    assert polling.count('_audio_is_being_missed("dropped")') == 1
+    assert polling.count("self._emit_loopback_silent(") == 2
